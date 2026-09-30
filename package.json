@@ -1,0 +1,40 @@
+{
+  "name": "keysmith-api",
+  "version": "0.1.0",
+  "description": "Forge an OpenAI-compatible API key out of any coding CLI. Bridges Command Code, opencode, Qoder CLI, GitHub Copilot, evren, Ollama & friends behind one /v1 endpoint, with failover, streaming and Cloudflare tunnel support.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "keysmith": "src/cli.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node --test",
+    "start": "node src/cli.js serve"
+  },
+  "keywords": [
+    "openai-compatible",
+    "llm-gateway",
+    "coding-agent",
+    "cli",
+    "opencode",
+    "command-code",
+    "copilot",
+    "cloudflared",
+    "byok"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hakkisagdic/keysmith.git"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "docs"
+  ],
+  "dependencies": {},
+  "devDependencies": {}
+}

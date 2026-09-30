@@ -1,0 +1,81 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "auth": {
+    "enabled": true,
+    "keys": ["ks_replace_me_with_keysmith_key_add"]
+  },
+  "log": { "usage": true, "body": false },
+  "limits": { "maxConcurrent": 4, "timeoutMs": 300000 },
+
+  "tunnel": {
+    "provider": "cloudflared",
+    "name": "keysmith",
+    "hostname": "llm.example.com",
+    "configFile": "~/.cloudflared/keysmith.yml"
+  },
+
+  "adapters": {
+    "cmd": {
+      "kind": "cli",
+      "bin": "cmd",
+      "args": ["-p", "{noSession}", "--output-format", "json", "--max-turns", "1", ["--model", "{model}"], "{prompt}"],
+      "resumeArgs": ["-p", "--output-format", "json", "--max-turns", "1", "--resume", "{session}", "{prompt}"],
+      "persistSessions": false,
+      "parser": "cmd-ndjson",
+      "modelsFrom": { "args": ["--list-models"] },
+      "maxConcurrent": 1,
+      "timeoutMs": 300000,
+      "note": "cmd adds its own ~16k-token agent prompt to every call and bills it."
+    },
+
+    "oc": {
+      "kind": "cli",
+      "bin": "opencode",
+      "args": ["run", "--format", "json", "--pure", "--auto", ["--model", "{model}"], "{prompt}"],
+      "resumeArgs": ["run", "--format", "json", "--pure", "--auto", "--session", "{session}", "{prompt}"],
+      "persistSessions": true,
+      "parser": "opencode-ndjson",
+      "modelsFrom": { "args": ["models"] },
+      "maxConcurrent": 2
+    },
+
+    "evren": {
+      "kind": "http",
+      "wire": "openai",
+      "baseUrl": "https://llmapi.example.org/v1",
+      "apiKey": "{json:~/.local/share/opencode/auth.json#evren.key}",
+      "priority": 10,
+      "note": "Reuse the key an agent already stores instead of pasting it into this file. Any OpenAI-compatible inference endpoint works here."
+    },
+
+    "copilot": {
+      "kind": "http",
+      "wire": "openai",
+      "baseUrl": "https://api.githubcopilot.com",
+      "apiKey": "{exec:security find-generic-password -s copilot-api -w}",
+      "headers": {
+        "editor-version": "vscode/1.104.1",
+        "copilot-integration-id": "vscode-chat",
+        "openai-intent": "chat"
+      },
+      "models": ["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
+      "priority": 60,
+      "note": "/models lists far more than your plan will actually run; declare the subset that answers."
+    },
+
+    "ollama": {
+      "kind": "http",
+      "wire": "openai",
+      "baseUrl": "http://127.0.0.1:11434/v1",
+      "apiKey": false,
+      "priority": 50
+    }
+  },
+
+  "aliases": {
+    "cheap": ["evren/deepseek-v4-flash", "ollama/qwen3:4b", "oc/evren/deepseek-v4-flash"],
+    "chat": ["evren/gpt-4.1", "copilot/gpt-4.1", "cmd/evren/glm-5.3"],
+    "fallback-only": ["evren/gpt-4.1", "cmd/gpt-5"]
+  }
+}

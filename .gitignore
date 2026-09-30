@@ -1,0 +1,22 @@
+# No dependencies, so only node_modules would ever appear; kept for completeness.
+node_modules/
+.npm/
+
+# Local state. The config file legitimately holds secret *references*, never secrets,
+# but it is still your machine's wiring — do not commit it.
+.config.json
+keysmith.config.json
+examples/config.local.json
+
+# Runtime artifacts
+*.log
+*.pid
+usage.jsonl
+data/
+.tmp/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
