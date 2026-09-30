@@ -55,7 +55,7 @@ before(async () => {
       // Configured, but its credential is not in this environment: it must fail loudly.
       broken: { kind: 'http', wire: 'openai', baseUrl: 'http://127.0.0.1:1/v1', apiKey: '{env:KEYSMITH_TEST_ABSENT_KEY}' },
     },
-    aliases: { resilient: ['stub/bad', 'stub/good'] },
+    aliases: { resilient: ['stub/bad', 'stub/good'], typo: ['ghost/m1', 'broken/gpt-4', 'stub/good'] },
   };
   const usage = new UsageLog(path.join(dir, 'usage.jsonl'));
   server = createServer(new Gateway(cfg, { log: (m) => log.push(m) }), cfg, { usage, log: () => {} });
@@ -123,6 +123,30 @@ test('an adapter that is configured but cannot load says why, in every place you
   assert.ok((listed.keysmith?.errors || []).some((e) => e.startsWith('broken:')), JSON.stringify(listed));
   const page = await (await fetch(`${base}/?api_key=${KEY}`)).text();
   assert.match(page, /did not load/);
+});
+
+test('a dead leg inside an alias keeps answering, and is named where you would look', async () => {
+  const { status, text } = await post('/v1/chat/completions', { model: 'typo', messages: [{ role: 'user', content: 'go' }] });
+  assert.equal(status, 200, 'the healthy leg serves the request; the route is not poisoned by its typos');
+  assert.match(JSON.parse(text).choices[0].message.content, /answer from good/);
+
+  const listed = await (await fetch(`${base}/v1/models`, { headers: auth })).json();
+  const aliasErrors = (listed.keysmith?.errors || []).filter((e) => e.startsWith('alias "typo"'));
+  assert.equal(aliasErrors.length, 2, JSON.stringify(listed.keysmith?.errors));
+  assert.ok(aliasErrors.some((e) => e.includes('ghost/m1') && e.includes('no adapter named "ghost"')), aliasErrors.join(' | '));
+  assert.ok(aliasErrors.some((e) => e.includes('broken/gpt-4') && e.includes('did not load')), aliasErrors.join(' | '));
+
+  const routes = await (await fetch(`${base}/v1/keysmith/routes`, { headers: auth })).json();
+  assert.equal(routes.alias_warnings.typo.length, 2, JSON.stringify(routes.alias_warnings));
+  assert.deepEqual(routes.aliases.typo, ['ghost/m1', 'broken/gpt-4', 'stub/good'], 'the config is still reported verbatim, warnings sit beside it');
+
+  const page = await (await fetch(`${base}/?api_key=${KEY}`)).text();
+  assert.match(page, /Alias legs that can never work/);
+  assert.match(page, /ghost\/m1/);
+  assert.ok(page.indexOf('<td class="bad">typo</td>') > -1 || page.includes('class="bad">typo<'), 'the alias is flagged red in the model table too');
+
+  const health = await (await fetch(`${base}/healthz`)).json();
+  assert.equal(health.alias_warnings, 1, 'a supervisor can see the count without a key — names stay private');
 });
 
 test('a non-streaming CLI call comes back as an OpenAI completion with real usage', async () => {

@@ -22,6 +22,7 @@ export class HttpAdapter {
     this.modelMap = cfg.modelMap || {};
     this._apiKey = cfg._apiKey ?? null;
     this._declared = cfg.models;
+    this._modelCache = null; // same 10-minute shape as CliAdapter's, so /v1/models does not refetch every provider on every poll
     this.defaultModel = cfg.defaultModel || null;
     this.note = cfg.note || null;
   }
@@ -49,9 +50,13 @@ export class HttpAdapter {
   }
 
   async models() {
-    if (Array.isArray(this._declared)) return this._declared.map((m) => (typeof m === 'string' ? { id: m } : m));
-    if (this._declared && typeof this._declared === 'object') {
-      return Object.entries(this._declared).map(([id, v]) => ({ id, ...(typeof v === 'object' && v ? v : {}) }));
+    if (this._modelCache && Date.now() - this._modelCache.at < 600_000) return this._modelCache.list;
+    // Declared in the config means authoritative *and* free: cache it like anything else,
+    // since `gateway.aliasIssues` reads that cache to check alias legs.
+    if (Array.isArray(this._declared) || (this._declared && typeof this._declared === 'object')) {
+      const list = this._declaredModelList();
+      this._modelCache = { at: Date.now(), list };
+      return list;
     }
     let res;
     try {
@@ -63,9 +68,19 @@ export class HttpAdapter {
     const body = await res.json().catch(() => null);
     if (!body) throw new LlmError(`${this.id}: /models returned no JSON`, { status: 502, provider: this.id });
     const list = Array.isArray(body) ? body : body.data || body.models || [];
-    return list
+    const fetched = list
       .map((m) => (typeof m === 'string' ? { id: m } : { id: m.id || m.name, name: m.name, contextWindow: m.context_length || m.context_window || m.limit?.context }))
       .filter((m) => m.id);
+    this._modelCache = { at: Date.now(), list: fetched };
+    return fetched;
+  }
+
+  /** `models` accepts a string array, an object array, or an id->details map. */
+  _declaredModelList() {
+    if (Array.isArray(this._declared)) {
+      return this._declared.map((m) => (typeof m === 'string' ? { id: m } : m)).filter((m) => m && m.id);
+    }
+    return Object.entries(this._declared).map(([id, v]) => ({ id, ...(typeof v === 'object' && v ? v : {}) }));
   }
 
   /** Verbatim relay — used when the client asked for `tools` (see server.tryPassthrough). */

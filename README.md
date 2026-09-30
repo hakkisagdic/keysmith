@@ -65,7 +65,7 @@ that is the interesting part.
 | `POST /v1/responses` | OpenAI Responses (Codex-style `input` arrays) |
 | `POST /v1/embeddings` | forwarded to HTTP adapters only |
 | `GET /v1/models` | the whole catalogue, namespaced; `?refresh` re-queries |
-| `GET /v1/keysmith/routes` | adapters, aliases and limits as JSON |
+| `GET /v1/keysmith/routes` | adapters, aliases, limits and any unusable alias leg (`alias_warnings`) as JSON |
 | `GET /v1/keysmith/usage?hours=24&tail=50` | request counts per model, latest entries |
 | `GET /` | status page in a browser (`?api_key=…`, same key as the API) |
 | `GET /healthz` | keyless liveness probe for a supervisor |
@@ -96,6 +96,16 @@ Declared order wins. keysmith tries the next candidate **only while nothing has 
 the client** — a half-delivered answer is never restarted, because the user already saw
 part of it. That makes aliases safe to point at a laptop's whole toolchain: a direct API
 first, a local model second, an agent CLI last.
+
+Which is also why a typo in a chain is invisible at request time: a leg naming an adapter
+you do not have gets skipped, and a leg naming a model the adapter never heard of gets
+rejected upstream and failover'd — both look like a slightly slow provider, while quietly
+answering from a route you did not choose and did not price. So keysmith reads every alias
+leg off the config at startup and names the unusable ones in `keysmith doctor`, on the
+status page, in `GET /v1/models` (`keysmith.errors`) and in
+`GET /v1/keysmith/routes` (`alias_warnings`). A leg pointing at a *dynamic* catalogue (a CLI
+with no `models` declared) can't be checked without spawning it — that's what
+`keysmith doctor --probe-models` is for.
 
 Per-adapter knobs that shape a route: `priority` (orders the flat listing), `disabled`,
 `timeoutMs`, `maxConcurrent` (a semaphore, so five browser tabs cannot fork five agents),

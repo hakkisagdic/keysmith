@@ -185,7 +185,17 @@ function stubAdapter(id, opts = {}) {
     priority: opts.priority ?? 100,
     resumeArgs: null,
     resumable: false,
-    models: async () => opts.models || [{ id: 'm1' }],
+    // HttpAdapter keeps the config's `models` on `_declared`; the gateway reads it (never `models()`)
+    // so alias legs can be checked without a network round trip.
+    _declared: opts.declared,
+    _modelCache: null,
+    // Both real adapters fill this on read, and the gateway uses it to check legs against a
+    // catalogue it could only learn by asking.
+    async models() {
+      const list = opts.models || [{ id: 'm1' }];
+      this._modelCache = { at: Date.now(), list };
+      return list;
+    },
     async *complete({ model }) {
       if (opts.fail) throw new Error(`${id} is down`);
       yield { type: 'delta', text: `${id}:${model}` };
@@ -221,6 +231,71 @@ test('an unknown adapter is a 404, not a silent empty answer', async () => {
   const gw = new Gateway({ adapters: {}, aliases: {} });
   await assert.rejects(() => gw.collect({ model: 'nope/m1', messages: [{ role: 'user', content: 'x' }] }), /no adapter named "nope"/);
 });
+
+test('a leg pointing at an adapter that does not exist is named in aliasIssues', () => {
+  const gw = new Gateway({ adapters: {}, aliases: { route: ['ghost/m1', 'real/m1'] } });
+  gw.adapters.set('real', stubAdapter('real'));
+  const issues = gw.aliasIssues;
+  assert.deepEqual(Object.keys(issues), ['route']);
+  assert.match(issues.route[0], /no adapter named "ghost"/);
+  assert.equal(issues.route.length, 1, 'the healthy leg is not reported');
+});
+
+test('a leg naming a model the adapter never declared is reported, a dynamic catalogue is not', () => {
+  const gw = new Gateway({ adapters: {}, aliases: { typed: ['http/gpt-5.1'], cli: ['cli/whatever'] } });
+  gw.adapters.set('http', stubAdapter('http', { declared: ['gpt-4.1', 'gpt-4o'] }));
+  gw.adapters.set('cli', stubAdapter('cli', { models: [{ id: 'anything' }] }));
+  assert.match(gw.aliasIssues.typed[0], /"gpt-5.1" is not among http's declared models/);
+  assert.equal(gw.aliasIssues.cli, undefined, 'a CLI with no declared models is a catalogue we cannot check without spawning it');
+});
+
+test('a leg whose adapter failed to load says why, and nesting and empty chains are caught too', () => {
+  const gw = new Gateway({ adapters: { broken: { kind: 'http', baseUrl: 'http://127.0.0.1:1', apiKey: '{env:KEYSMITH_TEST_NO_SUCH_VAR}' } }, aliases: { empty: [], nested: ['other'], other: ['x/m1'], off: ['dis/m1'] } });
+  gw.adapters.set('dis', Object.assign(stubAdapter('dis'), { disabled: true }));
+  const issues = gw.aliasIssues;
+  assert.match(issues.empty[0], /has no targets/);
+  assert.match(issues.nested[0], /aliases cannot nest/);
+  assert.match(issues.off[0], /adapter "dis" is disabled/);
+  assert.match(issues.other[0], /no adapter named "x"/);
+});
+
+test('a dynamic catalogue is checked once the gateway has read it, and only while that read is fresh', async () => {
+  const gw = new Gateway({ adapters: {}, aliases: { r: ['dyn/not-listed'] } });
+  const dyn = stubAdapter('dyn', { models: [{ id: 'listed' }] });
+  gw.adapters.set('dyn', dyn);
+  assert.equal(gw.aliasIssues.r, undefined, 'nothing has been read yet, so there is nothing to check against');
+  await gw.listModels();
+  assert.match(gw.aliasIssues.r[0], /"not-listed" is not among dyn's last-read model list/);
+  dyn._modelCache = { at: Date.now() - 601_000, list: [{ id: 'listed' }] };
+  assert.equal(gw.aliasIssues.r, undefined, 'a list more than ten minutes old is not evidence about right now');
+});
+
+
+test('aliasIssues is recomputed, so an adapter added after construction clears its leg', () => {
+  const gw = new Gateway({ adapters: {}, aliases: { route: ['late/m1'] } });
+  assert.equal(gw.aliasIssues.route[0].includes('no adapter named "late"'), true);
+  gw.adapters.set('late', stubAdapter('late'));
+  assert.deepEqual(gw.aliasIssues, {});
+});
+
+test('an unusable alias leg reaches listModels errors and never the client as a surprise', async () => {
+  const gw = new Gateway({ adapters: {}, aliases: { route: ['ghost/m1', 'real/m1'] } });
+  gw.adapters.set('real', stubAdapter('real'));
+  const { errors } = await gw.listModels();
+  assert.ok(errors.some((e) => e.includes('alias "route"') && e.includes('ghost/m1')), errors.join(' | '));
+  const { text } = await gw.collect({ model: 'route', messages: [{ role: 'user', content: 'x' }] });
+  assert.equal(text, 'real:m1', 'the route still answers from the next leg');
+});
+
+test('a dead leg in an alias is skipped, but an alias with only dead legs still reports the first reason', async () => {
+  const gw = new Gateway({ adapters: {}, aliases: { half: ['ghost/m1', 'real/m1'], all: ['ghost/m1', 'also/m1'], off: ['dis/m1', 'real/m1'] } });
+  gw.adapters.set('real', stubAdapter('real'));
+  gw.adapters.set('dis', Object.assign(stubAdapter('dis'), { disabled: true }));
+  assert.equal((await gw.collect({ model: 'half', messages: [{ role: 'user', content: 'x' }] })).text, 'real:m1');
+  assert.equal((await gw.collect({ model: 'off', messages: [{ role: 'user', content: 'x' }] })).text, 'real:m1', 'a disabled adapter is a dead leg too, not a hard failure');
+  await assert.rejects(() => gw.collect({ model: 'all', messages: [{ role: 'user', content: 'x' }] }), /no adapter named "ghost"/);
+});
+
 
 test('the catalogue prefixes ids and keeps upstream metadata', async () => {
   const gw = new Gateway({ adapters: {}, aliases: { duo: ['a/m1'] } });

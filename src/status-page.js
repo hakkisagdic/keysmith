@@ -5,9 +5,10 @@ import { configPath } from './config.js';
  * A one-screen status page at `/`. Not a product — a place to see, in a browser,
  * which adapters loaded and what the last requests cost, without opening a terminal.
  */
-export function statusPage({ cfg, models, usage, startedAt, loadErrors = {} }) {
+export function statusPage({ cfg, models, usage, startedAt, loadErrors = {}, aliasIssues = {} }) {
   const adapters = Object.entries(cfg.adapters || {});
   const failed = Object.entries(loadErrors);
+  const aliasList = Object.entries(aliasIssues);
   const summary = usage?.summarize?.() || { requests: 0, failures: 0, tokensIn: 0, tokensOut: 0, models: [] };
   const rows = (summary.models || [])
     .slice(0, 12)
@@ -44,9 +45,12 @@ ${adapters.length ? `<div class="grid">${adapters
 ${failed.length ? `<h2>Configured but did not load</h2><table><thead><tr><th>adapter</th><th>why</th></tr></thead><tbody>${failed
     .map(([id, msg]) => `<tr><td class="bad">${esc(id)}</td><td>${esc(msg)}</td></tr>`)
     .join('')}</tbody></table>` : ''}
+${aliasList.length ? `<h2>Alias legs that can never work</h2><table><thead><tr><th>alias</th><th>why</th></tr></thead><tbody>${aliasList
+    .map(([alias, problems]) => `<tr><td><b>${esc(alias)}</b></td><td>${problems.map((p) => esc(`alias "${alias}" ${p}`)).join('<br>')}</td></tr>`)
+    .join('')}</tbody></table><p class="muted">Failover hides these at request time — a dead first leg just looks like a slow provider, so this page is where the typo becomes visible.</p>` : ''}
 <h2>Models</h2>
 <table><thead><tr><th>id</th><th>adapter</th><th>upstream</th><th>context</th></tr></thead><tbody>
-${models.map((m) => `<tr><td>${esc(m.id)}</td><td class="muted">${esc(m.keysmith?.adapter || '')}</td><td class="muted">${esc(m.keysmith?.upstream || '')}</td><td class="n">${m.keysmith?.contextWindow || ''}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">no models listed — check <code>keysmith doctor</code></td></tr>'}
+${models.map((m) => `<tr><td${m.keysmith?.kind === 'alias' && aliasIssues[m.id] ? ' class="bad"' : ''}>${esc(m.id)}</td><td class="muted">${esc(m.keysmith?.adapter || '')}</td><td class="muted">${esc(m.keysmith?.upstream || '')}</td><td class="n">${m.keysmith?.contextWindow || ''}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">no models listed — check <code>keysmith doctor</code></td></tr>'}
 </tbody></table>
 ${rows ? `<h2>Last 24h by model</h2><table><thead><tr><th>model</th><th class="n">req</th><th class="n">err</th><th class="n">in</th><th class="n">out</th><th class="n">avg</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
 <p class="muted">Keys never leave this machine's config. <code>Authorization: Bearer &lt;key&gt;</code> is required on /v1 — and here, as <code>?api_key=…</code>.</p>

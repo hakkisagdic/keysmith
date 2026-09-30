@@ -30,12 +30,12 @@ export function createServer(gateway, cfg, { usage, log = () => {} } = {}) {
     res.setHeader('access-control-allow-headers', 'authorization,content-type,x-keysmith-session,x-api-key,anthropic-version');
     res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
 
-    if (route === '/healthz') return send(res, 200, { 'content-type': 'application/json' }, JSON.stringify({ ok: true, uptime_s: Math.round((Date.now() - startedAt) / 1000), adapters: gateway.publicAdapters.length }));
+    if (route === '/healthz') return send(res, 200, { 'content-type': 'application/json' }, JSON.stringify({ ok: true, uptime_s: Math.round((Date.now() - startedAt) / 1000), adapters: gateway.publicAdapters.length, failed_to_load: Object.keys(gateway.loadErrors).length, alias_warnings: Object.keys(gateway.aliasIssues).length }));
     // The status page lists every model and token count this gateway knows about, so it
     // is gated like the API. A browser can still open it: append ?api_key=<key>.
     if ((route === '/' || route === '/status') && req.method === 'GET' && authorize(req, keys)) {
       const { models } = await safeList(gateway);
-      return send(res, 200, { 'content-type': 'text/html; charset=utf-8' }, statusPage({ cfg, models, usage, startedAt, loadErrors: gateway.loadErrors }));
+      return send(res, 200, { 'content-type': 'text/html; charset=utf-8' }, statusPage({ cfg, models, usage, startedAt, loadErrors: gateway.loadErrors, aliasIssues: gateway.aliasIssues }));
     }
 
     if (!authorize(req, keys)) {
@@ -48,7 +48,7 @@ export function createServer(gateway, cfg, { usage, log = () => {} } = {}) {
         return json(res, 200, { object: 'list', data: models, ...(errors.length ? { keysmith: { errors } } : {}) });
       }
       if (route === '/v1/keysmith/routes' && req.method === 'GET') {
-        return json(res, 200, { adapters: describeAdapters(gateway), failed_to_load: gateway.loadErrors, aliases: cfg.aliases || {}, limits: cfg.limits });
+        return json(res, 200, { adapters: describeAdapters(gateway), failed_to_load: gateway.loadErrors, aliases: cfg.aliases || {}, alias_warnings: gateway.aliasIssues, limits: cfg.limits });
       }
       if (route === '/v1/keysmith/usage' && req.method === 'GET') {
         const n = Number(url.searchParams.get('tail') || 0);

@@ -22,11 +22,25 @@ Two kinds:
 | `priority` | cli 200, http 100 | orders the flat `/v1/models` listing only. **It does not order an alias chain** — declared order wins there, because you wrote the chain. |
 | `disabled` | `false` | keeps the entry, takes it out of service |
 | `timeoutMs` | cli 300000, http 120000 | SIGTERM, then SIGKILL five seconds later; for HTTP it is `AbortSignal.timeout` |
-| `models` | — | explicit catalogue: `["gpt-4.1","gpt-4o"]`, or `{"gpt-4o": {"contextWindow": 128000}}` |
+| `models` | — | explicit catalogue: `["gpt-4.1","gpt-4o"]`, or `{"gpt-4o": {"contextWindow": 128000}}`. Also what an alias leg is checked against at startup — declare the subset you can actually run and a typo in a chain becomes a warning instead of a silent re-route. |
 | `defaultModel` | — | used when the request has no model part (`"cmd"` alone) |
 | `modelMap` | — | `{ "<requested>": "<upstream>" }` rewrite, HTTP only |
 | `note` | — | shown in listings; the place to write down what you learned |
 | `headers` | `{}` | extra request headers, HTTP only |
+
+### Alias legs are checked against these fields, not against traffic
+
+`keysmith doctor`, the status page, `GET /v1/models` (`keysmith.errors`) and
+`GET /v1/keysmith/routes` (`alias_warnings`) all name any alias leg that cannot work:
+a leg whose adapter is missing, failed to load, or disabled; an empty chain; an alias
+referencing another alias; a leg naming a model that the adapter's `models` does not
+contain. Requests still succeed when only part of a chain is broken — `resolve()` skips a
+dead leg inside an alias rather than poisoning the route — the point of the check is that
+failover otherwise answers your `chat` request from a provider you did not choose.
+
+Legs pointing into a *dynamic* catalogue (a CLI with no `models`, whose list comes from
+`modelsFrom`) are not checked at startup: that would mean spawning every adapter on the way
+to a listening socket. `keysmith doctor --probe-models` spends the requests instead.
 
 ## CLI fields
 

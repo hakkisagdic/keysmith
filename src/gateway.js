@@ -32,6 +32,70 @@ export class Gateway {
     }
   }
 
+  /**
+   * Alias ids whose legs can never work, read straight off the config.
+   *
+   * A dead leg is invisible in the two ways that matter. If it names an adapter we do not
+   * have, `resolve()` skips it and the route answers from a different provider than the one
+   * you meant to be paying for. If it names a model that adapter never heard of, the
+   * upstream rejects it after a round trip and failover retries the next leg before anything
+   * reaches the client — so all you see is latency. Neither is loud until it is the whole
+   * chain and the client gets a 502. Checking the config before any traffic is what makes a
+   * typo a one-line warning in `keysmith doctor` instead of a mystery in production.
+   *
+   * Computed on access rather than cached in the constructor: adapters are added to the map
+   * after construction (a CLI whose binary appeared late, a test wiring stubs directly), and
+   * a snapshot taken that early would report legs as broken forever. It walks a handful of
+   * strings, so recomputing is cheaper than invalidating correctly.
+   *
+   * A leg naming a model in a *dynamic* catalogue (a CLI with no declared `models`, a
+   * provider whose `/models` has not been read yet) can only be checked once that list is
+   * known, so it is checked against the adapter's cache when there is one and left alone
+   * when there is not — the alternative is spawning every adapter on the way to a listening
+   * socket. `keysmith doctor --probe-models` covers what no listing can tell you: an id a
+   * catalogue advertises but the upstream refuses to actually run.
+   *
+   * @returns {Record<string, string[]>} alias id -> one line per unusable leg
+   */
+  get aliasIssues() {
+    const out = {};
+    for (const [alias, targets] of Object.entries(this.cfg.aliases || {})) {
+      const problems = [];
+      if (!Array.isArray(targets) || targets.length === 0) {
+        problems.push('has no targets, so requesting it can only fail');
+      } else {
+        for (const leg of targets) {
+          if (typeof leg !== 'string' || !leg) {
+            problems.push(`has an empty leg (${JSON.stringify(leg)})`);
+            continue;
+          }
+          const slash = leg.indexOf('/');
+          const adapterId = slash < 0 ? leg : leg.slice(0, slash);
+          const model = slash < 0 ? '' : leg.slice(slash + 1);
+          const adapter = this.adapters.get(adapterId);
+          if (!adapter && slash < 0 && this.cfg.aliases?.[leg]) {
+            problems.push(`${leg}: aliases cannot nest — name the adapter/model directly`);
+            continue;
+          }
+          if (!adapter) {
+            problems.push(`${leg}: ${this.loadErrors[adapterId] ? `adapter "${adapterId}" is configured but did not load (${this.loadErrors[adapterId]})` : `no adapter named "${adapterId}"`} — that leg 404s on every request`);
+            continue;
+          }
+          if (adapter.disabled) {
+            problems.push(`${leg}: adapter "${adapterId}" is disabled`);
+            continue;
+          }
+          const known = knownModels(adapter);
+          if (model && known && !known.ids.includes(model)) {
+            problems.push(`${leg}: "${model}" is not among ${adapterId}'s ${known.from} — it will be sent upstream and rejected`);
+          }
+        }
+      }
+      if (problems.length) out[alias] = problems;
+    }
+    return out;
+  }
+
   get publicAdapters() {
     return [...this.adapters.values()].filter((a) => !a.disabled);
   }
@@ -73,8 +137,14 @@ export class Gateway {
         id: alias,
         object: 'model',
         owned_by: 'keysmith:alias',
-        keysmith: { adapter: 'alias', kind: 'alias', routes: targets, priority: -1 },
+        keysmith: { adapter: 'alias', kind: 'alias', routes: targets, priority: -1, ...(this.aliasIssues[alias] ? { warnings: this.aliasIssues[alias] } : {}) },
       });
+    }
+    // After the fetches above: `knownModels` can only check a dynamic catalogue once the
+    // adapter has actually read one, so an alias leg pointing at a wrong evren/CLI model
+    // becomes knowable right here — report it in the same call that learned it.
+    for (const [alias, problems] of Object.entries(this.aliasIssues)) {
+      for (const p of problems) errors.push(`alias "${alias}" ${p}`);
     }
     models.sort((x, y) => x.id.localeCompare(y.id));
     return { models, errors };
@@ -86,24 +156,45 @@ export class Gateway {
     while (this.sessions.size > 1000) this.sessions.delete(this.sessions.keys().next().value);
   }
 
-  /** Resolve a requested model id into the ordered candidate list to try. */
+  /**
+   * Resolve a requested model id into the ordered candidate list to try.
+   *
+   * A bare model id that names no adapter is a straight error — you asked for a specific
+   * thing and we do not have it. Inside an alias it is a dead leg: the chain exists to be
+   * robust, so an unusable leg is skipped and reported rather than poisoning the route.
+   * `aliasIssues` (doctor, /status, /v1/models, the routes endpoint) is where the skip
+   * becomes loud, so skipping never hides a misconfiguration — it only keeps answering.
+   */
   resolve(requested) {
     if (!requested) throw new LlmError('missing "model"', { status: 400 });
     const aliases = this.cfg.aliases || {};
-    const chain = aliases[requested] ? [...aliases[requested]] : [requested];
+    const isAlias = !!aliases[requested];
+    const chain = isAlias ? [...aliases[requested]] : [requested];
     const out = [];
+    let firstError = null;
     for (const entry of chain) {
       const slash = entry.indexOf('/');
       const adapterId = slash < 0 ? entry : entry.slice(0, slash);
       const modelName = slash < 0 ? '' : entry.slice(slash + 1);
       const adapter = this.adapters.get(adapterId);
+      let err = null;
       if (!adapter) {
         const why = this.loadErrors[adapterId];
-        throw new LlmError(why ? `adapter "${adapterId}" is configured but did not load: ${why}` : `no adapter named "${adapterId}" — try one of: ${[...this.adapters.keys()].join(', ')}`, { status: why ? 503 : 404, provider: adapterId });
+        err = new LlmError(why ? `adapter "${adapterId}" is configured but did not load: ${why}` : `no adapter named "${adapterId}" — try one of: ${[...this.adapters.keys()].join(', ')}`, { status: why ? 503 : 404, provider: adapterId });
+      } else if (adapter.disabled) {
+        err = new LlmError(`adapter "${adapterId}" is disabled`, { status: 503, provider: adapterId });
       }
-      if (adapter.disabled) throw new LlmError(`adapter "${adapterId}" is disabled`, { status: 503, provider: adapterId });
+      if (err) {
+        firstError ??= err;
+        if (isAlias && chain.length > 1) {
+          this.log(`alias "${requested}" skipped a dead leg: ${err.message}`);
+          continue;
+        }
+        throw err;
+      }
       out.push({ adapter, model: modelName || adapter.defaultModel || '', target: entry });
     }
+    if (!out.length) throw firstError;
     // Declared order wins in an alias: you wrote the chain, you know which leg should
     // be tried first. `priority` only orders the flat model listing.
     return out;
@@ -210,6 +301,27 @@ function mergeUsage(a, b) {
 function adapterOf(target) {
   const i = String(target).indexOf('/');
   return i < 0 ? target : target.slice(0, i);
+}
+
+/**
+ * The model ids we can check a leg against without touching the network: the `models`
+ * the adapter was given in its config, or the catalogue it last actually read (a CLI's
+ * `--list-models`, upstream `/models`) while that read is still fresh.
+ * Returns null when neither exists — startup, before any listing has been asked for.
+ */
+function knownModels(adapter) {
+  const declared = adapter._declared ?? adapter.declaredModels ?? null;
+  if (Array.isArray(declared)) {
+    const ids = declared.map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean);
+    if (ids.length) return { ids, from: 'declared models' };
+  } else if (declared && typeof declared === 'object' && Object.keys(declared).length) {
+    return { ids: Object.keys(declared), from: 'declared models' };
+  }
+  const cached = adapter._modelCache;
+  if (Array.isArray(cached?.list) && cached.list.length && Date.now() - (cached.at || 0) < 600_000) {
+    return { ids: cached.list.map((m) => m?.id || m).filter(Boolean), from: 'last-read model list' };
+  }
+  return null;
 }
 
 function newSessionId() {

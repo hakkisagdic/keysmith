@@ -409,9 +409,17 @@ async function cmdDoctor(flags) {
     }
   }
 
+  // Read from gateway.aliasIssues, not the per-request log: failover makes a dead alias leg
+  // look like a slow provider, so a typo is only visible before any traffic has been sent.
+  for (const [alias, problems] of Object.entries(gateway.aliasIssues)) {
+    for (const p of problems) rows.push([alias, 'alias warning', truncate(p, 70)]);
+  }
+
   const w = Math.max(...rows.map((r) => r[0].length), 8);
   for (const [id, state, detail] of rows) {
-    out(`  ${state === 'ok' ? '✓' : '✗'} ${id.padEnd(w)}  ${state.padEnd(16)} ${detail}`);
+    // '!' rather than '✗': the route still answers, because the next leg in the chain picks it
+    // up. What is broken is the ordering you asked for, and the money you think you are saving.
+    out(`  ${state === 'ok' ? '✓' : state === 'alias warning' ? '!' : '✗'} ${id.padEnd(w)}  ${state.padEnd(16)} ${detail}`);
   }
 
   const t = tunnel.tunnelStatus(cfg);
