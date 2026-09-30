@@ -76,6 +76,12 @@ an HTTP adapter or an alias whose first leg is HTTP.
 For a gateway on the Anthropic wire, the adapter itself needs `"wire": "anthropic"`;
 clients never see that, they only see keysmith's own face.
 
+One Anthropic-specific trap: `max_tokens` is mandatory there, and a reasoning model spends
+it on thinking before it writes a word. Measured against a live upstream, `"max_tokens":
+32` on a one-word answer came back truncated to `"ANTH"` with `output_tokens: 32` — the
+bridge was not cutting anything off, the budget was gone. Give thinking models at least a
+couple of hundred.
+
 ## Command Code
 
 Command Code keeps the URL and the key in **separate files**, and refuses a raw secret in
