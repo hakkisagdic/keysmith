@@ -7,6 +7,8 @@ import { joinArgs, flattenMessages, agentCleanEnv } from '../src/util.js';
 import { resolveSecret } from '../src/config.js';
 import { cmdNdjson, opencodeNdjson, claudeStreamJson, rawText, toLines } from '../src/parsers.js';
 import { Gateway } from '../src/gateway.js';
+import { tunnelArgs } from '../src/tunnel.js';
+import * as service from '../src/service.js';
 
 /* ------------------------------------------------------------------- argv templates */
 
@@ -305,4 +307,53 @@ test('the catalogue prefixes ids and keeps upstream metadata', async () => {
   assert.equal(m.owned_by, 'keysmith:a');
   assert.equal(m.keysmith.contextWindow, 4096);
   assert.ok(models.some((x) => x.id === 'duo' && x.keysmith.kind === 'alias'), 'aliases are selectable in a picker');
+});
+
+/* --- tunnel argv ---------------------------------------------------------------- */
+
+test('a quick tunnel gets --url and no tunnel name', () => {
+  assert.deepEqual(tunnelArgs({ port: 8787 }), ['tunnel', '--no-autoupdate', '--url', 'http://127.0.0.1:8787']);
+});
+
+test('a named tunnel must carry --config, or cloudflared reads nothing and the edge 503s', () => {
+  const args = tunnelArgs({ port: 8787, name: 'keysmith', configFile: '/home/me/.cloudflared/keysmith.yml' });
+  assert.ok(args.includes('--config'), 'the ingress file has to be named explicitly');
+  assert.ok(args.includes('/home/me/.cloudflared/keysmith.yml'));
+  assert.deepEqual(args.slice(-2), ['run', 'keysmith']);
+  assert.ok(!args.includes('--url'), 'a named tunnel never points at a URL, only the ingress file does');
+});
+
+test('~ in a configured ingress path is expanded before it reaches cloudflared', () => {
+  const args = tunnelArgs({ port: 1, name: 'k', configFile: '~/.cloudflared/keysmith.yml' });
+  const given = args[args.indexOf('--config') + 1];
+  assert.ok(!given.startsWith('~'), `got ${given}`);
+  assert.ok(path.isAbsolute(given));
+  assert.equal(given, path.join(os.homedir(), '.cloudflared/keysmith.yml'));
+});
+
+test('a named tunnel with no ingress file still runs, which is the shape that fails silently', () => {
+  const args = tunnelArgs({ port: 8787, name: 'keysmith' });
+  assert.ok(!args.includes('--config'), 'documented: callers must pass configFile; startTunnel falls back to the on-disk file');
+});
+
+/* --- launchd service plists ------------------------------------------------------- */
+
+test('gateway plist runs serve under launchd with KeepAlive and a log path', () => {
+  const p = service.gatewayPlist({ nodeBin: '/opt/homebrew/bin/node', entry: '/Users/me/projects/keysmith/src/cli.js', port: 8787 });
+  assert.ok(p.includes('<string>dev.keysmith.gateway</string>'));
+  assert.ok(p.includes('<string>serve</string>'));
+  assert.ok(p.includes('<string>--port</string>') && p.includes('<string>8787</string>'));
+  assert.ok(p.includes('<key>KeepAlive</key>') && p.includes('<true/>'));
+  assert.ok(p.includes('launchd-gateway.log'));
+  assert.ok(p.includes('<key>PATH</key>'), 'launchd PATH must find the user CLIs the adapters spawn');
+});
+
+test('tunnel plist names the ingress file and the tunnel, and escapes XML in paths', () => {
+  const p = service.tunnelPlist({ cloudflared: '/opt/homebrew/bin/cloudflared', name: 'keysmith', configFile: '/Users/me/.cloudflared/keysmith.yml' });
+  const args = p.split('\n').filter((l) => l.includes('<string>')).map((l) => l.trim().replace(/<\/?string>/g, ''));
+  const runAt = args.indexOf('run');
+  assert.ok(args.includes('--config'));
+  assert.equal(args[runAt + 1], 'keysmith', 'tunnel name must be the last argument');
+  assert.ok(args.includes('/Users/me/.cloudflared/keysmith.yml'));
+  assert.ok(!p.includes('&amp;amp;'), 'no double-escaping');
 });

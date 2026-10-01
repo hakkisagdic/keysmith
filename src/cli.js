@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { loadConfig, saveConfig, configPath, dataDir, newApiKey, configExists } from './config.js';
 import { Gateway } from './gateway.js';
 import { createServer } from './server.js';
@@ -9,6 +9,7 @@ import { UsageLog } from './usage.js';
 import { CLI_PROFILES, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
 import { which } from './cli-adapter.js';
 import * as tunnel from './tunnel.js';
+import * as service from './service.js';
 import { rel, truncate } from './util.js';
 
 const PKG = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -28,6 +29,8 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith models [--refresh]        what this gateway exposes, and from where
   keysmith serve [--port N]          run the gateway  (http://127.0.0.1:<port>/v1)
   keysmith start | stop | status     keep it running in the background
+  keysmith install-service           run gateway (+ named tunnel) at login via launchd
+  keysmith uninstall-service         remove those launchd agents
   keysmith chat <model> <prompt>     one-shot request against your own gateway
   keysmith doctor [--probe-models]   is each adapter actually alive, and at what cost
   keysmith tunnel <status|setup|run> cloudflared: named tunnel first, quick as fallback
@@ -69,6 +72,10 @@ export async function main(argv) {
         return cmdStart(flags);
       case 'stop':
         return cmdStop(flags);
+      case 'install-service':
+        return cmdInstallService(flags);
+      case 'uninstall-service':
+        return cmdUninstallService(flags);
       case 'status':
         return cmdStatus(flags);
       case 'chat':
@@ -249,6 +256,7 @@ async function cmdServe(flags) {
       port: cfg.port,
       name: named ? cfg.tunnel.name : null,
       hostname: named ? cfg.tunnel.hostname : null,
+      configFile: named ? cfg.tunnel.configFile : null,
       onLog: (m) => log(m),
     });
     out(`  tunnel  : starting cloudflared (${named ? 'named' : 'quick'})…`);
@@ -325,6 +333,73 @@ function cmdStop() {
   process.kill(rec.pid, 'SIGTERM');
   removePid();
   out(`stopped pid ${rec.pid}`);
+}
+
+/* ---------------------------------------------------------------------- service */
+
+function cmdInstallService() {
+  const cfg = loadOrFail();
+  const named = cfg.tunnel?.name && cfg.tunnel?.configFile ? cfg.tunnel : null;
+  if (!named) {
+    out('no named tunnel configured — installing the gateway agent only.');
+    out('(a quick tunnel earns nothing from persistence: the hostname is random every start)\n');
+  }
+  const cloudflared = named ? tunnel.cloudflaredBin() : null;
+  if (named && !cloudflared) fail('named tunnel configured but cloudflared is not on PATH — install it first');
+  if (named && !fs.existsSync(named.configFile)) fail(`ingress file missing: ${rel(named.configFile)} — re-run \`keysmith tunnel setup <hostname> --yes\``);
+
+  const res = service.installService({
+    nodeBin: process.execPath,
+    entry: currentEntry(),
+    port: cfg.port,
+    cloudflared,
+    tunnelName: named?.name,
+    tunnelConfig: named?.configFile,
+  });
+
+  // Handover: launchd's gateway may have already tried and failed to bind while the
+  // old foreground one held the port (throttled retry picks it up within ~10s).
+  const rec = readPid();
+  if (rec && alive(rec.pid)) {
+    process.kill(rec.pid, 'SIGTERM');
+    removePid();
+    out(`handover: stopped foreground gateway pid ${rec.pid}`);
+  }
+  killStrayTunnel(named?.configFile);
+
+  out(`installed:\n${res.files.map((f) => `  ${f}`).join('\n')}`);
+  out(`logs: ${service.logDir()}/launchd-*.log`);
+  out(`verify: launchctl list | grep keysmith   (gateway answers within ~10s of the handover)`);
+}
+
+/** Kill cloudflared processes matching our ingress file that are NOT owned by launchd. */
+function killStrayTunnel(configFile) {
+  if (!configFile) return;
+  let lines = '';
+  try {
+    lines = execFileSync('ps', ['-Ao', 'pid=,ppid=,command='], { encoding: 'utf8' });
+  } catch {
+    return;
+  }
+  for (const line of lines.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const [, pid, ppid, cmd] = m;
+    if (Number(ppid) === 1) continue; // launchd's own connector — leave it
+    if (cmd.includes('cloudflared') && cmd.includes(configFile)) {
+      try {
+        process.kill(Number(pid), 'SIGTERM');
+        out(`handover: stopped stray tunnel pid ${pid}`);
+      } catch {}
+    }
+  }
+}
+
+function cmdUninstallService() {
+  const removed = service.uninstallService();
+  if (!removed.length) return out('no keysmith launchd agents installed');
+  out(`removed:\n${removed.map((f) => `  ${f}`).join('\n')}`);
+  out('the gateway keeps running until killed — `keysmith stop` if you want it down too');
 }
 
 async function cmdStatus() {
@@ -474,7 +549,13 @@ async function cmdTunnel(flags) {
   }
   if (sub === 'run') {
     const named = cfg.tunnel?.name;
-    const t = tunnel.startTunnel({ port: cfg.port, name: named, hostname: cfg.tunnel?.hostname, onLog: (m) => process.env.KEYSMITH_VERBOSE && out(m) });
+    const t = tunnel.startTunnel({
+      port: cfg.port,
+      name: named,
+      hostname: cfg.tunnel?.hostname,
+      configFile: cfg.tunnel?.configFile,
+      onLog: (m) => process.env.KEYSMITH_VERBOSE && out(m),
+    });
     out(`cloudflared ${t.mode} tunnel → 127.0.0.1:${cfg.port} (pid ${t.child.pid})`);
     await new Promise((resolve) => setTimeout(resolve, 3000));
     out(t.url ? `public: ${t.url}/v1` : 'no hostname yet — quick tunnels take a few seconds; watch stderr with KEYSMITH_VERBOSE=1');

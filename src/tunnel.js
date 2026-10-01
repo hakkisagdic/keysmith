@@ -90,6 +90,28 @@ export function readTunnelConfig() {
 }
 
 /**
+ * The argv cloudflared needs, as a pure function — because the one bug this file
+ * produced was an argument list built in two places and passed correctly in neither.
+ *
+ * A named tunnel created with `cloudflared tunnel create` carries its ingress in a
+ * LOCAL yaml file; cloudflared only ever auto-discovers `~/.cloudflared/config.yml`.
+ * `keysmith` writes `~/.cloudflared/keysmith.yml` so it never collides with a
+ * hand-rolled config, which means `--config` is not optional: without it cloudflared
+ * starts, registers a connector, looks healthy — and every request 503s at the edge
+ * because no ingress was ever read.
+ */
+export function tunnelArgs({ port, name = null, configFile = null }) {
+  if (!name && !configFile) return ['tunnel', '--no-autoupdate', '--url', `http://127.0.0.1:${port}`];
+  return [
+    'tunnel',
+    '--no-autoupdate',
+    ...(configFile ? ['--config', expand(configFile)] : []),
+    'run',
+    String(name),
+  ];
+}
+
+/**
  * Start a tunnel. Returns {mode, url, child, stop}.
  * mode === 'named' when a hostname is configured, else 'quick'.
  */
@@ -99,9 +121,11 @@ export function startTunnel({ port, name = null, hostname = null, configFile = n
     throw new Error('cloudflared not found on PATH — install it with `brew install cloudflared` and re-run');
   }
   const named = !!(name || configFile);
-  const args = named
-    ? ['tunnel', '--no-autoupdate', ...(configFile ? ['--config', expand(configFile)] : []), 'run', String(name)]
-    : ['tunnel', '--no-autoupdate', '--url', `http://127.0.0.1:${port}`];
+  // A named tunnel started without --config is the silent-503 shape: the connector
+  // registers, cloudflared logs nothing alarming, and the edge has no ingress to read.
+  // If keysmith wrote an ingress file, use it even when the caller forgot to say so.
+  if (named && !configFile && fs.existsSync(tunnelConfigPath())) configFile = tunnelConfigPath();
+  const args = tunnelArgs({ port, name, configFile });
 
   const child = spawn(bin, args.filter(Boolean), { stdio: ['ignore', 'pipe', 'pipe'] });
   let url = null;

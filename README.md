@@ -167,6 +167,15 @@ tunnels for anything you paste into a client you will not reopen. Details:
 Keep `host: 127.0.0.1`. There are no rate limits here, and a CLI adapter is a process
 spawner: an unauthenticated public gateway is a denial-of-wallet machine.
 
+On macOS, `keysmith install-service` writes two LaunchAgents
+(`~/Library/LaunchAgents/dev.keysmith.{gateway,tunnel}.plist`) so the gateway — and
+the named tunnel, when configured — come back at login without a terminal. It embeds
+absolute, symlink-resolved binary paths (an fnm multishell path dies with the shell
+that minted it) and a PATH that can find your CLIs, stops the foreground `keysmith
+start` / `tunnel run` processes it is replacing, and lets launchd's throttled retry
+rebind the port. `keysmith uninstall-service` reverses it. Quick tunnels are not
+persisted: a random hostname that changes every start earns nothing from a service.
+
 ## Built-in profiles
 
 | Profile | Kind | Status |
