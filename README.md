@@ -184,6 +184,7 @@ persisted: a random hostname that changes every start earns nothing from a servi
 | `opencode` | cli | verified live against opencode 1.18.27 |
 | `qoder` | cli | verified with `-p`; its `-o json/stream-json` modes fail inside a nested agent session |
 | `claude` | cli | flags and stream-json shape checked against Claude Code 2.1.261 |
+| `agy` | cli | verified live against Antigravity CLI 1.3.1 — your Google login, no key; ~20k-token harness prompt per call |
 | `codex`, `gemini` | cli | documented argv shape, not run against a live install |
 | `openai`, `anthropic`, `openrouter`, `groq`, `deepseek`, `together` | http | standard endpoints |
 | `ollama`, `lmstudio`, `llamacpp`, `vllm` | http | local servers, no key |
@@ -209,7 +210,7 @@ Warp, Claude Code, opencode, Codex, Qoder, `openai` Python — copy-paste config
 ## Development
 
 ```bash
-npm test          # 39 tests: parsers, routing, and an HTTP suite against a stub CLI
+npm test          # 61 tests: parsers, routing, and an HTTP suite against a stub CLI
 node src/cli.js doctor --probe-models   # the truth about which models answer (spends quota)
 ```
 

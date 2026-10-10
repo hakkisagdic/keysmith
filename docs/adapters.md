@@ -50,10 +50,10 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `args` | `["{prompt}"]` | argv template, see below |
 | `resumeArgs` | — | template used when a session id exists |
 | `persistSessions` | `false` | the CLI keeps its own threads, so `{noSession}` renders empty and `resumeArgs` becomes reachable |
-| `parser` | `raw` | one of `cmd-ndjson`, `opencode-ndjson`, `claude-stream-json`, `raw` |
+| `parser` | `raw` | one of `cmd-ndjson`, `opencode-ndjson`, `claude-stream-json`, `agy-stream-json`, `raw` |
 | `modelsFrom` | — | `{ "args": ["--list-models"], "drop": ["preview"] }` — run the binary, read stdout |
 | `promptVia` | `arg` | `"stdin"` pipes the prompt instead, for CLIs that choke on long argv |
-| `cwd` | process cwd | some agents read project context from here |
+| `cwd` | process cwd | some agents read project context from here; a configured one is created (0700) on first spawn |
 | `env` | `{}` | merged over the scrubbed parent env |
 | `maxConcurrent` | `1` | semaphore; each call is a real process |
 | `stripSystemPrompt` | `false` | drop system turns instead of inlining them |
@@ -120,6 +120,7 @@ yield `done` (a stream with no terminator is a client that hangs forever).
 | `cmd-ndjson` | `{"type":"event","event":{"type":"text_delta",…}}` then one `{"type":"result",…}` | Command Code 1.66.0 |
 | `opencode-ndjson` | `text` parts re-send the **whole** block; the parser forwards only the new tail | opencode 1.18.27 |
 | `claude-stream-json` | `assistant` message objects, then `result` with usage/session/`is_error` | Claude Code 2.1.261 |
+| `agy-stream-json` | `step_update` text deltas on `agent_response` steps, then `result`; usage summed per step (the `result` total re-counts a resumed thread), an auto-denied tool call with no answer is an error | Antigravity CLI 1.3.1 |
 | `raw` | stdout *is* the answer; no usage, no session | any `-p`-style CLI |
 
 Usage is normalised across spellings (`inputTokens` / `input_tokens` / `prompt_tokens`,

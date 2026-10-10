@@ -142,6 +142,77 @@ export async function* claudeStreamJson(lines) {
   yield EV.done('stop');
 }
 
+/**
+ * Antigravity CLI (`agy --output-format stream-json -p …`) — verified against agy 1.3.1.
+ *
+ *   {"event":"init","conversation_id":"…","init":{"model":…,"tools":[…]}}
+ *   {"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"po"}}
+ *   {"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":"ng","usage":{…}}}
+ *   {"event":"result","result":{"status":"SUCCESS","response":"pong","usage":{…},"denied_actions":[…]}}
+ *
+ * Two things the shape gets wrong for a completion API, both handled here:
+ *  - `result.usage` is the whole conversation's total, so a resumed thread reports every
+ *    earlier turn again. The per-step usage on `agent_response` steps is what this run
+ *    actually spent; it is summed and reported once.
+ *  - Headless mode cannot ask for tool permission, so a model that reaches for a tool is
+ *    auto-denied and the run "succeeds" with an empty response. That is an error, named.
+ */
+export async function* agyStreamJson(lines) {
+  let emitted = false;
+  let sessionSent = false;
+  const spent = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  let stepUsage = false;
+  const session = function* (id) {
+    if (id && !sessionSent) {
+      sessionSent = true;
+      yield EV.session(id);
+    }
+  };
+  for await (const line of lines) {
+    const d = json(line);
+    if (!d) continue;
+    if (d.event === 'init') {
+      yield* session(d.conversation_id || d.init?.conversation_id);
+    } else if (d.event === 'step_update') {
+      const s = d.step_update || {};
+      yield* session(s.conversation_id);
+      if (s.step_type === 'agent_response' && typeof s.text_delta === 'string' && s.text_delta) {
+        emitted = true;
+        yield EV.delta(s.text_delta);
+      }
+      const u = s.step_type === 'agent_response' ? normaliseUsage(s.usage) : null;
+      if (u) {
+        stepUsage = true;
+        for (const k of Object.keys(spent)) spent[k] += u[k] || 0;
+      }
+    } else if (d.event === 'result') {
+      const r = d.result || {};
+      yield* session(r.conversation_id);
+      // A resumed run's stream can carry no text deltas at all on some paths; the final
+      // response is still the answer, so it is the fallback rather than a dropped reply.
+      if (!emitted && typeof r.response === 'string' && r.response.trim()) {
+        emitted = true;
+        yield EV.delta(r.response);
+      }
+      const usage = stepUsage ? spent : normaliseUsage(r.usage);
+      if (usage && (usage.input || usage.output || usage.total)) yield EV.usage(usage);
+      const denied = Array.isArray(r.denied_actions) ? r.denied_actions : [];
+      if (r.status && r.status !== 'SUCCESS') {
+        const why = typeof r.error === 'string' ? r.error : r.error?.message || r.message || '';
+        yield EV.error(truncate(`agy: ${r.status}${why ? ' — ' + why : ''}`, 400));
+      } else if (!emitted && denied.length) {
+        const names = denied.map((a) => a.display_name || a.action).filter(Boolean).join(', ');
+        yield EV.error(`agy: the model called ${names || 'a tool'}, which headless mode auto-denies, and answered nothing`);
+      }
+      yield EV.done('stop');
+      return;
+    } else if (d.event === 'error') {
+      yield EV.error(truncate(`agy: ${typeof d.error === 'string' ? d.error : d.error?.message || d.message || 'error'}`, 400));
+    }
+  }
+  yield EV.done('stop');
+}
+
 /** Anything that just prints the answer. */
 export async function* rawText(lines) {
   const out = [];
@@ -155,6 +226,7 @@ export const PARSERS = {
   'cmd-ndjson': cmdNdjson,
   'opencode-ndjson': opencodeNdjson,
   'claude-stream-json': claudeStreamJson,
+  'agy-stream-json': agyStreamJson,
   raw: rawText,
 };
 

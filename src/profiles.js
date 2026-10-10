@@ -59,6 +59,26 @@ export const CLI_PROFILES = {
     provenance: 'Claude Code 2.1.261 — every flag here is accepted by `claude --help` (`--max-turns` is undocumented but parsed), and the stream-json `result` line carries usage/session_id',
     note: 'Declare `models: ["sonnet", "opus"]` or pass the id through; Claude Code has no offline model listing. A failed run prints one `result` line with is_error and the reason in `errors[]` — the parser surfaces it rather than returning an empty completion.',
   },
+  agy: {
+    kind: 'cli',
+    bin: 'agy',
+    // `-p` takes the prompt as its own value, so it goes last: anything after it is read as
+    // the prompt (agy refuses `-p --output-format …` rather than guessing).
+    args: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '280s', ['--model', '{model}'], '-p', '{prompt}'],
+    resumeArgs: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '280s', '--conversation', '{session}', ['--model', '{model}'], '-p', '{prompt}'],
+    // agy writes every run to disk as a conversation whether asked or not; there is no
+    // flag to stop it, so the honest setting is "sessions persist" and resume works.
+    persistSessions: true,
+    parser: 'agy-stream-json',
+    modelsFrom: { args: ['models'] },
+    // An empty directory keysmith owns: headless agy may read inside its workspace, and
+    // nothing in it is the workspace you are standing in.
+    cwd: '~/.local/share/keysmith/workspaces/agy',
+    timeoutMs: 300_000,
+    maxConcurrent: 2,
+    provenance: 'Antigravity CLI (agy) 1.3.1 — `agy --output-format stream-json -p` emits init / step_update (agent_response text_delta, per-step usage) / result; `agy models` prints id<TAB>name; `--conversation <id>` resumes',
+    note: 'Uses your Antigravity login, no key. Every call carries agy\'s own ~20k-token agent prompt (20,107 input tokens for a one-word answer) and boots agy plus every MCP server in ~/.gemini/config/mcp_config.json: ~8-15 s and ~200 MB per process before the first token, more with MCP servers. Headless mode auto-denies commands, edits and reads outside the workspace; a model that reaches for one answers nothing and the parser says so. Each run leaves a ~0.5 MB conversation under ~/.gemini/antigravity-cli/conversations.',
+  },
   codex: {
     kind: 'cli',
     bin: 'codex',

@@ -1,4 +1,4 @@
-import { statSync } from 'node:fs';
+import { statSync, mkdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { getParser, toLines } from './parsers.js';
 import { expand } from './config.js';
@@ -29,6 +29,10 @@ export class CliAdapter {
     this.parser = cfg.parser || 'raw';
     this.promptVia = cfg.promptVia || 'arg';
     this.cwd = cfg.cwd ? expand(cfg.cwd) : process.cwd();
+    // A configured cwd is the agent's workspace: an empty directory keysmith owns, so
+    // whatever the CLI reads "from the project" is nothing. Created on first spawn, because
+    // a missing cwd makes spawn() fail with an ENOENT that reads like a missing binary.
+    this._ownsCwd = !!cfg.cwd;
     this.env = cfg.env || {};
     this.timeoutMs = cfg.timeoutMs ?? 300_000;
     this.priority = cfg.priority ?? 200;
@@ -64,13 +68,14 @@ export class CliAdapter {
     const out = await this._spawn({ args: spec.args || ['--list-models'], timeoutMs: spec.timeoutMs ?? 30_000 });
     if (out.code !== 0) throw new LlmError(`${this.bin} ${spec.args?.join(' ')} exited ${out.code}: ${truncate(out.stderr, 160)}`, { status: 502, provider: this.id });
     // CLIs print their picker verbatim: section headers ("Open Source"), counts, and
-    // one model per line with an optional description after two or more spaces.
+    // one model per line with an optional description after two or more spaces or a
+    // tab (`agy models` prints `id<TAB>Display Name`).
     // A row only counts as a model if its first token is id-shaped and carries a
     // slash, digit or dot — that is what separates `gpt-5.4` from `Google`.
     const MODELISH = /^[a-z0-9][a-z0-9._+\-/]*$/i;
     const list = [];
     for (const line of (out.stdout || out.stderr).split('\n')) {
-      const m = line.trim().match(/^(\S+)(?:\s{2,}(.+))?$/);
+      const m = line.trim().match(/^(\S+)(?:(?:\t|\s{2,})\s*(.+))?$/);
       if (!m) continue;
       const id = m[1];
       if (!MODELISH.test(id) || !/[\/\d.]/.test(id)) continue;
@@ -107,6 +112,13 @@ export class CliAdapter {
     if (this.systemFlag && keepSystem && system) argv.push(...this.systemFlag.split(/\s+/), system);
 
     const release = await this._sem.acquire();
+    // A request can wait here longer than its client does (a curl --speed-time guard, a
+    // closed tab). Its abort already fired, and an AbortSignal does not re-fire for a late
+    // listener — spawning now would run a whole agent for nobody while holding the slot.
+    if (signal?.aborted) {
+      release();
+      throw new LlmError(`adapter "${this.id}": client disconnected while queued for a free process`, { status: 499, provider: this.id });
+    }
     try {
       const run = this._spawnStream({ args: argv, stdin: this.promptVia === 'stdin' ? body : null, timeoutMs: this.timeoutMs, signal });
       const parse = getParser(this.parser);
@@ -127,7 +139,15 @@ export class CliAdapter {
     }
   }
 
+  _ensureCwd() {
+    if (!this._ownsCwd) return;
+    try {
+      mkdirSync(this.cwd, { recursive: true, mode: 0o700 });
+    } catch {}
+  }
+
   _spawn({ args, timeoutMs }) {
+    this._ensureCwd();
     return new Promise((resolve) => {
       const child = spawn(which(this.bin) || this.bin, args, { cwd: this.cwd, env: { ...agentCleanEnv(), ...this.env }, stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
@@ -147,6 +167,7 @@ export class CliAdapter {
   }
 
   _spawnStream({ args, stdin, timeoutMs, signal }) {
+    this._ensureCwd();
     const child = spawn(which(this.bin) || this.bin, args, {
       cwd: this.cwd,
       env: { ...agentCleanEnv(), ...this.env },

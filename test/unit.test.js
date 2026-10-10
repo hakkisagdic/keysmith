@@ -5,7 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { joinArgs, flattenMessages, agentCleanEnv } from '../src/util.js';
 import { resolveSecret } from '../src/config.js';
-import { cmdNdjson, opencodeNdjson, claudeStreamJson, rawText, toLines } from '../src/parsers.js';
+import { cmdNdjson, opencodeNdjson, claudeStreamJson, agyStreamJson, rawText, toLines } from '../src/parsers.js';
+import { CliAdapter } from '../src/cli-adapter.js';
+import { CLI_PROFILES } from '../src/profiles.js';
 import { Gateway } from '../src/gateway.js';
 import { tunnelArgs } from '../src/tunnel.js';
 import * as service from '../src/service.js';
@@ -163,6 +165,64 @@ test('a claude result error says what actually went wrong, and still terminates'
   const err = events.find((e) => e.type === 'error');
   assert.match(err.message, /No conversation found/);
   assert.equal(events.at(-1).type, 'done');
+});
+
+// Captured from `agy --output-format stream-json --model gemini-3.8-flash-low -p "Reply with exactly: pong"`
+// on agy 1.3.1 (the init line's 60-entry tool list trimmed).
+const AGY_PONG = [
+  '{"event":"init","conversation_id":"76a2b832-2921-45af-9699-278563840736","init":{"model":"gemini-3.8-flash-low","tools":["run_command","view_file"],"permission_mode":"request-review"}}',
+  '{"event":"step_update","step_update":{"conversation_id":"76a2b832-2921-45af-9699-278563840736","step_index":0,"state":"DONE","step_type":"user_input"}}',
+  '{"event":"step_update","step_update":{"conversation_id":"76a2b832-2921-45af-9699-278563840736","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"pong"}}',
+  '{"event":"step_update","step_update":{"conversation_id":"76a2b832-2921-45af-9699-278563840736","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"\\n","duration_seconds":1.70496,"usage":{"input_tokens":20107,"output_tokens":1,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":20108}}}',
+  '{"event":"result","result":{"conversation_id":"76a2b832-2921-45af-9699-278563840736","status":"SUCCESS","response":"pong\\n","duration_seconds":8.618885,"num_turns":1,"usage":{"input_tokens":20107,"output_tokens":1,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":20108}}}',
+];
+
+test('agy-stream-json streams agent_response deltas once, with the session and the harness prompt in usage', async () => {
+  const events = await collect(agyStreamJson(asLines(AGY_PONG)));
+  assert.equal(events.filter((e) => e.type === 'delta').map((e) => e.text).join(''), 'pong\n', 'the final response is not appended a second time');
+  assert.equal(events.filter((e) => e.type === 'session').length, 1);
+  assert.equal(events.find((e) => e.type === 'session').id, '76a2b832-2921-45af-9699-278563840736');
+  assert.equal(events.find((e) => e.type === 'usage').usage.input, 20107, 'the ~20k agy prompt is billed and reported');
+  assert.equal(events.at(-1).type, 'done');
+  assert.ok(!events.some((e) => e.type === 'error'));
+});
+
+// Captured from a `--conversation <id>` resume: result.usage is the whole thread's total.
+test('agy-stream-json reports what this run spent, not the resumed conversation total', async () => {
+  const events = await collect(
+    agyStreamJson(
+      asLines([
+        '{"event":"init","conversation_id":"4dad756f","init":{"model":"gemini-3.8-flash-low"}}',
+        '{"event":"step_update","step_update":{"conversation_id":"4dad756f","step_index":4,"state":"ACTIVE","step_type":"agent_response","text_delta":"391"}}',
+        '{"event":"step_update","step_update":{"conversation_id":"4dad756f","step_index":4,"state":"DONE","step_type":"agent_response","text_delta":"\\n","usage":{"input_tokens":20674,"output_tokens":3,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":20677}}}',
+        '{"event":"result","result":{"conversation_id":"4dad756f","status":"SUCCESS","response":"391\\n","num_turns":2,"usage":{"input_tokens":40791,"output_tokens":199,"thinking_tokens":193,"cache_read_tokens":0,"total_tokens":40990}}}',
+      ]),
+    ),
+  );
+  assert.equal(events.filter((e) => e.type === 'usage').length, 1, 'one usage event, since the gateway keeps the max of several');
+  assert.deepEqual(events.find((e) => e.type === 'usage').usage, { input: 20674, output: 3, cacheRead: 0, cacheWrite: 0 });
+});
+
+// Captured: the model called run_command, headless mode denied it, the run "succeeded" empty.
+test('agy-stream-json turns an auto-denied tool call into an error instead of an empty answer', async () => {
+  const events = await collect(
+    agyStreamJson(
+      asLines([
+        '{"event":"step_update","step_update":{"conversation_id":"6d0a","step_index":1,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":20118,"output_tokens":229,"thinking_tokens":108,"cache_read_tokens":0,"total_tokens":20347}}}',
+        '{"event":"step_update","step_update":{"conversation_id":"6d0a","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"touch x"}}}}',
+        '{"event":"result","result":{"conversation_id":"6d0a","status":"SUCCESS","response":"","num_turns":1,"usage":{"input_tokens":20118,"output_tokens":229,"total_tokens":20347},"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}',
+      ]),
+    ),
+  );
+  assert.match(events.find((e) => e.type === 'error').message, /RunCommand.*auto-denies/);
+  assert.equal(events.at(-1).type, 'done');
+});
+
+test('agy-stream-json surfaces a failed status, and still terminates without a result line', async () => {
+  const failed = await collect(agyStreamJson(asLines(['{"event":"result","result":{"status":"ERROR","error":"You have exhausted your quota on this model."}}'])));
+  assert.match(failed.find((e) => e.type === 'error').message, /ERROR — You have exhausted your quota/);
+  const cut = await collect(agyStreamJson(asLines(['{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"half"}}'])));
+  assert.equal(cut.at(-1).type, 'done', 'a killed process still yields the terminator');
 });
 
 test('rawText treats a whole stdout as the answer', async () => {
@@ -356,4 +416,70 @@ test('tunnel plist names the ingress file and the tunnel, and escapes XML in pat
   assert.equal(args[runAt + 1], 'keysmith', 'tunnel name must be the last argument');
   assert.ok(args.includes('/Users/me/.cloudflared/keysmith.yml'));
   assert.ok(!p.includes('&amp;amp;'), 'no double-escaping');
+});
+
+/* --- the agy profile and CLI adapter plumbing ---------------------------------------- */
+
+test('the agy profile keeps -p and its prompt last, and drops --model when none was asked for', () => {
+  const p = CLI_PROFILES.agy;
+  const argv = joinArgs(p.args, { model: 'gemini-3.8-flash-medium', prompt: '--looks like a flag', session: '', noSession: '' });
+  assert.deepEqual(argv.slice(-2), ['-p', '--looks like a flag'], 'agy reads whatever follows -p as the prompt');
+  assert.equal(argv[argv.indexOf('--model') + 1], 'gemini-3.8-flash-medium');
+  assert.ok(argv.includes('--disable-slash-commands'), 'a completion must never expand /commands or skills');
+  assert.ok(!joinArgs(p.args, { model: '', prompt: 'hi' }).includes('--model'));
+  const resume = joinArgs(p.resumeArgs, { model: 'm', prompt: 'hi', session: 'conv-1' });
+  assert.equal(resume[resume.indexOf('--conversation') + 1], 'conv-1');
+  assert.deepEqual(resume.slice(-2), ['-p', 'hi']);
+  assert.equal(p.parser, 'agy-stream-json');
+  assert.ok(p.persistSessions && p.maxConcurrent >= 1 && p.timeoutMs > 280_000, 'agy --print-timeout must expire before keysmith kills it');
+});
+
+function stubBin(dir, name, body) {
+  const bin = path.join(dir, name);
+  fs.writeFileSync(bin, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  return bin;
+}
+
+test('a tab-separated model listing (agy models) is read, its stderr banner is not', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-models-'));
+  const bin = stubBin(dir, 'agy', `echo 'Fetching available models...' >&2\nprintf 'gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\nclaude-sonnet-5-5-low\\tClaude Sonnet 5.5 (Low)\\n'`);
+  const a = new CliAdapter('agy', { bin, modelsFrom: { args: ['models'] } });
+  const list = await a.models();
+  assert.deepEqual(list, [
+    { id: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+    { id: 'claude-sonnet-5-5-low', name: 'Claude Sonnet 5.5 (Low)' },
+  ]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a configured cwd is created on first spawn, so a fresh machine does not ENOENT', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-cwd-'));
+  const ws = path.join(dir, 'workspaces', 'agy');
+  const bin = stubBin(dir, 'echocwd', 'pwd -P');
+  const a = new CliAdapter('echocwd', { bin, cwd: ws, args: ['{prompt}'] });
+  let text = '';
+  for await (const e of a.complete({ model: '', messages: [{ role: 'user', content: 'x' }] })) if (e.type === 'delta') text += e.text;
+  assert.equal(text.trim(), fs.realpathSync(ws));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a request whose client left while queued never spawns the CLI', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-queue-'));
+  const runs = path.join(dir, 'runs');
+  const bin = stubBin(dir, 'slow', `echo run >> '${runs}'\nsleep 0.4\necho done`);
+  const a = new CliAdapter('slow', { bin, args: ['{prompt}'], maxConcurrent: 1 });
+  const drain = async (signal) => {
+    let t = '';
+    for await (const e of a.complete({ model: '', messages: [{ role: 'user', content: 'x' }], signal })) if (e.type === 'delta') t += e.text;
+    return t;
+  };
+  const first = drain();
+  const gone = new AbortController();
+  const second = drain(gone.signal);
+  await new Promise((r) => setTimeout(r, 100));
+  gone.abort(new Error('client disconnected'));
+  assert.equal((await first).trim(), 'done');
+  await assert.rejects(second, /client disconnected while queued/);
+  assert.equal(fs.readFileSync(runs, 'utf8').trim().split('\n').length, 1, 'the abandoned request did not run an agent for nobody');
+  fs.rmSync(dir, { recursive: true, force: true });
 });
