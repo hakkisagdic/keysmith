@@ -517,6 +517,8 @@ test('the agy profile runs the tool-less keysmith-text agent, fresh or resumed',
   }
   assert.match(agent.split('---').slice(2).join('---'), /^# keysmith-text$/m, 'the H1 section is the system prompt');
   assert.ok(p.toolDenialRetry && /no tool/i.test(p.toolDenialRetry));
+  assert.match(agent, /do not call `manage_task`/, 'the one tool agy leaves on every agent is named in the prompt');
+  assert.equal(p.stopAtToolCall, true, 'and a call to it after the answer ends the run');
 });
 
 test('workspace files are written into the owned cwd (0600) and rewritten when they drift', async () => {
@@ -642,5 +644,84 @@ test('the gateway reports a retried request, so the usage log can count it', asy
   assert.equal(out.text, 'ls -la\n');
   assert.equal(out.retries, 1);
   assert.ok(lines.some((l) => /agy\/m retried after tool_denied: agy: the model called RunCommand/.test(l)), lines.join('\n'));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/* --- agy as a plain text model: the tool agy keeps, and where the answer ends ----------- */
+
+test('agy-stream-json reports a tool step once, and what a run with no result line spent', async () => {
+  const events = await collect(
+    agyStreamJson(
+      asLines([
+        '{"event":"init","conversation_id":"c-9"}',
+        '{"event":"step_update","step_update":{"conversation_id":"c-9","step_index":1,"step_type":"agent_response","state":"DONE","text_delta":"ls -la","usage":{"input_tokens":700,"output_tokens":30}}}',
+        '{"event":"step_update","step_update":{"conversation_id":"c-9","step_index":2,"step_type":"tool","state":"ACTIVE","tool_name":"manage_task","tool_info":{"name":"manage_task","parameters":{"Action":"list"}}}}',
+        '{"event":"step_update","step_update":{"conversation_id":"c-9","step_index":2,"step_type":"tool","state":"DONE","tool_name":"manage_task","tool_info":{"name":"manage_task","output":"No background tasks are currently running."}}}',
+      ]),
+    ),
+  );
+  assert.deepEqual(events.filter((e) => e.type === 'tool'), [{ type: 'tool', name: 'manage_task' }], 'ACTIVE and DONE are one call');
+  assert.deepEqual(events.find((e) => e.type === 'usage').usage, { input: 700, output: 30, cacheRead: 0, cacheWrite: 0 }, 'a stopped run has no result line; its tokens were still spent');
+  assert.equal(events.at(-1).type, 'done');
+});
+
+/**
+ * agy-shaped stubs for the loop a text agent can fall into: answer, call `manage_task`,
+ * answer again. `loop` keeps going for half a minute unless it is stopped; `twice` ends by
+ * itself after the second answer; `toolfirst` calls the tool before it has said anything.
+ */
+function agyLoopStub(dir, kind) {
+  const step = (o) => `printf '%s\\n' '${JSON.stringify({ event: 'step_update', step_update: { conversation_id: 'c-1', ...o } })}'`;
+  const first = step({ step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'first answer', usage: { input_tokens: 700, output_tokens: 30 } });
+  const tool = step({ step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: 'manage_task' });
+  const second = step({ step_index: 3, step_type: 'agent_response', state: 'DONE', text_delta: ' second answer', usage: { input_tokens: 900, output_tokens: 40 } });
+  const result = (text) => `printf '%s\\n' '${JSON.stringify({ event: 'result', result: { conversation_id: 'c-1', status: 'SUCCESS', response: text } })}'`;
+  const init = `printf '%s\\n' '{"event":"init","conversation_id":"c-1"}'`;
+  const body = {
+    loop: [init, first, tool, second, 'sleep 1', step({ step_index: 5, step_type: 'agent_response', state: 'DONE', text_delta: ' third answer' }), 'exec sleep 30'],
+    twice: [init, first, tool, second, result('first answer second answer')],
+    toolfirst: [init, tool, step({ step_index: 3, step_type: 'agent_response', state: 'DONE', text_delta: 'the answer', usage: { input_tokens: 800, output_tokens: 20 } }), result('the answer')],
+  }[kind];
+  return stubBin(dir, `agy-${kind}`, body.join('\n'));
+}
+
+test('stopAtToolCall: the answer ends at the first tool call after its text, and the process is stopped', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-cut-'));
+  const a = new CliAdapter('agy', { bin: agyLoopStub(dir, 'loop'), args: ['-p', '{prompt}'], parser: 'agy-stream-json', stopAtToolCall: true, toolDenialRetry: 'RETRY: text only.' });
+  const t0 = Date.now();
+  const events = await collect(a.complete({ model: '', messages: [{ role: 'user', content: 'list the files' }] }));
+  assert.ok(Date.now() - t0 < 15_000, 'the run was stopped, not left to loop for its 30 s');
+  assert.equal(events.filter((e) => e.type === 'delta').map((e) => e.text).join(''), 'first answer', 'what the model says after the tool call is a second answer, not more of the first');
+  assert.deepEqual(events.filter((e) => e.type === 'cut'), [{ type: 'cut', reason: 'tool_call', tool: 'manage_task' }]);
+  assert.ok(!events.some((e) => e.type === 'tool'), 'the tool event is the adapter\'s own; no client sees it');
+  assert.ok(!events.some((e) => e.type === 'error' || e.type === 'retry'), 'a stopped answer is an answer');
+  assert.ok(events.find((e) => e.type === 'usage').usage.input >= 700, 'the tokens of the answer are reported without a result line');
+  assert.equal(events.at(-1).type, 'done');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('stopAtToolCall leaves a tool call before any text alone, and is off unless asked for', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-nocut-'));
+  const run = async (kind, extra) => {
+    const a = new CliAdapter('agy', { bin: agyLoopStub(dir, kind), args: ['-p', '{prompt}'], parser: 'agy-stream-json', ...extra });
+    const events = await collect(a.complete({ model: '', messages: [{ role: 'user', content: 'go' }] }));
+    return { text: events.filter((e) => e.type === 'delta').map((e) => e.text).join(''), cuts: events.filter((e) => e.type === 'cut').length, tools: events.filter((e) => e.type === 'tool').length };
+  };
+  assert.deepEqual(await run('toolfirst', { stopAtToolCall: true }), { text: 'the answer', cuts: 0, tools: 0 }, 'with nothing said yet, the call may be how the model gets to its answer');
+  assert.deepEqual(await run('twice', {}), { text: 'first answer second answer', cuts: 0, tools: 0 }, 'an agent that is meant to use tools keeps every step of its reply');
+  assert.deepEqual(await run('twice', { stopAtToolCall: true }), { text: 'first answer', cuts: 1, tools: 0 });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('the gateway reports an answer that was ended at a tool call', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-gwcut-'));
+  const lines = [];
+  const gw = new Gateway({ adapters: {} }, { log: (m) => lines.push(m) });
+  gw.adapters.set('agy', new CliAdapter('agy', { bin: agyLoopStub(dir, 'twice'), args: ['-p', '{prompt}'], parser: 'agy-stream-json', stopAtToolCall: true }));
+  const out = await gw.collect({ model: 'agy/m', messages: [{ role: 'user', content: 'go' }] });
+  assert.equal(out.text, 'first answer');
+  assert.equal(out.cutAt, 'manage_task');
+  assert.equal(out.retries, 0);
+  assert.ok(lines.some((l) => /agy\/m answer ended at a call to manage_task/.test(l)), lines.join('\n'));
   fs.rmSync(dir, { recursive: true, force: true });
 });

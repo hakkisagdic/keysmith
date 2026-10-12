@@ -239,6 +239,13 @@ export class Gateway {
             yield evt;
             continue;
           }
+          if (evt.type === 'cut') {
+            // Same rule for an answer the adapter ended early: it is in the log and the
+            // usage log, so a harness that keeps calling tools is a number, not a mystery.
+            this.log(`${adapter.id}/${truncate(upstreamModel, 60)} answer ended at a call to ${truncate(evt.tool, 60)}: the process was stopped`);
+            yield evt;
+            continue;
+          }
           if (evt.type === 'delta') emitted = true;
           if (evt.type === 'error') {
             if (emitted) {
@@ -280,8 +287,10 @@ export class Gateway {
     let sessionId = null;
     let err = null;
     let retries = 0;
+    let cutAt = null;
     for await (const evt of this.complete(opts)) {
       if (evt.type === 'retry') retries++;
+      else if (evt.type === 'cut') cutAt = evt.tool;
       else if (evt.type === 'delta') text += evt.text;
       else if (evt.type === 'reasoning') reasoning += evt.text;
       else if (evt.type === 'usage') usage = mergeUsage(usage, evt.usage);
@@ -289,7 +298,7 @@ export class Gateway {
       else if (evt.type === 'error') err = evt.message;
     }
     if (err && !text) throw new LlmError(err, { status: 502 });
-    return { text, reasoning, usage, session: sessionId, retries };
+    return { text, reasoning, usage, session: sessionId, retries, cutAt };
   }
 }
 

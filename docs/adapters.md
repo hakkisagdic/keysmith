@@ -56,6 +56,7 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `cwd` | process cwd | some agents read project context from here; a configured one is created (0700) on first spawn |
 | `workspaceFiles` | — | `{ "relative/path": "content" }` — files keysmith keeps inside a configured `cwd` (0600), put back before a spawn whenever they drift. Needs `cwd`; a path that leaves it is refused at load. See [agy as a plain text model](#agy-as-a-plain-text-model) |
 | `toolDenialRetry` | — | an instruction; when a run ends in a refused tool call and no text, the request runs once more with this text in front of the prompt, inside the same `timeoutMs` |
+| `stopAtToolCall` | `false` | for a CLI run as a text model: once the answer has text, the first tool call ends the run — the process is stopped and anything it says after that call is not part of the reply. A tool call before any text is left alone |
 | `env` | `{}` | merged over the scrubbed parent env |
 | `maxConcurrent` | `1` | semaphore; each call is a real process |
 | `stripSystemPrompt` | `false` | drop system turns instead of inlining them |
@@ -104,6 +105,7 @@ A parser is `async function*(lines)` yielding canonical events:
 { type: 'usage', usage }       // { input, output, cacheRead, cacheWrite } or { total }
 { type: 'session', id }        // resumable upstream conversation id
 { type: 'error', message, code? } // terminal for this adapter; an alias may move on
+{ type: 'tool', name }         // the agent started a tool call; for the adapter only (`stopAtToolCall`), never forwarded
 { type: 'done', finishReason } // exactly one, always last
 ```
 
@@ -126,7 +128,7 @@ yield `done` (a stream with no terminator is a client that hangs forever).
 | `cmd-ndjson` | `{"type":"event","event":{"type":"text_delta",…}}` then one `{"type":"result",…}` | Command Code 1.66.0 |
 | `opencode-ndjson` | `text` parts re-send the **whole** block; the parser forwards only the new tail | opencode 1.18.27 |
 | `claude-stream-json` | `assistant` message objects, then `result` with usage/session/`is_error` | Claude Code 2.1.261 |
-| `agy-stream-json` | `step_update` text deltas on `agent_response` steps, then `result`; usage summed per step (the `result` total re-counts a resumed thread), an auto-denied tool call with no answer is an error with code `tool_denied` | Antigravity CLI 1.3.3 |
+| `agy-stream-json` | `step_update` text deltas on `agent_response` steps, then `result`; usage summed per step (the `result` total re-counts a resumed thread), an auto-denied tool call with no answer is an error with code `tool_denied`, each `tool` step is reported once as a `tool` event, and a run stopped before its `result` line still reports what its steps spent | Antigravity CLI 1.3.3 |
 | `raw` | stdout *is* the answer; no usage, no session | any `-p`-style CLI |
 
 Usage is normalised across spellings (`inputTokens` / `input_tokens` / `prompt_tokens`,
@@ -164,12 +166,28 @@ refused tool call and no text. The client sees only the answer; the refused run'
 are added to the reported usage, the gateway log says `retried after tool_denied`, and the
 usage log row carries `retries: 1`. A second refusal is returned as the error it is.
 
+One tool survives `tools: []`: agy attaches `manage_task` (its background-task manager) to
+every agent, and nothing in the agent format removes it. A model that has just written a
+command sometimes calls it to "check on" that command, is told there is no task, and
+answers a second time. The agent's prompt names the tool, and the profile sets
+`stopAtToolCall`: once the answer has text, the first tool call ends the run. The process
+is stopped, the client gets the first answer only, the gateway log says `answer ended at a
+call to manage_task`, and the usage log row carries `cutAt: "manage_task"`. A call before
+any text is left alone — there it can be how the model gets to its answer.
+
+What `stopAtToolCall` does not end: a response that keeps writing past its answer in a
+single step, with no tool call. One replayed multi-turn shell-agent request did that in 2
+of 9 calls, writing on as if it were the rest of the transcript (`User: [exit] …`) until
+agy's 280 s print timeout. The answer is still the first part of the text, but the client
+waits for the timeout.
+
 Two things to know:
 
 - `keysmith add agy` copies the profile into your config. A config written before this
   agent existed keeps its old `args` — run `keysmith add agy` again to pick it up.
-- For agy's full coding agent, drop `--agent keysmith-text` from `args` and `resumeArgs`.
-  You get the harness prompt, the MCP start-up and the headless refusals back with it.
+- For agy's full coding agent, drop `--agent keysmith-text` from `args` and `resumeArgs`
+  and set `stopAtToolCall` to `false`. You get the harness prompt, the MCP start-up and the
+  headless refusals back with it.
 
 ## HTTP fields
 

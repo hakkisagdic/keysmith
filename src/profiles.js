@@ -10,8 +10,19 @@
  * default agent 20,107 input tokens; `tools: []` alone 10,488; plus `inheritMcp: false`,
  * `inheritCustomizations: false` (your GEMINI.md, skills, rules) and
  * `excludeDefaultComponents: true` (agy's built-in harness sections) 585 with a one-line
- * system prompt, 664 with the one below.
+ * system prompt, about 700 with the one below.
  * A plain-text request is all an API client can send, so that is all this agent does.
+ *
+ * `tools: []` leaves one tool behind: agy attaches `manage_task` (its background-task
+ * manager) to every agent, and nothing in the agent format removes it. A model that has
+ * just written a command sometimes calls it to "check on" that command, is told there is
+ * no task, and answers a second time. In three direct runs of one replayed shell-agent
+ * request two called it: one before writing anything (harmless, the answer followed), one
+ * after its answer, which it then wrote again. The prompt names the tool, and
+ * `stopAtToolCall` on the profile ends the run at the first such call after the answer.
+ * (The same request also ran to agy's 280 s print timeout in 2 of 9 calls. That was not
+ * this tool: both were one response step that kept writing past its answer, as if it were
+ * the rest of the transcript. `stopAtToolCall` does not end those.)
  */
 const AGY_TEXT_AGENT_NAME = 'keysmith-text';
 const AGY_TEXT_AGENT = `---
@@ -31,6 +42,8 @@ excludeDefaultComponents: true
 You are a language model answering one request through an API. You have no tools here: you cannot run commands, read or write files, browse, or call functions. Your text is the whole answer.
 
 Follow the request's own instructions. If it asks you to run, inspect or change something, do not refuse and do not try to do it yourself: write the commands, code or answer as text, in exactly the format the request asks for. Whoever sent the request acts on what you write.
+
+Nothing you write is run while you answer, so there is never a task to wait for or check on: do not call \`manage_task\` or any other function. Answer once, then stop.
 `;
 const AGY_TOOL_DENIAL_RETRY =
   'Your previous answer to this request was a tool call, and it was refused: there are no tools here, so it produced nothing. ' +
@@ -114,10 +127,13 @@ export const CLI_PROFILES = {
     cwd: '~/.local/share/keysmith/workspaces/agy',
     workspaceFiles: { [`.agents/agents/${AGY_TEXT_AGENT_NAME}.md`]: AGY_TEXT_AGENT },
     toolDenialRetry: AGY_TOOL_DENIAL_RETRY,
+    // agy keeps `manage_task` on every agent; after the answer, a call to it is the model
+    // starting over. The answer ends there.
+    stopAtToolCall: true,
     timeoutMs: 300_000,
     maxConcurrent: 2,
     provenance: 'Antigravity CLI (agy) 1.3.3 — `agy --output-format stream-json -p` emits init / step_update (agent_response text_delta, per-step usage) / result; `agy models` prints id<TAB>name; `--conversation <id>` resumes; `--agent <name>` loads a markdown agent from `.agents/agents/` (unknown names fall back to the default agent without an error)',
-    note: 'Uses your Antigravity login, no key. Runs agy as the tool-less `keysmith-text` agent: ~600 input tokens for a one-word answer instead of the default agent\'s ~20k, no MCP servers booted, no tools to be refused. If a model still answers with a refused tool call, keysmith retries once with a stricter instruction (logged, and counted as `retries` in the usage log). Drop `--agent keysmith-text` from args/resumeArgs for agy\'s full coding agent — and its harness prompt, MCP start-up and headless tool refusals. Each run leaves a conversation under ~/.gemini/antigravity-cli/conversations.',
+    note: 'Uses your Antigravity login, no key. Runs agy as the tool-less `keysmith-text` agent: ~600 input tokens for a one-word answer instead of the default agent\'s ~20k, no MCP servers booted, no tools to be refused. If a model still answers with a refused tool call, keysmith retries once with a stricter instruction (logged, and counted as `retries` in the usage log). agy keeps one tool, `manage_task`, on every agent: once the answer has text, a call to it ends the run (`stopAtToolCall`, `cutAt` in the usage log) instead of producing a second answer. For agy\'s full coding agent drop `--agent keysmith-text` from args/resumeArgs and set `stopAtToolCall` to false — you get its harness prompt, MCP start-up and headless tool refusals back. Each run leaves a conversation under ~/.gemini/antigravity-cli/conversations.',
   },
   codex: {
     kind: 'cli',

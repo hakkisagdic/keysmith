@@ -41,6 +41,10 @@ export class CliAdapter {
     // One more attempt, with this instruction in front of the prompt, when a run ends in a
     // refused tool call and no text (a parser `error` event with code 'tool_denied').
     this.toolDenialRetry = typeof cfg.toolDenialRetry === 'string' && cfg.toolDenialRetry.trim() ? cfg.toolDenialRetry.trim() : null;
+    // For a CLI run as a text model: once the answer has text, the first tool call ends it.
+    // A harness can keep a tool of its own that no agent definition removes (agy:
+    // `manage_task`), and a model that calls it after answering answers again, and again.
+    this.stopAtToolCall = !!cfg.stopAtToolCall;
     this.env = cfg.env || {};
     this.timeoutMs = cfg.timeoutMs ?? 300_000;
     this.priority = cfg.priority ?? 200;
@@ -151,7 +155,20 @@ export class CliAdapter {
         // The first text delta proves there is an answer, so the held events go out in order.
         const held = [];
         let carriedSent = false;
+        let cut = null; // the tool call the answer was ended at
         for await (let evt of parse(toLines(run.stdout))) {
+          if (evt.type === 'tool') {
+            // Before any text the call may be how the model gets to its answer, so the run
+            // goes on. After text, the answer exists: stop the process instead of letting
+            // it loop until its own timeout, and keep whatever it says next out of the reply.
+            if (this.stopAtToolCall && emitted && !cut) {
+              cut = evt.name || 'a tool';
+              run.stop(`answer complete, stopped at a call to ${cut}`);
+              yield { type: 'cut', reason: 'tool_call', tool: cut };
+            }
+            continue;
+          }
+          if (cut && (evt.type === 'delta' || evt.type === 'error')) continue;
           if (evt.type === 'usage' && carried && !carriedSent) {
             evt = { ...evt, usage: addUsage(carried, evt.usage) };
             carriedSent = true;
@@ -278,7 +295,7 @@ export class CliAdapter {
         resolve({ code: killed ? -1 : code, stderr: killed ? `${stderr}\n(${killed})`.trim() : stderr, killed: !!killed });
       });
     });
-    return { stdout: child.stdout, done };
+    return { stdout: child.stdout, done, stop };
   }
 }
 

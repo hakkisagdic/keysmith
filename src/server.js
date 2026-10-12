@@ -136,9 +136,9 @@ async function handleChat(req, res, gateway, { usage, log }) {
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
   if (!stream) {
-    const { text, reasoning, usage: u, session: sid, retries } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning });
+    const { text, reasoning, usage: u, session: sid, retries, cutAt } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning });
     meta.done = true;
-    record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: req.headers['user-agent'], ...retried(retries) });
+    record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: req.headers['user-agent'], ...marks(retries, cutAt) });
     // The header carries the session for clients that read headers; the body carries it
     // for the ones that do not (curl, `keysmith chat`), and OpenAI SDKs ignore extras.
     const payload = openaiResult({ id, model: requested, created, text, usage: u, reasoning: body.include_reasoning ? reasoning || null : null });
@@ -154,9 +154,12 @@ async function handleChat(req, res, gateway, { usage, log }) {
   let errMessage = null;
   let reasoning = '';
   let retries = 0;
+  let cutAt = null;
   for await (const evt of gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning })) {
     if (evt.type === 'retry') {
       retries++;
+    } else if (evt.type === 'cut') {
+      cutAt = evt.tool;
     } else if (evt.type === 'reasoning') {
       reasoning += evt.text;
       res.write(`data: ${JSON.stringify(openaiChunk(id, requested, created, { reasoning_content: evt.text }))}\n\n`);
@@ -185,7 +188,7 @@ async function handleChat(req, res, gateway, { usage, log }) {
   res.write('data: [DONE]\n\n');
   res.end();
   meta.done = true;
-  record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: req.headers['user-agent'], ...retried(retries) });
+  record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: req.headers['user-agent'], ...marks(retries, cutAt) });
 }
 
 async function handleAnthropic(req, res, gateway, { usage, log }) {
@@ -199,9 +202,9 @@ async function handleAnthropic(req, res, gateway, { usage, log }) {
   const meta = track(res, body.model, stream, t0);
   // The Messages API defaults to a single JSON reply; SSE only when asked.
   if (!stream) {
-    const { text, usage: u, session: sid, retries } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens });
+    const { text, usage: u, session: sid, retries, cutAt } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens });
     meta.done = true;
-    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: 'anthropic', via: '/v1/messages', ...retried(retries) });
+    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: 'anthropic', via: '/v1/messages', ...marks(retries, cutAt) });
     // Session goes out as a header only: Anthropic clients schema-check the body.
     return json(res, 200, anthropicResult({ id, model: body.model, text, usage: u }), sid);
   }
@@ -213,8 +216,10 @@ async function handleAnthropic(req, res, gateway, { usage, log }) {
   let text = '';
   let errMessage = null;
   let retries = 0;
+  let cutAt = null;
   for await (const evt of gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens })) {
     if (evt.type === 'retry') retries++;
+    else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'delta') {
       text += evt.text;
       sseEvent(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: evt.text } });
@@ -228,7 +233,7 @@ async function handleAnthropic(req, res, gateway, { usage, log }) {
   sseEvent(res, 'message_stop', { type: 'message_stop' });
   res.end();
   meta.done = true;
-  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: 'anthropic', via: '/v1/messages', ...retried(retries) });
+  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: 'anthropic', via: '/v1/messages', ...marks(retries, cutAt) });
   void log;
   void text;
 }
@@ -244,9 +249,9 @@ async function handleResponses(req, res, gateway, { usage, log }) {
   const session = sessionFrom(req, body);
   const meta = track(res, body.model, stream, t0);
   if (!stream) {
-    const { text, usage: u, session: sid, retries } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res) });
+    const { text, usage: u, session: sid, retries, cutAt } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res) });
     meta.done = true;
-    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, via: '/v1/responses', ...retried(retries) });
+    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, via: '/v1/responses', ...marks(retries, cutAt) });
     return json(res, 200, responsesResult({ id, model: body.model, text, usage: u, created }), sid);
   }
   startSse(res, 'text/event-stream');
@@ -255,8 +260,10 @@ async function handleResponses(req, res, gateway, { usage, log }) {
   let u = null;
   let errMessage = null;
   let retries = 0;
+  let cutAt = null;
   for await (const evt of gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res) })) {
     if (evt.type === 'retry') retries++;
+    else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'delta') {
       full += evt.text;
       sseEvent(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: `msg_${id}`, output_index: 0, content_index: 0, delta: evt.text });
@@ -269,7 +276,7 @@ async function handleResponses(req, res, gateway, { usage, log }) {
   sseEvent(res, 'response.completed', { type: 'response.completed', response: { id: `resp_${id}`, object: 'response', model: body.model, status: errMessage ? 'failed' : 'completed', usage: { input_tokens: u?.input || 0, output_tokens: u?.output || 0 } } });
   res.end();
   meta.done = true;
-  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, via: '/v1/responses', ...retried(retries) });
+  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, via: '/v1/responses', ...marks(retries, cutAt) });
   void log;
 }
 
@@ -346,9 +353,12 @@ function record(usage, entry) {
   usage?.record(entry);
 }
 
-/** A request the adapter had to run twice says so in the usage log; one that did not stays as it was. */
-function retried(n) {
-  return n ? { retries: n } : {};
+/**
+ * A request the adapter had to run twice, or whose answer it ended at a tool call, says so
+ * in the usage log; one that went straight through stays as it was.
+ */
+function marks(retries, cutAt) {
+  return { ...(retries ? { retries } : {}), ...(cutAt ? { cutAt } : {}) };
 }
 
 /**

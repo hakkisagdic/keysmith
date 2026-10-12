@@ -9,6 +9,8 @@
  *   {type:'session', id}            resumable conversation id
  *   {type:'error', message, code?}  code 'tool_denied': the run called a tool the
  *                                   harness refused, and answered nothing
+ *   {type:'tool', name}             the agent started a tool call. For the adapter only
+ *                                   (see `stopAtToolCall`); it never reaches a client
  *   {type:'done', finishReason}
  * Parsers must never throw on a line they do not understand — an unknown event is
  * just noise, and killing a half-finished completion over it would be worse.
@@ -21,6 +23,7 @@ const EV = {
   usage: (usage) => ({ type: 'usage', usage }),
   session: (id) => ({ type: 'session', id }),
   error: (message, code) => ({ type: 'error', message, ...(code ? { code } : {}) }),
+  tool: (name) => ({ type: 'tool', name }),
   done: (finishReason = 'stop') => ({ type: 'done', finishReason }),
 };
 
@@ -144,23 +147,29 @@ export async function* claudeStreamJson(lines) {
 }
 
 /**
- * Antigravity CLI (`agy --output-format stream-json -p …`) — verified against agy 1.3.1.
+ * Antigravity CLI (`agy --output-format stream-json -p …`) — verified against agy 1.3.3.
  *
  *   {"event":"init","conversation_id":"…","init":{"model":…,"tools":[…]}}
  *   {"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"po"}}
  *   {"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":"ng","usage":{…}}}
+ *   {"event":"step_update","step_update":{"step_index":2,"step_type":"tool","state":"ACTIVE","tool_name":"manage_task",…}}
  *   {"event":"result","result":{"status":"SUCCESS","response":"pong","usage":{…},"denied_actions":[…]}}
  *
- * Two things the shape gets wrong for a completion API, both handled here:
+ * Three things the shape gets wrong for a completion API, all handled here:
  *  - `result.usage` is the whole conversation's total, so a resumed thread reports every
  *    earlier turn again. The per-step usage on `agent_response` steps is what this run
  *    actually spent; it is summed and reported once.
  *  - Headless mode cannot ask for tool permission, so a model that reaches for a tool is
  *    auto-denied and the run "succeeds" with an empty response. That is an error, named.
+ *  - A run is an agent loop, not one answer: after its text the model may call a tool and
+ *    answer again, as often as it likes. Each tool step is reported once as a `tool` event,
+ *    so an adapter that wants one answer can end the run there. A run stopped that way has
+ *    no `result` line, so the usage counted so far is reported when the stream ends.
  */
 export async function* agyStreamJson(lines) {
   let emitted = false;
   let sessionSent = false;
+  let lastToolStep = null;
   const spent = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   let stepUsage = false;
   const session = function* (id) {
@@ -185,6 +194,14 @@ export async function* agyStreamJson(lines) {
       if (u) {
         stepUsage = true;
         for (const k of Object.keys(spent)) spent[k] += u[k] || 0;
+      }
+      if (s.step_type === 'tool') {
+        // ACTIVE then DONE/ERROR arrive for the same step: one call, one event.
+        const step = s.step_index ?? `${s.tool_name}`;
+        if (step !== lastToolStep) {
+          lastToolStep = step;
+          yield EV.tool(s.tool_name || s.tool_info?.name || 'a tool');
+        }
       }
     } else if (d.event === 'result') {
       const r = d.result || {};
@@ -213,6 +230,8 @@ export async function* agyStreamJson(lines) {
       yield EV.error(truncate(`agy: ${typeof d.error === 'string' ? d.error : d.error?.message || d.message || 'error'}`, 400));
     }
   }
+  // No `result` line: the process was stopped or killed. What it spent is still spent.
+  if (stepUsage && (spent.input || spent.output)) yield EV.usage(spent);
   yield EV.done('stop');
 }
 

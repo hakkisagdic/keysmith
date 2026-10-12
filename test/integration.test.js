@@ -35,14 +35,20 @@ line({ type: 'result', sessionId: 'up_42', subtype: 'success', usage: { inputTok
 `;
 
 // agy-shaped: a run whose prompt lacks the retry instruction calls a tool, is refused and
-// answers nothing — the failure keysmith retries once.
+// answers nothing — the failure keysmith retries once. A prompt that says "twice" gets the
+// other failure: an answer, a call to the one tool agy keeps, and a second answer.
 const AGY_STUB = `#!/usr/bin/env node
 const argv = process.argv.slice(2);
 const prompt = argv[argv.indexOf('-p') + 1] || '';
 const line = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
-const conv = prompt.startsWith('RETRY:') ? 'conv-2' : 'conv-1';
+const conv = prompt.includes('twice') ? 'conv-3' : prompt.startsWith('RETRY:') ? 'conv-2' : 'conv-1';
 line({ event: 'init', conversation_id: conv });
-if (conv === 'conv-1') {
+if (conv === 'conv-3') {
+  line({ event: 'step_update', step_update: { conversation_id: conv, step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'echo once', usage: { input_tokens: 700, output_tokens: 6 } } });
+  line({ event: 'step_update', step_update: { conversation_id: conv, step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: 'manage_task' } });
+  line({ event: 'step_update', step_update: { conversation_id: conv, step_index: 3, step_type: 'agent_response', state: 'DONE', text_delta: ' echo twice', usage: { input_tokens: 720, output_tokens: 6 } } });
+  line({ event: 'result', result: { conversation_id: conv, status: 'SUCCESS', response: 'echo once echo twice' } });
+} else if (conv === 'conv-1') {
   line({ event: 'step_update', step_update: { conversation_id: conv, step_type: 'agent_response', state: 'DONE', usage: { input_tokens: 600, output_tokens: 20 } } });
   line({ event: 'result', result: { conversation_id: conv, status: 'SUCCESS', response: '', denied_actions: [{ action: 'command', display_name: 'RunCommand' }] } });
 } else {
@@ -71,7 +77,7 @@ before(async () => {
     adapters: {
       stub: { kind: 'cli', bin, args: ['-p', '{noSession}', ['--model', '{model}'], '{prompt}'], resumeArgs: ['-p', '--resume', '{session}', '{prompt}'], persistSessions: true, parser: 'cmd-ndjson', models: ['good', 'bad'], timeoutMs: 15_000 },
       other: { kind: 'cli', bin, args: ['-p', ['--model', '{model}'], '{prompt}'], parser: 'cmd-ndjson', models: ['good'], timeoutMs: 15_000 },
-      agyish: { kind: 'cli', bin: agyBin, args: ['-p', '{prompt}'], parser: 'agy-stream-json', models: ['m'], toolDenialRetry: 'RETRY: text only.', timeoutMs: 20_000 },
+      agyish: { kind: 'cli', bin: agyBin, args: ['-p', '{prompt}'], parser: 'agy-stream-json', models: ['m'], toolDenialRetry: 'RETRY: text only.', stopAtToolCall: true, timeoutMs: 20_000 },
       // Configured, but its credential is not in this environment: it must fail loudly.
       broken: { kind: 'http', wire: 'openai', baseUrl: 'http://127.0.0.1:1/v1', apiKey: '{env:KEYSMITH_TEST_ABSENT_KEY}' },
     },
@@ -285,6 +291,24 @@ test('a refused tool call is retried once: the client gets text, the usage log g
   assert.equal(rows.length, 2);
   assert.ok(rows.every((e) => e.status === 'ok' && e.retries === 1), JSON.stringify(rows));
   assert.ok(log.some((l) => /agyish\/m retried after tool_denied/.test(l)), log.join('\n'));
+});
+
+test('an answer ends at the tool call that follows it, on every face, and the usage log says where', async () => {
+  const ask = { model: 'agyish/m', messages: [{ role: 'user', content: 'say it twice' }] };
+  const plain = await post('/v1/chat/completions', ask);
+  assert.equal(JSON.parse(plain.text).choices[0].message.content, 'echo once', 'not "echo once echo twice"');
+  const res = await fetch(`${base}/v1/chat/completions`, { method: 'POST', headers: auth, body: JSON.stringify({ ...ask, stream: true }) });
+  const chunks = (await res.text()).split('\n\n').filter((f) => f.startsWith('data: {')).map((f) => JSON.parse(f.slice(6)));
+  assert.equal(chunks.flatMap((c) => c.choices?.map((ch) => ch.delta?.content || '') ?? []).join(''), 'echo once');
+  const anthropic = await post('/v1/messages', { ...ask, max_tokens: 64 });
+  assert.equal(JSON.parse(anthropic.text).content[0].text, 'echo once');
+  const responses = await post('/v1/responses', { model: ask.model, input: [{ role: 'user', content: [{ type: 'input_text', text: 'say it twice' }] }] });
+  assert.equal(JSON.parse(responses.text).output_text, 'echo once');
+  const body = await (await fetch(`${base}/v1/keysmith/usage?hours=1&tail=50`, { headers: auth })).json();
+  const rows = body.entries.filter((e) => e.model === 'agyish/m' && e.cutAt);
+  assert.equal(rows.length, 4, JSON.stringify(body.entries.filter((e) => e.model === 'agyish/m')));
+  assert.ok(rows.every((e) => e.status === 'ok' && e.cutAt === 'manage_task' && !e.retries), JSON.stringify(rows));
+  assert.ok(log.some((l) => /agyish\/m answer ended at a call to manage_task/.test(l)), log.join('\n'));
 });
 
 /* ------------------------------------------------------------------------- bookkeeping */

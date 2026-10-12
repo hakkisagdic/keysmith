@@ -216,7 +216,7 @@ Warp, Claude Code, opencode, Codex, Qoder, `openai` Python — copy-paste config
 ## Development
 
 ```bash
-npm test          # 70 tests: parsers, routing, and an HTTP suite against a stub CLI
+npm test          # 75 tests: parsers, routing, and an HTTP suite against a stub CLI
 node src/cli.js doctor --probe-models   # the truth about which models answer (spends quota)
 ```
 
