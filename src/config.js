@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { redactKey, registerSecrets } from './redact.js';
 
 /**
  * Config & data locations.
@@ -116,17 +117,29 @@ export function loadConfig() {
   try {
     raw = JSON.parse(fs.readFileSync(p, 'utf8'));
   } catch (e) {
-    throw new Error(`${p}: invalid JSON (${e.message})`);
+    throw new Error(`${p}: ${jsonErrorWithoutText(e)}`);
   }
   const cfg = deepMerge(structuredClone(DEFAULTS), raw);
   cfg._path = p;
+  registerSecrets(cfg.auth?.keys);
   // A gateway that listens on a tunnel must not be keyless; refuse silently-defaulting.
   if (cfg.auth.enabled && (!cfg.auth.keys || cfg.auth.keys.length === 0)) {
     cfg.auth.keys = [newApiKey()];
+    registerSecrets(cfg.auth.keys);
     saveConfig(cfg);
-    process.stderr.write(`keysmith: no API keys configured — generated ${cfg.auth.keys[0]} and wrote it to ${p}\n`);
+    // This runs inside `serve`, whose stderr is launchd's log file: name the key, never print it.
+    process.stderr.write(`keysmith: no API keys configured — generated ${redactKey(cfg.auth.keys[0])} and wrote it to ${p} (\`keysmith key list\` in a terminal shows it)\n`);
   }
   return cfg;
+}
+
+/**
+ * V8 quotes the text around a JSON syntax error (`Unexpected token 'k', ...[ks_Q3x"... is not
+ * valid JSON`), and this file holds the gateway key. Keep where it broke, drop what it says.
+ */
+export function jsonErrorWithoutText(e) {
+  const where = String(e?.message || '').match(/at position \d+(?: \(line \d+ column \d+\))?/);
+  return `invalid JSON${where ? ` ${where[0]}` : ''} — the text around it is not shown, this file holds keys`;
 }
 
 export function saveConfig(cfg) {

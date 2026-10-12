@@ -17,7 +17,7 @@ One config file, one port, one key. Zero dependencies — Node 20+ and nothing e
 
 ```bash
 git clone https://github.com/hakkisagdic/keysmith.git && cd keysmith
-node src/cli.js init                 # writes ~/.config/keysmith/config.json (0600) + one API key
+node src/cli.js init                 # writes ~/.config/keysmith/config.json (0600) + one API key, shown to your terminal only
 node src/cli.js add cmd              # attach a built-in profile
 node src/cli.js add evren --base-url https://your-gateway/v1 --key '{json:~/.local/share/opencode/auth.json#evren.key}'
 node src/cli.js doctor               # is each adapter actually alive, and what does it cost
@@ -145,6 +145,39 @@ The `{json:…}` form is the one that matters: it reuses a credential an agent a
 keeps in its own store, so you never paste a key twice and nothing secret lands in this
 repo. A literal works too, but the file is `0600` for a reason.
 
+## The gateway key, and what is logged
+
+The key clients send (`ks_…`) is printed in full by `keysmith init` and `keysmith key
+list|add` only, and only when stdin and stdout are an interactive terminal. Piped,
+redirected, under launchd, or run by a coding agent, those commands print the redacted
+form instead, and so does everything else keysmith writes:
+
+```
+ks_Q…35 fp:3f9a0c12      first 4 characters · length · first 8 hex of sha256(key)
+```
+
+`keysmith key revoke fp:3f9a0c12` takes that fingerprint. A script that needs the key
+itself reads it from the config: `jq -r '.auth.keys[0]' ~/.config/keysmith/config.json`.
+
+| file (in `~/.local/share/keysmith/`) | written by | holds |
+|---|---|---|
+| `launchd-gateway.log` | launchd: `serve`'s stdout + stderr | start banner (address, adapters, the key redacted, tunnel URL); with `KEYSMITH_VERBOSE=1`, adapter failures, retries and skipped alias legs |
+| `keysmith.log` | `keysmith start`: the same stream | the same, for a gateway started without launchd |
+| `usage.jsonl` | the gateway, one line per request | time, model, status, duration, token counts, stream flag, user agent, error message, `retries`/`cutAt` |
+| `launchd-tunnel.log` | launchd: cloudflared | cloudflared's own output |
+
+keysmith does not log prompts, answers, request headers or request URLs — so `?api_key=`
+on the status page never reaches a log (your browser history is another matter). Error
+messages can quote anything a CLI printed, so every log line and every usage row goes
+through the same redaction: the configured keys, and anything shaped like a minted key,
+come out as above. The files are `0600` in a `0700` directory; `serve`, `start` and
+`install-service` tighten older ones, since launchd creates its log with the default
+`0644`. Logs from a keysmith older than this still hold the key in full:
+
+```bash
+keysmith scrub-logs      # rewrites them in place; prints replacement counts per file, never a key
+```
+
 ## Publishing it safely
 
 `keysmith serve --tunnel` is the whole point for remote clients, and a tunnel is
@@ -216,7 +249,7 @@ Warp, Claude Code, opencode, Codex, Qoder, `openai` Python — copy-paste config
 ## Development
 
 ```bash
-npm test          # 75 tests: parsers, routing, and an HTTP suite against a stub CLI
+npm test          # 98 tests: parsers, routing, an HTTP suite against a stub CLI, and the key never reaching a log
 node src/cli.js doctor --probe-models   # the truth about which models answer (spends quota)
 ```
 
@@ -225,7 +258,8 @@ spawning, parsing, SSE framing, session mapping and failover are covered without
 touching a provider or spending a token.
 
 Config: `~/.config/keysmith/config.json` (`$KEYSMITH_CONFIG`).
-State: `~/.local/share/keysmith/` (`$KEYSMITH_DATA`) — pid, log, `usage.jsonl`.
+State: `~/.local/share/keysmith/` (`$KEYSMITH_DATA`, `0700`) — pid, logs, `usage.jsonl`, all `0600`;
+see [what is logged](#the-gateway-key-and-what-is-logged).
 
 ## License
 

@@ -1,10 +1,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { dataDir } from './config.js';
+import { ensurePrivateDir, FILE_MODE } from './logfiles.js';
+import { redactSecrets } from './redact.js';
 
 /**
  * Append-only JSONL usage log: the thing you reach for at 1am when a CLI adapter is
  * quietly eating your quota. Kept as one line per request so `tail -f` is a dashboard.
+ *
+ * A line holds the time, model, status, duration, token counts, stream flag, user agent
+ * and — for a failure — the error message. Never the prompt, the answer, a header or the
+ * request URL. An error message can still quote anything (a CLI that echoes its argv
+ * quotes the prompt), so each line goes through the same redaction as stdout: a gateway
+ * key in it is written as `ks_Q…35 fp:…`. The file is 0600 in a 0700 directory.
  */
 export class UsageLog {
   constructor(file = null) {
@@ -15,8 +23,8 @@ export class UsageLog {
   record(entry) {
     if (!this.enabled) return;
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      fs.appendFileSync(this.file, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
+      ensurePrivateDir(path.dirname(this.file));
+      fs.appendFileSync(this.file, redactSecrets(JSON.stringify({ ts: new Date().toISOString(), ...entry })) + '\n', { mode: FILE_MODE });
     } catch {
       /* logging must never break a response */
     }

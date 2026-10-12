@@ -11,6 +11,8 @@ import { which } from './cli-adapter.js';
 import * as tunnel from './tunnel.js';
 import * as service from './service.js';
 import { rel, truncate } from './util.js';
+import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets } from './redact.js';
+import { ensurePrivateDir, logFiles, openPrivateLog, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
 
 const PKG = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
@@ -22,7 +24,7 @@ const GENERIC_PROFILES = { custom: 'cli', cli: 'cli', agent: 'cli', tool: 'cli',
 
 const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
 
-  keysmith init                      write a starter config (+ one API key)
+  keysmith init                      write a starter config (+ one API key, shown to a terminal only)
   keysmith add <profile>             attach an adapter (see: keysmith adapters)
   keysmith remove <adapter>          detach one
   keysmith adapters                  list profiles and what is attached
@@ -35,10 +37,18 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith doctor [--probe-models]   is each adapter actually alive, and at what cost
   keysmith tunnel <status|setup|run> cloudflared: named tunnel first, quick as fallback
   keysmith usage [--hours N]         who spent what
-  keysmith key <add|list|revoke>     client-facing API keys
+  keysmith key <add|list|revoke>     client-facing API keys (revoke takes a key, fp:<hex>, or its last ≤8 chars)
+  keysmith scrub-logs                redact keys an older keysmith left in its log files; prints counts only
 
   config  ${rel(configPath())}
   data    ${rel(dataDir())}/usage.jsonl
+
+  The gateway key is printed in full by \`init\` and \`key list|add\` only, and only when
+  stdin and stdout are an interactive terminal. Piped, redirected, under launchd or run by
+  an agent they print ks_Q…35 fp:3f9a0c12 (first 4 chars, length, sha256 fingerprint), and
+  so does everything else: the serve banner, errors, launchd-*.log, keysmith.log and
+  usage.jsonl. Log files are 0600 in a 0700 directory. A script that needs the key reads
+  auth.keys from the config file.
 `;
 
 export async function main(argv) {
@@ -88,6 +98,8 @@ export async function main(argv) {
         return cmdUsage(flags);
       case 'key':
         return cmdKey(flags);
+      case 'scrub-logs':
+        return cmdScrubLogs(flags);
       default:
         fail(`unknown command "${cmd}"\n\n${HELP}`);
     }
@@ -103,7 +115,9 @@ function cmdInit(flags) {
   const cfg = structuredClone(DEFAULT_CONFIG());
   const written = saveConfig(cfg);
   fs.chmodSync(written, 0o600);
-  out(`wrote ${rel(written)} (0600)\n\n  gateway key: ${cfg.auth.keys[0]}\n\nNext: keysmith add cmd && keysmith serve --tunnel`);
+  out(`wrote ${rel(written)} (0600)\n`);
+  showKeys(cfg.auth.keys, { label: '  gateway key: ', note: 'printed to this terminal only — `keysmith key list` shows it again' });
+  out('\nNext: keysmith add cmd && keysmith serve --tunnel');
 }
 
 function DEFAULT_CONFIG() {
@@ -213,7 +227,9 @@ function maskRef(ref) {
 
 function buildGateway(cfg) {
   const usage = new UsageLog();
-  const log = process.env.KEYSMITH_VERBOSE ? (m) => process.stderr.write(`[keysmith] ${m}\n`) : () => {};
+  // Under launchd this stderr is a log file. Adapter errors quote whatever a CLI printed,
+  // which can be a prompt that held the key, so every line is redacted on the way out.
+  const log = process.env.KEYSMITH_VERBOSE ? (m) => process.stderr.write(`[keysmith] ${redactSecrets(m)}\n`) : () => {};
   return { gateway: new Gateway(cfg, { log }), usage, log };
 }
 
@@ -227,7 +243,7 @@ async function cmdModels(flags) {
     const width = Math.max(...models.map((m) => m.id.length)) + 2;
     out(models.map((m) => `${m.id.padEnd(width)} ${m.keysmith.kind === 'cli' ? 'cli' : 'http'} ${m.keysmith.contextWindow ? 'ctx ' + m.keysmith.contextWindow : ''}`).join('\n'));
   }
-  for (const e of errors) process.stderr.write(`! ${e}\n`);
+  for (const e of errors) warn(`! ${e}`);
 }
 
 /* -------------------------------------------------------------------- serve/start */
@@ -236,6 +252,9 @@ async function cmdServe(flags) {
   const cfg = loadOrFail();
   if (flags.port) cfg.port = Number(flags.port);
   if (flags.host) cfg.host = flags.host;
+  // launchd opened its log before this process started, with the default umask: tighten
+  // that, and anything an older keysmith left behind, before the first line is written.
+  const secured = secureLogFiles();
   const { gateway, usage, log } = buildGateway(cfg);
   const server = createServer(gateway, cfg, { usage, log });
 
@@ -246,7 +265,10 @@ async function cmdServe(flags) {
   const local = `http://${cfg.host}:${cfg.port}`;
   out(`keysmith listening on ${local}/v1  (status page at ${local}/)`);
   out(`  adapters: ${gateway.publicAdapters.map((a) => a.id).join(', ') || 'none — keysmith add cmd'}`);
-  out(`  key     : ${cfg.auth.keys[0]}`);
+  // This banner is launchd's log file and keysmith.log: the key is named, never printed.
+  out(`  key     : ${keyBanner(cfg)}`);
+  if (secured.changed.length) out(`  logs    : tightened ${secured.changed.length} file(s)/dir(s) to 0600/0700`);
+  for (const f of secured.failed) warn(`! could not tighten ${f}`);
   writePid(cfg.port, process.pid);
 
   let tn = null;
@@ -283,9 +305,16 @@ async function cmdServe(flags) {
 function pidFile() {
   return path.join(dataDir(), 'keysmith.pid');
 }
+function keyBanner(cfg) {
+  const keys = cfg.auth?.keys || [];
+  if (!cfg.auth?.enabled) return 'none — auth is disabled';
+  if (!keys.length) return 'none';
+  return `${redactKey(keys[0])}${keys.length > 1 ? ` (+${keys.length - 1} more)` : ''} — full key: \`keysmith key list\`, in a terminal`;
+}
+
 function writePid(port, pid) {
-  fs.mkdirSync(dataDir(), { recursive: true });
-  fs.writeFileSync(pidFile(), JSON.stringify({ pid, port, at: new Date().toISOString() }));
+  ensurePrivateDir(dataDir());
+  fs.writeFileSync(pidFile(), JSON.stringify({ pid, port, at: new Date().toISOString() }), { mode: FILE_MODE });
 }
 function removePid() {
   try { fs.unlinkSync(pidFile()); } catch {}
@@ -302,8 +331,8 @@ function cmdStart(flags) {
   const rec = readPid();
   if (rec && alive(rec.pid)) return out(`already running (pid ${rec.pid}, port ${rec.port})`);
   const logFile = path.join(dataDir(), 'keysmith.log');
-  fs.mkdirSync(dataDir(), { recursive: true });
-  const fd = fs.openSync(logFile, 'a');
+  secureLogFiles();
+  const fd = openPrivateLog(logFile);
   const child = spawn(process.execPath, [currentEntry(), 'serve', ...(flags.tunnel ? ['--tunnel'] : [])], {
     detached: true,
     stdio: ['ignore', fd, fd],
@@ -367,8 +396,9 @@ function cmdInstallService() {
   }
   killStrayTunnel(named?.configFile);
 
+  secureLogFiles();
   out(`installed:\n${res.files.map((f) => `  ${f}`).join('\n')}`);
-  out(`logs: ${service.logDir()}/launchd-*.log`);
+  out(`logs: ${service.logDir()}/launchd-*.log (0600 in a 0700 directory; the key appears there redacted)`);
   out(`verify: launchctl list | grep keysmith   (gateway answers within ~10s of the handover)`);
 }
 
@@ -439,8 +469,8 @@ async function cmdChat(flags) {
     return;
   }
   for await (const evt of gateway.complete({ model, messages })) {
-    if (evt.type === 'delta') process.stdout.write(evt.text);
-    if (evt.type === 'error') process.stderr.write(`\nerror: ${evt.message}\n`);
+    if (evt.type === 'delta') process.stdout.write(redactSecrets(evt.text));
+    if (evt.type === 'error') warn(`\nerror: ${evt.message}`);
   }
   process.stdout.write(`\n\n— ${model}, ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
 }
@@ -586,24 +616,55 @@ function cmdKey(flags) {
   const cfg = loadOrFail();
   const sub = flags._[0] || 'list';
   cfg.auth = cfg.auth || { enabled: true, keys: [] };
-  if (sub === 'list') return out(cfg.auth.keys.join('\n') || '(none)');
+  if (sub === 'list') {
+    if (!cfg.auth.keys.length) return out('(none)');
+    return showKeys(cfg.auth.keys);
+  }
   if (sub === 'add') {
-    cfg.auth.keys.push(newApiKey());
+    const key = newApiKey();
+    cfg.auth.keys.push(key);
+    registerSecrets([key]);
     saveConfig(cfg);
-    return out(cfg.auth.keys[cfg.auth.keys.length - 1]);
+    return showKeys([key]);
   }
   if (sub === 'revoke') {
     const k = flags._[1];
-    if (!k) fail('usage: keysmith key revoke <key>');
+    if (!k) fail('usage: keysmith key revoke <key | fp:<8 hex> | last ≤8 chars>');
     const before = cfg.auth.keys.length;
-    // Accept the full key, or the last 4 characters for a key you only have on screen.
-    cfg.auth.keys = cfg.auth.keys.filter((x) => x !== k && !(k.length <= 8 && x.endsWith(k)));
-    const removed = before - cfg.auth.keys.length;
-    if (!removed) return out(`no key matched ${k} — this would have removed nothing`);
+    // The full key; its fingerprint, which is what every log and banner shows; or the last
+    // few characters of a key you have in a terminal.
+    const fp = String(k).replace(/^fp:/, '');
+    const revoked = cfg.auth.keys.filter((x) => x === k || (k.length <= 8 && x.endsWith(k)) || fingerprint(x) === fp);
+    cfg.auth.keys = cfg.auth.keys.filter((x) => !revoked.includes(x));
+    if (!revoked.length) return out(`no key matched ${/^(fp:)?[0-9a-f]{8}$/.test(k) || k.length <= 8 ? k : redactKey(k)} — this would have removed nothing`);
     saveConfig(cfg);
-    return out(`revoked ${removed} key(s); ${cfg.auth.keys.length} left`);
+    return out(`revoked ${before - cfg.auth.keys.length} key(s): ${revoked.map(redactKey).join(', ')}; ${cfg.auth.keys.length} left`);
   }
   fail('usage: keysmith key <list|add|revoke <key>>');
+}
+
+/* -------------------------------------------------------------------- scrub-logs */
+
+/**
+ * Logs written before keysmith redacted its banner hold the key in full. Rewrite them in
+ * place and say how many replacements were made — never what was replaced.
+ */
+function cmdScrubLogs() {
+  if (configExists()) loadConfig(); // registers the configured keys
+  const { changed, failed } = secureLogFiles();
+  const lines = [];
+  let total = 0;
+  for (const f of logFiles()) {
+    const r = scrubLogFile(f, knownSecrets());
+    if (!r) {
+      lines.push(`  ${rel(f)}  absent`);
+      continue;
+    }
+    total += r.configured + r.shaped;
+    lines.push(`  ${rel(f)}  ${r.configured} configured key(s), ${r.shaped} other ks_ key(s) replaced`);
+  }
+  out(`${lines.join('\n')}\n${total} replacement(s); ${changed.length} file(s)/dir(s) tightened to 0600/0700`);
+  for (const f of failed) warn(`! could not tighten ${f}`);
 }
 
 /* ------------------------------------------------------------------------ helpers */
@@ -628,12 +689,38 @@ function parseFlags(args) {
   return out;
 }
 
+/**
+ * Everything keysmith prints goes through redaction: the configured keys, and anything
+ * shaped like a minted one, come out as `ks_Q…35 fp:…`. Only `showKeys`, to a terminal, gets past it.
+ */
 function out(s) {
-  process.stdout.write(String(s) + '\n');
+  process.stdout.write(redactSecrets(s) + '\n');
+}
+function warn(s) {
+  process.stderr.write(redactSecrets(s) + '\n');
 }
 function fail(msg) {
-  process.stderr.write(`keysmith: ${msg}\n`);
+  process.stderr.write(`keysmith: ${redactSecrets(msg)}\n`);
   process.exit(1);
+}
+
+/**
+ * A full key goes to an interactive terminal and nowhere else. Not a pipe, not a file, not
+ * launchd's log and not an agent's tool call: a stdout that is not a TTY gets the redacted
+ * form. stdin is checked too, so `keysmith key list < /dev/null > tty` is not "interactive".
+ */
+function canReveal() {
+  return !!(process.stdout.isTTY && process.stdin.isTTY);
+}
+
+function showKeys(keys, { label = '', note = '' } = {}) {
+  if (canReveal()) {
+    process.stdout.write(keys.map((k) => `${label}${k}`).join('\n') + '\n');
+    if (note) out(`(${note})`);
+    return;
+  }
+  out(keys.map((k) => `${label}${redactKey(k)}`).join('\n'));
+  warn(`(full key${keys.length > 1 ? 's' : ''} not printed: stdout is not an interactive terminal — run \`keysmith key list\` in one, or read auth.keys from ${rel(configPath())})`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) main(process.argv.slice(2));

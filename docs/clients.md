@@ -4,7 +4,7 @@ Everything below points a client at a keysmith gateway. Local:
 
 ```
 base URL          http://127.0.0.1:8787/v1
-API key           keysmith key list          # the ks_… value
+API key           keysmith key list          # the ks_… value — in full only in a terminal
 model id          keysmith models            # <adapter>/<model>, or an alias
 ```
 
@@ -176,7 +176,7 @@ the upstreams instead of using the 10-minute cache.
 ## curl
 
 ```bash
-KEY=$(keysmith key list | head -1)
+KEY=$(jq -r '.auth.keys[0]' ~/.config/keysmith/config.json)   # piped, `keysmith key list` prints only ks_Q…35 fp:…
 curl -s http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"model":"cheap","messages":[{"role":"user","content":"one line, no preamble"}]}'

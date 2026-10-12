@@ -14,11 +14,15 @@ import {
   errorBody,
 } from './protocols.js';
 import { statusPage } from './status-page.js';
+import { registerSecrets } from './redact.js';
 
 const MAX_BODY = 32 * 1024 * 1024;
 
 export function createServer(gateway, cfg, { usage, log = () => {} } = {}) {
   const keys = cfg.auth?.enabled ? (cfg.auth.keys || []) : [];
+  // The usage log redacts these from every line it writes; register them even when the
+  // config did not come through loadConfig (an embedded server, a test).
+  registerSecrets(cfg.auth?.keys);
   const startedAt = Date.now();
 
   const server = http.createServer(async (req, res) => {

@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
+import { logDir, precreatePrivateLogs } from './logfiles.js';
 
 /**
  * launchd persistence (macOS). Two agents, deliberately separate:
@@ -23,8 +24,11 @@ export function launchAgentsDir() {
   return path.join(os.homedir(), 'Library', 'LaunchAgents');
 }
 
-export function logDir() {
-  return path.join(os.homedir(), '.local', 'share', 'keysmith');
+export { logDir };
+
+/** The two files launchd opens for the agents' stdout/stderr. */
+export function launchdLogFiles(dir = logDir()) {
+  return [path.join(dir, 'launchd-gateway.log'), path.join(dir, 'launchd-tunnel.log')];
 }
 
 const GATEWAY_LABEL = 'dev.keysmith.gateway';
@@ -85,7 +89,7 @@ ${processType ? `  <key>ProcessType</key>\n  <string>${esc(processType)}</string
 }
 
 export function gatewayPlist({ nodeBin, entry, port }) {
-  const log = path.join(logDir(), 'launchd-gateway.log');
+  const log = launchdLogFiles()[0];
   return plist({
     label: GATEWAY_LABEL,
     programArguments: [resolveBin(nodeBin), entry, 'serve', '--port', String(port)],
@@ -103,7 +107,7 @@ export function gatewayPlist({ nodeBin, entry, port }) {
 }
 
 export function tunnelPlist({ cloudflared, name, configFile }) {
-  const log = path.join(logDir(), 'launchd-tunnel.log');
+  const log = launchdLogFiles()[1];
   return plist({
     label: TUNNEL_LABEL,
     programArguments: [resolveBin(cloudflared), 'tunnel', '--no-autoupdate', '--config', configFile, 'run', name],
@@ -147,7 +151,10 @@ export function isLoaded(label) {
 export function installService({ nodeBin, entry, port, cloudflared = null, tunnelName = null, tunnelConfig = null }) {
   const dir = launchAgentsDir();
   fs.mkdirSync(dir, { recursive: true });
-  fs.mkdirSync(logDir(), { recursive: true });
+  // launchd creates a missing StandardOutPath with the default umask — 0644, readable by
+  // every account on the machine. Created here first, 0600 in a 0700 directory, it is
+  // opened as it is.
+  precreatePrivateLogs(launchdLogFiles());
 
   const written = [];
   const gwFile = path.join(dir, `${GATEWAY_LABEL}.plist`);

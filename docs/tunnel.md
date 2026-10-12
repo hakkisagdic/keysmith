@@ -88,6 +88,12 @@ keysmith status                   # process, config, adapters, tunnel, /healthz
 tail -f ~/.local/share/keysmith/keysmith.log
 ```
 
+The logs are safe to tail and paste: the key appears in them only as `ks_Q…35 fp:…` (first
+4 characters, length, fingerprint), never in full, and they are `0600`. Logs written by an
+older keysmith may still hold it — `keysmith scrub-logs` rewrites them in place. Behind a
+tunnel that key is the whole gate, so if it ever did leak: `keysmith key add`, move the
+clients over, `keysmith key revoke fp:<old>`.
+
 `--tunnel` on `serve`/`start` inherits the named tunnel from config. If the tunnel dies
 (a laptop sleeping through a Cloudflare reconnect is the common case), `cloudflared`
 reconnects itself; if it exits, restart with `keysmith start --tunnel`. To move to a new
