@@ -129,15 +129,20 @@ export function startTunnel({ port, name = null, hostname = null, configFile = n
 
   const child = spawn(bin, args.filter(Boolean), { stdio: ['ignore', 'pipe', 'pipe'] });
   let url = null;
-  const grab = (chunk) => {
-    const text = String(chunk);
-    onLog(text.trim());
+  const line = (text) => {
+    if (text.trim()) onLog(text.trim());
     const quick = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
     if (quick) url = quick[0];
     if (!url && named && hostname) url = `https://${hostname}`;
   };
-  child.stdout.on('data', grab);
-  child.stderr.on('data', grab);
+  // Whole lines only: a pipe hands over whatever was written so far, and a key (or the
+  // quick-tunnel URL) split across two chunks is in neither, so redacting each chunk the
+  // logger is given would let both halves through.
+  for (const stream of [child.stdout, child.stderr]) {
+    const lines = splitLines(line);
+    stream.on('data', lines.push);
+    stream.on('end', lines.end);
+  }
 
   return {
     mode: named ? 'named' : 'quick',
@@ -147,6 +152,29 @@ export function startTunnel({ port, name = null, hostname = null, configFile = n
     },
     stop() {
       try { child.kill('SIGTERM'); } catch {}
+    },
+  };
+}
+
+/** Hand `onLine` each complete line of a chunked stream; a line that never ends is cut at 16 KB. */
+export function splitLines(onLine, { max = 16_384 } = {}) {
+  let buf = '';
+  return {
+    push(chunk) {
+      buf += String(chunk);
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        onLine(buf.slice(0, i));
+        buf = buf.slice(i + 1);
+      }
+      if (buf.length > max) {
+        onLine(buf);
+        buf = '';
+      }
+    },
+    end() {
+      if (buf) onLine(buf);
+      buf = '';
     },
   };
 }

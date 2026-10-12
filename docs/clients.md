@@ -4,7 +4,7 @@ Everything below points a client at a keysmith gateway. Local:
 
 ```
 base URL          http://127.0.0.1:8787/v1
-API key           keysmith key list          # the ks_… value — in full only in a terminal
+API key           keysmith key list --reveal # the ks_… value — in full only to an interactive terminal
 model id          keysmith models            # <adapter>/<model>, or an alias
 ```
 
@@ -187,5 +187,6 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"cmd/gpt-5","messages":[{"role":"user","content":"and now in Turkish"}]}'
 ```
 
-`?api_key=$KEY` works too, for browsers and for links you will paste into a chat — but
-it puts the key in shell history and URL logs, so prefer the header.
+`?api_key=$KEY` works on `/v1` too, for clients that cannot set a header — but it puts the
+key in shell history, browser history and a tunnel's request logs, so prefer the header.
+The status page at `/` does not take it at all: open it and post the key through its form.

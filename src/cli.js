@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
-import { loadConfig, saveConfig, configPath, dataDir, newApiKey, configExists } from './config.js';
+import { loadConfig, saveConfig, configPath, dataDir, newApiKey, configExists, expand } from './config.js';
 import { Gateway } from './gateway.js';
 import { createServer } from './server.js';
 import { UsageLog } from './usage.js';
@@ -11,8 +11,8 @@ import { which } from './cli-adapter.js';
 import * as tunnel from './tunnel.js';
 import * as service from './service.js';
 import { rel, truncate } from './util.js';
-import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets } from './redact.js';
-import { ensurePrivateDir, logFiles, openPrivateLog, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
+import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets, streamRedactor } from './redact.js';
+import { ensurePrivateDir, logFiles, openPrivateLog, rotatedLogFiles, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
 
 const PKG = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
@@ -24,7 +24,7 @@ const GENERIC_PROFILES = { custom: 'cli', cli: 'cli', agent: 'cli', tool: 'cli',
 
 const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
 
-  keysmith init                      write a starter config (+ one API key, shown to a terminal only)
+  keysmith init [--reveal]           write a starter config (+ one API key; --reveal shows it, to a terminal only)
   keysmith add <profile>             attach an adapter (see: keysmith adapters)
   keysmith remove <adapter>          detach one
   keysmith adapters                  list profiles and what is attached
@@ -37,23 +37,28 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith doctor [--probe-models]   is each adapter actually alive, and at what cost
   keysmith tunnel <status|setup|run> cloudflared: named tunnel first, quick as fallback
   keysmith usage [--hours N]         who spent what
-  keysmith key <add|list|revoke>     client-facing API keys (revoke takes a key, fp:<hex>, or its last ≤8 chars)
-  keysmith scrub-logs                redact keys an older keysmith left in its log files; prints counts only
+  keysmith key <add|list> [--reveal] client-facing API keys; --reveal prints them in full, to a terminal only
+  keysmith key revoke fp:<8 hex>     revoke by the fingerprint list/logs print (never the key itself: argv is public)
+  keysmith scrub-logs [file…]        redact keys left in the logs, their rotated copies and any file named; counts only
 
   config  ${rel(configPath())}
   data    ${rel(dataDir())}/usage.jsonl
 
-  The gateway key is printed in full by \`init\` and \`key list|add\` only, and only when
-  stdin and stdout are an interactive terminal. Piped, redirected, under launchd or run by
-  an agent they print ks_Q…35 fp:3f9a0c12 (first 4 chars, length, sha256 fingerprint), and
-  so does everything else: the serve banner, errors, launchd-*.log, keysmith.log and
-  usage.jsonl. Log files are 0600 in a 0700 directory. A script that needs the key reads
-  auth.keys from the config file.
+  The gateway key is printed in full by \`init --reveal\` and \`key list|add --reveal\` only,
+  and only when stdin and stdout are an interactive terminal. Without --reveal, piped,
+  redirected, under launchd or in a terminal an agent opened, they print ks_Q…35 fp:3f9a0c12
+  (first 4 chars, length, sha256 fingerprint), and so does everything else: the serve
+  banner, errors, launchd-*.log, keysmith.log and usage.jsonl. Log files are 0600 in a 0700
+  directory. A script that needs the key reads it into a variable, never onto stdout:
+    KEY=$(jq -r '.auth.keys[0]' ${rel(configPath())})
 `;
 
 export async function main(argv) {
   const [cmd, ...rest] = argv;
   const flags = parseFlags(rest);
+  // `return await`, not `return`: a promise returned from inside `try` settles after the
+  // `catch` is gone, so its rejection skipped fail() and Node printed it raw — message,
+  // stack and fields, key and all — to stderr, which under launchd is a log file.
   try {
     switch (cmd) {
       case undefined:
@@ -66,40 +71,40 @@ export async function main(argv) {
       case 'version':
         return out(PKG.version);
       case 'init':
-        return cmdInit(flags);
+        return await cmdInit(flags);
       case 'add':
-        return cmdAdd(flags);
+        return await cmdAdd(flags);
       case 'remove':
       case 'rm':
-        return cmdRemove(flags);
+        return await cmdRemove(flags);
       case 'adapters':
-        return cmdAdapters(flags);
+        return await cmdAdapters(flags);
       case 'models':
-        return cmdModels(flags);
+        return await cmdModels(flags);
       case 'serve':
-        return cmdServe(flags);
+        return await cmdServe(flags);
       case 'start':
-        return cmdStart(flags);
+        return await cmdStart(flags);
       case 'stop':
-        return cmdStop(flags);
+        return await cmdStop(flags);
       case 'install-service':
-        return cmdInstallService(flags);
+        return await cmdInstallService(flags);
       case 'uninstall-service':
-        return cmdUninstallService(flags);
+        return await cmdUninstallService(flags);
       case 'status':
-        return cmdStatus(flags);
+        return await cmdStatus(flags);
       case 'chat':
-        return cmdChat(flags);
+        return await cmdChat(flags);
       case 'doctor':
-        return cmdDoctor(flags);
+        return await cmdDoctor(flags);
       case 'tunnel':
-        return cmdTunnel(flags);
+        return await cmdTunnel(flags);
       case 'usage':
-        return cmdUsage(flags);
+        return await cmdUsage(flags);
       case 'key':
-        return cmdKey(flags);
+        return await cmdKey(flags);
       case 'scrub-logs':
-        return cmdScrubLogs(flags);
+        return await cmdScrubLogs(flags);
       default:
         fail(`unknown command "${cmd}"\n\n${HELP}`);
     }
@@ -116,7 +121,7 @@ function cmdInit(flags) {
   const written = saveConfig(cfg);
   fs.chmodSync(written, 0o600);
   out(`wrote ${rel(written)} (0600)\n`);
-  showKeys(cfg.auth.keys, { label: '  gateway key: ', note: 'printed to this terminal only — `keysmith key list` shows it again' });
+  showKeys(cfg.auth.keys, { label: '  gateway key: ', note: 'printed to this terminal only — `keysmith key list --reveal` shows it again', reveal: flags.reveal });
   out('\nNext: keysmith add cmd && keysmith serve --tunnel');
 }
 
@@ -309,7 +314,7 @@ function keyBanner(cfg) {
   const keys = cfg.auth?.keys || [];
   if (!cfg.auth?.enabled) return 'none — auth is disabled';
   if (!keys.length) return 'none';
-  return `${redactKey(keys[0])}${keys.length > 1 ? ` (+${keys.length - 1} more)` : ''} — full key: \`keysmith key list\`, in a terminal`;
+  return `${redactKey(keys[0])}${keys.length > 1 ? ` (+${keys.length - 1} more)` : ''} — full key: \`keysmith key list --reveal\`, in a terminal`;
 }
 
 function writePid(port, pid) {
@@ -443,6 +448,8 @@ async function cmdStatus() {
     const t = tunnel.tunnelStatus(cfg);
     lines.push(`tunnel  : cloudflared ${t.installed ? 'installed' : 'MISSING'}${t.logged_in ? ', cloudflare login ok' : ', not logged in'}${t.configured ? `, named "${t.configured.name}" → ${t.configured.hostname}` : ', no named tunnel'}`);
     if (rec && alive(rec.pid)) {
+      const stale = staleCode(rec);
+      if (stale) lines.push(`code    : ${stale}`);
       try {
         const r = await fetch(`http://127.0.0.1:${rec.port}/healthz`);
         lines.push(`healthz : ${await r.text()}`);
@@ -452,6 +459,29 @@ async function cmdStatus() {
     }
   }
   out(lines.join('\n'));
+}
+
+/**
+ * A gateway keeps running the code it started with. After an upgrade — a fix to what it
+ * logs, say — it goes on doing the old thing until it is restarted, and nothing says so.
+ */
+function staleCode(rec) {
+  const started = Date.parse(rec?.at || '');
+  if (!Number.isFinite(started)) return null;
+  const src = path.dirname(currentEntry());
+  let newest = 0;
+  let newestFile = null;
+  try {
+    for (const f of fs.readdirSync(src)) {
+      if (!f.endsWith('.js')) continue;
+      const t = fs.statSync(path.join(src, f)).mtimeMs;
+      if (t > newest) [newest, newestFile] = [t, f];
+    }
+  } catch {
+    return null;
+  }
+  if (newest <= started) return null;
+  return `${rel(path.join(src, newestFile))} changed ${new Date(newest).toISOString()}, after this gateway started (${rec.at}): it still runs the old code — restart it (launchd: launchctl kickstart -k gui/${process.getuid?.() ?? '$UID'}/${service.labels.gateway}; otherwise keysmith stop && keysmith start)`;
 }
 
 /* -------------------------------------------------------------------------- chat */
@@ -468,11 +498,17 @@ async function cmdChat(flags) {
     out(`${text.trim()}\n\n— ${model}, ${((Date.now() - started) / 1000).toFixed(1)}s`);
     return;
   }
+  // A delta is a token or two, so a key is never inside one: each is redacted as part of
+  // the text around it, with the tail that could still be a key held for the next delta.
+  const redactor = streamRedactor();
   for await (const evt of gateway.complete({ model, messages })) {
-    if (evt.type === 'delta') process.stdout.write(redactSecrets(evt.text));
-    if (evt.type === 'error') warn(`\nerror: ${evt.message}`);
+    if (evt.type === 'delta') process.stdout.write(redactor.push(evt.text));
+    if (evt.type === 'error') {
+      process.stdout.write(redactor.end());
+      warn(`\nerror: ${evt.message}`);
+    }
   }
-  process.stdout.write(`\n\n— ${model}, ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
+  process.stdout.write(`${redactor.end()}\n\n— ${model}, ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
 }
 
 /* ------------------------------------------------------------------------ doctor */
@@ -618,53 +654,79 @@ function cmdKey(flags) {
   cfg.auth = cfg.auth || { enabled: true, keys: [] };
   if (sub === 'list') {
     if (!cfg.auth.keys.length) return out('(none)');
-    return showKeys(cfg.auth.keys);
+    return showKeys(cfg.auth.keys, { reveal: flags.reveal });
   }
   if (sub === 'add') {
     const key = newApiKey();
     cfg.auth.keys.push(key);
     registerSecrets([key]);
     saveConfig(cfg);
-    return showKeys([key]);
+    return showKeys([key], { reveal: flags.reveal });
   }
   if (sub === 'revoke') {
-    const k = flags._[1];
-    if (!k) fail('usage: keysmith key revoke <key | fp:<8 hex> | last ≤8 chars>');
+    // The fingerprint only — what `key list`, the serve banner and every log line show. A
+    // key on the command line is in shell history and, while it runs, in everyone's `ps`;
+    // so is any piece of one.
+    const m = String(flags._[1] ?? '').match(/^(?:fp:)?([0-9a-fA-F]{8})$/);
+    if (!m) fail('usage: keysmith key revoke fp:<8 hex>\n  the fingerprint `keysmith key list` prints next to each key; the key itself is never taken on the command line');
+    const fp = m[1].toLowerCase();
     const before = cfg.auth.keys.length;
-    // The full key; its fingerprint, which is what every log and banner shows; or the last
-    // few characters of a key you have in a terminal.
-    const fp = String(k).replace(/^fp:/, '');
-    const revoked = cfg.auth.keys.filter((x) => x === k || (k.length <= 8 && x.endsWith(k)) || fingerprint(x) === fp);
+    const revoked = cfg.auth.keys.filter((x) => fingerprint(x) === fp);
     cfg.auth.keys = cfg.auth.keys.filter((x) => !revoked.includes(x));
-    if (!revoked.length) return out(`no key matched ${/^(fp:)?[0-9a-f]{8}$/.test(k) || k.length <= 8 ? k : redactKey(k)} — this would have removed nothing`);
+    if (!revoked.length) return out(`no key matched fp:${fp} — this would have removed nothing`);
     saveConfig(cfg);
     return out(`revoked ${before - cfg.auth.keys.length} key(s): ${revoked.map(redactKey).join(', ')}; ${cfg.auth.keys.length} left`);
   }
-  fail('usage: keysmith key <list|add|revoke <key>>');
+  fail('usage: keysmith key <list|add> [--reveal] | keysmith key revoke fp:<8 hex>');
 }
 
 /* -------------------------------------------------------------------- scrub-logs */
 
 /**
  * Logs written before keysmith redacted its banner hold the key in full. Rewrite them in
- * place and say how many replacements were made — never what was replaced.
+ * place — and their rotated copies, and any file named on the command line (a log another
+ * KEYSMITH_DATA wrote, an agent's transcript) — and say how many replacements were made,
+ * never what was replaced.
  */
-function cmdScrubLogs() {
+function cmdScrubLogs(flags) {
   if (configExists()) loadConfig(); // registers the configured keys
   const { changed, failed } = secureLogFiles();
+  const rotated = rotatedLogFiles();
+  const named = flags._.map((p) => path.resolve(expand(p)));
   const lines = [];
   let total = 0;
-  for (const f of logFiles()) {
+  let configured = 0;
+  for (const f of [...new Set([...logFiles(), ...rotated.files, ...named])]) {
+    if (fs.existsSync(f) && !fs.statSync(f).isFile()) {
+      lines.push(`  ${rel(f)}  not a file — skipped`);
+      continue;
+    }
     const r = scrubLogFile(f, knownSecrets());
     if (!r) {
       lines.push(`  ${rel(f)}  absent`);
       continue;
     }
     total += r.configured + r.shaped;
+    configured += r.configured;
     lines.push(`  ${rel(f)}  ${r.configured} configured key(s), ${r.shaped} other ks_ key(s) replaced`);
   }
+  for (const f of rotated.compressed) lines.push(`  ${rel(f)}  compressed — not rewritten; delete it, or unpack it and name it here`);
   out(`${lines.join('\n')}\n${total} replacement(s); ${changed.length} file(s)/dir(s) tightened to 0600/0700`);
   for (const f of failed) warn(`! could not tighten ${f}`);
+  if (configured) {
+    // A key that reached a log has been copied wherever that log went: backups, a pasted
+    // tail, an agent's transcript. Scrubbing these files cannot reach those copies.
+    out(
+      [
+        '',
+        'A configured key was in these files, so it may also be in copies scrub-logs cannot reach',
+        '(Time Machine, transcripts, rotated archives, logs under another KEYSMITH_DATA). Rotate it:',
+        '  keysmith key add --reveal     # in a terminal; move every client to the new key',
+        '  keysmith key revoke fp:<old>  # the fingerprint `keysmith key list` shows',
+        '  then restart the gateway, which reads its keys at start',
+      ].join('\n'),
+    );
+  }
 }
 
 /* ------------------------------------------------------------------------ helpers */
@@ -705,22 +767,46 @@ function fail(msg) {
 }
 
 /**
- * A full key goes to an interactive terminal and nowhere else. Not a pipe, not a file, not
- * launchd's log and not an agent's tool call: a stdout that is not a TTY gets the redacted
- * form. stdin is checked too, so `keysmith key list < /dev/null > tty` is not "interactive".
+ * A full key goes to an interactive terminal, when asked for by name, and nowhere else.
+ * Not a pipe, not a file, not launchd's log: a stdout that is not a TTY gets the redacted
+ * form, and stdin is checked too, so `keysmith key list < /dev/null > tty` is not
+ * "interactive". A TTY alone is not enough either: an agent's terminal tool (tmux, expect,
+ * `script`) opens a real one, and what it reads there lands in a transcript. `--reveal`
+ * is the one thing such a tool has to type on purpose.
  */
-function canReveal() {
-  return !!(process.stdout.isTTY && process.stdin.isTTY);
+function canReveal(reveal) {
+  return !!(reveal && process.stdout.isTTY && process.stdin.isTTY);
 }
 
-function showKeys(keys, { label = '', note = '' } = {}) {
-  if (canReveal()) {
+function showKeys(keys, { label = '', note = '', reveal = false } = {}) {
+  if (canReveal(reveal)) {
     process.stdout.write(keys.map((k) => `${label}${k}`).join('\n') + '\n');
     if (note) out(`(${note})`);
     return;
   }
   out(keys.map((k) => `${label}${redactKey(k)}`).join('\n'));
-  warn(`(full key${keys.length > 1 ? 's' : ''} not printed: stdout is not an interactive terminal — run \`keysmith key list\` in one, or read auth.keys from ${rel(configPath())})`);
+  const s = keys.length > 1 ? 's' : '';
+  const why = !process.stdout.isTTY || !process.stdin.isTTY ? 'stdout is not an interactive terminal' : 'no --reveal';
+  warn(`(full key${s} not printed: ${why} — \`keysmith key list --reveal\` prints ${s ? 'them' : 'it'} to an interactive terminal; a script reads auth.keys from ${rel(configPath())} into a variable)`);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) main(process.argv.slice(2));
+/**
+ * The last word on an error nothing else caught: redacted, on stderr, exit 1. Node's own
+ * report prints the message, the stack and every field it can find (a bad URL's `input`,
+ * an adapter's stderr) as they are.
+ */
+export function installCrashHandlers(proc = process) {
+  const report = (what) => (e) => {
+    try {
+      proc.stderr.write(`keysmith: ${what}: ${redactSecrets(e?.stack || e?.message || String(e))}\n`);
+    } catch {}
+    proc.exit(1);
+  };
+  proc.on('uncaughtException', report('uncaught exception'));
+  proc.on('unhandledRejection', report('unhandled rejection'));
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  installCrashHandlers();
+  main(process.argv.slice(2));
+}

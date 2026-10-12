@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { LlmError, truncate } from './util.js';
 import {
   chatId,
@@ -13,7 +13,7 @@ import {
   responsesResult,
   errorBody,
 } from './protocols.js';
-import { statusPage } from './status-page.js';
+import { loginPage, statusPage } from './status-page.js';
 import { registerSecrets } from './redact.js';
 
 const MAX_BODY = 32 * 1024 * 1024;
@@ -24,9 +24,30 @@ export function createServer(gateway, cfg, { usage, log = () => {} } = {}) {
   // config did not come through loadConfig (an embedded server, a test).
   registerSecrets(cfg.auth?.keys);
   const startedAt = Date.now();
+  const pages = pageSessions();
 
-  const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, 'http://internal');
+  // Whatever one request does, it never takes the process down: launchd would restart it
+  // every 10 s for as long as somebody keeps sending the request, and Node's own crash
+  // report prints the error's fields — a bad URL's among them — unredacted.
+  const server = http.createServer((req, res) => {
+    handle(req, res).catch((e) => {
+      log(`request crashed: ${e?.stack || e}`);
+      try {
+        if (!res.headersSent) json(res, 500, errorBody('internal error', 'internal_error', 500));
+        else res.end();
+      } catch {}
+    });
+  });
+
+  async function handle(req, res) {
+    let url;
+    try {
+      url = new URL(req.url, 'http://internal');
+    } catch {
+      // `GET //a:99999/` or `GET http://a:99999/?api_key=…`: a target that does not parse.
+      // Nothing is checked yet, so nothing is said — and the target is never echoed.
+      return json(res, 400, errorBody('malformed request target', 'invalid_request_error', 400));
+    }
     const route = url.pathname.replace(/\/+$/, '') || '/';
 
     if (req.method === 'OPTIONS') return send(res, 204, {}, '');
@@ -35,14 +56,22 @@ export function createServer(gateway, cfg, { usage, log = () => {} } = {}) {
     res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
 
     if (route === '/healthz') return send(res, 200, { 'content-type': 'application/json' }, JSON.stringify({ ok: true, uptime_s: Math.round((Date.now() - startedAt) / 1000), adapters: gateway.publicAdapters.length, failed_to_load: Object.keys(gateway.loadErrors).length, alias_warnings: Object.keys(gateway.aliasIssues).length }));
-    // The status page lists every model and token count this gateway knows about, so it
-    // is gated like the API. A browser can still open it: append ?api_key=<key>.
-    if ((route === '/' || route === '/status') && req.method === 'GET' && authorize(req, keys)) {
-      const { models } = await safeList(gateway);
-      return send(res, 200, { 'content-type': 'text/html; charset=utf-8' }, statusPage({ cfg, models, usage, startedAt, loadErrors: gateway.loadErrors, aliasIssues: gateway.aliasIssues }));
+    // The status page lists every model and token count this gateway knows about, so it is
+    // gated like the API — but never by `?api_key=`: a URL is kept by browser history and
+    // sync, and behind a tunnel by the edge's request logs. A browser posts the key once
+    // through the page's form and gets a cookie that opens this page alone, for an hour.
+    if (route === '/' || route === '/status') {
+      if (req.method === 'POST') return pageLogin(req, res, route);
+      if (req.method === 'GET') {
+        if (keys.length && !headerAuthorized(req, keys) && !pages.valid(cookieFrom(req, PAGE_COOKIE))) {
+          return send(res, 401, PAGE_HEADERS, loginPage({ action: route }));
+        }
+        const { models } = await safeList(gateway);
+        return send(res, 200, PAGE_HEADERS, statusPage({ cfg, models, usage, startedAt, loadErrors: gateway.loadErrors, aliasIssues: gateway.aliasIssues }));
+      }
     }
 
-    if (!authorize(req, keys)) {
+    if (!authorize(req, keys, url)) {
       return json(res, 401, errorBody('missing or invalid API key — send `Authorization: Bearer <key>`', 'authentication_error', 401));
     }
 
@@ -81,7 +110,26 @@ export function createServer(gateway, cfg, { usage, log = () => {} } = {}) {
       }
       return json(res, status, errorBody(e.message || String(e), e instanceof LlmError ? e.type : 'internal_error', status, e?.provider || null));
     }
-  });
+  }
+
+  async function pageLogin(req, res, route) {
+    let body = '';
+    for await (const c of req) {
+      body += c;
+      if (body.length > 4096) return send(res, 413, PAGE_HEADERS, loginPage({ action: route }));
+    }
+    const candidate = new URLSearchParams(body).get('api_key') || '';
+    if (keys.length && !keys.some((k) => safeEqual(String(k), candidate))) {
+      return send(res, 401, PAGE_HEADERS, loginPage({ action: route, failed: true }));
+    }
+    const secure = String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+    res.writeHead(303, {
+      location: route,
+      'cache-control': 'no-store',
+      'set-cookie': `${PAGE_COOKIE}=${pages.create()}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${PAGE_TTL_MS / 1000}${secure ? '; Secure' : ''}`,
+    });
+    return res.end();
+  }
 
   server.on('clientError', (err, socket) => {
     if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
@@ -89,6 +137,41 @@ export function createServer(gateway, cfg, { usage, log = () => {} } = {}) {
   });
 
   return server;
+}
+
+const PAGE_HEADERS = { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' };
+const PAGE_COOKIE = 'keysmith_page';
+const PAGE_TTL_MS = 3600_000;
+const PAGE_SESSIONS_MAX = 64;
+
+/** Status-page logins: random tokens, unrelated to the key, that expire and open nothing else. */
+function pageSessions() {
+  const live = new Map(); // token -> expires at
+  return {
+    create() {
+      const now = Date.now();
+      for (const [t, exp] of live) if (exp <= now) live.delete(t);
+      while (live.size >= PAGE_SESSIONS_MAX) live.delete(live.keys().next().value);
+      const token = randomBytes(32).toString('base64url');
+      live.set(token, now + PAGE_TTL_MS);
+      return token;
+    },
+    valid(token) {
+      const exp = token ? live.get(token) : null;
+      if (!exp) return false;
+      if (exp > Date.now()) return true;
+      live.delete(token);
+      return false;
+    },
+  };
+}
+
+function cookieFrom(req, name) {
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return null;
 }
 
 async function safeList(gateway) {
@@ -452,11 +535,19 @@ function send(res, status, headers, body) {
   res.end(body);
 }
 
-function authorize(req, keys) {
+/** The key from a header: `Authorization: Bearer` or `x-api-key`. */
+function headerAuthorized(req, keys) {
   if (!keys.length) return true;
   const header = req.headers.authorization || '';
-  const candidate = header.startsWith('Bearer ') ? header.slice(7) : req.headers['x-api-key'] || new URL(req.url, 'http://x').searchParams.get('api_key') || '';
+  const candidate = header.startsWith('Bearer ') ? header.slice(7) : req.headers['x-api-key'] || '';
   return keys.some((k) => safeEqual(String(k), String(candidate)));
+}
+
+/** The API also takes `?api_key=`, for clients that cannot set a header. */
+function authorize(req, keys, url) {
+  if (headerAuthorized(req, keys)) return true;
+  const candidate = url.searchParams.get('api_key') || '';
+  return !!candidate && keys.some((k) => safeEqual(String(k), candidate));
 }
 
 function safeEqual(a, b) {

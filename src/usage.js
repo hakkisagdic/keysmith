@@ -11,8 +11,11 @@ import { redactSecrets } from './redact.js';
  * A line holds the time, model, status, duration, token counts, stream flag, user agent
  * and — for a failure — the error message. Never the prompt, the answer, a header or the
  * request URL. An error message can still quote anything (a CLI that echoes its argv
- * quotes the prompt), so each line goes through the same redaction as stdout: a gateway
- * key in it is written as `ks_Q…35 fp:…`. The file is 0600 in a 0700 directory.
+ * quotes the prompt), so every string in a line goes through the same redaction as
+ * stdout: a gateway key in it is written as `ks_Q…35 fp:…`. Each field is redacted before
+ * the line is JSON-encoded, not after: JSON spells a key holding `"` or `\` differently
+ * from the key, and a replacement spliced into encoded JSON could break the line. The file
+ * is 0600 in a 0700 directory.
  */
 export class UsageLog {
   constructor(file = null) {
@@ -24,7 +27,8 @@ export class UsageLog {
     if (!this.enabled) return;
     try {
       ensurePrivateDir(path.dirname(this.file));
-      fs.appendFileSync(this.file, redactSecrets(JSON.stringify({ ts: new Date().toISOString(), ...entry })) + '\n', { mode: FILE_MODE });
+      const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }, (_, v) => (typeof v === 'string' ? redactSecrets(v) : v));
+      fs.appendFileSync(this.file, line + '\n', { mode: FILE_MODE });
     } catch {
       /* logging must never break a response */
     }

@@ -14,21 +14,7 @@ export function statusPage({ cfg, models, usage, startedAt, loadErrors = {}, ali
     .slice(0, 12)
     .map((m) => `<tr><td>${esc(m.model)}</td><td class="n">${m.requests}</td><td class="n ${m.failures ? 'bad' : ''}">${m.failures}</td><td class="n">${fmt(m.input)}</td><td class="n">${fmt(m.output)}</td><td class="n">${Math.round(m.msTotal / m.requests)} ms</td></tr>`)
     .join('');
-  return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>keysmith</title>
-<style>
- :root{color-scheme:dark} body{margin:0;padding:40px;background:#0d1017;color:#e6e9f0;font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
- h1{font-size:20px;margin:0 0 4px} h1 span{color:#7c8cff} .sub{color:#8891a6;margin-bottom:28px}
- h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#8891a6;margin:28px 0 10px}
- .grid{display:flex;flex-wrap:wrap;gap:10px}
- .card{background:#151a26;border:1px solid #232a3b;border-radius:8px;padding:10px 12px;min-width:180px}
- .card b{display:block} .card small{color:#8891a6}
- .pill{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px;border:1px solid #2e3a52;color:#9fb0d8}
- table{border-collapse:collapse;width:100%;font-size:13px} th,td{padding:6px 8px;border-bottom:1px solid #1e2433;text-align:left}
- .n{text-align:right} .bad{color:#ff7b7b} .ok{color:#6ee7a0} .muted{color:#8891a6}
- code{background:#151a26;padding:1px 5px;border-radius:4px}
-</style></head>
+  return `${HEAD}
 <body>
 <h1>key<span>smith</span></h1>
 <div class="sub">OpenAI-compatible front for the agents already on this machine · up ${humanUptime(Date.now() - startedAt)} · config <code>${esc(rel(configPath()))}</code></div>
@@ -53,9 +39,45 @@ ${aliasList.length ? `<h2>Alias legs that can never work</h2><table><thead><tr><
 ${models.map((m) => `<tr><td${m.keysmith?.kind === 'alias' && aliasIssues[m.id] ? ' class="bad"' : ''}>${esc(m.id)}</td><td class="muted">${esc(m.keysmith?.adapter || '')}</td><td class="muted">${esc(m.keysmith?.upstream || '')}</td><td class="n">${m.keysmith?.contextWindow || ''}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">no models listed — check <code>keysmith doctor</code></td></tr>'}
 </tbody></table>
 ${rows ? `<h2>Last 24h by model</h2><table><thead><tr><th>model</th><th class="n">req</th><th class="n">err</th><th class="n">in</th><th class="n">out</th><th class="n">avg</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
-<p class="muted">Keys never leave this machine's config. <code>Authorization: Bearer &lt;key&gt;</code> is required on /v1 — and here, as <code>?api_key=…</code>.</p>
+<p class="muted">Keys never leave this machine's config. <code>Authorization: Bearer &lt;key&gt;</code> is required on /v1. This page takes the key once, through its form, and keeps a cookie that opens this page alone for an hour.</p>
 </body></html>`;
 }
+
+/**
+ * The status page's door. The key is posted, never put in the address: a URL is kept by
+ * browser history and sync, and behind a tunnel by the edge's request logs.
+ */
+export function loginPage({ action = '/', failed = false } = {}) {
+  return `${HEAD}
+<body>
+<h1>key<span>smith</span></h1>
+<div class="sub">status page — the gateway key opens it</div>
+<form method="post" action="${esc(action)}">
+  <input type="password" name="api_key" autocomplete="current-password" placeholder="ks_…" required autofocus>
+  <button type="submit">open</button>
+</form>
+${failed ? '<p class="bad">that key did not match</p>' : ''}
+<p class="muted">The key goes in the request body, not the address. This browser gets a cookie for this page alone, good for an hour; the API still wants <code>Authorization: Bearer &lt;key&gt;</code>.</p>
+</body></html>`;
+}
+
+const HEAD = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>keysmith</title>
+<style>
+ :root{color-scheme:dark} body{margin:0;padding:40px;background:#0d1017;color:#e6e9f0;font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+ h1{font-size:20px;margin:0 0 4px} h1 span{color:#7c8cff} .sub{color:#8891a6;margin-bottom:28px}
+ h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#8891a6;margin:28px 0 10px}
+ .grid{display:flex;flex-wrap:wrap;gap:10px}
+ .card{background:#151a26;border:1px solid #232a3b;border-radius:8px;padding:10px 12px;min-width:180px}
+ .card b{display:block} .card small{color:#8891a6}
+ .pill{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px;border:1px solid #2e3a52;color:#9fb0d8}
+ table{border-collapse:collapse;width:100%;font-size:13px} th,td{padding:6px 8px;border-bottom:1px solid #1e2433;text-align:left}
+ .n{text-align:right} .bad{color:#ff7b7b} .ok{color:#6ee7a0} .muted{color:#8891a6}
+ code{background:#151a26;padding:1px 5px;border-radius:4px}
+ input,button{font:inherit;color:inherit;background:#151a26;border:1px solid #2e3a52;border-radius:6px;padding:6px 10px}
+ input{width:min(28em,100%)} button{cursor:pointer}
+</style></head>`;
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);

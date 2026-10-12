@@ -61,7 +61,14 @@ export function resolveSecret(ref, env = process.env) {
       const [file, dotted] = arg.split('#');
       const p = expand(file);
       if (!fs.existsSync(p)) return null;
-      let v = JSON.parse(fs.readFileSync(p, 'utf8'));
+      let v;
+      try {
+        v = JSON.parse(fs.readFileSync(p, 'utf8'));
+      } catch (e) {
+        // The file is somebody's credential store: V8's error quotes the text around the
+        // break, and that text is the secret. The message ends up on /status and /routes.
+        throw new Error(`${file}: ${jsonErrorWithoutText(e)}`);
+      }
       for (const seg of (dotted || '').split('.').filter(Boolean)) v = v?.[seg];
       return typeof v === 'string' ? v : null;
     }
@@ -128,7 +135,7 @@ export function loadConfig() {
     registerSecrets(cfg.auth.keys);
     saveConfig(cfg);
     // This runs inside `serve`, whose stderr is launchd's log file: name the key, never print it.
-    process.stderr.write(`keysmith: no API keys configured — generated ${redactKey(cfg.auth.keys[0])} and wrote it to ${p} (\`keysmith key list\` in a terminal shows it)\n`);
+    process.stderr.write(`keysmith: no API keys configured — generated ${redactKey(cfg.auth.keys[0])} and wrote it to ${p} (\`keysmith key list --reveal\`, in a terminal, shows it)\n`);
   }
   return cfg;
 }

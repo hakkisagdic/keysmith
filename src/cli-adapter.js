@@ -3,7 +3,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { getParser, toLines } from './parsers.js';
 import { expand } from './config.js';
-import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, agentCleanEnv } from './util.js';
+import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, agentCleanEnv } from './util.js';
 
 /**
  * Run a coding CLI once per request and turn its stdout into a chat completion.
@@ -272,7 +272,7 @@ export class CliAdapter {
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (c) => {
       stderr += c;
-      if (stderr.length > 64_000) stderr = stderr.slice(-32_000);
+      if (stderr.length > 64_000) stderr = keepTail(stderr, 32_000);
     });
     let killed = null;
     const stop = (why) => {

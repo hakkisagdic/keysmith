@@ -67,10 +67,12 @@ that is the interesting part.
 | `GET /v1/models` | the whole catalogue, namespaced; `?refresh` re-queries |
 | `GET /v1/keysmith/routes` | adapters, aliases, limits and any unusable alias leg (`alias_warnings`) as JSON |
 | `GET /v1/keysmith/usage?hours=24&tail=50` | request counts per model, latest entries |
-| `GET /` | status page in a browser (`?api_key=…`, same key as the API) |
+| `GET /` | status page in a browser: post the key once through its form, a cookie opens it for an hour |
 | `GET /healthz` | keyless liveness probe for a supervisor |
 
-Everything under `/v1` needs `Authorization: Bearer <key>`, `x-api-key`, or `?api_key=`.
+Everything under `/v1` needs `Authorization: Bearer <key>`, `x-api-key`, or `?api_key=` (the
+last for clients that cannot set a header; a URL is kept by shell history, browsers and a
+tunnel's request logs, so prefer the header).
 CORS is open, so browser apps can call it directly.
 
 ## Models are namespaced
@@ -147,17 +149,24 @@ repo. A literal works too, but the file is `0600` for a reason.
 
 ## The gateway key, and what is logged
 
-The key clients send (`ks_…`) is printed in full by `keysmith init` and `keysmith key
-list|add` only, and only when stdin and stdout are an interactive terminal. Piped,
-redirected, under launchd, or run by a coding agent, those commands print the redacted
-form instead, and so does everything else keysmith writes:
+The key clients send (`ks_…`) is printed in full by `keysmith init --reveal` and
+`keysmith key list|add --reveal` only, and only when stdin and stdout are an interactive
+terminal. A terminal alone is not enough: a coding agent's terminal tool (tmux, expect,
+`script`) opens a real one, and what it reads lands in a transcript — `--reveal` is the word
+it has to type on purpose. Without it, piped, redirected or under launchd, those commands
+print the redacted form instead, and so does everything else keysmith writes:
 
 ```
 ks_Q…35 fp:3f9a0c12      first 4 characters · length · first 8 hex of sha256(key)
 ```
 
-`keysmith key revoke fp:3f9a0c12` takes that fingerprint. A script that needs the key
-itself reads it from the config: `jq -r '.auth.keys[0]' ~/.config/keysmith/config.json`.
+`keysmith key revoke fp:3f9a0c12` takes that fingerprint, and only that: a key on the
+command line is in shell history and in every local user's `ps`. A script that needs the
+key itself reads it from the config into a variable, never onto stdout:
+
+```bash
+KEY=$(jq -r '.auth.keys[0]' ~/.config/keysmith/config.json)
+```
 
 | file (in `~/.local/share/keysmith/`) | written by | holds |
 |---|---|---|
@@ -166,17 +175,30 @@ itself reads it from the config: `jq -r '.auth.keys[0]' ~/.config/keysmith/confi
 | `usage.jsonl` | the gateway, one line per request | time, model, status, duration, token counts, stream flag, user agent, error message, `retries`/`cutAt` |
 | `launchd-tunnel.log` | launchd: cloudflared | cloudflared's own output |
 
-keysmith does not log prompts, answers, request headers or request URLs — so `?api_key=`
-on the status page never reaches a log (your browser history is another matter). Error
-messages can quote anything a CLI printed, so every log line and every usage row goes
-through the same redaction: the configured keys, and anything shaped like a minted key,
-come out as above. The files are `0600` in a `0700` directory; `serve`, `start` and
-`install-service` tighten older ones, since launchd creates its log with the default
-`0644`. Logs from a keysmith older than this still hold the key in full:
+keysmith does not log prompts, answers, request headers or request URLs, and a request
+whose URL does not even parse is answered 400 without a word about it. The status page does
+not take `?api_key=` at all: it asks for the key in a form, and keeps a cookie that opens
+that page alone, for an hour. Error messages can quote anything a CLI printed, so every log
+line and every usage row goes through the same redaction: the configured keys — as written,
+as JSON escapes them, and any run of 12 or more of their characters a cut left behind — and
+anything shaped like a minted key, whole or cut, come out as above. Messages are redacted
+before they are shortened, streamed text (`keysmith chat --stream`, cloudflared's output)
+is redacted across the pieces it arrives in, and an error nothing caught is reported
+redacted too. The files are `0600` in a `0700` directory; `serve`, `start` and
+`install-service` tighten older ones, and the launchd agents run with `Umask` 077, so a log
+launchd re-creates after it was deleted or rotated is `0600` as well. Logs from a keysmith
+older than this still hold the key in full:
 
 ```bash
-keysmith scrub-logs      # rewrites them in place; prints replacement counts per file, never a key
+keysmith scrub-logs                 # the logs and their rotated copies, rewritten in place; counts only, never a key
+keysmith scrub-logs path/to/file…   # and any other file the key reached: another KEYSMITH_DATA, a transcript
 ```
+
+A scrub rewrites what it can reach. A key that was in a log may also be in copies it
+cannot — backups, rotated archives, an agent's transcript — so when `scrub-logs` finds a
+configured key it says to rotate it: `keysmith key add --reveal` in a terminal, move the
+clients over, `keysmith key revoke fp:<old>`, restart the gateway. `keysmith status` says
+when the running gateway is older than the code on disk and needs that restart.
 
 ## Publishing it safely
 

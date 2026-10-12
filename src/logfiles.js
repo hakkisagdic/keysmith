@@ -12,9 +12,10 @@ import { scrubBuffer } from './redact.js';
  *   <logDir>/launchd-gateway.log   launchd — serve's stdout + stderr
  *   <logDir>/launchd-tunnel.log    launchd — cloudflared's output
  *
- * Every one is created 0600 inside a 0700 directory. launchd creates its StandardOutPath
- * itself with the default umask (0644), and a file from an older keysmith keeps the mode
- * it was born with, so `serve`, `start` and `install-service` tighten what already exists.
+ * Every one is created 0600 inside a 0700 directory. launchd creates a missing
+ * StandardOutPath itself, with the job's umask — 077 since the plists set `Umask`, 022
+ * (0644) for an agent installed before that — and a file from an older keysmith keeps the
+ * mode it was born with, so `serve`, `start` and `install-service` tighten what exists.
  */
 
 export const FILE_MODE = 0o600;
@@ -36,6 +37,39 @@ export function logFiles() {
 
 export function logDirs() {
   return unique([dataDir(), logDir()]);
+}
+
+const COMPRESSED = /\.(gz|bz2|xz|zst|zip|lz4)$/i;
+
+/**
+ * Older copies of those logs next to them — `launchd-gateway.log.0` from newsyslog,
+ * `usage.jsonl.1`, `keysmith.log.old` — which hold whatever the log held when it was moved.
+ * Compressed ones cannot be rewritten in place and are listed apart.
+ */
+export function rotatedLogFiles(files = logFiles()) {
+  const plain = [];
+  const compressed = [];
+  for (const f of files) {
+    const dir = path.dirname(f);
+    const base = path.basename(f);
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const n of names.sort()) {
+      if (!n.startsWith(`${base}.`) || n.length === base.length + 1) continue;
+      const p = path.join(dir, n);
+      try {
+        if (!fs.statSync(p).isFile()) continue;
+      } catch {
+        continue;
+      }
+      (COMPRESSED.test(n) ? compressed : plain).push(p);
+    }
+  }
+  return { files: unique(plain), compressed: unique(compressed) };
 }
 
 export function ensurePrivateDir(dir) {
@@ -78,8 +112,11 @@ export function secureLogFiles({ dirs = logDirs(), files = logFiles() } = {}) {
 /**
  * Replace every key in a log file with its redacted form, on the same inode: launchd holds
  * the gateway log open for append, and a rename would leave it writing to a deleted file.
- * A line appended between the read and the write can be lost; the gateway writes a banner
- * per start and little else, so that window is the price of not stopping the service.
+ *
+ * Each replacement is padded with spaces to the length of what it replaces, so the bytes
+ * that were read are overwritten one for one and the file is never truncated. A line the
+ * gateway appends while this runs lands past the end of what was read, and stays: a
+ * shorter rewrite would need an ftruncate, and that would cut it off.
  * Returns the counts only — the file's contents never leave this function.
  */
 export function scrubLogFile(file, keys) {
@@ -87,11 +124,9 @@ export function scrubLogFile(file, keys) {
   const fd = fs.openSync(file, 'r+');
   try {
     const before = fs.readFileSync(fd);
-    const { buf, configured, shaped } = scrubBuffer(before, keys);
-    if (configured + shaped) {
-      fs.writeSync(fd, buf, 0, buf.length, 0);
-      fs.ftruncateSync(fd, buf.length);
-    }
+    const { buf, configured, shaped } = scrubBuffer(before, keys, { sameLength: true });
+    if (buf.length !== before.length) throw new Error(`${file}: scrub changed the length — not written`);
+    if (configured + shaped) fs.writeSync(fd, buf, 0, buf.length, 0);
     return { file, configured, shaped, bytes: { before: before.length, after: buf.length } };
   } finally {
     fs.closeSync(fd);

@@ -52,6 +52,13 @@ function servicePath() {
   return dirs.filter((d) => d && !seen.has(d) && seen.add(d)).join(':');
 }
 
+/**
+ * 077: a log that launchd re-creates — after it was deleted, or rotated away by newsyslog —
+ * is opened 0600 instead of 0644, and every CLI the gateway spawns inherits the same mask.
+ * Pre-creating the files at install time only covers the first open.
+ */
+export const PRIVATE_UMASK = 0o077;
+
 /** Minimal plist builder — enough for a LaunchAgent, no dependency needed. */
 export function plist({ label, programArguments, workingDirectory, standardOutPath, standardErrorPath, processType = null }) {
   const esc = (s) =>
@@ -79,6 +86,8 @@ ${programArguments.map((a) => `    <string>${esc(a)}</string>`).join('\n')}
   <true/>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <key>Umask</key>
+  <integer>${PRIVATE_UMASK}</integer>
 ${processType ? `  <key>ProcessType</key>\n  <string>${esc(processType)}</string>\n` : ''}  <key>StandardOutPath</key>
   <string>${esc(standardOutPath)}</string>
   <key>StandardErrorPath</key>

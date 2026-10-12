@@ -1,5 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
+import { redactSecrets } from './redact.js';
 
 /** Placeholder expansion for argv templates: `{model}`, `{prompt}`, `{system}`, `{session}`. */
 export function expandTemplate(token, vars) {
@@ -101,9 +102,25 @@ export function rel(p) {
   return p.startsWith(os.homedir()) ? '~' + p.slice(os.homedir().length) : path.relative(process.cwd(), p) || '.';
 }
 
+/**
+ * One line of at most `n` characters, for a log line or an error message. Redacted before it
+ * is cut: a cut through the middle of a key leaves `ks_` and 31 of its 32 characters, which
+ * is neither the key nor anything shaped like one, and is the key in 64 guesses.
+ */
 export function truncate(s, n = 160) {
-  s = String(s ?? '').replace(/\s+/g, ' ');
+  s = redactSecrets(String(s ?? '')).replace(/\s+/g, ' ');
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+/**
+ * The last `n` characters of a growing buffer (a child's stderr), starting at a token
+ * boundary. A plain `slice(-n)` can start inside a key and keep its 32 random characters
+ * without the `ks_` that marks them as one.
+ */
+export function keepTail(s, n) {
+  s = String(s ?? '');
+  if (s.length <= n) return s;
+  return '…' + s.slice(-n).replace(/^[A-Za-z0-9_-]+/, '');
 }
 
 export function sleep(ms) {

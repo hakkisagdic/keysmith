@@ -115,11 +115,11 @@ test('/healthz stays keyless so a supervisor can poll it', async () => {
   assert.equal(typeof r.adapters, 'number', 'healthz must not enumerate adapter ids to strangers');
 });
 
-test('the status page is behind the same key as the API', async () => {
+test('the status page is behind the same key as the API, sent as a header', async () => {
   assert.equal((await fetch(`${base}/`)).status, 401);
-  const ok = await fetch(`${base}/?api_key=${KEY}`);
+  const ok = await fetch(`${base}/`, { headers: auth });
   assert.equal(ok.status, 200);
-  assert.match(await ok.text(), /key<\/span>smith|keysmith/);
+  assert.match(await ok.text(), /Adapters/);
 });
 
 /* ------------------------------------------------------------------------- models */
@@ -147,7 +147,7 @@ test('an adapter that is configured but cannot load says why, in every place you
   assert.match(JSON.parse(text).error.message, /KEYSMITH_TEST_ABSENT_KEY/, 'the hint must name the missing credential');
   const listed = await (await fetch(`${base}/v1/models`, { headers: auth })).json();
   assert.ok((listed.keysmith?.errors || []).some((e) => e.startsWith('broken:')), JSON.stringify(listed));
-  const page = await (await fetch(`${base}/?api_key=${KEY}`)).text();
+  const page = await (await fetch(`${base}/`, { headers: auth })).text();
   assert.match(page, /did not load/);
 });
 
@@ -166,7 +166,7 @@ test('a dead leg inside an alias keeps answering, and is named where you would l
   assert.equal(routes.alias_warnings.typo.length, 2, JSON.stringify(routes.alias_warnings));
   assert.deepEqual(routes.aliases.typo, ['ghost/m1', 'broken/gpt-4', 'stub/good'], 'the config is still reported verbatim, warnings sit beside it');
 
-  const page = await (await fetch(`${base}/?api_key=${KEY}`)).text();
+  const page = await (await fetch(`${base}/`, { headers: auth })).text();
   assert.match(page, /Alias legs that can never work/);
   assert.match(page, /ghost\/m1/);
   assert.ok(page.indexOf('<td class="bad">typo</td>') > -1 || page.includes('class="bad">typo<'), 'the alias is flagged red in the model table too');
