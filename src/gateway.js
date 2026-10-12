@@ -233,6 +233,12 @@ export class Gateway {
           // a client that asked for it. Providers and CLIs emit it freely; a UI that
           // shows it unasked is a surprise, and it costs output tokens.
           if (evt.type === 'reasoning' && !includeReasoning) continue;
+          if (evt.type === 'retry') {
+            // The adapter is already trying again on its own; say so, never silently.
+            this.log(`${adapter.id}/${truncate(upstreamModel, 60)} retried after ${evt.reason}: ${truncate(evt.message, 160)}`);
+            yield evt;
+            continue;
+          }
           if (evt.type === 'delta') emitted = true;
           if (evt.type === 'error') {
             if (emitted) {
@@ -273,15 +279,17 @@ export class Gateway {
     let usage = null;
     let sessionId = null;
     let err = null;
+    let retries = 0;
     for await (const evt of this.complete(opts)) {
-      if (evt.type === 'delta') text += evt.text;
+      if (evt.type === 'retry') retries++;
+      else if (evt.type === 'delta') text += evt.text;
       else if (evt.type === 'reasoning') reasoning += evt.text;
       else if (evt.type === 'usage') usage = mergeUsage(usage, evt.usage);
       else if (evt.type === 'session') sessionId = sessionId || evt.id;
       else if (evt.type === 'error') err = evt.message;
     }
     if (err && !text) throw new LlmError(err, { status: 502 });
-    return { text, reasoning, usage, session: sessionId };
+    return { text, reasoning, usage, session: sessionId, retries };
   }
 }
 

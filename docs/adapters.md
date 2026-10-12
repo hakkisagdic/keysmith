@@ -54,6 +54,8 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `modelsFrom` | — | `{ "args": ["--list-models"], "drop": ["preview"] }` — run the binary, read stdout |
 | `promptVia` | `arg` | `"stdin"` pipes the prompt instead, for CLIs that choke on long argv |
 | `cwd` | process cwd | some agents read project context from here; a configured one is created (0700) on first spawn |
+| `workspaceFiles` | — | `{ "relative/path": "content" }` — files keysmith keeps inside a configured `cwd` (0600), put back before a spawn whenever they drift. Needs `cwd`; a path that leaves it is refused at load. See [agy as a plain text model](#agy-as-a-plain-text-model) |
+| `toolDenialRetry` | — | an instruction; when a run ends in a refused tool call and no text, the request runs once more with this text in front of the prompt, inside the same `timeoutMs` |
 | `env` | `{}` | merged over the scrubbed parent env |
 | `maxConcurrent` | `1` | semaphore; each call is a real process |
 | `stripSystemPrompt` | `false` | drop system turns instead of inlining them |
@@ -101,9 +103,13 @@ A parser is `async function*(lines)` yielding canonical events:
 { type: 'reasoning', text }    // thinking text — dropped unless the request asked for it
 { type: 'usage', usage }       // { input, output, cacheRead, cacheWrite } or { total }
 { type: 'session', id }        // resumable upstream conversation id
-{ type: 'error', message }     // terminal for this adapter; an alias may move on
+{ type: 'error', message, code? } // terminal for this adapter; an alias may move on
 { type: 'done', finishReason } // exactly one, always last
 ```
+
+`code` names a failure the adapter can act on without reading the sentence. There is one:
+`tool_denied`, a run that called a tool the harness refused and answered nothing — the
+failure `toolDenialRetry` retries.
 
 `reasoning` is gated by the gateway, not the parser: it only reaches a client that sent
 `"include_reasoning": true` on `/v1/chat/completions`, where it arrives as
@@ -120,12 +126,50 @@ yield `done` (a stream with no terminator is a client that hangs forever).
 | `cmd-ndjson` | `{"type":"event","event":{"type":"text_delta",…}}` then one `{"type":"result",…}` | Command Code 1.66.0 |
 | `opencode-ndjson` | `text` parts re-send the **whole** block; the parser forwards only the new tail | opencode 1.18.27 |
 | `claude-stream-json` | `assistant` message objects, then `result` with usage/session/`is_error` | Claude Code 2.1.261 |
-| `agy-stream-json` | `step_update` text deltas on `agent_response` steps, then `result`; usage summed per step (the `result` total re-counts a resumed thread), an auto-denied tool call with no answer is an error | Antigravity CLI 1.3.1 |
+| `agy-stream-json` | `step_update` text deltas on `agent_response` steps, then `result`; usage summed per step (the `result` total re-counts a resumed thread), an auto-denied tool call with no answer is an error with code `tool_denied` | Antigravity CLI 1.3.3 |
 | `raw` | stdout *is* the answer; no usage, no session | any `-p`-style CLI |
 
 Usage is normalised across spellings (`inputTokens` / `input_tokens` / `prompt_tokens`,
 `cache.read`, …). When an upstream reports only a total, keysmith keeps the total and
 **invents no split** — the split is exactly what people use to reason about quota.
+
+### agy as a plain text model
+
+Out of the box `agy -p` is a coding agent: a ~20k-token harness prompt, every MCP server in
+your Antigravity config booted, and tools that headless mode then refuses — a model that
+reaches for `RunCommand` answers nothing. A client that sends text and wants text back
+needs none of it, so the `agy` profile runs agy's own agent format with the tools removed:
+
+- `--agent keysmith-text` in `args` and `resumeArgs`;
+- `workspaceFiles` writes `.agents/agents/keysmith-text.md` into the adapter's `cwd`, where
+  agy looks for project agents. Its frontmatter is what does the work: `tools: []`,
+  `inheritMcp: false`, `inheritCustomizations: false` (your `GEMINI.md`, skills, rules) and
+  `excludeDefaultComponents: true` (agy's built-in harness sections). The H1 section is the
+  whole system prompt;
+- the file is compared before every spawn and put back if it changed, because agy treats
+  an agent name it cannot find as "use the default agent" and says nothing.
+
+Measured through the gateway on agy 1.3.3, `gemini-3.8-flash-medium`, three one-line
+prompts, same machine, minutes apart:
+
+| | prompt tokens | time to first token |
+|---|---|---|
+| default agent | 20,157 (16,303 of them cached from the second call on) | 17.7 – 19.1 s |
+| `keysmith-text` | 666 – 675 | 4.5 – 6.1 s |
+
+A model with no tools has nothing to be refused, so the retry below should never fire with
+this agent. It is there for the setups where it can: `toolDenialRetry` runs a request once
+more, with a stricter instruction in front of the prompt, when the first run ends in a
+refused tool call and no text. The client sees only the answer; the refused run's tokens
+are added to the reported usage, the gateway log says `retried after tool_denied`, and the
+usage log row carries `retries: 1`. A second refusal is returned as the error it is.
+
+Two things to know:
+
+- `keysmith add agy` copies the profile into your config. A config written before this
+  agent existed keeps its old `args` — run `keysmith add agy` again to pick it up.
+- For agy's full coding agent, drop `--agent keysmith-text` from `args` and `resumeArgs`.
+  You get the harness prompt, the MCP start-up and the headless refusals back with it.
 
 ## HTTP fields
 

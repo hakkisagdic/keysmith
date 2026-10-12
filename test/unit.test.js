@@ -214,13 +214,16 @@ test('agy-stream-json turns an auto-denied tool call into an error instead of an
       ]),
     ),
   );
-  assert.match(events.find((e) => e.type === 'error').message, /RunCommand.*auto-denies/);
+  const err = events.find((e) => e.type === 'error');
+  assert.match(err.message, /RunCommand.*auto-denies/);
+  assert.equal(err.code, 'tool_denied', 'the adapter retries on the code, not on the wording');
   assert.equal(events.at(-1).type, 'done');
 });
 
 test('agy-stream-json surfaces a failed status, and still terminates without a result line', async () => {
   const failed = await collect(agyStreamJson(asLines(['{"event":"result","result":{"status":"ERROR","error":"You have exhausted your quota on this model."}}'])));
   assert.match(failed.find((e) => e.type === 'error').message, /ERROR — You have exhausted your quota/);
+  assert.equal(failed.find((e) => e.type === 'error').code, undefined, 'only a refused tool call is retryable; a quota error is not');
   const cut = await collect(agyStreamJson(asLines(['{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"half"}}'])));
   assert.equal(cut.at(-1).type, 'done', 'a killed process still yields the terminator');
 });
@@ -481,5 +484,152 @@ test('a request whose client left while queued never spawns the CLI', async () =
   assert.equal((await first).trim(), 'done');
   await assert.rejects(second, /client disconnected while queued/);
   assert.equal(fs.readFileSync(runs, 'utf8').trim().split('\n').length, 1, 'the abandoned request did not run an agent for nobody');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/* --- agy as a plain text model: the tool-less agent and the one retry ------------------ */
+
+test('the agy profile runs the tool-less keysmith-text agent, fresh or resumed', () => {
+  const p = CLI_PROFILES.agy;
+  for (const tpl of [p.args, p.resumeArgs]) {
+    const argv = joinArgs(tpl, { model: 'm', prompt: 'hi', session: 'conv-1' });
+    assert.equal(argv[argv.indexOf('--agent') + 1], 'keysmith-text');
+    assert.deepEqual(argv.slice(-2), ['-p', 'hi'], 'the agent flag must not land after -p');
+  }
+  const agent = p.workspaceFiles['.agents/agents/keysmith-text.md'];
+  assert.ok(agent, 'the agent definition ships with the profile, in the directory agy reads project agents from');
+  const front = agent.split('---')[1];
+  assert.match(front, /^name: keysmith-text$/m, 'agy resolves --agent by this name; an unknown name silently means the full harness');
+  assert.match(front, /^tools: \[\]$/m);
+  for (const flag of ['inheritMcp: false', 'inheritCustomizations: false', 'excludeDefaultComponents: true', 'mainAgent: true']) {
+    assert.ok(front.split('\n').includes(flag), `${flag} is part of the ~600-token prompt`);
+  }
+  assert.match(agent.split('---').slice(2).join('---'), /^# keysmith-text$/m, 'the H1 section is the system prompt');
+  assert.ok(p.toolDenialRetry && /no tool/i.test(p.toolDenialRetry));
+});
+
+test('workspace files are written into the owned cwd (0600) and rewritten when they drift', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-wsfiles-'));
+  const ws = path.join(dir, 'workspaces', 'agy');
+  const rel = '.agents/agents/keysmith-text.md';
+  const bin = stubBin(dir, 'showagent', `cat '${rel}'`);
+  const a = new CliAdapter('showagent', { bin, cwd: ws, args: ['{prompt}'], workspaceFiles: { [rel]: 'AGENT v1\n' } });
+  const run = async () => {
+    let t = '';
+    for await (const e of a.complete({ model: '', messages: [{ role: 'user', content: 'x' }] })) if (e.type === 'delta') t += e.text;
+    return t;
+  };
+  assert.equal(await run(), 'AGENT v1', 'the file exists before the CLI starts');
+  assert.equal(fs.statSync(path.join(ws, rel)).mode & 0o777, 0o600);
+  fs.writeFileSync(path.join(ws, rel), 'edited by hand\n');
+  assert.equal(await run(), 'AGENT v1', 'a drifted file is put back, since agy would silently ignore a broken agent');
+  assert.deepEqual(fs.readdirSync(path.join(ws, '.agents/agents')), ['keysmith-text.md'], 'no temp files left behind');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('workspace files never leave the workspace, and need one keysmith owns', () => {
+  const cwd = path.join(os.tmpdir(), 'keysmith-never-created');
+  for (const rel of ['../escape.md', '/etc/agent.md', 'a/../../escape.md', '']) {
+    assert.throws(() => new CliAdapter('x', { bin: 'sh', cwd, workspaceFiles: { [rel]: 'x' } }), /must stay inside cwd/, rel);
+  }
+  assert.throws(() => new CliAdapter('x', { bin: 'sh', workspaceFiles: { 'a.md': 'x' } }), /needs a configured cwd/, 'never write into whatever directory keysmith was started from');
+  assert.throws(() => new CliAdapter('x', { bin: 'sh', cwd, workspaceFiles: { 'a.md': 42 } }), /must be a string/);
+  assert.ok(!fs.existsSync(cwd), 'a rejected config writes nothing');
+});
+
+/**
+ * An agy-shaped stub: it refuses (a denied RunCommand, no text) unless the prompt carries
+ * the retry instruction, or always when `deny=always` is in the prompt. Each run appends
+ * its prompt to `runs`.
+ */
+function agyStub(dir) {
+  const runs = path.join(dir, 'runs');
+  const bin = stubBin(
+    dir,
+    'agy',
+    `for a; do last="$a"; done
+printf '%s\\n---\\n' "$last" >> '${runs}'
+case "$last" in
+  RETRY:*deny=always*|"deny=always"*) conv=c-again ;;
+  RETRY:*) conv=c-2
+    printf '%s\\n' '{"event":"init","conversation_id":"c-2"}'
+    printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"c-2","step_type":"agent_response","state":"ACTIVE","text_delta":"ls -la"}}'
+    printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"c-2","step_type":"agent_response","state":"DONE","text_delta":"\\n","usage":{"input_tokens":650,"output_tokens":5}}}'
+    printf '%s\\n' '{"event":"result","result":{"conversation_id":"c-2","status":"SUCCESS","response":"ls -la\\n"}}'
+    exit 0 ;;
+  *) conv=c-1 ;;
+esac
+printf '%s\\n' "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"$conv\\"}"
+printf '%s\\n' "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$conv\\",\\"step_type\\":\\"agent_response\\",\\"state\\":\\"DONE\\",\\"usage\\":{\\"input_tokens\\":600,\\"output_tokens\\":20,\\"cache_read_tokens\\":100}}}"
+printf '%s\\n' "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"$conv\\",\\"status\\":\\"SUCCESS\\",\\"response\\":\\"\\",\\"denied_actions\\":[{\\"action\\":\\"command\\",\\"display_name\\":\\"RunCommand\\"}]}}"`,
+  );
+  const count = () => (fs.existsSync(runs) ? fs.readFileSync(runs, 'utf8').split('\n---\n').filter(Boolean) : []);
+  return { bin, prompts: count };
+}
+
+function agyLike(dir, bin, extra = {}) {
+  return new CliAdapter('agy', { bin, args: ['-p', '{prompt}'], parser: 'agy-stream-json', toolDenialRetry: 'RETRY: text only.', ...extra });
+}
+
+test('a refused tool call is retried once with the stricter instruction, and the client sees only the answer', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-retry-'));
+  const { bin, prompts } = agyStub(dir);
+  const events = await collect(agyLike(dir, bin).complete({ model: '', messages: [{ role: 'system', content: 'You drive a shell.' }, { role: 'user', content: 'list the files' }] }));
+  assert.equal(events.filter((e) => e.type === 'delta').map((e) => e.text).join(''), 'ls -la\n');
+  assert.ok(!events.some((e) => e.type === 'error'), 'the refusal of the first run is not the answer');
+  assert.deepEqual(events.filter((e) => e.type === 'retry').map((e) => e.reason), ['tool_denied'], 'the retry is announced, once');
+  assert.deepEqual(events.filter((e) => e.type === 'session').map((e) => e.id), ['c-2'], 'the session is the run that answered');
+  const usage = events.filter((e) => e.type === 'usage');
+  assert.equal(usage.length, 1);
+  assert.deepEqual(usage[0].usage, { input: 1250, output: 25, cacheRead: 100, cacheWrite: 0 }, 'both runs were billed, so both are reported');
+  assert.equal(events.at(-1).type, 'done');
+  const [first, second] = prompts();
+  assert.equal(prompts().length, 2);
+  assert.match(first, /^<system>\nYou drive a shell\.\n<\/system>\n\nUser: list the files$/);
+  assert.equal(second, `RETRY: text only.\n\n${first}`, 'the retry is the same request with the instruction in front');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a model that refuses twice is an error after exactly one retry', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-retry2-'));
+  const { bin, prompts } = agyStub(dir);
+  const events = await collect(agyLike(dir, bin).complete({ model: '', messages: [{ role: 'user', content: 'deny=always' }] }));
+  assert.equal(prompts().length, 2);
+  const err = events.find((e) => e.type === 'error');
+  assert.equal(err.code, 'tool_denied');
+  assert.match(err.message, /RunCommand/);
+  assert.equal(events.filter((e) => e.type === 'usage').length, 1);
+  assert.equal(events.find((e) => e.type === 'usage').usage.input, 1200, 'the refused first run is still counted');
+  assert.equal(events.at(-1).type, 'done');
+  // Through the gateway, the named refusal is what the client gets — never an empty 200.
+  const gw = new Gateway({ adapters: {} });
+  gw.adapters.set('agy', agyLike(dir, bin));
+  await assert.rejects(gw.collect({ model: 'agy/m', messages: [{ role: 'user', content: 'deny=always' }] }), /RunCommand.*auto-denies/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('no retry unless the adapter asks for one, or when the time budget is nearly spent', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-noretry-'));
+  const { bin, prompts } = agyStub(dir);
+  const plain = await collect(agyLike(dir, bin, { toolDenialRetry: undefined }).complete({ model: '', messages: [{ role: 'user', content: 'go' }] }));
+  assert.equal(prompts().length, 1);
+  assert.equal(plain.find((e) => e.type === 'error').code, 'tool_denied');
+  const tight = await collect(agyLike(dir, bin, { timeoutMs: 10_000 }).complete({ model: '', messages: [{ role: 'user', content: 'go' }] }));
+  assert.equal(prompts().length, 2, 'a retry must fit inside timeoutMs, so with 10 s in total it is skipped');
+  assert.ok(!tight.some((e) => e.type === 'retry'));
+  assert.equal(tight.find((e) => e.type === 'error').code, 'tool_denied');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('the gateway reports a retried request, so the usage log can count it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-gwretry-'));
+  const { bin } = agyStub(dir);
+  const lines = [];
+  const gw = new Gateway({ adapters: {} }, { log: (m) => lines.push(m) });
+  gw.adapters.set('agy', agyLike(dir, bin));
+  const out = await gw.collect({ model: 'agy/m', messages: [{ role: 'user', content: 'go' }] });
+  assert.equal(out.text, 'ls -la\n');
+  assert.equal(out.retries, 1);
+  assert.ok(lines.some((l) => /agy\/m retried after tool_denied: agy: the model called RunCommand/.test(l)), lines.join('\n'));
   fs.rmSync(dir, { recursive: true, force: true });
 });

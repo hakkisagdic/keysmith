@@ -1,4 +1,5 @@
-import { statSync, mkdirSync } from 'node:fs';
+import { statSync, mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { getParser, toLines } from './parsers.js';
 import { expand } from './config.js';
@@ -33,6 +34,13 @@ export class CliAdapter {
     // whatever the CLI reads "from the project" is nothing. Created on first spawn, because
     // a missing cwd makes spawn() fail with an ENOENT that reads like a missing binary.
     this._ownsCwd = !!cfg.cwd;
+    // Files keysmith keeps inside that workspace (relative path -> exact content), rewritten
+    // whenever they drift. This is how an agent's own configuration travels with the profile:
+    // agy reads a tool-less agent definition from `.agents/agents/` in its cwd.
+    this.workspaceFiles = checkWorkspaceFiles(id, cfg.workspaceFiles, this._ownsCwd);
+    // One more attempt, with this instruction in front of the prompt, when a run ends in a
+    // refused tool call and no text (a parser `error` event with code 'tool_denied').
+    this.toolDenialRetry = typeof cfg.toolDenialRetry === 'string' && cfg.toolDenialRetry.trim() ? cfg.toolDenialRetry.trim() : null;
     this.env = cfg.env || {};
     this.timeoutMs = cfg.timeoutMs ?? 300_000;
     this.priority = cfg.priority ?? 200;
@@ -101,15 +109,18 @@ export class CliAdapter {
     const keepSystem = !this.stripSystemPrompt;
     const body = keepSystem && system && !this.systemFlag ? `<system>\n${system}\n</system>\n\n${prompt}` : prompt;
     const useResume = !!(session && this.resumable);
-    const argv = joinArgs(useResume ? this.resumeArgs : this.args, {
-      model: model || '',
-      prompt: this.promptVia === 'stdin' ? '' : body,
-      system: keepSystem ? system || '' : '',
-      session: useResume ? session : '',
-      noSession: this.persistSessions || useResume ? '' : '--no-session',
-      maxTokens: maxTokens || '',
-    });
-    if (this.systemFlag && keepSystem && system) argv.push(...this.systemFlag.split(/\s+/), system);
+    const argvFor = (text) => {
+      const argv = joinArgs(useResume ? this.resumeArgs : this.args, {
+        model: model || '',
+        prompt: this.promptVia === 'stdin' ? '' : text,
+        system: keepSystem ? system || '' : '',
+        session: useResume ? session : '',
+        noSession: this.persistSessions || useResume ? '' : '--no-session',
+        maxTokens: maxTokens || '',
+      });
+      if (this.systemFlag && keepSystem && system) argv.push(...this.systemFlag.split(/\s+/), system);
+      return argv;
+    };
 
     const release = await this._sem.acquire();
     // A request can wait here longer than its client does (a curl --speed-time guard, a
@@ -120,19 +131,63 @@ export class CliAdapter {
       throw new LlmError(`adapter "${this.id}": client disconnected while queued for a free process`, { status: 499, provider: this.id });
     }
     try {
-      const run = this._spawnStream({ args: argv, stdin: this.promptVia === 'stdin' ? body : null, timeoutMs: this.timeoutMs, signal });
       const parse = getParser(this.parser);
-      let emitted = false;
-      for await (const evt of parse(toLines(run.stdout))) {
-        if (evt.type === 'delta' && evt.text) emitted = true;
-        yield evt;
-      }
-      const outcome = await run.done;
-      if (outcome.code !== 0 && !emitted) {
-        throw new LlmError(
-          `${this.id} exited ${outcome.code}${outcome.killed ? ' (killed)' : ''}: ${truncate(outcome.stderr || outcome.error || 'no output', 300)}`,
-          { status: outcome.killed ? 504 : 502, provider: this.id, retriable: !!outcome.killed },
-        );
+      // A retry spends the same budget as the first run: one request never takes longer
+      // than `timeoutMs`, however it got its answer.
+      const deadline = Date.now() + this.timeoutMs;
+      let carried = null; // what a refused-and-retried run cost, added to the next usage report
+      for (let attempt = 0; ; attempt++) {
+        const retryable = attempt === 0 && !!this.toolDenialRetry;
+        const text = attempt === 0 ? body : `${this.toolDenialRetry}\n\n${body}`;
+        const run = this._spawnStream({
+          args: argvFor(text),
+          stdin: this.promptVia === 'stdin' ? text : null,
+          timeoutMs: Math.max(1_000, deadline - Date.now()),
+          signal,
+        });
+        let emitted = false;
+        // While a run may still be retried, everything but text is held back: a refused run's
+        // session, usage and error must not reach the client if a second run replaces it.
+        // The first text delta proves there is an answer, so the held events go out in order.
+        const held = [];
+        let carriedSent = false;
+        for await (let evt of parse(toLines(run.stdout))) {
+          if (evt.type === 'usage' && carried && !carriedSent) {
+            evt = { ...evt, usage: addUsage(carried, evt.usage) };
+            carriedSent = true;
+          }
+          if (evt.type === 'done' && carried && !carriedSent) {
+            yield { type: 'usage', usage: carried };
+            carriedSent = true;
+          }
+          const isText = evt.type === 'delta' && !!evt.text;
+          if (retryable && !emitted && !isText) {
+            held.push(evt);
+            continue;
+          }
+          if (isText && !emitted) {
+            emitted = true;
+            yield* held.splice(0);
+          }
+          yield evt;
+        }
+        const outcome = await run.done;
+        const denial = held.find((e) => e.type === 'error' && e.code === 'tool_denied');
+        if (retryable && !emitted && denial && !signal?.aborted && deadline - Date.now() > MIN_RETRY_BUDGET_MS) {
+          carried = maxUsage(held.filter((e) => e.type === 'usage').map((e) => e.usage));
+          // Not an answer and not an error: a marker the gateway logs and the usage log counts,
+          // so a retried refusal is never mistaken for a model that behaved.
+          yield { type: 'retry', reason: 'tool_denied', message: denial.message };
+          continue;
+        }
+        yield* held.splice(0);
+        if (outcome.code !== 0 && !emitted) {
+          throw new LlmError(
+            `${this.id} exited ${outcome.code}${outcome.killed ? ' (killed)' : ''}: ${truncate(outcome.stderr || outcome.error || 'no output', 300)}`,
+            { status: outcome.killed ? 504 : 502, provider: this.id, retriable: !!outcome.killed },
+          );
+        }
+        return;
       }
     } finally {
       release();
@@ -144,6 +199,25 @@ export class CliAdapter {
     try {
       mkdirSync(this.cwd, { recursive: true, mode: 0o700 });
     } catch {}
+    for (const [rel, content] of Object.entries(this.workspaceFiles || {})) {
+      const file = path.join(this.cwd, rel);
+      let current = null;
+      try {
+        current = readFileSync(file, 'utf8');
+      } catch {}
+      if (current === content) continue;
+      // A missing agent file is not an error to agy: it falls back to its full harness and
+      // tools without a word. So a file that cannot be written fails the request instead.
+      try {
+        mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+        const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+        writeFileSync(tmp, content, { mode: 0o600 });
+        renameSync(tmp, file);
+        chmodSync(file, 0o600);
+      } catch (e) {
+        throw new LlmError(`adapter "${this.id}": could not write ${file}: ${e.message}`, { status: 500, provider: this.id });
+      }
+    }
   }
 
   _spawn({ args, timeoutMs }) {
@@ -206,6 +280,42 @@ export class CliAdapter {
     });
     return { stdout: child.stdout, done };
   }
+}
+
+/** Below this much of `timeoutMs` left, a refused run is reported instead of retried. */
+const MIN_RETRY_BUDGET_MS = 15_000;
+
+function checkWorkspaceFiles(id, files, ownsCwd) {
+  if (files == null) return null;
+  if (typeof files !== 'object' || Array.isArray(files)) throw new Error(`adapter "${id}": workspaceFiles must map a relative path to its content`);
+  if (!ownsCwd) throw new Error(`adapter "${id}": workspaceFiles needs a configured cwd — keysmith only writes into a workspace it owns`);
+  for (const [rel, content] of Object.entries(files)) {
+    const norm = path.normalize(rel);
+    if (!rel || path.isAbsolute(rel) || norm === '..' || norm.startsWith(`..${path.sep}`)) {
+      throw new Error(`adapter "${id}": workspaceFiles path "${rel}" must stay inside cwd`);
+    }
+    if (typeof content !== 'string') throw new Error(`adapter "${id}": workspaceFiles["${rel}"] must be a string`);
+  }
+  return files;
+}
+
+function addUsage(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  const out = {};
+  for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) out[k] = (a[k] || 0) + (b[k] || 0);
+  return out;
+}
+
+/** Several usage reports from one run: the gateway's rule — per-field max, never a sum. */
+function maxUsage(list) {
+  let out = null;
+  for (const u of list) {
+    if (!u) continue;
+    out = out || {};
+    for (const [k, v] of Object.entries(u)) if (typeof v === 'number') out[k] = Math.max(out[k] || 0, v);
+  }
+  return out;
 }
 
 function terminate(child) {

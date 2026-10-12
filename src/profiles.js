@@ -4,6 +4,39 @@
  * plugin. Fields marked "verified" were read off the live tools listed in `provenance`.
  */
 
+/**
+ * agy's own agent format, verified on agy 1.3.3: markdown with YAML frontmatter, the H1
+ * section is the system prompt. Measured on a one-word answer (gemini-3.8-flash-low):
+ * default agent 20,107 input tokens; `tools: []` alone 10,488; plus `inheritMcp: false`,
+ * `inheritCustomizations: false` (your GEMINI.md, skills, rules) and
+ * `excludeDefaultComponents: true` (agy's built-in harness sections) 585 with a one-line
+ * system prompt, 664 with the one below.
+ * A plain-text request is all an API client can send, so that is all this agent does.
+ */
+const AGY_TEXT_AGENT_NAME = 'keysmith-text';
+const AGY_TEXT_AGENT = `---
+name: ${AGY_TEXT_AGENT_NAME}
+description: Plain text completions for keysmith. No tools.
+tools: []
+mainAgent: true
+subagent: false
+hidden: true
+inheritMcp: false
+inheritCustomizations: false
+excludeDefaultComponents: true
+---
+
+# ${AGY_TEXT_AGENT_NAME}
+
+You are a language model answering one request through an API. You have no tools here: you cannot run commands, read or write files, browse, or call functions. Your text is the whole answer.
+
+Follow the request's own instructions. If it asks you to run, inspect or change something, do not refuse and do not try to do it yourself: write the commands, code or answer as text, in exactly the format the request asks for. Whoever sent the request acts on what you write.
+`;
+const AGY_TOOL_DENIAL_RETRY =
+  'Your previous answer to this request was a tool call, and it was refused: there are no tools here, so it produced nothing. ' +
+  'Answer again in plain text only, with no tool or function calls. If the request asks for something to be run, read or changed, ' +
+  'write the commands or code out as text in the format the request asks for.';
+
 export const CLI_PROFILES = {
   cmd: {
     kind: 'cli',
@@ -64,20 +97,27 @@ export const CLI_PROFILES = {
     bin: 'agy',
     // `-p` takes the prompt as its own value, so it goes last: anything after it is read as
     // the prompt (agy refuses `-p --output-format …` rather than guessing).
-    args: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '280s', ['--model', '{model}'], '-p', '{prompt}'],
-    resumeArgs: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '280s', '--conversation', '{session}', ['--model', '{model}'], '-p', '{prompt}'],
+    // `--agent keysmith-text` is the tool-less agent below. Without it every call is agy's
+    // full coding agent: a ~20k-token harness prompt, every MCP server booted, and tools
+    // that headless mode then refuses, so a model that reaches for one answers nothing.
+    args: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '280s', '--agent', AGY_TEXT_AGENT_NAME, ['--model', '{model}'], '-p', '{prompt}'],
+    resumeArgs: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '280s', '--conversation', '{session}', '--agent', AGY_TEXT_AGENT_NAME, ['--model', '{model}'], '-p', '{prompt}'],
     // agy writes every run to disk as a conversation whether asked or not; there is no
     // flag to stop it, so the honest setting is "sessions persist" and resume works.
     persistSessions: true,
     parser: 'agy-stream-json',
     modelsFrom: { args: ['models'] },
     // An empty directory keysmith owns: headless agy may read inside its workspace, and
-    // nothing in it is the workspace you are standing in.
+    // nothing in it is the workspace you are standing in. agy finds project agents in
+    // `.agents/agents/` under its cwd, so the tool-less agent lives there and is rewritten
+    // whenever it drifts — an agent name agy cannot find is silently the full harness.
     cwd: '~/.local/share/keysmith/workspaces/agy',
+    workspaceFiles: { [`.agents/agents/${AGY_TEXT_AGENT_NAME}.md`]: AGY_TEXT_AGENT },
+    toolDenialRetry: AGY_TOOL_DENIAL_RETRY,
     timeoutMs: 300_000,
     maxConcurrent: 2,
-    provenance: 'Antigravity CLI (agy) 1.3.1 — `agy --output-format stream-json -p` emits init / step_update (agent_response text_delta, per-step usage) / result; `agy models` prints id<TAB>name; `--conversation <id>` resumes',
-    note: 'Uses your Antigravity login, no key. Every call carries agy\'s own ~20k-token agent prompt (20,107 input tokens for a one-word answer) and boots agy plus every MCP server in ~/.gemini/config/mcp_config.json: ~8-15 s and ~200 MB per process before the first token, more with MCP servers. Headless mode auto-denies commands, edits and reads outside the workspace; a model that reaches for one answers nothing and the parser says so. Each run leaves a ~0.5 MB conversation under ~/.gemini/antigravity-cli/conversations.',
+    provenance: 'Antigravity CLI (agy) 1.3.3 — `agy --output-format stream-json -p` emits init / step_update (agent_response text_delta, per-step usage) / result; `agy models` prints id<TAB>name; `--conversation <id>` resumes; `--agent <name>` loads a markdown agent from `.agents/agents/` (unknown names fall back to the default agent without an error)',
+    note: 'Uses your Antigravity login, no key. Runs agy as the tool-less `keysmith-text` agent: ~600 input tokens for a one-word answer instead of the default agent\'s ~20k, no MCP servers booted, no tools to be refused. If a model still answers with a refused tool call, keysmith retries once with a stricter instruction (logged, and counted as `retries` in the usage log). Drop `--agent keysmith-text` from args/resumeArgs for agy\'s full coding agent — and its harness prompt, MCP start-up and headless tool refusals. Each run leaves a conversation under ~/.gemini/antigravity-cli/conversations.',
   },
   codex: {
     kind: 'cli',

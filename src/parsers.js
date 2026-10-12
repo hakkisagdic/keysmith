@@ -7,7 +7,8 @@
  *   {type:'reasoning', text}        thinking text (only forwarded when the client asked)
  *   {type:'usage', usage:{input,output,cacheRead,cacheWrite}}
  *   {type:'session', id}            resumable conversation id
- *   {type:'error', message}
+ *   {type:'error', message, code?}  code 'tool_denied': the run called a tool the
+ *                                   harness refused, and answered nothing
  *   {type:'done', finishReason}
  * Parsers must never throw on a line they do not understand — an unknown event is
  * just noise, and killing a half-finished completion over it would be worse.
@@ -19,7 +20,7 @@ const EV = {
   delta: (text) => ({ type: 'delta', text }),
   usage: (usage) => ({ type: 'usage', usage }),
   session: (id) => ({ type: 'session', id }),
-  error: (message) => ({ type: 'error', message }),
+  error: (message, code) => ({ type: 'error', message, ...(code ? { code } : {}) }),
   done: (finishReason = 'stop') => ({ type: 'done', finishReason }),
 };
 
@@ -202,7 +203,9 @@ export async function* agyStreamJson(lines) {
         yield EV.error(truncate(`agy: ${r.status}${why ? ' — ' + why : ''}`, 400));
       } else if (!emitted && denied.length) {
         const names = denied.map((a) => a.display_name || a.action).filter(Boolean).join(', ');
-        yield EV.error(`agy: the model called ${names || 'a tool'}, which headless mode auto-denies, and answered nothing`);
+        // `code` is what lets the adapter retry this one failure (see `toolDenialRetry`)
+        // without pattern-matching an English sentence.
+        yield EV.error(`agy: the model called ${names || 'a tool'}, which headless mode auto-denies, and answered nothing`, 'tool_denied');
       }
       yield EV.done('stop');
       return;
