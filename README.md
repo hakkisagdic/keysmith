@@ -176,6 +176,12 @@ start` / `tunnel run` processes it is replacing, and lets launchd's throttled re
 rebind the port. `keysmith uninstall-service` reverses it. Quick tunnels are not
 persisted: a random hostname that changes every start earns nothing from a service.
 
+The gateway agent is `ProcessType: Interactive`. Without it launchd runs the gateway, and
+every CLI the gateway spawns, at utility priority with throttled I/O; on a busy machine
+that tripled the wait for an agent's first token (9–30 s against 4–5 s, same code). An
+agent installed by an older keysmith keeps its old plist — run `keysmith install-service`
+again to rewrite it.
+
 ## Built-in profiles
 
 | Profile | Kind | Status |
@@ -210,7 +216,7 @@ Warp, Claude Code, opencode, Codex, Qoder, `openai` Python — copy-paste config
 ## Development
 
 ```bash
-npm test          # 69 tests: parsers, routing, and an HTTP suite against a stub CLI
+npm test          # 70 tests: parsers, routing, and an HTTP suite against a stub CLI
 node src/cli.js doctor --probe-models   # the truth about which models answer (spends quota)
 ```
 

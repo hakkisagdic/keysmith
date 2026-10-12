@@ -411,6 +411,17 @@ test('gateway plist runs serve under launchd with KeepAlive and a log path', () 
   assert.ok(p.includes('<key>PATH</key>'), 'launchd PATH must find the user CLIs the adapters spawn');
 });
 
+test('the gateway agent is Interactive, so launchd does not throttle the CLIs it spawns', () => {
+  const gw = service.gatewayPlist({ nodeBin: '/opt/homebrew/bin/node', entry: '/Users/me/projects/keysmith/src/cli.js', port: 8787 });
+  assert.match(gw, /<key>ProcessType<\/key>\n\s*<string>Interactive<\/string>/, 'no ProcessType means utility priority for every spawned agent');
+  const tn = service.tunnelPlist({ cloudflared: '/opt/homebrew/bin/cloudflared', name: 'keysmith', configFile: '/Users/me/.cloudflared/keysmith.yml' });
+  assert.ok(!tn.includes('ProcessType'), 'the tunnel was not measured and keeps the launchd default');
+  for (const p of [gw, tn]) {
+    assert.ok(p.trimEnd().endsWith('</plist>'));
+    assert.equal(p.split('<key>').length - 1, new Set(p.match(/<key>[^<]+<\/key>/g)).size, 'no key written twice');
+  }
+});
+
 test('tunnel plist names the ingress file and the tunnel, and escapes XML in paths', () => {
   const p = service.tunnelPlist({ cloudflared: '/opt/homebrew/bin/cloudflared', name: 'keysmith', configFile: '/Users/me/.cloudflared/keysmith.yml' });
   const args = p.split('\n').filter((l) => l.includes('<string>')).map((l) => l.trim().replace(/<\/?string>/g, ''));

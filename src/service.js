@@ -49,7 +49,7 @@ function servicePath() {
 }
 
 /** Minimal plist builder — enough for a LaunchAgent, no dependency needed. */
-export function plist({ label, programArguments, workingDirectory, standardOutPath, standardErrorPath }) {
+export function plist({ label, programArguments, workingDirectory, standardOutPath, standardErrorPath, processType = null }) {
   const esc = (s) =>
     String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -75,7 +75,7 @@ ${programArguments.map((a) => `    <string>${esc(a)}</string>`).join('\n')}
   <true/>
   <key>ThrottleInterval</key>
   <integer>10</integer>
-  <key>StandardOutPath</key>
+${processType ? `  <key>ProcessType</key>\n  <string>${esc(processType)}</string>\n` : ''}  <key>StandardOutPath</key>
   <string>${esc(standardOutPath)}</string>
   <key>StandardErrorPath</key>
   <string>${esc(standardErrorPath)}</string>
@@ -92,6 +92,13 @@ export function gatewayPlist({ nodeBin, entry, port }) {
     workingDirectory: path.dirname(entry),
     standardOutPath: log,
     standardErrorPath: log,
+    // A job with no ProcessType gets launchd's "light resource limits": it, and every CLI
+    // it spawns, runs at utility priority (20, not 31) with throttled I/O. On a busy
+    // machine that is most of the wait: agy's first token took 9-30 s under the default
+    // and 3.9-5.0 s as Interactive, same code, same config, calls interleaved. The gateway
+    // answers someone who is waiting, which is what launchd means by Interactive. The
+    // tunnel only forwards bytes and was not measured, so it keeps the default.
+    processType: 'Interactive',
   });
 }
 
