@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { LlmError, truncate } from './util.js';
+import { LlmError } from './util.js';
 import {
   chatId,
   openaiMessages,
@@ -14,11 +14,14 @@ import {
   errorBody,
 } from './protocols.js';
 import { loginPage, statusPage } from './status-page.js';
-import { registerSecrets } from './redact.js';
+import { redactSecrets, registerSecrets } from './redact.js';
+import { upstreamError } from './http-adapter.js';
 
 const MAX_BODY = 32 * 1024 * 1024;
 
-export function createServer(gateway, cfg, { usage, log = () => {} } = {}) {
+export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}) {
+  // Every line this server logs can quote an upstream error; it leaves here redacted.
+  const log = (m) => write(redactSecrets(m));
   const keys = cfg.auth?.enabled ? (cfg.auth.keys || []) : [];
   // The usage log redacts these from every line it writes; register them even when the
   // config did not come through loadConfig (an embedded server, a test).
@@ -95,20 +98,25 @@ export function createServer(gateway, cfg, { usage, log = () => {} } = {}) {
     } catch (e) {
       const status = e instanceof LlmError ? e.status : 500;
       if (status >= 500) log(`${route} crashed: ${e.stack || e.message}`);
+      // The client gets the error the way a log line does: an upstream message can quote
+      // a provider key, and a client of this gateway was never given that key.
+      const message = redactSecrets(e.message || String(e));
       const meta = res._keysmith;
       if (meta && !meta.done) {
-        record(usage, { model: meta.model, status: 'error', ms: Date.now() - meta.t0, stream: meta.stream, error: e.message, client: req.headers['user-agent'] });
+        record(usage, { model: meta.model, status: 'error', ms: Date.now() - meta.t0, stream: meta.stream, error: message, client: req.headers['user-agent'] });
       }
       if (res.headersSent) {
         // A stream that already started must be closed politely: an SSE error frame
         // and [DONE], or clients hang waiting for a terminator that never comes.
         if ((res.getHeader('content-type') || '').includes('text/event-stream')) {
-          res.write(`data: ${JSON.stringify({ error: { message: `keysmith: ${e.message}`, type: e.type || 'upstream_error' } })}\n\n`);
+          res.write(`data: ${JSON.stringify({ error: { message: `keysmith: ${message}`, type: e.type || 'upstream_error' } })}\n\n`);
           res.write('data: [DONE]\n\n');
         }
         return res.end();
       }
-      return json(res, status, errorBody(e.message || String(e), e instanceof LlmError ? e.type : 'internal_error', status, e?.provider || null));
+      // A provider's "retry after N s" is for the client's backoff: pass it on.
+      if (e?.retryAfter) res.setHeader('retry-after', String(e.retryAfter));
+      return json(res, status, errorBody(message, e instanceof LlmError ? e.type : 'internal_error', status, e?.provider || null));
     }
   }
 
@@ -399,12 +407,13 @@ async function tryPassthrough(gateway, requested, body, req, res, { usage, log, 
   }
   const candidates = chain.filter((c) => c.adapter.kind === 'http' && c.adapter.wire === 'openai');
   void label;
+  let lastError = null;
   for (const { adapter, model } of candidates) {
     try {
       const upstream = await adapter.rawChat({ ...body, model }, req, res);
       if (!upstream.ok) {
         const t = await upstream.text().catch(() => '');
-        throw new LlmError(`${adapter.id} ${upstream.status}: ${truncate(t, 200)}`, { status: upstream.status, provider: adapter.id });
+        throw upstreamError(adapter.id, upstream, t, { keepStatus: true });
       }
       res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') || 'text/event-stream', 'x-keysmith-mode': 'passthrough' });
       for await (const chunk of upstream.body) res.write(chunk);
@@ -412,6 +421,7 @@ async function tryPassthrough(gateway, requested, body, req, res, { usage, log, 
       record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, stream: !!body.stream, via: 'passthrough', client: req.headers['user-agent'] });
       return true;
     } catch (e) {
+      lastError = e instanceof LlmError ? e : new LlmError(`${adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: adapter.id });
       log(`passthrough via ${adapter.id} failed: ${e.message}`);
       if (res.headersSent) {
         res.end();
@@ -419,6 +429,11 @@ async function tryPassthrough(gateway, requested, body, req, res, { usage, log, 
       }
     }
   }
+  // Every leg of this route could take the tools, and each one refused. Running the route
+  // again as a plain completion would ask the same upstream a second time, drop the tools
+  // without a word and turn a 429 into a 502: answer with what the provider said instead.
+  // (A route with a CLI leg still falls back to it, tool-less, as before.)
+  if (lastError && candidates.length === chain.length) throw lastError;
   return false;
 }
 

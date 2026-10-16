@@ -40,11 +40,12 @@ export function expand(p) {
  *   "{env:OPENAI_API_KEY}"                    -> environment variable
  *   "{file:~/.config/x/token}"                -> trimmed file contents
  *   "{json:~/.local/share/opencode/auth.json#evren.key}"  -> dot-path into a JSON file
+ *   "{dotenv:~/project/.env#GOOGLE_API_KEY}"              -> one variable of a .env file
  *   "{exec:security find-generic-password -s x -w}"       -> stdout of a command
  *   "sk-live-..."                             -> literal (works, but discouraged)
  *
- * The `{json:...}` form is what lets keysmith reuse a credential an agent already
- * keeps in its own store instead of asking you to paste the key twice.
+ * The `{json:...}` and `{dotenv:...}` forms are what let keysmith reuse a credential an
+ * agent or a project already keeps instead of asking you to paste the key twice.
  */
 export function resolveSecret(ref, env = process.env) {
   if (ref == null || ref === false) return null;
@@ -72,6 +73,14 @@ export function resolveSecret(ref, env = process.env) {
       for (const seg of (dotted || '').split('.').filter(Boolean)) v = v?.[seg];
       return typeof v === 'string' ? v : null;
     }
+    case 'dotenv': {
+      const at = arg.lastIndexOf('#');
+      const name = at < 0 ? '' : arg.slice(at + 1);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error('{dotenv:…} names one variable after a #, e.g. {dotenv:~/project/.env#GOOGLE_API_KEY}');
+      const p = expand(arg.slice(0, at));
+      if (!fs.existsSync(p)) return null;
+      return dotenvValue(fs.readFileSync(p, 'utf8'), name);
+    }
     case 'exec': {
       try {
         const r = spawnSync(arg, { shell: true, encoding: 'utf8', timeout: 10_000 });
@@ -83,6 +92,35 @@ export function resolveSecret(ref, env = process.env) {
     default:
       throw new Error(`unknown secret reference kind: ${kind}`);
   }
+}
+
+/**
+ * One variable out of a `.env` file, read the way `set -a; . ./.env` and python-dotenv
+ * agree on: `NAME=value` or `export NAME=value`, one per line, `#` comments, the last
+ * assignment wins. A value is unquoted (an inline ` #comment` and surrounding blanks are
+ * dropped), 'single-quoted' (taken as written) or "double-quoted" (`\n`, `\"`, `\\`
+ * unescaped); a quoted value ends on its own line. Nothing is expanded and nothing is
+ * executed, and the file's text never goes into an error: it is somebody's secrets.
+ */
+export function dotenvValue(text, name) {
+  let found = null;
+  for (const raw of String(text).split(/\r?\n/)) {
+    const m = raw.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!m || m[1] !== name) continue;
+    const rest = m[2];
+    let value;
+    if (rest.startsWith("'")) {
+      const end = rest.indexOf("'", 1);
+      value = end < 0 ? null : rest.slice(1, end);
+    } else if (rest.startsWith('"')) {
+      const close = rest.slice(1).match(/^((?:[^"\\]|\\.)*)"/);
+      value = close ? close[1].replace(/\\(.)/g, (_, c) => (c === 'n' ? '\n' : c === 'r' ? '\r' : c === 't' ? '\t' : c)) : null;
+    } else {
+      value = rest.replace(/\s+#.*$/, '').trim();
+    }
+    found = value;
+  }
+  return found || null;
 }
 
 export function newApiKey() {

@@ -3,6 +3,7 @@ import { HttpAdapter } from './http-adapter.js';
 import { CliAdapter, which } from './cli-adapter.js';
 import { LlmError, truncate } from './util.js';
 import { resolveSecret } from './config.js';
+import { redactSecrets, registerSecrets } from './redact.js';
 
 /**
  * The gateway: config in, one model catalogue + one streaming `complete()` out.
@@ -15,7 +16,9 @@ import { resolveSecret } from './config.js';
 export class Gateway {
   constructor(cfg, { log = () => {} } = {}) {
     this.cfg = cfg;
-    this.log = log;
+    // Redacted here as well as by the CLI's writer: an embedding's own log function is
+    // handed provider errors, and those can quote a key.
+    this.log = (m) => log(redactSecrets(m));
     this.adapters = new Map();
     this.loadErrors = {}; // adapter id -> why it never constructed; doctor and /status must say so
     this.sessions = new Map(); // x-keysmith-session id -> {adapter, upstream session}
@@ -23,10 +26,14 @@ export class Gateway {
     for (const [id, raw] of Object.entries(cfg.adapters || {})) {
       try {
         const prepared = prepareAdapter(id, raw);
+        // From here on every log line, usage row and error message takes this key out, the
+        // way it takes out the gateway's own (redact.js).
+        registerSecrets([prepared._apiKey]);
         const adapter = prepared.kind === 'cli' ? new CliAdapter(id, prepared) : new HttpAdapter(id, prepared);
         this.adapters.set(id, adapter);
       } catch (e) {
-        this.loadErrors[id] = e.message;
+        // Shown on /status, /v1/models, /v1/keysmith/routes and by doctor: redacted at the source.
+        this.loadErrors[id] = redactSecrets(e.message);
         this.log(`adapter "${id}" failed to load: ${e.message}`);
       }
     }
@@ -128,7 +135,7 @@ export class Gateway {
             });
           }
         } catch (e) {
-          errors.push(`${a.id}: ${e.message}`);
+          errors.push(redactSecrets(`${a.id}: ${e.message}`));
         }
       }),
     );

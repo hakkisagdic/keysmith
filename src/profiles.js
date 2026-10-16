@@ -171,6 +171,19 @@ export const HTTP_PROFILES = {
   groq: { kind: 'http', wire: 'openai', baseUrl: 'https://api.groq.com/openai/v1', apiKey: '{env:GROQ_API_KEY}' },
   deepseek: { kind: 'http', wire: 'openai', baseUrl: 'https://api.deepseek.com/v1', apiKey: '{env:DEEPSEEK_API_KEY}' },
   together: { kind: 'http', wire: 'openai', baseUrl: 'https://api.together.xyz/v1', apiKey: '{env:TOGETHER_API_KEY}' },
+  google: {
+    kind: 'http',
+    wire: 'openai',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    apiKey: '{env:GOOGLE_API_KEY}',
+    // Gemini 3 returns a thought signature with its function calls and refuses the next
+    // turn without it; most OpenAI clients drop the field. See thought-signatures.js.
+    thoughtSignatures: true,
+    // /models lists `models/gemini-3.8-flash`; requests take `gemini-3.8-flash`.
+    stripModelPrefix: 'models/',
+    provenance: "Google's OpenAI-compatible Gemini endpoint — Bearer auth, /chat/completions with tools, tool_choice and streaming; Gemini 3 thought signatures ride on tool_calls[].extra_content.google.thought_signature (ai.google.dev OpenAI compatibility; Vertex AI 'Thought signatures', checked 2026-10-16)",
+    note: "Unlike `agy`, this is the API itself: tools, tool_choice and tool_calls go through verbatim. A key made in Google AI Studio; on the free tier each model allows about 20 requests a day per project (429 RESOURCE_EXHAUSTED, passed on as 429), shared with anything else using the same key. Keep a key that already lives in a project's .env where it is: --key '{dotenv:~/project/.env#GOOGLE_API_KEY}'.",
+  },
   ollama: { kind: 'http', wire: 'openai', baseUrl: 'http://127.0.0.1:11434/v1', apiKey: false, priority: 50 },
   lmstudio: { kind: 'http', wire: 'openai', baseUrl: 'http://127.0.0.1:1234/v1', apiKey: false, priority: 50 },
   llamacpp: { kind: 'http', wire: 'openai', baseUrl: 'http://127.0.0.1:8080/v1', apiKey: false, priority: 50 },

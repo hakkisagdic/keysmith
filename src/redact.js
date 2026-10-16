@@ -52,7 +52,23 @@ export function redactKey(key) {
   return `${s.length >= 16 ? s.slice(0, 4) : ''}…${s.length} fp:${fingerprint(s)}`;
 }
 
-/** Remember the gateway keys, so every later write can take them out. */
+/**
+ * A Google API key (`AIza` + 35 characters): what the `google` profile sends upstream. Like
+ * a minted key, it is taken out on its shape alone, so one that was never registered here —
+ * read by another process, quoted back in a provider's error — is not printed either.
+ */
+const GOOGLE_KEY_SHAPE = /AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/g;
+const GOOGLE_KEY_LENGTH = 39;
+
+/** The start of a Google API key, as the tail of a piece of streamed text. */
+const GOOGLE_KEY_PREFIX = /^A(?:I(?:z(?:a[0-9A-Za-z_-]{0,35})?)?)?$/;
+
+/**
+ * Remember a secret, so every later write can take it out: the gateway keys (loadConfig,
+ * createServer) and every provider key an adapter resolved from its `apiKey` reference (the
+ * Gateway, as it loads the adapter). Both get the same treatment everywhere keysmith writes:
+ * the log, usage.jsonl, error messages, the status page.
+ */
 export function registerSecrets(keys) {
   for (const k of keys || []) if (typeof k === 'string' && k.length >= MIN_REGISTERED) known.add(k);
 }
@@ -165,7 +181,7 @@ function rewrite(s, keys, { enc = same, sameLength = false } = {}) {
   }
 
   // Keys nobody registered here — revoked, from another config, added after start.
-  for (const re of [KEY_SHAPE, CUT_SHAPE]) {
+  for (const re of [KEY_SHAPE, CUT_SHAPE, GOOGLE_KEY_SHAPE]) {
     s = s.replace(re, (m) => {
       shaped++;
       return fit(redactKey(m), m);
@@ -216,7 +232,7 @@ function secretRanges(s, keys) {
     for (let i = s.indexOf(k); i !== -1; i = s.indexOf(k, i + 1)) ranges.push([i, i + k.length]);
     if (k.length > MIN_FRAGMENT) ranges.push(...fragmentRanges(s, k));
   }
-  for (const m of s.matchAll(KEY_SHAPE)) ranges.push([m.index, m.index + m[0].length]);
+  for (const re of [KEY_SHAPE, GOOGLE_KEY_SHAPE]) for (const m of s.matchAll(re)) ranges.push([m.index, m.index + m[0].length]);
   return merge(ranges);
 }
 
@@ -226,11 +242,11 @@ function secretRanges(s, keys) {
  * of a minted one. A whole key that the cut would split goes out whole instead.
  */
 function settledLength(s, keys) {
-  const longest = Math.max(MINTED_LENGTH, ...keys.map((k) => k.length));
+  const longest = Math.max(MINTED_LENGTH, GOOGLE_KEY_LENGTH, ...keys.map((k) => k.length));
   let cut = s.length;
   for (let i = Math.max(0, s.length - longest); i < s.length; i++) {
     const tail = s.slice(i);
-    if (MINTED_PREFIX.test(tail) || keys.some((k) => k.includes(tail))) {
+    if (MINTED_PREFIX.test(tail) || GOOGLE_KEY_PREFIX.test(tail) || keys.some((k) => k.includes(tail))) {
       cut = i;
       break;
     }

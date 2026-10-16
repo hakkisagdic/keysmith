@@ -1,4 +1,6 @@
 import { LlmError } from './util.js';
+import { ThoughtSignatures } from './thought-signatures.js';
+import { redactSecrets } from './redact.js';
 
 /**
  * Talk to an HTTP upstream that already speaks a chat API and translate its stream
@@ -22,9 +24,16 @@ export class HttpAdapter {
     this.modelMap = cfg.modelMap || {};
     this._apiKey = cfg._apiKey ?? null;
     this._declared = cfg.models;
+    // Google lists `models/gemini-3.8-flash` and answers to `gemini-3.8-flash`: the listing
+    // drops the prefix, so the catalogue, alias checks and requests all use the short id.
+    this.stripModelPrefix = typeof cfg.stripModelPrefix === 'string' ? cfg.stripModelPrefix : null;
     this._modelCache = null; // same 10-minute shape as CliAdapter's, so /v1/models does not refetch every provider on every poll
     this.defaultModel = cfg.defaultModel || null;
     this.note = cfg.note || null;
+    // Gemini 3 (the `google` profile): signatures its function calls carry, kept for the
+    // clients that drop them — see thought-signatures.js. `true`, or the store's limits.
+    const ts = cfg.thoughtSignatures;
+    this.thoughtSignatures = ts ? new ThoughtSignatures(ts && typeof ts === 'object' ? pickLimits(ts) : {}) : null;
   }
 
   get resumeArgs() {
@@ -68,8 +77,9 @@ export class HttpAdapter {
     const body = await res.json().catch(() => null);
     if (!body) throw new LlmError(`${this.id}: /models returned no JSON`, { status: 502, provider: this.id });
     const list = Array.isArray(body) ? body : body.data || body.models || [];
+    const strip = (id) => (this.stripModelPrefix && typeof id === 'string' && id.startsWith(this.stripModelPrefix) ? id.slice(this.stripModelPrefix.length) : id);
     const fetched = list
-      .map((m) => (typeof m === 'string' ? { id: m } : { id: m.id || m.name, name: m.name, contextWindow: m.context_length || m.context_window || m.limit?.context }))
+      .map((m) => (typeof m === 'string' ? { id: strip(m) } : { id: strip(m.id || m.name), name: m.name, contextWindow: m.context_length || m.context_window || m.limit?.context }))
       .filter((m) => m.id);
     this._modelCache = { at: Date.now(), list: fetched };
     return fetched;
@@ -83,17 +93,44 @@ export class HttpAdapter {
     return Object.entries(this._declared).map(([id, v]) => ({ id, ...(typeof v === 'object' && v ? v : {}) }));
   }
 
-  /** Verbatim relay — used when the client asked for `tools` (see server.tryPassthrough). */
+  /**
+   * Verbatim relay — used when the client asked for `tools` (see server.tryPassthrough).
+   *
+   * With `thoughtSignatures` on, "verbatim" has one exception each way: on the way up, a
+   * tool call the client replayed without the signature it came with gets it back; on the
+   * way down, the answer is read as it passes (not changed) for the signatures to keep.
+   */
   async rawChat(body) {
     if (this.wire !== 'openai') {
       throw new LlmError(`adapter "${this.id}" cannot relay tool calls on the ${this.wire} wire`, { status: 400, provider: this.id });
     }
-    return fetch(this.route('/chat/completions'), {
+    const outgoing = this.thoughtSignatures ? this.thoughtSignatures.attach(body).body : body;
+    const res = await fetch(this.route('/chat/completions'), {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...this.authHeaders(), ...this.headers },
-      body: JSON.stringify({ ...body, model: this.upstreamModel(body.model) }),
+      body: JSON.stringify({ ...outgoing, model: this.upstreamModel(body.model) }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
+    if (!this.thoughtSignatures || !res.ok || !res.body) return res;
+    const seen = this.thoughtSignatures.observe(res.headers.get('content-type'));
+    const tapped = res.body.pipeThrough(
+      new TransformStream({
+        transform(chunk, controller) {
+          // Read first, pass on second: the signature is stored before the client holds the
+          // chunk, so its next request cannot outrun it.
+          try {
+            seen.push(chunk);
+          } catch {}
+          controller.enqueue(chunk);
+        },
+        flush() {
+          try {
+            seen.end();
+          } catch {}
+        },
+      }),
+    );
+    return new Response(tapped, { status: res.status, statusText: res.statusText, headers: res.headers });
   }
 
   async *complete({ model, messages, maxTokens, temperature, signal, includeReasoning }) {
@@ -136,11 +173,7 @@ export class HttpAdapter {
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       clearTimeout(timer);
-      throw new LlmError(`${this.id} ${res.status}: ${describeErrorBody(text)}`, {
-        status: res.status === 401 || res.status === 403 ? res.status : 502,
-        type: res.status === 401 || res.status === 403 ? 'auth_error' : 'upstream_error',
-        provider: this.id,
-      });
+      throw upstreamError(this.id, res, text);
     }
     try {
       const events = isAnthropic ? parseAnthropicStream(res.body) : parseOpenaiStream(res.body);
@@ -254,13 +287,47 @@ async function* iterate(body) {
   }
 }
 
-function describeErrorBody(text) {
-  const t = String(text || '').replace(/\s+/g, ' ').trim();
+/**
+ * An upstream's refusal, as the provider said it. Auth failures, rate limits (429) and
+ * "unavailable / overloaded" (503) keep their status, and a `retry-after` the provider sent
+ * travels with them, so a client's own backoff sees what it would have seen talking to the
+ * provider directly. Anything else is a 502 from the gateway's point of view — except on
+ * the tool-call relay (`keepStatus`), which answers with whatever status the provider did.
+ */
+export function upstreamError(id, res, text, { keepStatus = false } = {}) {
+  const status = res.status;
+  const kept = keepStatus || status === 401 || status === 403 || status === 429 || status === 503;
+  const err = new LlmError(`${id} ${status}: ${describeErrorBody(text)}`, {
+    status: kept ? status : 502,
+    type: status === 401 || status === 403 ? 'auth_error' : status === 429 ? 'rate_limit_error' : 'upstream_error',
+    provider: id,
+  });
+  const retryAfter = res.headers?.get?.('retry-after');
+  if (retryAfter) err.retryAfter = retryAfter;
+  return err;
+}
+
+/**
+ * The message out of an error body. Google's OpenAI-compatible endpoint wraps its error in
+ * a one-element array (`[{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", …}}]`); its
+ * quota message names the limit and the model near the end, so the cut is generous. Redacted
+ * before it is cut, like truncate(): a cut through a key leaves a piece no pattern knows.
+ */
+export function describeErrorBody(text) {
+  const t = redactSecrets(String(text || '')).replace(/\s+/g, ' ').trim();
   if (!t) return '(empty body)';
   try {
-    const j = JSON.parse(t);
+    let j = JSON.parse(t);
+    if (Array.isArray(j)) j = j[0] || {};
     const m = j.error?.message || j.message || (typeof j.error === 'string' ? j.error : null);
-    if (m) return String(m).slice(0, 300);
+    const kind = typeof j.error?.status === 'string' ? `${j.error.status}: ` : '';
+    if (m) return `${kind}${m}`.slice(0, 600);
   } catch {}
-  return t.slice(0, 300);
+  return t.slice(0, 600);
+}
+
+function pickLimits(o) {
+  const out = {};
+  for (const k of ['maxEntries', 'maxBytes', 'maxAgeMs']) if (Number.isFinite(o[k]) && o[k] > 0) out[k] = o[k];
+  return out;
 }

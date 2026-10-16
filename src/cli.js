@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
-import { loadConfig, saveConfig, configPath, dataDir, newApiKey, configExists, expand } from './config.js';
+import { loadConfig, saveConfig, configPath, dataDir, newApiKey, configExists, expand, resolveSecret } from './config.js';
 import { Gateway } from './gateway.js';
 import { createServer } from './server.js';
 import { UsageLog } from './usage.js';
@@ -183,7 +183,20 @@ function cmdAdd(flags) {
   }
   if (entry.kind === 'http' && entry.apiKey && String(entry.apiKey).startsWith('{env:')) {
     const varName = String(entry.apiKey).slice(5, -1);
-    if (!process.env[varName]) out(`! ${varName} is not set in this shell. Either export it, or store the key:\n  keysmith add ${name} --key "{file:~/secrets/${name}.txt}"`);
+    if (!process.env[varName]) out(`! ${varName} is not set in this shell. Either export it, or point at where the key already is:\n  keysmith add ${name} --key "{dotenv:~/project/.env#${varName}}"    (or {file:…}, {json:…#path})`);
+  } else if (entry.kind === 'http' && /^\{(file|json|dotenv):/.test(String(entry.apiKey || ''))) {
+    const ref = String(entry.apiKey);
+    // A reference that can never work is a typo: refuse it rather than save it.
+    if (ref.startsWith('{dotenv:') && !/#[A-Za-z_][A-Za-z0-9_]*\}$/.test(ref)) fail('--key: {dotenv:…} names one variable after a #, e.g. {dotenv:~/project/.env#GOOGLE_API_KEY}');
+    // Resolved here only to say whether it would load; the value goes nowhere.
+    let ok = false;
+    let why = '';
+    try {
+      ok = !!resolveSecret(ref);
+    } catch (e) {
+      why = ` (${e.message})`;
+    }
+    if (!ok) out(`! ${ref} does not resolve to a key right now${why} — the adapter is saved, \`keysmith doctor\` will report it until it does`);
   }
   cfg.adapters = cfg.adapters || {};
   cfg.adapters[id] = entry;
@@ -708,7 +721,7 @@ function cmdScrubLogs(flags) {
     }
     total += r.configured + r.shaped;
     configured += r.configured;
-    lines.push(`  ${rel(f)}  ${r.configured} configured key(s), ${r.shaped} other ks_ key(s) replaced`);
+    lines.push(`  ${rel(f)}  ${r.configured} configured key(s), ${r.shaped} other key-shaped string(s) (ks_…, AIza…) replaced`);
   }
   for (const f of rotated.compressed) lines.push(`  ${rel(f)}  compressed — not rewritten; delete it, or unpack it and name it here`);
   out(`${lines.join('\n')}\n${total} replacement(s); ${changed.length} file(s)/dir(s) tightened to 0600/0700`);

@@ -196,7 +196,15 @@ Two things to know:
 | `baseUrl` | required | `…/v1` or `…/v1/` both fine; a route suffix you pasted by accident is trimmed |
 | `wire` | `openai` | `openai` → `POST {base}/chat/completions`; `anthropic` → `POST {base}/messages` with `x-api-key`. Set it explicitly — the other shape is not guessed from a hostname. |
 | `apiKey` | — | a secret *reference*, see below; `false` for no auth (local servers) |
-| `rawChat` behaviour | automatic | when a request carries `tools`, keysmith forwards the body verbatim to the first HTTP candidate and streams its answer unchanged, so real `tool_calls` survive |
+| `rawChat` behaviour | automatic | when a request carries `tools`, keysmith forwards the body verbatim to the first HTTP candidate and streams its answer unchanged, so real `tool_calls` survive. When every candidate refuses, the client gets the last refusal with the provider's own status (and `retry-after`) |
+| `thoughtSignatures` | `false` | Gemini 3 (the `google` profile): remember `tool_calls[].extra_content.google.thought_signature` as answers pass through the tool relay, and put it back on a replayed call that lost it (same id, same function name). `true`, or `{ "maxEntries": 4096, "maxBytes": 16777216, "maxAgeMs": 21600000 }`; in memory, per adapter, never logged |
+| `stripModelPrefix` | — | dropped from ids `/models` returns: `"models/"` for Google, whose listing says `models/gemini-3.8-flash` and whose requests take `gemini-3.8-flash` |
+
+Upstream statuses: 401/403 stay auth errors, 429 and 503 keep their status (with
+`retry-after` when the provider sent one) on the plain-completion path too; anything else
+there is a 502. Google wraps its errors in a one-element array; the message the client
+sees is `<adapter> <status>: <STATUS>: <provider message>`, e.g.
+`google 429: RESOURCE_EXHAUSTED: You exceeded your current quota…`.
 
 ## Secret references
 
@@ -206,13 +214,22 @@ Two things to know:
 {env:OPENAI_API_KEY}
 {file:~/.config/keys/copilot}
 {json:~/.local/share/opencode/auth.json#evren.key}
+{dotenv:~/project/.env#GOOGLE_API_KEY}
 {exec:security find-generic-password -s copilot-api -w}
 sk-live-…                      (a literal; works, discouraged)
 ```
 
 `{json:…#dot.path}` is the interesting one: it reuses a credential an agent already
-keeps in its own store, so the same key is not pasted into a second file. `{exec:…}`
+keeps in its own store, so the same key is not pasted into a second file.
+`{dotenv:path#NAME}` does the same for a project's `.env`: one `NAME=value` line
+(`export` allowed; unquoted with an inline ` #comment` dropped, `'single'` as written,
+`"double"` with `\n \" \\` unescaped; the last assignment wins; a quoted value ends on its
+line). Nothing is expanded or executed, and an error never quotes the file. `{exec:…}`
 covers a Keychain entry or a secrets manager; it runs through a shell with a 10 s cap.
+
+A resolved key is registered with the redactor (`src/redact.js`) the moment its adapter
+loads, so it comes out of every log line, usage row, error body and page as
+`AIza…39 fp:1a2b3c4d` — the same treatment as the gateway key.
 
 A reference that resolves to nothing is a **load error, not a silent skip**: the adapter
 stays out of service, `doctor` names the missing env var, `/v1/models` reports it,

@@ -125,7 +125,52 @@ caching. Sessions live in memory: restart the gateway and clients start fresh.
 
 `tools`/`tool_choice` pass straight through to the first HTTP candidate in the chain.
 If none can take them, keysmith logs it and runs a plain completion rather than
-pretending a CLI produced `tool_calls`.
+pretending a CLI produced `tool_calls`. If every leg could take them and each one refused
+(a 429, a 400), the client gets the last refusal with the provider's status and message —
+not the same request again without its tools.
+
+An upstream's 429 and 503 keep their status on every path, with its `retry-after` when it
+sent one, so a client backs off the way it would talking to the provider directly. (On a
+stream that has already started, which only happens without `tools`, it is an SSE error
+frame instead.) Auth failures stay 401/403; other upstream failures are a 502.
+
+## Gemini with tools: the `google` profile
+
+```bash
+keysmith add google                                              # reads {env:GOOGLE_API_KEY}
+keysmith add google --key '{dotenv:~/project/.env#GOOGLE_API_KEY}'  # or where the key already lives
+```
+
+Google's own OpenAI-compatible endpoint
+(`https://generativelanguage.googleapis.com/v1beta/openai`), so `google/gemini-3.8-flash`
+is the API itself: `tools`, `tool_choice`, streaming and `tool_calls` go through verbatim,
+which the `agy` CLI adapter cannot do. The catalogue drops Google's `models/` prefix
+(`stripModelPrefix`), so ids read the way requests send them.
+
+**Thought signatures.** Gemini 3 returns an opaque signature with each step's function
+call — `tool_calls[].extra_content.google.thought_signature`, streamed or not — and refuses
+the next turn if a replayed call comes back without it (`400 INVALID_ARGUMENT: Function call
+is missing a thought_signature in functionCall parts`). Most OpenAI clients, LangChain's
+`ChatOpenAI` among them, rebuild the assistant message from the fields they know and drop
+it. With `thoughtSignatures: true` (on in the profile) the adapter reads the answer as it
+passes — the bytes reach the client unchanged — keeps each signature by tool call id, and on
+the next request puts it back on any call that arrived without one, if the function name
+matches (Gemini's ids are short, `call_10078`; the name check keeps an id two conversations
+both drew from crossing over unless they also called the same function, and then Gemini's
+400 says so). A signature the client did send is left alone. The store lives in the gateway's
+memory, per adapter: 4096 entries, 16 MiB, 6 hours, whichever comes first
+(`"thoughtSignatures": {"maxEntries": …, "maxBytes": …, "maxAgeMs": …}` to change them), and
+it is never logged. A call the gateway never saw — before a restart, from another process —
+gets nothing, and Gemini's 400 reaches the client: Google's documented bypass value
+degrades the model, so keysmith does not send it.
+
+Checked live on 2026-10-16 (gemini-3.6-flash): the replayed history without the signature
+was refused with that 400, and the same history through the adapter answered.
+
+**Quota.** On the free tier each model allows about 20 requests a day per project — a 429
+`RESOURCE_EXHAUSTED` that keysmith passes on as a 429 — and the count is the key's, shared
+with anything else that uses the same key, such as a direct `google:` client. A tool loop
+spends one request per step.
 
 A CLI that emits thinking (`cmd`, Claude, opencode) keeps it to itself unless the request
 says `"include_reasoning": true` — then it arrives as `delta.reasoning_content` on
@@ -139,13 +184,22 @@ An adapter's `apiKey` is a *reference*, resolved at load and never written to a 
 "{env:OPENAI_API_KEY}"
 "{file:~/.config/keys/copilot}"
 "{json:~/.local/share/opencode/auth.json#evren.key}"
+"{dotenv:~/project/.env#GOOGLE_API_KEY}"
 "{exec:security find-generic-password -s copilot-api -w}"
 "sk-live-…"
 ```
 
-The `{json:…}` form is the one that matters: it reuses a credential an agent already
-keeps in its own store, so you never paste a key twice and nothing secret lands in this
-repo. A literal works too, but the file is `0600` for a reason.
+The `{json:…}` and `{dotenv:…}` forms are the ones that matter: they reuse a credential an
+agent or a project already keeps, so you never paste a key twice and nothing secret lands
+in this repo. `{dotenv:…}` reads one `NAME=value` (or `export NAME=value`, quoted or not)
+and executes nothing; a LaunchAgent does not see your shell's exports, so it is also how a
+gateway under launchd reaches a key a project's `.env` holds. A literal works too, but the
+file is `0600` for a reason.
+
+A provider key is redacted the way the gateway key is: once an adapter has resolved it,
+every log line, usage row, error message (the client's included) and the status page show
+`AIza…39 fp:…` in its place, and anything shaped like a Google key (`AIza` + 35) is taken
+out even when nothing here registered it.
 
 ## The gateway key, and what is logged
 
@@ -248,6 +302,7 @@ again to rewrite it.
 | `agy` | cli | verified live against Antigravity CLI 1.3.3 — your Google login, no key; runs as a tool-less text agent (~600-token prompt instead of ~20k), see [docs/adapters.md](docs/adapters.md#agy-as-a-plain-text-model) |
 | `codex`, `gemini` | cli | documented argv shape, not run against a live install |
 | `openai`, `anthropic`, `openrouter`, `groq`, `deepseek`, `together` | http | standard endpoints |
+| `google` | http | verified live against Gemini's OpenAI-compatible endpoint: tools, streaming, thought signatures — see [above](#gemini-with-tools-the-google-profile) |
 | `ollama`, `lmstudio`, `llamacpp`, `vllm` | http | local servers, no key |
 | `copilot` | http | verified live against `api.githubcopilot.com` with an OAuth device token |
 
@@ -271,7 +326,7 @@ Warp, Claude Code, opencode, Codex, Qoder, `openai` Python — copy-paste config
 ## Development
 
 ```bash
-npm test          # 98 tests: parsers, routing, an HTTP suite against a stub CLI, and the key never reaching a log
+npm test          # 135 tests: parsers, routing, HTTP suites against a stub CLI and a stub Gemini, and no key reaching a log
 node src/cli.js doctor --probe-models   # the truth about which models answer (spends quota)
 ```
 
