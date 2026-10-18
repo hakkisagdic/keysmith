@@ -1,5 +1,5 @@
 import { LlmError } from './util.js';
-import { ThoughtSignatures } from './thought-signatures.js';
+import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { redactSecrets } from './redact.js';
 
 /**
@@ -31,9 +31,10 @@ export class HttpAdapter {
     this.defaultModel = cfg.defaultModel || null;
     this.note = cfg.note || null;
     // Gemini 3 (the `google` profile): signatures its function calls carry, kept for the
-    // clients that drop them — see thought-signatures.js. `true`, or the store's limits.
+    // clients that drop them — see thought-signatures.js. `true`, or the store's limits. The
+    // Gateway hands every adapter on one upstream URL the same store; alone, it has its own.
     const ts = cfg.thoughtSignatures;
-    this.thoughtSignatures = ts ? new ThoughtSignatures(ts && typeof ts === 'object' ? pickLimits(ts) : {}) : null;
+    this.thoughtSignatures = ts ? cfg._signatureStore || new ThoughtSignatures(limitsFrom(ts)) : null;
   }
 
   get resumeArgs() {
@@ -99,12 +100,14 @@ export class HttpAdapter {
    * With `thoughtSignatures` on, "verbatim" has one exception each way: on the way up, a
    * tool call the client replayed without the signature it came with gets it back; on the
    * way down, the answer is read as it passes (not changed) for the signatures to keep.
+   * `caller` names the gateway key the request came with (a hash of it, never the key): a
+   * signature only ever goes back up on a request from the caller it came down to.
    */
-  async rawChat(body) {
+  async rawChat(body, { caller = '' } = {}) {
     if (this.wire !== 'openai') {
       throw new LlmError(`adapter "${this.id}" cannot relay tool calls on the ${this.wire} wire`, { status: 400, provider: this.id });
     }
-    const outgoing = this.thoughtSignatures ? this.thoughtSignatures.attach(body).body : body;
+    const outgoing = this.thoughtSignatures ? this.thoughtSignatures.attach(body, { caller }).body : body;
     const res = await fetch(this.route('/chat/completions'), {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...this.authHeaders(), ...this.headers },
@@ -112,7 +115,7 @@ export class HttpAdapter {
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!this.thoughtSignatures || !res.ok || !res.body) return res;
-    const seen = this.thoughtSignatures.observe(res.headers.get('content-type'));
+    const seen = this.thoughtSignatures.observe(res.headers.get('content-type'), { caller, messages: outgoing.messages });
     const tapped = res.body.pipeThrough(
       new TransformStream({
         transform(chunk, controller) {
@@ -213,7 +216,9 @@ async function* parseOpenaiStream(body) {
       };
     }
     if (choice?.finish_reason) yield { type: 'done', finishReason: choice.finish_reason };
-    if (d.error) yield { type: 'error', message: typeof d.error === 'string' ? d.error : d.error.message || JSON.stringify(d.error) };
+    // Redacted here, at the source: a provider that rejects its key mid-stream quotes it, and
+    // this message is written to clients, logs and the usage log further on.
+    if (d.error) yield { type: 'error', message: redactSecrets(typeof d.error === 'string' ? d.error : d.error.message || JSON.stringify(d.error)) };
   }
   yield { type: 'done', finishReason: 'stop' };
 }
@@ -240,7 +245,7 @@ async function* parseAnthropicStream(body) {
         if (d.usage?.output_tokens) yield { type: 'usage', usage: { input: 0, output: d.usage.output_tokens, cacheRead: 0, cacheWrite: 0 } };
         break;
       case 'error':
-        yield { type: 'error', message: d.error?.message || 'anthropic stream error' };
+        yield { type: 'error', message: redactSecrets(d.error?.message || 'anthropic stream error') };
         break;
       case 'message_stop':
         yield { type: 'done', finishReason: 'stop' };
@@ -324,10 +329,4 @@ export function describeErrorBody(text) {
     if (m) return `${kind}${m}`.slice(0, 600);
   } catch {}
   return t.slice(0, 600);
-}
-
-function pickLimits(o) {
-  const out = {};
-  for (const k of ['maxEntries', 'maxBytes', 'maxAgeMs']) if (Number.isFinite(o[k]) && o[k] > 0) out[k] = o[k];
-  return out;
 }

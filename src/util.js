@@ -94,6 +94,18 @@ export class LlmError extends Error {
   }
 }
 
+/**
+ * Of a route's failures, the one to answer with. Failover moves on after a 429 or a 503,
+ * and the leg it moves on to can refuse for a reason of its own (a 400, a missing key); that
+ * refusal only happened because the first leg backed off, so a client that sees it gives up
+ * where it should have waited. A 429/503 from an earlier leg is kept over a later leg's
+ * other refusal; otherwise the latest failure is the answer.
+ */
+export function routeError(kept, next) {
+  const backoff = (e) => e?.status === 429 || e?.status === 503;
+  return kept && backoff(kept) && !backoff(next) ? kept : next;
+}
+
 export function nowMs() {
   return Number(process.hrtime.bigint() / 1000n) / 1000;
 }

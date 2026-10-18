@@ -383,16 +383,19 @@ test('{dotenv:path#NAME} reads one variable the way a shell or python-dotenv wou
 
 /* ----------------------------------------------------------- the signature store */
 
-test('the store re-attaches only to a call that lacks a signature, and only for the same function', () => {
+test('the store re-attaches only to a call that lacks a signature, and only to the call it came with', () => {
   const s = new ThoughtSignatures();
-  s.remember('call_1', 'S1', 'get_weather');
+  s.remember({ id: 'call_1', name: 'get_weather', args: '{"city":"Ankara","units":"c"}', sig: 'S1' });
+  const call = (id, name, args, extra) => ({ id, type: 'function', function: { ...(name ? { name } : {}), arguments: args }, ...(extra ? { extra_content: extra } : {}) });
   const body = {
     model: 'm',
     messages: [
       { role: 'user', content: 'x' },
-      { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }, { id: 'call_2', type: 'function', function: { name: 'other', arguments: '{}' } }] },
-      { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{}' }, extra_content: { google: { thought_signature: 'MINE' }, other: 1 } }] },
-      { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'not_the_same', arguments: '{}' } }] },
+      { role: 'assistant', content: null, tool_calls: [call('call_1', 'get_weather', '{"units": "c", "city": "Ankara"}'), call('call_2', 'other', '{}')] },
+      { role: 'assistant', content: null, tool_calls: [call('call_1', 'get_weather', '{"city":"Ankara","units":"c"}', { google: { thought_signature: 'MINE' }, other: 1 })] },
+      { role: 'assistant', content: null, tool_calls: [call('call_1', 'not_the_same', '{"city":"Ankara","units":"c"}')] },
+      { role: 'assistant', content: null, tool_calls: [call('call_1', null, '{"city":"Ankara","units":"c"}')] },
+      { role: 'assistant', content: null, tool_calls: [call('call_1', 'get_weather', '{"city":"Izmir","units":"c"}')] },
       { role: 'tool', tool_call_id: 'call_1', content: '{}' },
     ],
   };
@@ -400,49 +403,79 @@ test('the store re-attaches only to a call that lacks a signature, and only for 
   const { body: out, attached } = s.attach(body);
   assert.equal(attached, 1);
   assert.equal(JSON.stringify(body), frozen, 'the client body is not mutated');
-  assert.equal(signatureOf(out.messages[1].tool_calls[0]), 'S1');
+  assert.equal(signatureOf(out.messages[1].tool_calls[0]), 'S1', 'arguments re-serialized in another key order and spacing are the same arguments');
   assert.equal(signatureOf(out.messages[1].tool_calls[1]), null, 'a call it never saw gets nothing');
   assert.deepEqual(out.messages[2], body.messages[2], 'a signature the client sent is kept, with its siblings');
   assert.equal(signatureOf(out.messages[3].tool_calls[0]), null, 'same id, different function: an id collision, not this call');
+  assert.equal(signatureOf(out.messages[4].tool_calls[0]), null, 'a call that names no function gets nothing');
+  assert.equal(signatureOf(out.messages[5].tool_calls[0]), null, 'same id and function, other arguments: another call');
   assert.equal(s.attach({ messages: [{ role: 'user', content: 'x' }] }).attached, 0);
+  assert.equal(s.attach(body, { caller: 'someone-else' }).attached, 0, 'another caller gets nothing');
+  s.remember({ id: 'call_9', args: '{}', sig: 'NAMELESS' });
+  assert.equal(s.lookup({ id: 'call_9', args: '{}' }), null, 'a call without a name is never stored');
 });
 
-test('the store is bounded by entries, bytes and age', () => {
+test('calls that agree on caller, id, name and arguments are told apart by the conversation before them', () => {
+  const s = new ThoughtSignatures();
+  const call = { id: 'call_5', name: 'browser_snapshot', args: '{}' };
+  s.remember({ ...call, convo: 'A', sig: 'SA' });
+  s.remember({ ...call, convo: 'B', sig: 'SB' });
+  assert.equal(s.lookup({ ...call, convo: 'A' }), 'SA');
+  assert.equal(s.lookup({ ...call, convo: 'B' }), 'SB');
+  assert.equal(s.lookup({ ...call, convo: 'C' }), null, 'two candidates and neither conversation: nothing, rather than a guess');
+  s.remember({ ...call, convo: 'A', sig: 'SA2' });
+  assert.equal(s.lookup({ ...call, convo: 'A' }), 'SA2', 'the same call in the same conversation again: the newest');
+  const one = new ThoughtSignatures();
+  one.remember({ ...call, convo: 'A', sig: 'ONLY' });
+  assert.equal(one.lookup({ ...call, convo: 'rewritten history' }), 'ONLY', 'a single candidate does not need the history to match');
+});
+
+test('the store is bounded by entries, bytes and age, and a shared store takes the larger limits', () => {
   let t = 0;
   const s = new ThoughtSignatures({ maxEntries: 3, maxBytes: 1000, maxAgeMs: 100, now: () => t });
-  for (const id of ['a', 'b', 'c', 'd']) s.remember(id, 'x'.repeat(10));
+  const at = (id) => ({ id, name: 'f', args: '{}' });
+  for (const id of ['a', 'b', 'c', 'd']) s.remember({ ...at(id), sig: 'x'.repeat(10) });
   assert.equal(s.size, 3);
-  assert.equal(s.lookup('a'), null, 'the oldest goes first');
-  s.remember('big', 'y'.repeat(990));
-  assert.ok(s.bytes <= 1000 && s.lookup('big'), `bytes ${s.bytes}`);
-  assert.equal(s.lookup('b'), null);
+  assert.equal(s.lookup(at('a')), null, 'the oldest goes first');
+  s.remember({ ...at('big'), sig: 'y'.repeat(960) });
+  assert.ok(s.bytes <= 1000 && s.lookup(at('big')), `bytes ${s.bytes}`);
+  assert.equal(s.lookup(at('b')), null);
+  assert.equal(s.lookup(at('c')), null, 'and then by bytes');
   t = 101;
-  s.remember('e', 'z');
+  s.remember({ ...at('e'), sig: 'z' });
   assert.equal(s.size, 1, 'expired entries are dropped on the next write');
-  assert.equal(s.lookup('big'), null);
+  assert.equal(s.lookup(at('big')), null);
   t = 202;
-  assert.equal(s.lookup('e'), null, 'stale after maxAgeMs');
+  assert.equal(s.lookup(at('e')), null, 'stale after maxAgeMs');
+  s.widen({ maxEntries: 10 });
+  assert.deepEqual([s.maxEntries, s.maxBytes, s.maxAgeMs], [10, 16 * 1024 * 1024, 6 * 3600_000], 'the defaults count as asked for too');
 });
 
-test('the observer reads signatures from a JSON answer and from SSE split anywhere, id before or after', () => {
+test('the observer reads signatures from a JSON answer and from SSE split anywhere, id before or after, arguments in pieces', () => {
   const s = new ThoughtSignatures();
   const j = s.observe('application/json');
-  const json = JSON.stringify({ choices: [{ index: 0, message: { tool_calls: [{ id: 'j1', function: { name: 'f' }, extra_content: { google: { thought_signature: 'SJ' } } }, { id: 'j2', function: { name: 'g' } }] } }] });
+  const json = JSON.stringify({ choices: [{ index: 0, message: { tool_calls: [{ id: 'j1', function: { name: 'f', arguments: '{"a":1}' }, extra_content: { google: { thought_signature: 'SJ' } } }, { id: 'j2', function: { name: 'g', arguments: '{}' } }] } }] });
   for (let i = 0; i < json.length; i += 7) j.push(new TextEncoder().encode(json.slice(i, i + 7)));
   j.end();
-  assert.equal(s.lookup('j1', 'f'), 'SJ');
-  assert.equal(s.lookup('j2'), null);
+  assert.equal(s.lookup({ id: 'j1', name: 'f', args: '{"a": 1}' }), 'SJ');
+  assert.equal(s.lookup({ id: 'j2', name: 'g', args: '{}' }), null);
 
   const sse = s.observe('text/event-stream; charset=utf-8');
   const events = [
     { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, extra_content: { google: { thought_signature: 'EARLY' } } }] } }] },
     { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 's1', function: { name: 'f', arguments: '' } }] } }] },
     { choices: [{ index: 0, delta: { tool_calls: [{ id: 's2', function: { name: 'g', arguments: '{}' }, extra_content: { google: { thought_signature: 'NOINDEX' } } }] } }] },
+    // OpenAI's way: the arguments in pieces, after the id and name.
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: 's3', function: { name: 'h', arguments: '' }, extra_content: { google: { thought_signature: 'PIECES' } } }] } }] },
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 1, function: { arguments: '{"city": "An' } }] } }] },
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 1, function: { arguments: 'kara"}' } }] } }] },
   ];
   const wire = events.map((e) => `data: ${JSON.stringify(e)}\r\n\r\n`).join('') + 'data: [DONE]\r\n\r\n';
   const bytes = new TextEncoder().encode(wire);
   for (let i = 0; i < bytes.length; i += 5) sse.push(bytes.slice(i, i + 5));
   sse.end();
-  assert.equal(s.lookup('s1', 'f'), 'EARLY', 'a signature that came before its id is kept for it');
-  assert.equal(s.lookup('s2', 'g'), 'NOINDEX');
+  assert.equal(s.lookup({ id: 's1', name: 'f', args: '{}' }), 'EARLY', 'a signature that came before its id is kept for it');
+  assert.equal(s.lookup({ id: 's2', name: 'g', args: '{}' }), 'NOINDEX');
+  assert.equal(s.lookup({ id: 's3', name: 'h', args: '{"city":"Ankara"}' }), 'PIECES');
+  assert.equal(s.lookup({ id: 's3', name: 'h', args: '{"city": "An' }), null, 'only the whole arguments are the call');
 });

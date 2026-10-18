@@ -1,6 +1,6 @@
 import http from 'node:http';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { LlmError } from './util.js';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { LlmError, routeError } from './util.js';
 import {
   chatId,
   openaiMessages,
@@ -18,6 +18,7 @@ import { redactSecrets, registerSecrets } from './redact.js';
 import { upstreamError } from './http-adapter.js';
 
 const MAX_BODY = 32 * 1024 * 1024;
+const STREAM_HOLD_MS = 10_000;
 
 export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}) {
   // Every line this server logs can quote an upstream error; it leaves here redacted.
@@ -28,6 +29,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
   registerSecrets(cfg.auth?.keys);
   const startedAt = Date.now();
   const pages = pageSessions();
+  // How long a streamed answer's headers wait for its first event (see `held`).
+  const holdMs = Number.isFinite(cfg.limits?.streamHoldMs) && cfg.limits.streamHoldMs >= 0 ? cfg.limits.streamHoldMs : STREAM_HOLD_MS;
 
   // Whatever one request does, it never takes the process down: launchd would restart it
   // every 10 s for as long as somebody keeps sending the request, and Node's own crash
@@ -74,7 +77,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
       }
     }
 
-    if (!authorize(req, keys, url)) {
+    const caller = callerOf(req, keys, url);
+    if (caller === null) {
       return json(res, 401, errorBody('missing or invalid API key — send `Authorization: Bearer <key>`', 'authentication_error', 401));
     }
 
@@ -90,9 +94,9 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
         const n = Number(url.searchParams.get('tail') || 0);
         return json(res, 200, { summary: usage?.summarize(Number(url.searchParams.get('hours') || 24) * 3600_000), ...(n ? { entries: usage.tail(n) } : {}) });
       }
-      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage, log });
-      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage, log });
-      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage, log });
+      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage, log, caller, holdMs });
+      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage, log, holdMs });
+      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage, log, holdMs });
       if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway);
       return json(res, 404, errorBody(`no route ${req.method} ${route}`, 'invalid_request_error', 404));
     } catch (e) {
@@ -206,7 +210,7 @@ function describeAdapters(gateway) {
 
 /* ---------------------------------------------------------------------- handlers */
 
-async function handleChat(req, res, gateway, { usage, log }) {
+async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS }) {
   const body = await readJson(req);
   const messages = openaiMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -220,18 +224,26 @@ async function handleChat(req, res, gateway, { usage, log }) {
 
   // Tool calls need verbatim upstream deltas. A CLI harness would run the tools
   // itself rather than hand them back, so pass through only to HTTP upstreams.
+  let exclude = null;
   if (Array.isArray(body.tools) && body.tools.length) {
-    const passthrough = await tryPassthrough(gateway, requested, body, req, res, { usage, log, t0, label: 'chat' });
-    if (passthrough) return;
-    log(`tools requested but no HTTP upstream matched for "${requested}" — running as a plain completion`);
+    const relay = await tryPassthrough(gateway, requested, body, req, res, { usage, log, t0, caller });
+    if (relay.done) return;
+    if (relay.refused.length) {
+      // Those legs already said no to this very request: asking them again without the tools
+      // spends their quota twice and can turn their refusal into a tool-less answer.
+      exclude = new Set(relay.refused.map((r) => r.target));
+      log(`tools requested; ${relay.refused.map((r) => `${r.target} refused (${r.status})`).join(', ')} — the rest of "${requested}" runs as a plain completion, without tools`);
+    } else {
+      log(`tools requested but no HTTP upstream matched for "${requested}" — running as a plain completion`);
+    }
   }
 
-  const chain = gateway.resolve(requested);
+  const chain = gateway.resolve(requested, { exclude });
   const publicId = session || null;
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
   if (!stream) {
-    const { text, reasoning, usage: u, session: sid, retries, cutAt } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning });
+    const { text, reasoning, usage: u, session: sid, retries, cutAt } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, exclude });
     meta.done = true;
     record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: req.headers['user-agent'], ...marks(retries, cutAt) });
     // The header carries the session for clients that read headers; the body carries it
@@ -241,6 +253,7 @@ async function handleChat(req, res, gateway, { usage, log }) {
     return json(res, 200, payload, sid);
   }
 
+  const events = await held(gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, exclude }), holdMs);
   startSse(res, 'text/event-stream');
   res.write(`data: ${JSON.stringify(openaiChunk(id, requested, created, { role: 'assistant', content: '' }))}\n\n`);
   let text = '';
@@ -250,7 +263,7 @@ async function handleChat(req, res, gateway, { usage, log }) {
   let reasoning = '';
   let retries = 0;
   let cutAt = null;
-  for await (const evt of gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning })) {
+  for await (const evt of events) {
     if (evt.type === 'retry') {
       retries++;
     } else if (evt.type === 'cut') {
@@ -266,7 +279,7 @@ async function handleChat(req, res, gateway, { usage, log }) {
     } else if (evt.type === 'session') {
       sid = evt.id;
     } else if (evt.type === 'error') {
-      errMessage = evt.message;
+      errMessage = redactSecrets(evt.message);
     } else if (evt.type === 'done') {
       break;
     }
@@ -286,7 +299,7 @@ async function handleChat(req, res, gateway, { usage, log }) {
   record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: req.headers['user-agent'], ...marks(retries, cutAt) });
 }
 
-async function handleAnthropic(req, res, gateway, { usage, log }) {
+async function handleAnthropic(req, res, gateway, { usage, log, holdMs = STREAM_HOLD_MS }) {
   const body = await readJson(req);
   const messages = anthropicMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -303,6 +316,7 @@ async function handleAnthropic(req, res, gateway, { usage, log }) {
     // Session goes out as a header only: Anthropic clients schema-check the body.
     return json(res, 200, anthropicResult({ id, model: body.model, text, usage: u }), sid);
   }
+  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens }), holdMs);
   startSse(res, 'text/event-stream');
   writeAnthicHead(res, { id, model: body.model });
   // Headers are on the wire by now, so a streamed response cannot advertise the session
@@ -312,14 +326,14 @@ async function handleAnthropic(req, res, gateway, { usage, log }) {
   let errMessage = null;
   let retries = 0;
   let cutAt = null;
-  for await (const evt of gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens })) {
+  for await (const evt of events) {
     if (evt.type === 'retry') retries++;
     else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'delta') {
       text += evt.text;
       sseEvent(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: evt.text } });
     } else if (evt.type === 'usage') u = mergeUsage(u, evt.usage);
-    else if (evt.type === 'error') errMessage = evt.message;
+    else if (evt.type === 'error') errMessage = redactSecrets(evt.message); // written to the client below
     else if (evt.type === 'done') break;
   }
   if (errMessage) sseEvent(res, 'error', { type: 'error', error: { type: 'overloaded_error', message: errMessage } });
@@ -333,7 +347,7 @@ async function handleAnthropic(req, res, gateway, { usage, log }) {
   void text;
 }
 
-async function handleResponses(req, res, gateway, { usage, log }) {
+async function handleResponses(req, res, gateway, { usage, log, holdMs = STREAM_HOLD_MS }) {
   const body = await readJson(req);
   const messages = responsesMessages(body);
   if (!messages.length) throw new LlmError('input is empty', { status: 400 });
@@ -349,6 +363,7 @@ async function handleResponses(req, res, gateway, { usage, log }) {
     record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, via: '/v1/responses', ...marks(retries, cutAt) });
     return json(res, 200, responsesResult({ id, model: body.model, text, usage: u, created }), sid);
   }
+  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res) }), holdMs);
   startSse(res, 'text/event-stream');
   for (const e of responsesStreamEventsHead({ id, model: body.model })) sseEvent(res, e.event, e.data);
   let full = '';
@@ -356,14 +371,14 @@ async function handleResponses(req, res, gateway, { usage, log }) {
   let errMessage = null;
   let retries = 0;
   let cutAt = null;
-  for await (const evt of gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res) })) {
+  for await (const evt of events) {
     if (evt.type === 'retry') retries++;
     else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'delta') {
       full += evt.text;
       sseEvent(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: `msg_${id}`, output_index: 0, content_index: 0, delta: evt.text });
     } else if (evt.type === 'usage') u = mergeUsage(u, evt.usage);
-    else if (evt.type === 'error') errMessage = evt.message;
+    else if (evt.type === 'error') errMessage = redactSecrets(evt.message); // written to the client below
     else if (evt.type === 'done') break;
   }
   if (errMessage) sseEvent(res, 'response.failed', { type: 'response.failed', response: { id: `resp_${id}`, object: 'response', model: body.model, status: 'failed', error: { message: errMessage } } });
@@ -390,27 +405,32 @@ async function handleEmbeddings(req, res, gateway) {
   });
   const text = await r.text();
   res.writeHead(r.status, { 'content-type': 'application/json' });
-  res.end(text);
+  // A refusal is the provider's error body, which can quote the key it refused; vectors are
+  // passed on as they came.
+  res.end(r.ok ? text : redactSecrets(text));
 }
 
 /**
  * Straight pipe to an HTTP upstream, byte for byte, used when the client asked for
  * tools. Only candidates that can honour that are tried, so a mixed route degrades
  * to the API-backed model instead of returning a tool-free answer.
+ *
+ * `{ done: true }` once an answer (or a broken one) went out; otherwise `{ done: false,
+ * refused }`, the legs that refused this request, which the plain completion leaves out.
  */
-async function tryPassthrough(gateway, requested, body, req, res, { usage, log, t0, label }) {
+async function tryPassthrough(gateway, requested, body, req, res, { usage, log, t0, caller = '' }) {
   let chain;
   try {
     chain = gateway.resolve(requested);
   } catch {
-    return false;
+    return { done: false, refused: [] };
   }
   const candidates = chain.filter((c) => c.adapter.kind === 'http' && c.adapter.wire === 'openai');
-  void label;
   let lastError = null;
-  for (const { adapter, model } of candidates) {
+  const refused = [];
+  for (const { adapter, model, target } of candidates) {
     try {
-      const upstream = await adapter.rawChat({ ...body, model }, req, res);
+      const upstream = await adapter.rawChat({ ...body, model }, { caller });
       if (!upstream.ok) {
         const t = await upstream.text().catch(() => '');
         throw upstreamError(adapter.id, upstream, t, { keepStatus: true });
@@ -419,22 +439,24 @@ async function tryPassthrough(gateway, requested, body, req, res, { usage, log, 
       for await (const chunk of upstream.body) res.write(chunk);
       res.end();
       record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, stream: !!body.stream, via: 'passthrough', client: req.headers['user-agent'] });
-      return true;
+      return { done: true };
     } catch (e) {
-      lastError = e instanceof LlmError ? e : new LlmError(`${adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: adapter.id });
+      const err = e instanceof LlmError ? e : new LlmError(`${adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: adapter.id });
+      lastError = routeError(lastError, err);
+      refused.push({ target, status: err.status });
       log(`passthrough via ${adapter.id} failed: ${e.message}`);
       if (res.headersSent) {
         res.end();
-        return true;
+        return { done: true };
       }
     }
   }
   // Every leg of this route could take the tools, and each one refused. Running the route
   // again as a plain completion would ask the same upstream a second time, drop the tools
   // without a word and turn a 429 into a 502: answer with what the provider said instead.
-  // (A route with a CLI leg still falls back to it, tool-less, as before.)
+  // (A route with a CLI leg still falls back to that leg, tool-less, and only to it.)
   if (lastError && candidates.length === chain.length) throw lastError;
-  return false;
+  return { done: false, refused };
 }
 
 /* ---------------------------------------------------------------------- plumbing */
@@ -507,6 +529,34 @@ function sseEvent(res, name, data) {
   res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
+/**
+ * A streamed answer's status line waits for its first event, for up to `holdMs`. A refusal
+ * that comes before then — a 429, a 503, a 401: the upstream's answer to the request itself,
+ * after failover had its turn — is thrown from here while the status can still say so, with
+ * its retry-after. An answer slower than that (a CLI starting up, a model thinking) gets its
+ * 200 and `: stream open` at `holdMs`, and a failure after that is an SSE error frame.
+ *
+ * Returns the events, the first one included; closing it early closes `events` too, so the
+ * adapter's own cleanup (a process killed, a fetch aborted) runs as it did before.
+ */
+async function held(events, holdMs) {
+  const it = events[Symbol.asyncIterator]();
+  const first = it.next();
+  let timer;
+  try {
+    await Promise.race([first, new Promise((resolve) => (timer = setTimeout(resolve, holdMs)))]);
+  } finally {
+    clearTimeout(timer);
+  }
+  return (async function* () {
+    try {
+      for (let r = await first; !r.done; r = await it.next()) yield r.value;
+    } finally {
+      await it.return?.();
+    }
+  })();
+}
+
 function startSse(res, type) {
   res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' });
   res.write(': stream open\n\n');
@@ -550,19 +600,31 @@ function send(res, status, headers, body) {
   res.end(body);
 }
 
-/** The key from a header: `Authorization: Bearer` or `x-api-key`. */
-function headerAuthorized(req, keys) {
-  if (!keys.length) return true;
+/** The configured key a header presents (`Authorization: Bearer` or `x-api-key`), or null. */
+function headerKey(req, keys) {
   const header = req.headers.authorization || '';
   const candidate = header.startsWith('Bearer ') ? header.slice(7) : req.headers['x-api-key'] || '';
-  return keys.some((k) => safeEqual(String(k), String(candidate)));
+  return keys.find((k) => safeEqual(String(k), String(candidate))) ?? null;
 }
 
-/** The API also takes `?api_key=`, for clients that cannot set a header. */
-function authorize(req, keys, url) {
-  if (headerAuthorized(req, keys)) return true;
-  const candidate = url.searchParams.get('api_key') || '';
-  return !!candidate && keys.some((k) => safeEqual(String(k), candidate));
+function headerAuthorized(req, keys) {
+  return !keys.length || headerKey(req, keys) !== null;
+}
+
+/**
+ * Who is asking: a hash of the gateway key the request presented — by header, or by
+ * `?api_key=` for clients that cannot set one — `''` with auth off, null when no key fits.
+ * What one caller's requests leave behind (Gemini's thought signatures) goes back up on that
+ * caller's requests only; the hash keeps the key itself out of anything that remembers it.
+ */
+function callerOf(req, keys, url) {
+  if (!keys.length) return '';
+  let key = headerKey(req, keys);
+  if (key === null) {
+    const candidate = url.searchParams.get('api_key') || '';
+    key = candidate ? (keys.find((k) => safeEqual(String(k), candidate)) ?? null) : null;
+  }
+  return key === null ? null : createHash('sha256').update(String(key)).digest('base64url').slice(0, 22);
 }
 
 function safeEqual(a, b) {

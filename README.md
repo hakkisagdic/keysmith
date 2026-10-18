@@ -126,13 +126,19 @@ caching. Sessions live in memory: restart the gateway and clients start fresh.
 `tools`/`tool_choice` pass straight through to the first HTTP candidate in the chain.
 If none can take them, keysmith logs it and runs a plain completion rather than
 pretending a CLI produced `tool_calls`. If every leg could take them and each one refused
-(a 429, a 400), the client gets the last refusal with the provider's status and message —
-not the same request again without its tools.
+(a 429, a 400), the client gets the refusal with the provider's status and message — not
+the same request again without its tools. In a route that also has CLI legs, the legs that
+refused are not asked a second time: the CLI legs answer, without tools, and the log names
+each leg that refused and its status.
 
 An upstream's 429 and 503 keep their status on every path, with its `retry-after` when it
-sent one, so a client backs off the way it would talking to the provider directly. (On a
-stream that has already started, which only happens without `tools`, it is an SSE error
-frame instead.) Auth failures stay 401/403; other upstream failures are a 502.
+sent one, so a client backs off the way it would talking to the provider directly. When
+failover moved on from a 429/503 and the next leg refused for a reason of its own, the
+client gets the 429/503: that is why the route failed. A streamed request holds its headers
+until its first event, for up to `limits.streamHoldMs` (10 s), so a refusal in that time
+keeps its status too; one that comes later — a CLI or a model slower than that, an error in
+the middle of an answer — is an SSE error frame on a 200. Auth failures stay 401/403; other
+upstream failures are a 502.
 
 ## Gemini with tools: the `google` profile
 
@@ -153,14 +159,19 @@ the next turn if a replayed call comes back without it (`400 INVALID_ARGUMENT: F
 is missing a thought_signature in functionCall parts`). Most OpenAI clients, LangChain's
 `ChatOpenAI` among them, rebuild the assistant message from the fields they know and drop
 it. With `thoughtSignatures: true` (on in the profile) the adapter reads the answer as it
-passes — the bytes reach the client unchanged — keeps each signature by tool call id, and on
-the next request puts it back on any call that arrived without one, if the function name
-matches (Gemini's ids are short, `call_10078`; the name check keeps an id two conversations
-both drew from crossing over unless they also called the same function, and then Gemini's
-400 says so). A signature the client did send is left alone. The store lives in the gateway's
-memory, per adapter: 4096 entries, 16 MiB, 6 hours, whichever comes first
-(`"thoughtSignatures": {"maxEntries": …, "maxBytes": …, "maxAgeMs": …}` to change them), and
-it is never logged. A call the gateway never saw — before a restart, from another process —
+passes — the bytes reach the client unchanged — keeps each signature, and on the next request
+puts it back on a call that arrived without one. Only on the call it came with: Gemini's ids
+are short (`call_10078`), and two conversations, or two steps of one, draw the same id. So a
+signature is kept under the gateway key the request came with, the call id, the function
+name and the arguments (compared parsed, since clients re-serialize them); calls that agree
+on all of that are told apart by the conversation before them. A call that names no
+function, comes with another gateway key, or cannot be told apart gets nothing, and Gemini's
+400 reaches the client. A signature the client did send is left alone. The store lives in
+the gateway's memory, one per upstream URL — every adapter on that endpoint shares it, so a
+failover leg to a second key can put back what the first leg saw: 4096 entries, 16 MiB,
+6 hours, whichever comes first (`"thoughtSignatures": {"maxEntries": …, "maxBytes": …,
+"maxAgeMs": …}` to change them; the largest any adapter asks for wins), and it is never
+logged. A call the gateway never saw — before a restart, from another process —
 gets nothing, and Gemini's 400 reaches the client: Google's documented bypass value
 degrades the model, so keysmith does not send it.
 

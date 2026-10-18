@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { HttpAdapter } from './http-adapter.js';
 import { CliAdapter, which } from './cli-adapter.js';
-import { LlmError, truncate } from './util.js';
+import { LlmError, routeError, truncate } from './util.js';
 import { resolveSecret } from './config.js';
 import { redactSecrets, registerSecrets } from './redact.js';
+import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 
 /**
  * The gateway: config in, one model catalogue + one streaming `complete()` out.
@@ -23,12 +24,16 @@ export class Gateway {
     this.loadErrors = {}; // adapter id -> why it never constructed; doctor and /status must say so
     this.sessions = new Map(); // x-keysmith-session id -> {adapter, upstream session}
     this.inFlight = 0;
+    // Upstream URL -> the one thought-signature store every adapter on it shares, so a
+    // failover leg to a second key on the same endpoint can put back what the first leg saw.
+    this.signatureStores = new Map();
     for (const [id, raw] of Object.entries(cfg.adapters || {})) {
       try {
         const prepared = prepareAdapter(id, raw);
         // From here on every log line, usage row and error message takes this key out, the
         // way it takes out the gateway's own (redact.js).
         registerSecrets([prepared._apiKey]);
+        if (prepared.kind !== 'cli' && prepared.thoughtSignatures) prepared._signatureStore = this._signatureStore(prepared);
         const adapter = prepared.kind === 'cli' ? new CliAdapter(id, prepared) : new HttpAdapter(id, prepared);
         this.adapters.set(id, adapter);
       } catch (e) {
@@ -103,6 +108,17 @@ export class Gateway {
     return out;
   }
 
+  _signatureStore(cfg) {
+    const url = String(cfg.baseUrl || '')
+      .replace(/\/+$/, '')
+      .replace(/\/chat\/completions$/, '');
+    const limits = limitsFrom(cfg.thoughtSignatures);
+    let store = this.signatureStores.get(url);
+    if (store) store.widen(limits);
+    else this.signatureStores.set(url, (store = new ThoughtSignatures(limits)));
+    return store;
+  }
+
   get publicAdapters() {
     return [...this.adapters.values()].filter((a) => !a.disabled);
   }
@@ -171,8 +187,11 @@ export class Gateway {
    * robust, so an unusable leg is skipped and reported rather than poisoning the route.
    * `aliasIssues` (doctor, /status, /v1/models, the routes endpoint) is where the skip
    * becomes loud, so skipping never hides a misconfiguration — it only keeps answering.
+   *
+   * `exclude` takes out legs (by `adapter/model` target) that already answered this request:
+   * the tool relay's refusals, which a plain completion must not ask a second time.
    */
-  resolve(requested) {
+  resolve(requested, { exclude = null } = {}) {
     if (!requested) throw new LlmError('missing "model"', { status: 400 });
     const aliases = this.cfg.aliases || {};
     const isAlias = !!aliases[requested];
@@ -199,9 +218,10 @@ export class Gateway {
         }
         throw err;
       }
+      if (exclude?.has(entry)) continue;
       out.push({ adapter, model: modelName || adapter.defaultModel || '', target: entry });
     }
-    if (!out.length) throw firstError;
+    if (!out.length) throw firstError || new LlmError(`every leg of "${requested}" has already refused this request`, { status: 502 });
     // Declared order wins in an alias: you wrote the chain, you know which leg should
     // be tried first. `priority` only orders the flat model listing.
     return out;
@@ -216,8 +236,8 @@ export class Gateway {
    * upstream session, so a chat app gets genuine multi-turn (and prompt-cache)
    * behaviour out of a tool that was never meant to answer HTTP.
    */
-  async *complete({ model, messages, session, signal, maxTokens, temperature, includeReasoning = false }) {
-    const chain = this.resolve(model);
+  async *complete({ model, messages, session, signal, maxTokens, temperature, includeReasoning = false, exclude = null }) {
+    const chain = this.resolve(model, { exclude });
     const publicId = session || newSessionId();
     const known = session ? this.sessions.get(publicId) : null;
     let reportedSession = false;
@@ -255,11 +275,14 @@ export class Gateway {
           }
           if (evt.type === 'delta') emitted = true;
           if (evt.type === 'error') {
+            // Every face writes this message to its client: an adapter that let a provider's
+            // quoted key through is not the last line of defence.
+            const message = redactSecrets(evt.message);
             if (emitted) {
-              yield evt;
+              yield { ...evt, message };
               return;
             }
-            throw new LlmError(evt.message, { status: 502, provider: adapter.id });
+            throw new LlmError(message, { status: 502, provider: adapter.id });
           }
           if (evt.type === 'session' && evt.id) {
             this._remember(publicId, { target: `${adapter.id}/${upstreamModel}`, upstreamSession: evt.id });
@@ -277,10 +300,11 @@ export class Gateway {
         }
         return;
       } catch (e) {
-        lastError = e instanceof LlmError ? e : new LlmError(e.message, { status: 502, provider: adapter.id });
-        if (signal?.aborted) throw lastError;
+        const err = e instanceof LlmError ? e : new LlmError(e.message, { status: 502, provider: adapter.id });
+        if (signal?.aborted) throw err;
         this.log(`${adapter.id}/${truncate(upstreamModel, 60)} failed, ${chain.length > 1 ? 'trying next candidate' : 'giving up'}: ${truncate(e.message, 160)}`);
-        if (chain.length === 1) throw lastError;
+        if (chain.length === 1) throw err;
+        lastError = routeError(lastError, err);
       }
     }
     throw lastError || new LlmError('no candidate in this route succeeded', { status: 502 });

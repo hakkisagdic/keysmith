@@ -196,14 +196,18 @@ Two things to know:
 | `baseUrl` | required | `…/v1` or `…/v1/` both fine; a route suffix you pasted by accident is trimmed |
 | `wire` | `openai` | `openai` → `POST {base}/chat/completions`; `anthropic` → `POST {base}/messages` with `x-api-key`. Set it explicitly — the other shape is not guessed from a hostname. |
 | `apiKey` | — | a secret *reference*, see below; `false` for no auth (local servers) |
-| `rawChat` behaviour | automatic | when a request carries `tools`, keysmith forwards the body verbatim to the first HTTP candidate and streams its answer unchanged, so real `tool_calls` survive. When every candidate refuses, the client gets the last refusal with the provider's own status (and `retry-after`) |
-| `thoughtSignatures` | `false` | Gemini 3 (the `google` profile): remember `tool_calls[].extra_content.google.thought_signature` as answers pass through the tool relay, and put it back on a replayed call that lost it (same id, same function name). `true`, or `{ "maxEntries": 4096, "maxBytes": 16777216, "maxAgeMs": 21600000 }`; in memory, per adapter, never logged |
+| `rawChat` behaviour | automatic | when a request carries `tools`, keysmith forwards the body verbatim to the first HTTP candidate and streams its answer unchanged, so real `tool_calls` survive. When every candidate refuses, the client gets the refusal with the provider's own status (and `retry-after`) — an earlier leg's 429/503 over a later leg's other refusal |
+| `thoughtSignatures` | `false` | Gemini 3 (the `google` profile): remember `tool_calls[].extra_content.google.thought_signature` as answers pass through the tool relay, and put it back on a replayed call that lost it — the same call: same gateway key, id, function name and (parsed) arguments, told apart by the conversation before it when that is not enough; a call with no function name gets nothing. `true`, or `{ "maxEntries": 4096, "maxBytes": 16777216, "maxAgeMs": 21600000 }`; in memory, one store per upstream URL shared by every adapter on it (the largest limits win), never logged |
 | `stripModelPrefix` | — | dropped from ids `/models` returns: `"models/"` for Google, whose listing says `models/gemini-3.8-flash` and whose requests take `gemini-3.8-flash` |
 
 Upstream statuses: 401/403 stay auth errors, 429 and 503 keep their status (with
 `retry-after` when the provider sent one) on the plain-completion path too; anything else
-there is a 502. Google wraps its errors in a one-element array; the message the client
-sees is `<adapter> <status>: <STATUS>: <provider message>`, e.g.
+there is a 502. A streamed request holds its headers until its first event, for up to
+`limits.streamHoldMs` (default 10000), so a refusal in that time keeps its status; one after
+that is an SSE error frame on a 200. When failover moved on from a 429/503 and a later leg
+refused for another reason, the 429/503 is what the client gets. A route with CLI legs does
+not ask a leg that refused the tools again; its CLI legs answer without them. Google wraps
+its errors in a one-element array; the message the client sees is `<adapter> <status>: <STATUS>: <provider message>`, e.g.
 `google 429: RESOURCE_EXHAUSTED: You exceeded your current quota…`.
 
 ## Secret references
