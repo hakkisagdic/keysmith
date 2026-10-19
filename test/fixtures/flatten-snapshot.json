@@ -1,0 +1,876 @@
+{
+  "_provenance": "Recorded from keysmith 4dce929 (src/protocols.js openaiMessages/anthropicMessages, then src/util.js flattenMessages with the CLI adapter defaults), before the tool bridge existed. It is what a tool-less request turned into on that day: never regenerate it from newer code.",
+  "cases": [
+    {
+      "name": "system and user",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be terse."
+          },
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be terse."
+        },
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ],
+      "flat": {
+        "system": "Be terse.",
+        "prompt": "User: hi",
+        "history": "User: hi"
+      }
+    },
+    {
+      "name": "developer is system",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "developer",
+            "content": "Rules."
+          },
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "Rules."
+        },
+        {
+          "role": "user",
+          "content": "x"
+        }
+      ],
+      "flat": {
+        "system": "Rules.",
+        "prompt": "User: x",
+        "history": "User: x"
+      }
+    },
+    {
+      "name": "multi-turn",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "S"
+          },
+          {
+            "role": "user",
+            "content": "one"
+          },
+          {
+            "role": "assistant",
+            "content": "two"
+          },
+          {
+            "role": "user",
+            "content": "three"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "S"
+        },
+        {
+          "role": "user",
+          "content": "one"
+        },
+        {
+          "role": "assistant",
+          "content": "two"
+        },
+        {
+          "role": "user",
+          "content": "three"
+        }
+      ],
+      "flat": {
+        "system": "S",
+        "prompt": "User: one\n\nAssistant: two\n\nUser: three",
+        "history": "User: one\n\nAssistant: two\n\nUser: three"
+      }
+    },
+    {
+      "name": "text and image parts",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "look"
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:,"
+                }
+              },
+              {
+                "type": "text",
+                "text": "here"
+              }
+            ]
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "look\n[image omitted by keysmith]\nhere"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: look\n[image omitted by keysmith]\nhere",
+        "history": "User: look\n[image omitted by keysmith]\nhere"
+      }
+    },
+    {
+      "name": "input_text, output_text and bare string parts",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "a"
+              },
+              "b",
+              {
+                "type": "output_text",
+                "text": "c"
+              }
+            ]
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "a\nb\nc"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: a\nb\nc",
+        "history": "User: a\nb\nc"
+      }
+    },
+    {
+      "name": "null and empty content",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": null
+          },
+          {
+            "role": "assistant",
+            "content": ""
+          },
+          {
+            "role": "user",
+            "content": "still here"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": ""
+        },
+        {
+          "role": "assistant",
+          "content": ""
+        },
+        {
+          "role": "user",
+          "content": "still here"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: still here",
+        "history": "User: still here"
+      }
+    },
+    {
+      "name": "missing role",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "content": "who am I"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "who am I"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: who am I",
+        "history": "User: who am I"
+      }
+    },
+    {
+      "name": "two system turns",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "first"
+          },
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "second"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "go"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "first"
+        },
+        {
+          "role": "system",
+          "content": "second"
+        },
+        {
+          "role": "user",
+          "content": "go"
+        }
+      ],
+      "flat": {
+        "system": "first\n\nsecond",
+        "prompt": "User: go",
+        "history": "User: go"
+      }
+    },
+    {
+      "name": "unknown part types",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "mystery",
+                "text": "kept"
+              },
+              {
+                "type": "audio",
+                "input_audio": {}
+              },
+              null,
+              7
+            ]
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "kept"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: kept",
+        "history": "User: kept"
+      }
+    },
+    {
+      "name": "messages is not a list",
+      "wire": "openai",
+      "body": {
+        "messages": {
+          "role": "user",
+          "content": "x"
+        }
+      },
+      "messages": [],
+      "flat": {
+        "system": "",
+        "prompt": "",
+        "history": ""
+      }
+    },
+    {
+      "name": "name fields are ignored",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "name": "alice",
+            "content": "hello"
+          },
+          {
+            "role": "assistant",
+            "name": "bot",
+            "content": "hi alice"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "assistant",
+          "content": "hi alice"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: hello\n\nAssistant: hi alice",
+        "history": "User: hello\n\nAssistant: hi alice"
+      }
+    },
+    {
+      "name": "unicode, newlines and whitespace",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Ankara'da hava?\n\nŞimdi."
+          },
+          {
+            "role": "assistant",
+            "content": "   "
+          },
+          {
+            "role": "user",
+            "content": "\n"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "Ankara'da hava?\n\nŞimdi."
+        },
+        {
+          "role": "assistant",
+          "content": "   "
+        },
+        {
+          "role": "user",
+          "content": "\n"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: Ankara'da hava?\n\nŞimdi.\n\nAssistant:    \n\nUser: \n",
+        "history": "User: Ankara'da hava?\n\nŞimdi.\n\nAssistant:    \n\nUser: \n"
+      }
+    },
+    {
+      "name": "a number as content",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": 5
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "5"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: 5",
+        "history": "User: 5"
+      }
+    },
+    {
+      "name": "an object as content",
+      "wire": "openai",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": {
+              "type": "text",
+              "text": "x"
+            }
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "[object Object]"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: [object Object]",
+        "history": "User: [object Object]"
+      }
+    },
+    {
+      "name": "empty list",
+      "wire": "openai",
+      "body": {
+        "messages": []
+      },
+      "messages": [],
+      "flat": {
+        "system": "",
+        "prompt": "",
+        "history": ""
+      }
+    },
+    {
+      "name": "system string and user string",
+      "wire": "anthropic",
+      "body": {
+        "system": "Be terse.",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be terse."
+        },
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ],
+      "flat": {
+        "system": "Be terse.",
+        "prompt": "User: hi",
+        "history": "User: hi"
+      }
+    },
+    {
+      "name": "system blocks",
+      "wire": "anthropic",
+      "body": {
+        "system": [
+          {
+            "type": "text",
+            "text": "S1"
+          },
+          {
+            "type": "text",
+            "text": "S2"
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "go"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "S1\nS2"
+        },
+        {
+          "role": "user",
+          "content": "go"
+        }
+      ],
+      "flat": {
+        "system": "S1\nS2",
+        "prompt": "User: go",
+        "history": "User: go"
+      }
+    },
+    {
+      "name": "user text and image blocks",
+      "wire": "anthropic",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "look"
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "AA=="
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "look\n[image omitted by keysmith]"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: look\n[image omitted by keysmith]",
+        "history": "User: look\n[image omitted by keysmith]"
+      }
+    },
+    {
+      "name": "multi-turn with assistant string",
+      "wire": "anthropic",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "one"
+          },
+          {
+            "role": "assistant",
+            "content": "two"
+          },
+          {
+            "role": "user",
+            "content": "three"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "one"
+        },
+        {
+          "role": "assistant",
+          "content": "two"
+        },
+        {
+          "role": "user",
+          "content": "three"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: one\n\nAssistant: two\n\nUser: three",
+        "history": "User: one\n\nAssistant: two\n\nUser: three"
+      }
+    },
+    {
+      "name": "thinking block next to text",
+      "wire": "anthropic",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "q"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "hmm",
+                "signature": "sig"
+              },
+              {
+                "type": "text",
+                "text": "answer"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "more"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "q"
+        },
+        {
+          "role": "assistant",
+          "content": "answer"
+        },
+        {
+          "role": "user",
+          "content": "more"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: q\n\nAssistant: answer\n\nUser: more",
+        "history": "User: q\n\nAssistant: answer\n\nUser: more"
+      }
+    },
+    {
+      "name": "empty content is dropped",
+      "wire": "anthropic",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": ""
+          },
+          {
+            "role": "user",
+            "content": []
+          },
+          {
+            "role": "user",
+            "content": "kept"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "kept"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: kept",
+        "history": "User: kept"
+      }
+    },
+    {
+      "name": "tool-shaped turns are skipped",
+      "wire": "anthropic",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "a"
+          },
+          {
+            "role": "tool",
+            "content": "out"
+          },
+          {
+            "type": "tool_result",
+            "content": "x"
+          },
+          {
+            "role": "user",
+            "content": "b"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "a"
+        },
+        {
+          "role": "user",
+          "content": "b"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: a\n\nUser: b",
+        "history": "User: a\n\nUser: b"
+      }
+    },
+    {
+      "name": "no system, no messages",
+      "wire": "anthropic",
+      "body": {},
+      "messages": [],
+      "flat": {
+        "system": "",
+        "prompt": "",
+        "history": ""
+      }
+    },
+    {
+      "name": "empty system",
+      "wire": "anthropic",
+      "body": {
+        "system": "",
+        "messages": [
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "x"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: x",
+        "history": "User: x"
+      }
+    },
+    {
+      "name": "document block has no text",
+      "wire": "anthropic",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "document",
+                "source": {
+                  "type": "text",
+                  "media_type": "text/plain",
+                  "data": "doc"
+                }
+              },
+              {
+                "type": "text",
+                "text": "summarise"
+              }
+            ]
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "summarise"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: summarise",
+        "history": "User: summarise"
+      }
+    },
+    {
+      "name": "a role other than assistant is user",
+      "wire": "anthropic",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "in the list"
+          },
+          {
+            "role": "user",
+            "content": "x"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "in the list"
+        },
+        {
+          "role": "user",
+          "content": "x"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: in the list\n\nUser: x",
+        "history": "User: in the list\n\nUser: x"
+      }
+    },
+    {
+      "name": "unicode and newlines",
+      "wire": "anthropic",
+      "body": {
+        "system": "Türkçe yanıt ver.",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "satır 1\nsatır 2"
+              },
+              {
+                "type": "text",
+                "text": ""
+              },
+              {
+                "type": "text",
+                "text": "son"
+              }
+            ]
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "Türkçe yanıt ver."
+        },
+        {
+          "role": "user",
+          "content": "satır 1\nsatır 2\nson"
+        }
+      ],
+      "flat": {
+        "system": "Türkçe yanıt ver.",
+        "prompt": "User: satır 1\nsatır 2\nson",
+        "history": "User: satır 1\nsatır 2\nson"
+      }
+    }
+  ]
+}
