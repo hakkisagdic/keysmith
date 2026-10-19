@@ -16,8 +16,9 @@ import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, age
  *  - A CLI injects its own (large) system prompt, so reported `input` tokens are not
  *    the tokens you sent. We report what the upstream actually charged, not what we
  *    wished it charged.
- *  - A CLI is an agent: uncapped, it will start calling tools and editing files.
- *    Profiles pass a turn cap (`--max-turns 1`) so the call stays a completion.
+ *  - A CLI is an agent: with tools, it will run commands and edit files. Profiles take the
+ *    tools away with the CLI's own switches and run it in an empty workspace keysmith owns;
+ *    one whose tools cannot be taken away is marked `unsafeTools` and ships disabled.
  */
 export class CliAdapter {
   constructor(id, cfg) {
@@ -44,7 +45,29 @@ export class CliAdapter {
     // For a CLI run as a text model: once the answer has text, the first tool call ends it.
     // A harness can keep a tool of its own that no agent definition removes (agy:
     // `manage_task`), and a model that calls it after answering answers again, and again.
-    this.stopAtToolCall = !!cfg.stopAtToolCall;
+    // `'always'` ends the run at a tool call before any text too, and fails the request: for
+    // a CLI whose tools could not be taken away (Warp), a tool call is never the way to an answer.
+    this.stopAtToolCall = cfg.stopAtToolCall === 'always' ? 'always' : !!cfg.stopAtToolCall;
+    // What `{noSession}` renders as when the run is not resumed. CLIs disagree on the spelling:
+    // Command Code takes `--no-session`, Claude Code and Qoder refuse it and take
+    // `--no-session-persistence`.
+    this.noSessionFlag = typeof cfg.noSessionFlag === 'string' ? cfg.noSessionFlag : '--no-session';
+    // A CLI whose tools keysmith could not take away: it can run commands and edit files.
+    // Never an alias leg, never probed by `doctor --probe-models` (see Gateway.resolve).
+    this.unsafeTools = !!cfg.unsafeTools;
+    // An argv that auto-approves the agent's tool calls (`opencode --auto`, `--yolo`, …) is an
+    // agent that acts on this machine for whoever holds a key. That is never a default: it
+    // loads only when the entry says so with `unsafeTools`, which keeps it out of every alias
+    // and every probe. A config copied from an older profile stops here, with the way out.
+    const approving = autoApproveFlag(cfg);
+    if (approving && !this.unsafeTools) {
+      throw new Error(
+        `adapter "${id}": its argv passes ${approving}, which auto-approves the agent's tool calls — it could run commands and edit files on this machine for any request that reaches it. ` +
+          `Take the flag out (\`keysmith add <profile> --as ${id}\` re-copies a built-in profile's tool-less argv), or mark it unsafeTools with --allow-unsafe-tools`,
+      );
+    }
+    // Answers only a request that names it: never an alias leg, never probed.
+    this.explicitOnly = !!cfg.explicitOnly || this.unsafeTools;
     this.env = cfg.env || {};
     this.timeoutMs = cfg.timeoutMs ?? 300_000;
     this.priority = cfg.priority ?? 200;
@@ -85,6 +108,14 @@ export class CliAdapter {
     // A row only counts as a model if its first token is id-shaped and carries a
     // slash, digit or dot — that is what separates `gpt-5.4` from `Google`.
     const MODELISH = /^[a-z0-9][a-z0-9._+\-/]*$/i;
+    // Some CLIs list their models as JSON (`kiro-cli chat --list-models --format json`,
+    // `oz model list --output-format json`, `codex debug models`): read that as JSON.
+    const fromJson = jsonModelList(out.stdout || out.stderr);
+    if (fromJson) {
+      const list = fromJson.filter((m) => !spec.drop?.some((d) => m.id.startsWith(d)));
+      this._modelCache = { at: Date.now(), list };
+      return list;
+    }
     const list = [];
     for (const line of (out.stdout || out.stderr).split('\n')) {
       const m = line.trim().match(/^(\S+)(?:(?:\t|\s{2,})\s*(.+))?$/);
@@ -119,7 +150,7 @@ export class CliAdapter {
         prompt: this.promptVia === 'stdin' ? '' : text,
         system: keepSystem ? system || '' : '',
         session: useResume ? session : '',
-        noSession: this.persistSessions || useResume ? '' : '--no-session',
+        noSession: this.persistSessions || useResume ? '' : this.noSessionFlag,
         maxTokens: maxTokens || '',
       });
       if (this.systemFlag && keepSystem && system) argv.push(...this.systemFlag.split(/\s+/), system);
@@ -156,6 +187,7 @@ export class CliAdapter {
         const held = [];
         let carriedSent = false;
         let cut = null; // the tool call the answer was ended at
+        let blocked = null; // a tool call before any text, stopped (`stopAtToolCall: 'always'`)
         for await (let evt of parse(toLines(run.stdout))) {
           if (evt.type === 'tool') {
             // Before any text the call may be how the model gets to its answer, so the run
@@ -165,6 +197,11 @@ export class CliAdapter {
               cut = evt.name || 'a tool';
               run.stop(`answer complete, stopped at a call to ${cut}`);
               yield { type: 'cut', reason: 'tool_call', tool: cut };
+            } else if (this.stopAtToolCall === 'always' && !emitted && !cut) {
+              // A CLI that kept its tools: a call is stopped wherever it comes. The harness
+              // may have started it already — this is a limit on the damage, not a sandbox.
+              cut = blocked = evt.name || 'a tool';
+              run.stop(`stopped at a call to ${cut}: this adapter may not run tools`);
             }
             continue;
           }
@@ -198,6 +235,12 @@ export class CliAdapter {
           continue;
         }
         yield* held.splice(0);
+        if (blocked && !emitted) {
+          throw new LlmError(`adapter "${this.id}": the agent started a tool call (${blocked}) before answering, and keysmith stopped the run — this adapter may not run tools`, {
+            status: 502,
+            provider: this.id,
+          });
+        }
         if (outcome.code !== 0 && !emitted) {
           throw new LlmError(
             `${this.id} exited ${outcome.code}${outcome.killed ? ' (killed)' : ''}: ${truncate(outcome.stderr || outcome.error || 'no output', 300)}`,
@@ -237,10 +280,20 @@ export class CliAdapter {
     }
   }
 
+  /**
+   * The child's environment. `PWD` is set to the workspace: spawn() changes the directory but
+   * leaves the parent's PWD, and opencode takes PWD as its project directory — with the
+   * gateway's (or the shell's that started it) it fails ("Unexpected server error"), or reads
+   * that directory's config instead of the tool-less one in its workspace.
+   */
+  _childEnv() {
+    return { ...agentCleanEnv(), PWD: this.cwd, ...this.env };
+  }
+
   _spawn({ args, timeoutMs }) {
     this._ensureCwd();
     return new Promise((resolve) => {
-      const child = spawn(which(this.bin) || this.bin, args, { cwd: this.cwd, env: { ...agentCleanEnv(), ...this.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+      const child = spawn(which(this.bin) || this.bin, args, { cwd: this.cwd, env: this._childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';
       const timer = setTimeout(() => terminate(child, 'timeout'), timeoutMs);
@@ -261,7 +314,7 @@ export class CliAdapter {
     this._ensureCwd();
     const child = spawn(which(this.bin) || this.bin, args, {
       cwd: this.cwd,
-      env: { ...agentCleanEnv(), ...this.env },
+      env: this._childEnv(),
       stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
     if (stdin) {
@@ -301,6 +354,86 @@ export class CliAdapter {
 
 /** Below this much of `timeoutMs` left, a refused run is reported instead of retried. */
 const MIN_RETRY_BUDGET_MS = 15_000;
+
+/**
+ * Switches that hand an agent permission to act without asking, as their CLIs spell them:
+ * opencode `--auto`, Command Code / Gemini CLI `--yolo`, Claude Code
+ * `--dangerously-skip-permissions`, Codex `--dangerously-bypass-approvals-and-sandbox` and
+ * `--full-auto`, Kiro `--trust-all-tools`, Command Code `--tools-all` / `--accept-edits`.
+ * Short forms (`-a`, `-y`) are left out: too many CLIs use those letters for something else.
+ */
+const AUTO_APPROVE_FLAGS = new Set([
+  '--auto',
+  '--yolo',
+  '--dangerously-skip-permissions',
+  '--allow-dangerously-skip-permissions',
+  '--dangerously-bypass-approvals-and-sandbox',
+  '--full-auto',
+  '--trust-all-tools',
+  '--tools-all',
+  '--accept-edits',
+  '--approve-for-me',
+]);
+/** A mode switch whose value is the auto-approving one. */
+const AUTO_APPROVE_MODES = {
+  '--permission-mode': ['yolo', 'bypassPermissions', 'bypass_permissions', 'acceptEdits', 'accept-edits'],
+  '--approval-mode': ['yolo', 'auto_edit', 'auto-edit'],
+  '--sandbox': ['danger-full-access'],
+};
+
+/**
+ * The first auto-approving switch in an adapter's `args` or `resumeArgs` (`--auto`,
+ * `--permission-mode yolo`, `--sandbox=danger-full-access`), or null.
+ */
+export function autoApproveFlag(cfg) {
+  for (const tpl of [cfg?.args, cfg?.resumeArgs]) {
+    if (!Array.isArray(tpl)) continue;
+    const tokens = tpl.flat(Infinity).filter((t) => typeof t === 'string');
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      const eq = t.startsWith('--') ? t.indexOf('=') : -1;
+      const flag = eq > 0 ? t.slice(0, eq) : t;
+      if (AUTO_APPROVE_FLAGS.has(flag)) return t;
+      const value = eq > 0 ? t.slice(eq + 1) : tokens[i + 1];
+      if (Object.hasOwn(AUTO_APPROVE_MODES, flag) && AUTO_APPROVE_MODES[flag].includes(value)) return eq > 0 ? t : `${flag} ${value}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * A model listing printed as JSON — an array, or an object holding one under `models` or
+ * `data` — as `[{id, name?, contextWindow?}]`; null when the text is not that, so the
+ * line-by-line reading takes over. The id is the first of `model_id` (Kiro), `id` (oz,
+ * OpenAI-shaped), `slug` (Codex), `model`, `name`; an entry marked `visibility: "hide"` or
+ * `hidden: true` is a model the CLI itself keeps out of its picker, so it stays out here too.
+ */
+function jsonModelList(text) {
+  const s = String(text || '').trim();
+  if (!/^[[{]/.test(s)) return null;
+  let v;
+  try {
+    v = JSON.parse(s);
+  } catch {
+    return null;
+  }
+  const rows = Array.isArray(v) ? v : Array.isArray(v?.models) ? v.models : Array.isArray(v?.data) ? v.data : null;
+  if (!rows) return null;
+  const list = [];
+  for (const r of rows) {
+    if (typeof r === 'string') {
+      if (r.trim()) list.push({ id: r.trim() });
+      continue;
+    }
+    if (!r || typeof r !== 'object' || r.visibility === 'hide' || r.hidden === true) continue;
+    const id = [r.model_id, r.id, r.slug, r.model, r.name].find((x) => typeof x === 'string' && x.trim());
+    if (!id) continue;
+    const name = [r.display_name, r.displayName, r.description, r.model_name].find((x) => typeof x === 'string' && x.trim() && x !== id);
+    const ctx = [r.context_window_tokens, r.context_window, r.contextWindow].find((x) => typeof x === 'number' && x > 0);
+    list.push({ id: id.trim(), ...(name ? { name: name.trim() } : {}), ...(ctx ? { contextWindow: ctx } : {}) });
+  }
+  return list;
+}
 
 function checkWorkspaceFiles(id, files, ownsCwd) {
   if (files == null) return null;

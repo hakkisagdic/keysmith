@@ -30,6 +30,12 @@ export class HttpAdapter {
     this._modelCache = null; // same 10-minute shape as CliAdapter's, so /v1/models does not refetch every provider on every poll
     this.defaultModel = cfg.defaultModel || null;
     this.note = cfg.note || null;
+    // Answers only a request that names it: never an alias leg, never probed (Gateway.resolve).
+    this.explicitOnly = !!cfg.explicitOnly;
+    this.unsafeTools = false;
+    // Request fields sent with one upstream model unless the client set them itself:
+    // `{ "gemini-4-argon": { "reasoning_effort": "high" } }`, `"*"` for every model.
+    this.modelParams = checkModelParams(id, cfg.modelParams);
     // Gemini 3 (the `google` profile): signatures its function calls carry, kept for the
     // clients that drop them — see thought-signatures.js. `true`, or the store's limits. The
     // Gateway hands every adapter on one upstream URL the same store; alone, it has its own.
@@ -57,6 +63,12 @@ export class HttpAdapter {
 
   upstreamModel(model) {
     return this.modelMap[model] ?? model;
+  }
+
+  /** `modelParams` for one upstream model id: the `"*"` entry, then the model's own on top. */
+  paramsFor(upstream) {
+    if (!this.modelParams) return {};
+    return { ...(this.modelParams['*'] || {}), ...(this.modelParams[upstream] || {}) };
   }
 
   async models() {
@@ -108,10 +120,13 @@ export class HttpAdapter {
       throw new LlmError(`adapter "${this.id}" cannot relay tool calls on the ${this.wire} wire`, { status: 400, provider: this.id });
     }
     const outgoing = this.thoughtSignatures ? this.thoughtSignatures.attach(body, { caller }).body : body;
+    const upstream = this.upstreamModel(body.model);
     const res = await fetch(this.route('/chat/completions'), {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...this.authHeaders(), ...this.headers },
-      body: JSON.stringify({ ...outgoing, model: this.upstreamModel(body.model) }),
+      // The client's own fields win over `modelParams`: a request that set its reasoning effort
+      // meant it — in whichever spelling it chose (see withoutEffortIfSet).
+      body: JSON.stringify({ ...withoutEffortIfSet(this.paramsFor(upstream), outgoing), ...outgoing, model: upstream }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!this.thoughtSignatures || !res.ok || !res.body) return res;
@@ -143,7 +158,9 @@ export class HttpAdapter {
     const timer = setTimeout(() => controller.abort(new Error(`timeout after ${this.timeoutMs}ms`)), this.timeoutMs);
     const isAnthropic = this.wire === 'anthropic';
     const system = messages.find((m) => m.role === 'system');
-    const payload = isAnthropic
+    // `modelParams` go first, so the fields keysmith builds (model, messages, stream…) win.
+    const payload = { ...this.paramsFor(this.upstreamModel(model)) };
+    Object.assign(payload, isAnthropic
       ? {
           model: this.upstreamModel(model),
           max_tokens: maxTokens || 4096,
@@ -158,7 +175,7 @@ export class HttpAdapter {
           stream_options: { include_usage: true },
           ...(maxTokens ? { max_tokens: maxTokens } : {}),
           ...(temperature != null ? { temperature } : {}),
-        };
+        });
 
     let res;
     try {
@@ -189,6 +206,51 @@ export class HttpAdapter {
       controller.abort(new Error('stream drained'));
     }
   }
+}
+
+/**
+ * The spellings a request chooses its reasoning effort in: OpenAI's `reasoning_effort`, the
+ * `reasoning: {effort}` object some OpenAI-compatible APIs take, and Google's
+ * `thinking_config` (`thinking_budget` / `thinking_level`), which its OpenAI-compatible
+ * endpoint reads from `extra_body.google` (Google's own examples) or `google`. Google refuses
+ * `reasoning_effort` and a thinking budget in one request; here that refusal would be counted
+ * as the leg refusing the tools, and the route would answer tool-less from a CLI leg.
+ */
+function effortIn(body) {
+  if (!body || typeof body !== 'object') return false;
+  if (body.reasoning_effort != null || body.reasoning != null) return true;
+  return [body.extra_body?.google, body.google].some((g) => g && typeof g === 'object' && g.thinking_config != null);
+}
+
+/**
+ * `modelParams` under a client body: when the client set its effort itself, in any spelling,
+ * every effort field `modelParams` would add is left out, so the request carries one — the
+ * client's. Other params are untouched.
+ */
+function withoutEffortIfSet(params, body) {
+  if (!effortIn(body) || !effortIn(params)) return params;
+  const out = { ...params };
+  delete out.reasoning_effort;
+  delete out.reasoning;
+  for (const key of ['extra_body', 'google']) {
+    const holder = key === 'extra_body' ? out.extra_body?.google : out.google;
+    if (!holder || typeof holder !== 'object' || holder.thinking_config == null) continue;
+    const { thinking_config: _dropped, ...rest } = holder;
+    if (key === 'extra_body') out.extra_body = { ...out.extra_body, google: rest };
+    else out.google = rest;
+  }
+  return out;
+}
+
+/** `modelParams` must map a model id (or `"*"`) to an object of request fields; a load error otherwise. */
+function checkModelParams(id, params) {
+  if (params == null) return null;
+  const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
+  if (!isObj(params)) throw new Error(`adapter "${id}": modelParams must map a model id to request fields, e.g. {"gemini-4-argon": {"reasoning_effort": "high"}}`);
+  for (const [model, fields] of Object.entries(params)) {
+    if (!isObj(fields)) throw new Error(`adapter "${id}": modelParams["${model}"] must be an object of request fields`);
+  }
+  return params;
 }
 
 async function* parseOpenaiStream(body) {

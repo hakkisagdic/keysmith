@@ -36,6 +36,7 @@ export class Gateway {
         if (prepared.kind !== 'cli' && prepared.thoughtSignatures) prepared._signatureStore = this._signatureStore(prepared);
         const adapter = prepared.kind === 'cli' ? new CliAdapter(id, prepared) : new HttpAdapter(id, prepared);
         this.adapters.set(id, adapter);
+        if (adapter.unsafeTools && !adapter.disabled) this.log(`adapter "${id}" can run commands and edit files (unsafeTools) and is enabled: it answers requests that name it, never an alias`);
       } catch (e) {
         // Shown on /status, /v1/models, /v1/keysmith/routes and by doctor: redacted at the source.
         this.loadErrors[id] = redactSecrets(e.message);
@@ -85,16 +86,21 @@ export class Gateway {
           const adapterId = slash < 0 ? leg : leg.slice(0, slash);
           const model = slash < 0 ? '' : leg.slice(slash + 1);
           const adapter = this.adapters.get(adapterId);
-          if (!adapter && slash < 0 && this.cfg.aliases?.[leg]) {
+          if (!adapter && slash < 0 && own(this.cfg.aliases, leg)) {
             problems.push(`${leg}: aliases cannot nest — name the adapter/model directly`);
             continue;
           }
           if (!adapter) {
-            problems.push(`${leg}: ${this.loadErrors[adapterId] ? `adapter "${adapterId}" is configured but did not load (${this.loadErrors[adapterId]})` : `no adapter named "${adapterId}"`} — that leg 404s on every request`);
+            const why = this.loadError(adapterId);
+            problems.push(`${leg}: ${why ? `adapter "${adapterId}" is configured but did not load (${why})` : `no adapter named "${adapterId}"`} — that leg 404s on every request`);
             continue;
           }
           if (adapter.disabled) {
             problems.push(`${leg}: adapter "${adapterId}" is disabled`);
+            continue;
+          }
+          if (adapter.explicitOnly) {
+            problems.push(`${leg}: ${keptOutOfAliases(adapterId, adapter)} — keysmith skips this leg`);
             continue;
           }
           const known = knownModels(adapter);
@@ -106,6 +112,11 @@ export class Gateway {
       if (problems.length) out[alias] = problems;
     }
     return out;
+  }
+
+  /** Why adapter `id` did not load, or undefined — an own entry only, so `constructor` is no adapter. */
+  loadError(id) {
+    return own(this.loadErrors, id) ? this.loadErrors[id] : undefined;
   }
 
   _signatureStore(cfg) {
@@ -193,22 +204,35 @@ export class Gateway {
    */
   resolve(requested, { exclude = null } = {}) {
     if (!requested) throw new LlmError('missing "model"', { status: 400 });
+    if (typeof requested !== 'string') throw new LlmError('"model" must be a string', { status: 400 });
     const aliases = this.cfg.aliases || {};
-    const isAlias = !!aliases[requested];
-    const chain = isAlias ? [...aliases[requested]] : [requested];
+    // Own names only: a model called `constructor` or `toString` is not an alias, and an
+    // alias that is not a list of legs is an alias with no legs.
+    const isAlias = own(aliases, requested);
+    const chain = isAlias ? (Array.isArray(aliases[requested]) ? [...aliases[requested]] : []) : [requested];
+    if (isAlias && !chain.length) throw new LlmError(`alias "${requested}" has no legs`, { status: 503 });
     const out = [];
     let firstError = null;
     for (const entry of chain) {
+      if (typeof entry !== 'string' || !entry) {
+        // A hand-edited leg that is not `adapter/model` at all; aliasIssues names it.
+        firstError ??= new LlmError(`alias "${requested}" has an empty leg (${JSON.stringify(entry)})`, { status: 503 });
+        continue;
+      }
       const slash = entry.indexOf('/');
       const adapterId = slash < 0 ? entry : entry.slice(0, slash);
       const modelName = slash < 0 ? '' : entry.slice(slash + 1);
       const adapter = this.adapters.get(adapterId);
       let err = null;
       if (!adapter) {
-        const why = this.loadErrors[adapterId];
+        const why = this.loadError(adapterId);
         err = new LlmError(why ? `adapter "${adapterId}" is configured but did not load: ${why}` : `no adapter named "${adapterId}" — try one of: ${[...this.adapters.keys()].join(', ')}`, { status: why ? 503 : 404, provider: adapterId });
       } else if (adapter.disabled) {
         err = new LlmError(`adapter "${adapterId}" is disabled`, { status: 503, provider: adapterId });
+      } else if (isAlias && adapter.explicitOnly) {
+        // An alias is a route the gateway picks legs from on its own; this adapter is only
+        // ever run by a request that names it. A hand-edited leg is a dead leg, not a route.
+        err = new LlmError(`alias "${requested}": ${keptOutOfAliases(adapterId, adapter)}`, { status: 403, provider: adapterId });
       }
       if (err) {
         firstError ??= err;
@@ -344,6 +368,30 @@ function mergeUsage(a, b) {
     cacheWrite: Math.max(a.cacheWrite || 0, b.cacheWrite || 0),
     ...(a.total || b.total ? { total: Math.max(a.total || 0, b.total || 0) } : {}),
   };
+}
+
+/** Why an adapter never answers through an alias, in one clause. */
+export function keptOutOfAliases(id, adapter) {
+  return adapter.unsafeTools
+    ? `adapter "${id}" can run commands and edit files (unsafeTools), so it is never an alias leg`
+    : `adapter "${id}" is explicit-only: it answers a request that names it, never an alias leg`;
+}
+
+/** `name` is an entry of `obj` itself, not something every object inherits (`constructor`, `toString`). */
+export function own(obj, name) {
+  return !!obj && typeof obj === 'object' && typeof name === 'string' && Object.hasOwn(obj, name);
+}
+
+/**
+ * The adapter a config entry builds, built the way the gateway builds it — or the error that
+ * would keep it from loading (a malformed `modelParams`, an auto-approving argv, a missing
+ * `baseUrl`, a `workspaceFiles` path that leaves its cwd). Credentials are not resolved: a key
+ * this shell cannot see may well be visible to the gateway, and that is `doctor`'s question.
+ */
+export function checkAdapter(id, raw) {
+  const cfg = { ...raw, _apiKey: null };
+  delete cfg.key;
+  return cfg.kind === 'cli' ? new CliAdapter(id, cfg) : new HttpAdapter(id, cfg);
 }
 
 function adapterOf(target) {

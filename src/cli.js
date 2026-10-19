@@ -3,11 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { loadConfig, saveConfig, configPath, dataDir, newApiKey, configExists, expand, resolveSecret } from './config.js';
-import { Gateway } from './gateway.js';
+import { Gateway, checkAdapter, own } from './gateway.js';
 import { createServer } from './server.js';
 import { UsageLog } from './usage.js';
 import { CLI_PROFILES, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
-import { which } from './cli-adapter.js';
+import { autoApproveFlag, which } from './cli-adapter.js';
 import * as tunnel from './tunnel.js';
 import * as service from './service.js';
 import { rel, truncate } from './util.js';
@@ -25,8 +25,10 @@ const GENERIC_PROFILES = { custom: 'cli', cli: 'cli', agent: 'cli', tool: 'cli',
 const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
 
   keysmith init [--reveal]           write a starter config (+ one API key; --reveal shows it, to a terminal only)
-  keysmith add <profile>             attach an adapter (see: keysmith adapters)
+  keysmith add <profile>             attach an adapter (see: keysmith adapters); --explicit-only keeps it out of aliases
   keysmith remove <adapter>          detach one
+  keysmith set <adapter> <field> <v> change one field of an attached adapter (JSON when it parses); --unset removes it
+  keysmith alias [<name> <leg>…]     list aliases, or set one; --prepend/--append/--drop <leg>, --delete
   keysmith adapters                  list profiles and what is attached
   keysmith models [--refresh]        what this gateway exposes, and from where
   keysmith serve [--port N]          run the gateway  (http://127.0.0.1:<port>/v1)
@@ -77,6 +79,11 @@ export async function main(argv) {
       case 'remove':
       case 'rm':
         return await cmdRemove(flags);
+      case 'set':
+        return await cmdSet(flags);
+      case 'alias':
+      case 'aliases':
+        return await cmdAlias(flags);
       case 'adapters':
         return await cmdAdapters(flags);
       case 'models':
@@ -122,7 +129,7 @@ function cmdInit(flags) {
   fs.chmodSync(written, 0o600);
   out(`wrote ${rel(written)} (0600)\n`);
   showKeys(cfg.auth.keys, { label: '  gateway key: ', note: 'printed to this terminal only — `keysmith key list --reveal` shows it again', reveal: flags.reveal });
-  out('\nNext: keysmith add cmd && keysmith serve --tunnel');
+  out('\nNext: keysmith adapters (the profiles), keysmith add <profile>, keysmith serve --tunnel');
 }
 
 function DEFAULT_CONFIG() {
@@ -140,7 +147,7 @@ function DEFAULT_CONFIG() {
 
 function loadOrFail() {
   if (!configExists()) {
-    fail(`no config at ${rel(configPath())} — run \`keysmith init\`, or \`keysmith add cmd\``);
+    fail(`no config at ${rel(configPath())} — run \`keysmith init\`, or \`keysmith add <profile>\``);
   }
   return loadConfig();
 }
@@ -152,20 +159,25 @@ function cmdAdd(flags) {
   }
   const cfg = configExists() ? loadConfig() : structuredClone(DEFAULT_CONFIG());
   const id = flags.as || name;
-  const profile = getProfile(name);
+  if (typeof id !== 'string' || !id || /[/\s]/.test(id) || id.startsWith('-') || FORBIDDEN_FIELDS.has(id)) {
+    fail(`"${id}" cannot be an adapter id: it becomes the model prefix, so no "/", no spaces, not starting with "-", and not __proto__, prototype or constructor`);
+  }
+  const profile = Object.hasOwn(CLI_PROFILES, name) || Object.hasOwn(HTTP_PROFILES, name) ? getProfile(name) : null;
   let entry;
   if (profile) {
     entry = structuredClone(profile);
   } else {
     // No built-in profile — but `custom`/`http` and an explicit --bin/--base-url are a
     // legitimate way to declare an adapter the shipped profiles have never heard of.
-    const generic = GENERIC_PROFILES[name];
+    const generic = Object.hasOwn(GENERIC_PROFILES, name) ? GENERIC_PROFILES[name] : null;
     if (!generic && !flags.bin && !flags.baseUrl && !flags.url) {
       fail(`no built-in profile "${name}". Either pick one of: ${profileNames().join(', ')}\n  or declare your own:\n  keysmith add custom --as ${name} --bin ${name} --args '["-p","{prompt}"]' --parser raw`);
     }
     const kind = flags.kind || generic || (flags.bin ? 'cli' : 'http');
-    if (!flags.as && GENERIC_PROFILES[name]) fail(`"${name}" only says the kind — name the adapter itself: --as <id>, which becomes the model prefix`);
-    entry = kind === 'cli' ? { kind: 'cli', bin: flags.bin || id, args: ['{prompt}'], parser: 'raw', maxConcurrent: 1 } : { kind: 'http', wire: 'openai', baseUrl: flags.baseUrl || flags.url || '', apiKey: flags.key || null };
+    if (!flags.as && generic) fail(`"${name}" only says the kind — name the adapter itself: --as <id>, which becomes the model prefix`);
+    // A hand-written agent runs in an empty directory keysmith owns too, never in whatever
+    // directory the gateway happens to run in (under launchd: keysmith's own source tree).
+    entry = kind === 'cli' ? { kind: 'cli', bin: flags.bin || id, args: ['{prompt}'], parser: 'raw', cwd: `~/.local/share/keysmith/workspaces/${id}`, maxConcurrent: 1 } : { kind: 'http', wire: 'openai', baseUrl: flags.baseUrl || flags.url || '', apiKey: flags.key || null };
     entry.note = 'hand-written template — nothing about this argv is verified; `keysmith doctor` and one `keysmith chat` will tell you fast.';
     if (kind === 'http' && !entry.baseUrl) fail('an http adapter needs --base-url https://host/v1');
   }
@@ -178,8 +190,40 @@ function cmdAdd(flags) {
   if (flags.parser) entry.parser = flags.parser;
   if (flags.priority != null) entry.priority = Number(flags.priority);
   if (flags.model) entry.models = (entry.models || []).concat(flags.model);
+  if (flags.explicitOnly) entry.explicitOnly = true;
+  // Re-adding replaces the entry — to pin a binary, to pick up a newer profile — but it never
+  // loosens a guard: a mark the old entry had is kept. Dropping one is a `keysmith set`.
+  const prev = own(cfg.adapters, id) ? cfg.adapters[id] : null;
+  if (prev && typeof prev === 'object') {
+    const kept = ['explicitOnly', 'unsafeTools', 'disabled'].filter((k) => prev[k] && !entry[k]);
+    for (const k of kept) entry[k] = true;
+    if (kept.length) {
+      const undo = (k) => `keysmith set ${id} ${k} false${k === 'unsafeTools' || (k === 'disabled' && entry.unsafeTools) ? ' --allow-unsafe-tools' : ''}`;
+      out(`  kept ${kept.join(', ')} from the "${id}" entry this replaces: a re-add never drops a guard (${kept.map(undo).join('; ')})`);
+    }
+  }
+  // Refused here what the gateway would refuse to load: an auto-approving argv, a malformed
+  // field. Credentials and binaries are only reported below — they can appear later.
+  try {
+    checkAdapter(id, entry);
+  } catch (e) {
+    if (!flags.force) fail(`not added: ${e.message}`);
+    out(`! saved although "${id}" will not load: ${e.message}`);
+  }
   if (entry.kind === 'cli' && !which(entry.bin)) {
     out(`! ${entry.bin} is not on PATH right now — the adapter is saved, \`keysmith doctor\` will keep reporting it until it is`);
+  }
+  if (entry.unsafeTools) {
+    out(`! ${id} can run commands and edit files: keysmith could not take its tools away (unsafeTools).\n  It is added ${entry.disabled ? 'disabled' : 'ENABLED'}, is never an alias leg and is never probed.${entry.disabled ? `\n  To serve it anyway: keysmith set ${id} disabled false --allow-unsafe-tools` : ''}`);
+  } else if (entry.explicitOnly) {
+    out(`  explicit-only: "${id}" answers requests that name it — never an alias leg, never probed by doctor`);
+  }
+  if (entry.unsafeTools || entry.explicitOnly) {
+    for (const [alias, legs] of Object.entries(cfg.aliases || {})) {
+      for (const leg of Array.isArray(legs) ? legs : []) {
+        if (legAdapter(leg) === id) out(`! alias "${alias}" names ${leg}: keysmith skips that leg — keysmith alias ${alias} --drop ${leg}`);
+      }
+    }
   }
   if (entry.kind === 'http' && entry.apiKey && String(entry.apiKey).startsWith('{env:')) {
     const varName = String(entry.apiKey).slice(5, -1);
@@ -202,6 +246,7 @@ function cmdAdd(flags) {
   cfg.adapters[id] = entry;
   saveConfig(cfg);
   out(`added adapter "${id}" (${entry.kind}) → ${rel(configPath())}\n  models will appear as ${id}/<model>`);
+  noteRestart(`adapter "${id}"`);
 }
 
 function looksLikeRef(v) {
@@ -212,10 +257,204 @@ function cmdRemove(flags) {
   const id = flags._[0];
   if (!id) fail('usage: keysmith remove <adapter>');
   const cfg = loadOrFail();
-  if (!cfg.adapters?.[id]) fail(`no adapter named "${id}"`);
+  if (!own(cfg.adapters, id)) fail(`no adapter named "${id}"`);
   delete cfg.adapters[id];
   saveConfig(cfg);
   out(`removed "${id}"`);
+  noteRestart(`removing "${id}"`);
+}
+
+/** Names `keysmith` refuses for a field, an adapter or an alias: they would reach Object.prototype, not the config. */
+const FORBIDDEN_FIELDS = new Set(['__proto__', 'prototype', 'constructor']);
+
+/**
+ * On an `unsafeTools` adapter, the fields `keysmith set` changes without
+ * `--allow-unsafe-tools`: none of them shapes what is spawned or how a run is stopped.
+ * Everything else — `stopAtToolCall`, `args`, `resumeArgs`, `bin`, `env`, `cwd`, `parser`,
+ * `modelsFrom`, a field added later — is the same decision as serving it.
+ */
+const SAFE_ON_UNSAFE = new Set(['note', 'provenance', 'models', 'defaultModel', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'explicitOnly']);
+
+/** Why setting `field` (entry → next) needs --allow-unsafe-tools, or null when it does not. */
+function unsafeChange(entry, next, field) {
+  if (JSON.stringify(entry[field]) === JSON.stringify(next[field])) return null;
+  if (entry.unsafeTools) {
+    if (field === 'disabled') return next.disabled ? null : 'serving it';
+    if (field === 'unsafeTools') return next.unsafeTools ? null : 'taking the mark off';
+    if (SAFE_ON_UNSAFE.has(field)) return null;
+    return `changing ${field}, which shapes what it runs or how keysmith stops it`;
+  }
+  // The mark is what lets an auto-approving argv load at all: on an enabled entry, adding it
+  // serves an agent that approves its own tool calls.
+  const approving = field === 'unsafeTools' && next.unsafeTools && !next.disabled ? autoApproveFlag(next) : null;
+  return approving ? `marking it unsafeTools while its argv passes ${approving}, which serves an agent that approves its own tool calls` : null;
+}
+
+/**
+ * `keysmith set <adapter> <field> <value>` — one field of an attached adapter, so a change
+ * to a live config (a model's request defaults, `explicitOnly`, a pinned `bin`) never means
+ * opening the file that holds the gateway key. The value is JSON when it parses (`true`,
+ * `42`, `["a","b"]`, `{"k":1}`) and a plain string otherwise. Nothing is echoed back: the
+ * field might be `apiKey`.
+ */
+function cmdSet(flags) {
+  const [id, field, raw] = flags._;
+  if (!id || !field || (raw === undefined && !flags.unset)) {
+    fail('usage: keysmith set <adapter> <field> <value>   (value: JSON when it parses, a string otherwise)\n       keysmith set <adapter> <field> --unset');
+  }
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(field) || FORBIDDEN_FIELDS.has(field)) fail(`"${field}" is not a field name`);
+  const cfg = loadOrFail();
+  if (!own(cfg.adapters, id)) fail(`no adapter named "${id}" — keysmith add <profile> first`);
+  const entry = cfg.adapters[id];
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) fail(`adapter "${id}" is not an object in ${rel(configPath())}`);
+  let value;
+  if (!flags.unset) {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      value = raw;
+    }
+  }
+  const next = { ...entry };
+  if (flags.unset) delete next[field];
+  else next[field] = value;
+  // A tool-capable CLI is served only by someone who said so: turning it on, taking the mark
+  // off, or changing what it runs and how it is stopped needs the flag that names what it means.
+  const unsafe = unsafeChange(entry, next, field);
+  if (unsafe && !flags.allowUnsafeTools) {
+    fail(`"${id}" can run commands and edit files: keysmith could not take its tools away, and ${unsafe} needs --allow-unsafe-tools.\n  Serving it means a request through this gateway — from any client holding a key, through the tunnel too — can make it act on this machine.\n  If you accept that: keysmith set ${id} ${field} ${flags.unset ? '--unset' : raw} --allow-unsafe-tools`);
+  }
+  if (field === 'explicitOnly' && !next.explicitOnly && next.unsafeTools) {
+    out(`! "${id}" stays out of aliases anyway: unsafeTools implies explicit-only`);
+  }
+  // What the gateway would refuse to load is refused here, before it replaces a working entry:
+  // after the next restart the adapter, its routes and every alias leg on it would be gone.
+  try {
+    checkAdapter(id, next);
+    if ((field === 'apiKey' || field === 'key') && !flags.unset) checkKeyRef(value);
+  } catch (e) {
+    if (!flags.force) fail(`not saved: ${e.message}\n  (--force saves it anyway; the gateway then refuses to load "${id}" until it is fixed)`);
+    out(`! saved although "${id}" will not load: ${e.message}`);
+  }
+  cfg.adapters[id] = next;
+  saveConfig(cfg);
+  out(`${flags.unset ? 'removed' : 'set'} ${id}.${field} → ${rel(configPath())}`);
+  if (unsafe) out(`! "${id}": ${unsafe}, with --allow-unsafe-tools. It can run commands and edit files on this machine${next.disabled ? ' once it is enabled' : ''}; it is still never an alias leg.`);
+  noteRestart(`${id}.${field}`);
+}
+
+/**
+ * An `apiKey` reference the gateway could never resolve — an unknown kind, a `{dotenv:…}`
+ * with no `#NAME`, a JSON file that does not parse — throws, as it would at load. One that is
+ * well-formed but empty in this shell is only said: launchd's environment is not this one.
+ * `{env:…}` and `{exec:…}` are not resolved here, and nothing about the value is printed.
+ */
+function checkKeyRef(value) {
+  if (value == null || value === false) return;
+  if (typeof value !== 'string') throw new Error('apiKey must be a string reference, e.g. {env:GOOGLE_API_KEY}');
+  const m = value.match(/^\{(\w+):([\s\S]*)\}$/);
+  if (!m) return; // a literal key
+  if (!['env', 'file', 'json', 'dotenv', 'exec'].includes(m[1])) throw new Error(`apiKey reference: unknown kind "${m[1]}" — env, file, json, dotenv or exec`);
+  if (m[1] === 'env' || m[1] === 'exec') return;
+  let ok = false;
+  try {
+    ok = !!resolveSecret(value);
+  } catch (e) {
+    throw new Error(`apiKey reference: ${e.message}`);
+  }
+  if (!ok) out('! the apiKey reference does not resolve to a key right now — saved; `keysmith doctor` reports it until it does');
+}
+
+/** The adapter part of an alias leg: everything before the first slash. */
+function legAdapter(leg) {
+  const s = String(leg);
+  const i = s.indexOf('/');
+  return i < 0 ? s : s.slice(0, i);
+}
+
+/**
+ * `keysmith alias` — the alias chains, without opening the config file:
+ *
+ *   keysmith alias                              every alias and its legs
+ *   keysmith alias <name> <leg> [leg…]          set the chain (replaces it)
+ *   keysmith alias <name> --prepend <leg>       put a leg first (moved there if already in it)
+ *   keysmith alias <name> --append <leg>        put a leg last (moved there if already in it)
+ *   keysmith alias <name> --drop <leg>          take a leg out
+ *   keysmith alias <name> --delete              remove the alias
+ *
+ * A leg must name an attached adapter (`--force` saves one that is not attached yet), and
+ * never an explicit-only or tool-capable one: those answer only requests that name them.
+ */
+function cmdAlias(flags) {
+  const [name, ...legs] = flags._;
+  const cfg = loadOrFail();
+  cfg.aliases = cfg.aliases || {};
+  if (!name) {
+    const entries = Object.entries(cfg.aliases);
+    if (!entries.length) return out('no aliases — keysmith alias <name> <adapter/model> [<adapter/model>…]');
+    return out(entries.map(([a, l]) => `${a.padEnd(12)} ${(Array.isArray(l) ? l : []).join('  →  ')}`).join('\n'));
+  }
+  if (name.includes('/') || /\s/.test(name)) fail(`alias names cannot contain "/" or spaces: "${name}"`);
+  if (FORBIDDEN_FIELDS.has(name)) fail(`"${name}" cannot be an alias name`);
+  if (own(cfg.adapters, name)) fail(`"${name}" is an adapter: an alias with that name would hide it`);
+  const exists = own(cfg.aliases, name);
+  const current = exists && Array.isArray(cfg.aliases[name]) ? [...cfg.aliases[name]] : [];
+
+  if (flags.delete) {
+    if (!exists) fail(`no alias named "${name}"`);
+    delete cfg.aliases[name];
+    saveConfig(cfg);
+    out(`removed alias "${name}"`);
+    return noteRestart(`removing alias "${name}"`);
+  }
+
+  const edits = ['prepend', 'append', 'drop'].filter((k) => flags[k] !== undefined);
+  if (edits.length > 1 || (edits.length && legs.length)) fail('one change at a time: legs to set the chain, or one of --prepend / --append / --drop');
+  let chain;
+  if (edits.length) {
+    const op = edits[0];
+    const leg = flags[op];
+    if (typeof leg !== 'string' || !leg) fail(`--${op} takes a leg: adapter/model`);
+    if (op !== 'drop') checkAliasLeg(cfg, leg, flags);
+    if (op === 'drop' && !current.includes(leg)) fail(`alias "${name}" has no leg ${leg}`);
+    const rest = current.filter((l) => l !== leg);
+    chain = op === 'prepend' ? [leg, ...rest] : op === 'append' ? [...rest, leg] : rest;
+    if (!chain.length) fail(`that would leave alias "${name}" with no legs — keysmith alias ${name} --delete removes it`);
+  } else {
+    if (!legs.length) {
+      if (!exists) fail(`no alias named "${name}" — keysmith alias ${name} <adapter/model> [<adapter/model>…] creates it`);
+      return out(`${name.padEnd(12)} ${current.join('  →  ')}`);
+    }
+    for (const leg of legs) checkAliasLeg(cfg, leg, flags);
+    if (new Set(legs).size !== legs.length) fail('a leg is named twice: each one is tried once, in order');
+    chain = legs;
+  }
+  cfg.aliases[name] = chain;
+  saveConfig(cfg);
+  out(`alias "${name}": ${chain.join('  →  ')}`);
+  // The same check doctor and the status page run, so a model the adapter does not list is
+  // said now rather than discovered as a slow failover later.
+  const { gateway } = buildGateway(cfg);
+  for (const p of gateway.aliasIssues[name] || []) warn(`! ${p}`);
+  noteRestart(`alias "${name}"`);
+}
+
+function checkAliasLeg(cfg, leg, flags) {
+  if (typeof leg !== 'string' || !leg.trim() || /\s/.test(leg)) fail(`not a leg: "${leg}" — adapter/model, e.g. agy/gemini-4-argon-high`);
+  const id = legAdapter(leg);
+  if (own(cfg.aliases, leg)) fail(`${leg} is an alias: aliases cannot nest — name the adapter/model directly`);
+  const entry = own(cfg.adapters, id) ? cfg.adapters[id] : null;
+  if (!entry || typeof entry !== 'object') {
+    if (!flags.force) fail(`no adapter named "${id}" — keysmith add ${id} first (or --force to save the leg anyway)`);
+    return;
+  }
+  // `--force` never lets these in: a tool-capable agent in a route the gateway picks legs from
+  // on its own is exactly what the marks exist to prevent.
+  const approving = autoApproveFlag(entry);
+  if (entry.unsafeTools || approving) {
+    fail(`${leg}: adapter "${id}" can run commands and edit files (${entry.unsafeTools ? 'unsafeTools' : `its argv passes ${approving}`}), so keysmith keeps it out of every alias`);
+  }
+  if (entry.explicitOnly) fail(`${leg}: adapter "${id}" is explicit-only — it answers requests that name it, never an alias. \`keysmith set ${id} explicitOnly false\` first if you mean it`);
 }
 
 function cmdAdapters() {
@@ -223,10 +462,11 @@ function cmdAdapters() {
   const attached = Object.entries(cfg.adapters || {});
   const lines = [];
   lines.push('attached:');
-  if (!attached.length) lines.push('  (none — keysmith add cmd)');
+  if (!attached.length) lines.push('  (none — keysmith add <profile>)');
   for (const [id, a] of attached) {
     const state = a.kind === 'cli' ? (which(a.bin || id) ? 'binary ok' : `MISSING ${a.bin || id}`) : `key ${maskRef(a.apiKey)}`;
-    lines.push(`  ${id.padEnd(14)} ${String(a.kind).padEnd(5)} ${a.wire || a.parser || ''}  ${state}`);
+    const marks = `${a.disabled ? ' · disabled' : ''}${a.unsafeTools ? ' · unsafeTools' : a.explicitOnly ? ' · explicit-only' : ''}`;
+    lines.push(`  ${id.padEnd(14)} ${String(a.kind).padEnd(5)} ${a.wire || a.parser || ''}  ${state}${marks}`);
   }
   lines.push('');
   lines.push('profiles:');
@@ -282,7 +522,7 @@ async function cmdServe(flags) {
   });
   const local = `http://${cfg.host}:${cfg.port}`;
   out(`keysmith listening on ${local}/v1  (status page at ${local}/)`);
-  out(`  adapters: ${gateway.publicAdapters.map((a) => a.id).join(', ') || 'none — keysmith add cmd'}`);
+  out(`  adapters: ${gateway.publicAdapters.map((a) => a.id).join(', ') || 'none — keysmith add <profile>'}`);
   // This banner is launchd's log file and keysmith.log: the key is named, never printed.
   out(`  key     : ${keyBanner(cfg)}`);
   if (secured.changed.length) out(`  logs    : tightened ${secured.changed.length} file(s)/dir(s) to 0600/0700`);
@@ -463,6 +703,8 @@ async function cmdStatus() {
     if (rec && alive(rec.pid)) {
       const stale = staleCode(rec);
       if (stale) lines.push(`code    : ${stale}`);
+      const changed = staleConfig(rec);
+      if (changed) lines.push(`changes : ${changed}`);
       try {
         const r = await fetch(`http://127.0.0.1:${rec.port}/healthz`);
         lines.push(`healthz : ${await r.text()}`);
@@ -494,7 +736,39 @@ function staleCode(rec) {
     return null;
   }
   if (newest <= started) return null;
-  return `${rel(path.join(src, newestFile))} changed ${new Date(newest).toISOString()}, after this gateway started (${rec.at}): it still runs the old code — restart it (launchd: launchctl kickstart -k gui/${process.getuid?.() ?? '$UID'}/${service.labels.gateway}; otherwise keysmith stop && keysmith start)`;
+  return `${rel(path.join(src, newestFile))} changed ${new Date(newest).toISOString()}, after this gateway started (${rec.at}): it still runs the old code — restart it (${restartCommand()})`;
+}
+
+/**
+ * The same for the config: the gateway reads it once, at start. An alias set since then is a
+ * 404, an adapter disabled since then still answers, a key revoked since then still works.
+ */
+function staleConfig(rec) {
+  const started = Date.parse(rec?.at || '');
+  if (!Number.isFinite(started)) return null;
+  let changed = 0;
+  try {
+    changed = fs.statSync(configPath()).mtimeMs;
+  } catch {
+    return null;
+  }
+  if (changed <= started) return null;
+  return `${rel(configPath())} changed ${new Date(changed).toISOString()}, after this gateway started (${rec.at}): it still serves the old config — restart it (${restartCommand()})`;
+}
+
+function restartCommand() {
+  return `launchd: launchctl kickstart -k gui/${process.getuid?.() ?? '$UID'}/${service.labels.gateway}; otherwise keysmith stop && keysmith start`;
+}
+
+/**
+ * Said after `add`, `remove`, `set`, `alias` and `key` save the config while a gateway runs:
+ * what they changed is not what it serves until it restarts — in the safe direction too
+ * (`set warp disabled true`, `key revoke`).
+ */
+function noteRestart(what) {
+  const rec = readPid();
+  if (!rec || !alive(rec.pid)) return;
+  out(`! the running gateway (pid ${rec.pid}) still serves the config it started with — ${what} takes effect when it restarts: ${restartCommand()}`);
 }
 
 /* -------------------------------------------------------------------------- chat */
@@ -535,9 +809,14 @@ async function cmdDoctor(flags) {
   for (const [id, raw] of Object.entries(cfg.adapters || {})) {
     const adapter = gateway.adapters.get(id);
     if (!adapter) {
-      rows.push([id, 'load error', gateway.loadErrors[id] || 'did not construct']);
+      rows.push([id, 'load error', gateway.loadError(id) || 'did not construct']);
       continue;
     }
+    if (adapter.disabled) {
+      rows.push([id, 'disabled', adapter.unsafeTools ? `can run commands and edit files (unsafeTools) — keysmith set ${id} disabled false --allow-unsafe-tools serves it` : 'disabled in the config']);
+      continue;
+    }
+    const tag = adapter.unsafeTools ? ' · UNSAFE TOOLS: can run commands, never an alias' : adapter.explicitOnly ? ' · explicit-only' : '';
     if (adapter.kind === 'cli') {
       const bin = which(adapter.bin);
       if (!bin) {
@@ -551,11 +830,11 @@ async function cmdDoctor(flags) {
         rows.push([id, 'model list failed', truncate(e.message, 60)]);
         continue;
       }
-      rows.push([id, models.length ? 'ok' : 'no models', `${bin} · ${models.length} models · parser ${adapter.parser}`]);
+      rows.push([id, models.length ? 'ok' : 'no models', `${bin} · ${models.length} models · parser ${adapter.parser}${tag}`]);
     } else {
       try {
         const models = await adapter.models();
-        rows.push([id, 'ok', `${adapter.baseUrl} · ${models.length} models`]);
+        rows.push([id, 'ok', `${adapter.baseUrl} · ${models.length} models${tag}`]);
       } catch (e) {
         rows.push([id, 'unreachable', truncate(e.message, 70)]);
         continue;
@@ -573,7 +852,7 @@ async function cmdDoctor(flags) {
   for (const [id, state, detail] of rows) {
     // '!' rather than '✗': the route still answers, because the next leg in the chain picks it
     // up. What is broken is the ordering you asked for, and the money you think you are saving.
-    out(`  ${state === 'ok' ? '✓' : state === 'alias warning' ? '!' : '✗'} ${id.padEnd(w)}  ${state.padEnd(16)} ${detail}`);
+    out(`  ${state === 'ok' ? '✓' : state === 'alias warning' ? '!' : state === 'disabled' ? '·' : '✗'} ${id.padEnd(w)}  ${state.padEnd(16)} ${detail}`);
   }
 
   const t = tunnel.tunnelStatus(cfg);
@@ -586,6 +865,14 @@ async function cmdDoctor(flags) {
     out('\nprobing every model with a 1-token request (this spends real quota):');
     const { models } = await gateway.listModels();
     for (const m of models) {
+      // An explicit-only adapter spends something its owner keeps for requests that name it
+      // (a Claude subscription, say), and a tool-capable one acts on this machine: neither is
+      // spent on a probe nobody asked of it by name.
+      const owner = gateway.adapters.get(m.keysmith?.adapter);
+      if (owner?.explicitOnly) {
+        out(`  · ${m.id.padEnd(42)} skipped: ${owner.unsafeTools ? 'unsafeTools' : 'explicit-only'}, never probed`);
+        continue;
+      }
       const t0 = Date.now();
       try {
         const { text } = await gateway.collect({ model: m.id, messages: [{ role: 'user', content: 'Reply with exactly: OK' }] });
@@ -674,7 +961,8 @@ function cmdKey(flags) {
     cfg.auth.keys.push(key);
     registerSecrets([key]);
     saveConfig(cfg);
-    return showKeys([key], { reveal: flags.reveal });
+    showKeys([key], { reveal: flags.reveal });
+    return noteRestart('the new key');
   }
   if (sub === 'revoke') {
     // The fingerprint only — what `key list`, the serve banner and every log line show. A
@@ -688,7 +976,8 @@ function cmdKey(flags) {
     cfg.auth.keys = cfg.auth.keys.filter((x) => !revoked.includes(x));
     if (!revoked.length) return out(`no key matched fp:${fp} — this would have removed nothing`);
     saveConfig(cfg);
-    return out(`revoked ${before - cfg.auth.keys.length} key(s): ${revoked.map(redactKey).join(', ')}; ${cfg.auth.keys.length} left`);
+    out(`revoked ${before - cfg.auth.keys.length} key(s): ${revoked.map(redactKey).join(', ')}; ${cfg.auth.keys.length} left`);
+    return noteRestart('the revocation (the revoked key works until then)');
   }
   fail('usage: keysmith key <list|add> [--reveal] | keysmith key revoke fp:<8 hex>');
 }

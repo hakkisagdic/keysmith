@@ -59,9 +59,15 @@ function json(line) {
   }
 }
 
-/** Command Code (`cmd -p --output-format json`) — verified against cmd 1.66.0. */
+/**
+ * Command Code (`cmd -p --output-format json`) — verified against cmd 1.66.0. A tool call is
+ * reported once, at `tool_queued` — which Command Code 1.81.0 emits before its permission
+ * check and `tool_running` (read from its bundle, not seen live) — so `stopAtToolCall` can
+ * stop the run as early as the stream allows.
+ */
 export async function* cmdNdjson(lines) {
   let done = false;
+  const tools = new Set();
   for await (const line of lines) {
     const d = json(line);
     if (!d) continue;
@@ -70,6 +76,13 @@ export async function* cmdNdjson(lines) {
       if (e.type === 'text_delta' && e.delta) yield EV.delta(e.delta);
       else if (e.type === 'thinking_delta' && e.delta) yield { type: 'reasoning', text: e.delta };
       else if (e.type === 'model_request_end' && e.usage) yield EV.usage(normaliseUsage(e.usage));
+      else if ((e.type === 'tool_queued' || e.type === 'tool_running') && (e.toolName || e.toolCallId)) {
+        const key = e.toolCallId || `${e.toolName}#${tools.size}`;
+        if (!tools.has(key)) {
+          tools.add(key);
+          yield EV.tool(e.toolName || 'a tool');
+        }
+      }
       continue;
     }
     if (d.type === 'result') {
@@ -83,13 +96,27 @@ export async function* cmdNdjson(lines) {
   if (!done) yield EV.done('stop');
 }
 
-/** opencode (`opencode run --format json`) — verified against opencode 1.18.27. */
+/**
+ * opencode (`opencode run --format json`) — verified against opencode 1.18.27. A tool call
+ * is a `tool_use` line (`part.tool`, `part.callID`), reported once per call. An error line
+ * carries its reason under `error.data.message`, with the upstream's `statusCode` (opencode's
+ * free tier refuses the tool-less run with a 403 that says why).
+ */
 export async function* opencodeNdjson(lines) {
   let emitted = 0;
+  const tools = new Set();
   for await (const line of lines) {
     const d = json(line);
     if (!d) continue;
     const part = d.part || {};
+    if (d.type === 'tool_use') {
+      const key = part.callID || part.id || `${part.tool}#${tools.size}`;
+      if (!tools.has(key)) {
+        tools.add(key);
+        yield EV.tool(part.tool || 'a tool');
+      }
+      continue;
+    }
     if (d.type === 'text' && typeof part.text === 'string') {
       // opencode flushes the whole text block, not deltas; only send the new tail.
       if (part.text.length > emitted) {
@@ -104,7 +131,9 @@ export async function* opencodeNdjson(lines) {
       if (u) yield EV.usage(u);
       if (d.sessionID) yield EV.session(d.sessionID);
     } else if (d.type === 'error') {
-      yield EV.error(part.message || d.error?.message || 'opencode error');
+      const why = part.message || d.error?.message || d.error?.data?.message;
+      const status = d.error?.data?.statusCode;
+      yield EV.error(why ? `opencode${status ? ` ${status}` : ''}: ${truncate(String(why), 400)}` : 'opencode error');
     }
   }
   yield EV.done('stop');
@@ -235,6 +264,119 @@ export async function* agyStreamJson(lines) {
   yield EV.done('stop');
 }
 
+/** Text out of an ACP content block: `{type:'text', text}`, an array of them, or a string. */
+function acpText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map(acpText).join('');
+  if (content && typeof content === 'object' && (content.type === 'text' || content.type == null) && typeof content.text === 'string') return content.text;
+  return '';
+}
+
+/**
+ * Kiro CLI (`kiro-cli chat --no-interactive --output-format stream-json`) — kiro-cli 2.27.1.
+ * One `{type, data}` object per line, the run's ACP events wrapped:
+ *
+ *   {"type":"runStarted","data":{"payloadSchema":"acp","acpProtocolVersion":1,"engine":"v2"}}
+ *   {"type":"metadata","data":{"sessionId":"…","contextUsagePercentage":0.76,…}}
+ *   {"type":"sessionUpdate","data":{"sessionId":"…","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"O"}}}}
+ *   {"type":"runFinished","data":{"finalText":"OK","finalTextTruncated":false}}
+ *   {"type":"runError","data":{"sessionId":"…","stage":"prompt","message":"Internal error (code -32603): …"}}
+ *
+ * runStarted, metadata and runError were read off a live run, which the account's overage
+ * limit refused before it wrote any text. The text events are the ACP `session/update`
+ * notification (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`) and runFinished's
+ * `finalText`, both named in the binary — so the answer is taken from the chunks, and from
+ * `finalText` when no chunk carried any. A `sessionUpdate` whose payload is the update
+ * itself (no `update` wrapper) is read the same way.
+ */
+export async function* kiroStreamJson(lines) {
+  let emitted = false;
+  let sessionSent = false;
+  let usage = null;
+  const toolCalls = new Set();
+  for await (const line of lines) {
+    const d = json(line);
+    if (!d || typeof d.type !== 'string') continue;
+    const data = d.data && typeof d.data === 'object' ? d.data : {};
+    if (typeof data.sessionId === 'string' && data.sessionId && !sessionSent) {
+      sessionSent = true;
+      yield EV.session(data.sessionId);
+    }
+    if (d.type === 'metadata') {
+      // Token counts, when a metadata event carries them (the turn summary does in Kiro's
+      // telemetry); the last one wins, since each is the turn so far.
+      const u = normaliseUsage(data.tokenUsage) || normaliseUsage(data.usage) || normaliseUsage(data);
+      if (u) usage = u;
+    } else if (d.type === 'sessionUpdate') {
+      const up = data.update && typeof data.update === 'object' ? data.update : data;
+      const text = acpText(up.content);
+      if (up.sessionUpdate === 'agent_message_chunk' && text) {
+        emitted = true;
+        yield EV.delta(text);
+      } else if (up.sessionUpdate === 'agent_thought_chunk' && text) {
+        yield { type: 'reasoning', text };
+      } else if (up.sessionUpdate === 'tool_call') {
+        // ACP sends `tool_call` once and `tool_call_update` after it: one call, one event.
+        const id = up.toolCallId ?? `${up.title ?? ''}#${toolCalls.size}`;
+        if (!toolCalls.has(id)) {
+          toolCalls.add(id);
+          yield EV.tool(up.title || up.kind || 'a tool');
+        }
+      }
+    } else if (d.type === 'runFinished') {
+      if (!emitted && typeof data.finalText === 'string' && data.finalText.trim()) {
+        emitted = true;
+        yield EV.delta(data.finalText);
+      }
+      if (usage) yield EV.usage(usage);
+      yield EV.done('stop');
+      return;
+    } else if (d.type === 'runError') {
+      const why = typeof data.message === 'string' ? data.message : data.error?.message || data.stage || 'error';
+      yield EV.error(truncate(`kiro: ${why}`, 400));
+    }
+  }
+  if (usage) yield EV.usage(usage);
+  yield EV.done('stop');
+}
+
+/** The tools Warp's agent can call, as the binary names them; a `tool_call` line names one of them. */
+const WARP_TOOLS = ['run_command', 'read_files', 'edit_files', 'search_codebase', 'call_mcp_tool', 'read_mcp_resource', 'upload_artifact'];
+
+/**
+ * Warp's agent CLI (`oz agent run --output-format ndjson`) — Oz v0.2026.10.07, read off a
+ * live run:
+ *
+ *   {"type":"system","event_type":"run_started","run_id":"…","run_url":"https://oz.warp.dev/runs/…"}
+ *   {"type":"system","event_type":"conversation_started","conversation_id":"…"}
+ *   {"type":"agent","text":"OK\n"}
+ *
+ * No usage and no closing line: the process exiting is the end of the answer. The binary
+ * names the other message types — agent_reasoning, tool_call, tool_result, tool_error,
+ * tool_canceled, update_todos — and a `tool_call` is reported as a `tool` event, which is
+ * what lets the adapter stop a run that reached for one (`stopAtToolCall`).
+ */
+export async function* warpNdjson(lines) {
+  for await (const line of lines) {
+    const d = json(line);
+    if (!d || typeof d.type !== 'string') continue;
+    if (d.type === 'agent' && typeof d.text === 'string' && d.text) {
+      yield EV.delta(d.text);
+    } else if (d.type === 'agent_reasoning' && typeof d.text === 'string' && d.text) {
+      yield { type: 'reasoning', text: d.text };
+    } else if (d.type === 'tool_call') {
+      const named = [d.tool, d.name, d.tool_name, d.tool_call?.name].find((v) => typeof v === 'string' && v);
+      yield EV.tool(named || WARP_TOOLS.find((t) => t in d || (d.tool_call && t in d.tool_call)) || 'a tool');
+    } else if (d.type === 'system' && d.event_type === 'conversation_started' && typeof d.conversation_id === 'string') {
+      yield EV.session(d.conversation_id);
+    } else if (d.type === 'error') {
+      const why = typeof d.error === 'string' ? d.error : d.error?.message || d.message || 'error';
+      yield EV.error(truncate(`warp: ${why}`, 400));
+    }
+  }
+  yield EV.done('stop');
+}
+
 /** Anything that just prints the answer. */
 export async function* rawText(lines) {
   const out = [];
@@ -249,6 +391,8 @@ export const PARSERS = {
   'opencode-ndjson': opencodeNdjson,
   'claude-stream-json': claudeStreamJson,
   'agy-stream-json': agyStreamJson,
+  'kiro-stream-json': kiroStreamJson,
+  'warp-ndjson': warpNdjson,
   raw: rawText,
 };
 

@@ -205,6 +205,8 @@ function describeAdapters(gateway) {
     parser: a.parser || null,
     resumable: !!a.resumable,
     timeoutMs: a.timeoutMs,
+    explicit_only: !!a.explicitOnly,
+    unsafe_tools: !!a.unsafeTools,
   }));
 }
 

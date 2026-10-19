@@ -2,7 +2,7 @@
 
 **Forge an API key out of any coding CLI.**
 
-You already pay for Command Code, opencode, Claude Code, Qoder, Copilot — and their
+You already pay for Command Code, opencode, Claude Code, Qoder, Kiro, Copilot — and their
 credentials are logins, not keys. Apps that only speak `Authorization: Bearer` cannot
 use them. keysmith runs each CLI once per request, reads its event stream, and serves
 the result as an OpenAI-compatible endpoint:
@@ -18,7 +18,7 @@ One config file, one port, one key. Zero dependencies — Node 20+ and nothing e
 ```bash
 git clone https://github.com/hakkisagdic/keysmith.git && cd keysmith
 node src/cli.js init                 # writes ~/.config/keysmith/config.json (0600) + one API key, shown to your terminal only
-node src/cli.js add cmd              # attach a built-in profile
+node src/cli.js add agy              # attach a built-in profile (a tool-less one: see "Agents that could act on this machine")
 node src/cli.js add evren --base-url https://your-gateway/v1 --key '{json:~/.local/share/opencode/auth.json#evren.key}'
 node src/cli.js doctor               # is each adapter actually alive, and what does it cost
 node src/cli.js serve --tunnel       # http://127.0.0.1:8787/v1 (+ Cloudflare tunnel)
@@ -29,7 +29,7 @@ Point anything at it:
 ```bash
 curl -N http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer $KEYSMITH_KEY" -H 'content-type: application/json' \
-  -d '{"model":"cmd/gpt-5","stream":true,"messages":[{"role":"user","content":"one-line haiku"}]}'
+  -d '{"model":"agy/gemini-3.8-flash-low","stream":true,"messages":[{"role":"user","content":"one-line haiku"}]}'
 ```
 
 ---
@@ -99,6 +99,32 @@ the client** — a half-delivered answer is never restarted, because the user al
 part of it. That makes aliases safe to point at a laptop's whole toolchain: a direct API
 first, a local model second, an agent CLI last.
 
+Aliases are edited from the command line, so a live config never has to be opened (it holds
+the gateway key):
+
+```bash
+keysmith alias                                              # every alias and its legs
+keysmith alias argon agy/gemini-4-argon-high google/gemini-4-argon   # set a chain
+keysmith alias chat --prepend agy/gemini-4-argon-high       # a new first leg; the others keep their order
+keysmith alias chat --append ollama/qwen3:4b                # a new last leg (a leg already there moves)
+keysmith alias chat --drop ollama/qwen3:4b                  # take one out
+keysmith alias chat --delete
+```
+
+A leg has to name an attached adapter (`--force` saves one you have not attached yet), an
+alias cannot name another alias or share an adapter's name, and an
+[explicit-only or tool-capable adapter](#agents-that-could-act-on-this-machine) is refused —
+`--force` or not; an adapter whose argv carries an auto-approve flag counts as tool-capable
+whether it is marked or not. After a change the same checks `doctor` runs are printed, so a
+model the adapter does not list is said then, not discovered as a slow failover later.
+
+The gateway reads its config once, when it starts. `add`, `remove`, `set`, `alias` and
+`key add|revoke` change the file, not the running gateway: while one runs they say so, with
+the restart command (`launchctl kickstart -k gui/$UID/dev.keysmith.gateway` under launchd,
+`keysmith stop && keysmith start` otherwise), and `keysmith status` says when the config is
+newer than the gateway. Until then a new alias is a 404, a disabled adapter keeps answering
+and a revoked key keeps working.
+
 Which is also why a typo in a chain is invisible at request time: a leg naming an adapter
 you do not have gets skipped, and a leg naming a model the adapter never heard of gets
 rejected upstream and failover'd — both look like a slightly slow provider, while quietly
@@ -111,7 +137,14 @@ with no `models` declared) can't be checked without spawning it — that's what
 
 Per-adapter knobs that shape a route: `priority` (orders the flat listing), `disabled`,
 `timeoutMs`, `maxConcurrent` (a semaphore, so five browser tabs cannot fork five agents),
-`stripSystemPrompt`, `maxPromptChars`, `headers`, `modelMap`, `defaultModel`.
+`stripSystemPrompt`, `maxPromptChars`, `headers`, `modelMap`, `modelParams`, `defaultModel`,
+`explicitOnly`. One field of an attached adapter changes with
+`keysmith set <adapter> <field> <value>` (the value is JSON when it parses, a string
+otherwise; `--unset` removes the field; nothing is echoed back, since the field may be
+`apiKey`). A value the gateway would refuse to load — a `modelParams` that is not an object
+of fields, an `args` with an auto-approve flag, an http adapter without `baseUrl` — is refused
+before it replaces a working entry (`--force` saves it anyway, and says the adapter will not
+load); credentials are not resolved for that check, so a key only launchd can see is fine.
 
 ## Sessions: multi-turn out of a stateless client
 
@@ -186,6 +219,118 @@ spends one request per step.
 A CLI that emits thinking (`cmd`, Claude, opencode) keeps it to itself unless the request
 says `"include_reasoning": true` — then it arrives as `delta.reasoning_content` on
 `/v1/chat/completions`. The other two faces drop it.
+
+## Gemini 4 Argon at its highest effort
+
+Two routes reach it, and they spell the effort differently:
+
+- **agy** puts the effort in the model id: `agy/gemini-4-argon-low|medium|high`. `high` is
+  Argon's maximum — agy refuses `--effort max` and `--effort xhigh` for it. Through the
+  tool-less `keysmith-text` agent, `agy/gemini-4-argon-high` answered "Reply with exactly: OK"
+  in 3.2 s. No tools: a CLI leg answers in text.
+- **google** (the API) lists `gemini-4-argon`, takes tools, and takes OpenAI's
+  `reasoning_effort` field. keysmith builds the body of a plain completion itself, so the
+  effort goes in the adapter's `modelParams`, which is sent with that model and no other:
+
+  ```bash
+  keysmith set google modelParams '{"gemini-4-argon":{"reasoning_effort":"high"}}'
+  ```
+
+  On the tool relay the client's body goes upstream verbatim; `modelParams` fills in only
+  what the client did not set, so a client that chose its own effort keeps it — in any
+  spelling: `reasoning_effort`, `reasoning: {effort}`, or Google's `thinking_config` (under
+  `extra_body.google` or `google`). Then no effort field from `modelParams` is added at all:
+  Google's documentation says `reasoning_effort` and a thinking budget cannot be used
+  together, and that 400 would count as the leg refusing the tools. `high` here matches agy's
+  `-high`; the Google leg was not run live with it.
+
+So one alias drives Argon both ways, agy first:
+
+```bash
+keysmith alias argon agy/gemini-4-argon-high google/gemini-4-argon
+```
+
+A plain request is answered by agy and fails over to the API; a request with `tools` goes
+to the API leg, the one that can return `tool_calls`. Each leg spends its own quota: your
+Antigravity login for agy, the API key's (free tier: about 20 requests a day per model) for
+google.
+
+## Agents that could act on this machine
+
+A CLI adapter runs an agent, and an agent has tools: a shell, file edits, MCP servers. Behind
+a tunnel, a request that can reach such an adapter can make it act on this machine. So every
+built-in CLI profile that can be made tool-less is: it runs in an empty directory keysmith
+owns (`~/.local/share/keysmith/workspaces/<name>`), with the CLI's own switches for "no
+tools", and no auto-approve flag. The ones that cannot are marked `unsafeTools` and ship
+disabled. Every CLI profile has its own workspace — under launchd the gateway's working
+directory is keysmith's source tree, and no agent runs there; `keysmith add custom` gives a
+hand-written adapter one too.
+
+| Profile | How its tools are taken away | Checked |
+|---|---|---|
+| `agy` | `--agent keysmith-text`: an agent file with `tools: []`, no MCP, no customizations; `stopAtToolCall` for the one tool agy keeps | live, agy 1.3.3 |
+| `kiro` | `--agent keysmith-text`: `tools: []`, `mcpServers: {}`, `includeMcpJson: false`, `resources: []`; `--trust-tools=` trusts nothing; `stopAtToolCall` | argv and agent file accepted by kiro-cli 2.27.1; its first live run was refused for quota before any text |
+| `claude` | `--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--disable-slash-commands`, `--safe-mode`, `--max-turns 1` | parsed by Claude Code 2.1.261; no live request sent |
+| `qoder` | `--tools ""`, `--strict-mcp-config` | parsed by qodercli 1.1.59 |
+| `codex` | `--disable shell_tool`, `--sandbox read-only`, `approval_policy="never"`, `web_search="disabled"`, `--disable goals`, `--ignore-user-config` (no MCP servers from your config), plugins/apps/browser/computer-use off, `agents.max_threads=1` | a stub Responses endpoint, codex 0.163.0: gpt-5.5 is offered request_user_input and apply_patch (the read-only sandbox refuses it); gpt-6-* keep code mode's exec (no shell) and sub-agent tools no switch removes — capped at one sub-agent |
+| `opencode` | `--agent keysmith-text` (`permission: {"*": deny}`, `tools: {"*": false}`) and a workspace `opencode.json` denying every tool to any agent; no `--auto`; `stopAtToolCall` | a stub OpenAI endpoint, opencode 1.18.27: no tools offered, a bash call the model made anyway ran nothing; its free tier (`opencode/*`) refuses this run with a 403 |
+| `cmd` | — (cannot be done: a `-p` run approves its own tool calls) | `unsafeTools`; Command Code 1.81.0's bundle |
+| `gemini` | — (never run from here) | `unsafeTools` until a tool-less argv is checked against a real install |
+| `warp` | — (cannot be done, see below) | `unsafeTools` |
+
+Two marks keep an adapter out of routes it was not asked for by name:
+
+- **`explicitOnly: true`** — the adapter answers a request that names it (`claude/sonnet`)
+  and nothing else: never an alias leg (`keysmith alias` refuses it; a hand-edited leg is
+  skipped and named in `doctor`, `/v1/models` and the routes endpoint), never probed by
+  `doctor --probe-models`. For an adapter that spends something you keep for yourself; the
+  `claude` profile ships it, and `keysmith add <profile> --explicit-only` sets it on any other.
+- **`unsafeTools: true`** — keysmith could not take the CLI's tools away. Everything
+  `explicitOnly` does, and the profile ships `disabled: true`. Serving it is a decision with
+  its own flag: `keysmith set <id> disabled false --allow-unsafe-tools`, and so is any later
+  change to what it runs or how it is stopped — `stopAtToolCall`, `args`, `resumeArgs`,
+  `bin`, `env`, `cwd`, `parser`, `modelsFrom`; only `note`, `models`, `defaultModel`,
+  `priority`, `timeoutMs`, `maxConcurrent`, `maxPromptChars` and `explicitOnly` change
+  without it, and turning it off never needs it. Its profile also sets
+  `stopAtToolCall: "always"` where the parser can see tool calls: the run is stopped at the
+  first one it reports, and a call before any text fails the request. That limits the damage,
+  it is not a sandbox — the harness may have started the command by the time keysmith sees
+  the call.
+
+An argv with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`,
+`--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`,
+…) does not load unless the entry is marked `unsafeTools`: the gateway reports it as a load
+error (`doctor`, `/v1/models`, the routes endpoint) and a request to it is a 503 naming the
+flag. A config written by an older keysmith — the `opencode` profile used to pass `--auto` —
+stops there; `keysmith add opencode --as <id>` copies the tool-less argv over it. A re-add
+never drops a guard: `explicitOnly`, `unsafeTools` and `disabled` on the entry it replaces
+are kept, and it says so — taking one off is a `keysmith set`.
+
+**Warp (`oz`) is the `unsafeTools` one.** `oz agent run` takes an agent profile by id;
+profiles are made in the Warp app, the default one lets the agent run commands and edit
+files, and the permission values a profile has only ask or allow — none denies. Nothing on
+`oz`'s command line removes the tools. Every run is also recorded in your Warp account (a
+`run_url` on oz.warp.dev). `/usr/local/bin/warp-cli` is Cloudflare WARP, a VPN client — the
+profile uses the `oz` inside Warp.app.
+
+**Command Code (`cmd`) keeps its tools.** A `cmd -p` run answers every tool confirmation
+itself with "allow" (Command Code 1.81.0: a headless run is `autoAllow`), and `-p` withholds
+only its interactive tools (ask_user_question, plan mode, todo_write, cron, taste) — shell,
+read, write and edit stay, and `--max-turns 1` limits the turns after a call, not the call. So
+`cmd` is `unsafeTools`: it ships disabled, and when served it is stopped at its first
+`tool_queued` event, which comes before its permission check. A `cmd` adapter attached
+before this keeps serving until it is re-added (`keysmith add cmd`, which arrives disabled) or
+switched off (`keysmith set cmd disabled true`).
+
+**Claude Code: attached, not used.** The `claude` profile is tool-less and explicit-only as
+shipped, so `keysmith add claude` puts it in no alias and no probe, and a re-add (to pin its
+`bin`, say) keeps it that way. That is what a setup whose own work runs on the same Claude
+subscription needs: every request to `claude/…` spends that subscription.
+
+**Ollaya** ([ollaya.dev](https://ollaya.dev)) is out of scope: it is a local runtime for
+decision models — typed questions answered with calibrated probabilities over their
+options, on `/v1/decisions` and `/v1/systemone` — not a chat-completion API, so there is no
+`/v1/chat/completions` for an adapter to forward to.
 
 ## Secrets stay out of the config
 
@@ -263,7 +408,7 @@ A scrub rewrites what it can reach. A key that was in a log may also be in copie
 cannot — backups, rotated archives, an agent's transcript — so when `scrub-logs` finds a
 configured key it says to rotate it: `keysmith key add --reveal` in a terminal, move the
 clients over, `keysmith key revoke fp:<old>`, restart the gateway. `keysmith status` says
-when the running gateway is older than the code on disk and needs that restart.
+when the running gateway is older than the code or the config on disk and needs that restart.
 
 ## Publishing it safely
 
@@ -306,12 +451,15 @@ again to rewrite it.
 
 | Profile | Kind | Status |
 |---|---|---|
-| `cmd` | cli | verified live against Command Code 1.66.0 |
-| `opencode` | cli | verified live against opencode 1.18.27 |
-| `qoder` | cli | verified with `-p`; its `-o json/stream-json` modes fail inside a nested agent session |
-| `claude` | cli | flags and stream-json shape checked against Claude Code 2.1.261 |
+| `cmd` | cli | verified live against Command Code 1.66.0 — **`unsafeTools`**: a `-p` run approves its own tool calls, so it ships disabled, see [above](#agents-that-could-act-on-this-machine) |
+| `opencode` | cli | verified live against opencode 1.18.27; tool-less agent checked against a stub endpoint (no `--auto`); its free `opencode/*` models refuse the tool-less run (403) |
+| `qoder` | cli | verified with `-p`; its `-o json/stream-json` modes fail inside a nested agent session; tool-less flags parsed by 1.1.59 |
+| `claude` | cli | tool-less flags and stream-json shape checked against Claude Code 2.1.261; no live request; explicit-only as shipped |
 | `agy` | cli | verified live against Antigravity CLI 1.3.3 — your Google login, no key; runs as a tool-less text agent (~600-token prompt instead of ~20k), see [docs/adapters.md](docs/adapters.md#agy-as-a-plain-text-model) |
-| `codex`, `gemini` | cli | documented argv shape, not run against a live install |
+| `kiro` | cli | Kiro CLI 2.27.1 — tool-less agent, `stream-json`, model list as JSON; the first live run was refused for quota before any text, see [docs/adapters.md](docs/adapters.md#kiro-as-a-plain-text-model) |
+| `codex` | cli | argv run against a stub Responses endpoint with codex 0.163.0 (read-only, no shell, no web search); gpt-6-* keep sub-agent tools; no request reached OpenAI |
+| `warp` | cli | Warp's `oz` agent CLI, ndjson verified live — **`unsafeTools`**: ships disabled, never an alias leg, see [above](#agents-that-could-act-on-this-machine) |
+| `gemini` | cli | documented argv shape, not run against a live install — **`unsafeTools`** until a tool-less argv is checked: ships disabled |
 | `openai`, `anthropic`, `openrouter`, `groq`, `deepseek`, `together` | http | standard endpoints |
 | `google` | http | verified live against Gemini's OpenAI-compatible endpoint: tools, streaming, thought signatures — see [above](#gemini-with-tools-the-google-profile) |
 | `ollama`, `lmstudio`, `llamacpp`, `vllm` | http | local servers, no key |
@@ -337,7 +485,7 @@ Warp, Claude Code, opencode, Codex, Qoder, `openai` Python — copy-paste config
 ## Development
 
 ```bash
-npm test          # 135 tests: parsers, routing, HTTP suites against a stub CLI and a stub Gemini, and no key reaching a log
+npm test          # 182 tests: parsers, routing, HTTP suites against stub CLIs and a stub Gemini, and no key reaching a log
 node src/cli.js doctor --probe-models   # the truth about which models answer (spends quota)
 ```
 

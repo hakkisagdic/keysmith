@@ -1,5 +1,5 @@
 /**
- * Built-in adapter profiles. `keysmith add cmd` copies one of these into your config;
+ * Built-in adapter profiles. `keysmith add agy` copies one of these into your config;
  * every field stays yours to edit, so a profile is a starting config, not an opaque
  * plugin. Fields marked "verified" were read off the live tools listed in `provenance`.
  */
@@ -50,6 +50,74 @@ const AGY_TOOL_DENIAL_RETRY =
   'Answer again in plain text only, with no tool or function calls. If the request asks for something to be run, read or changed, ' +
   'write the commands or code out as text in the format the request asks for.';
 
+/**
+ * Kiro's own agent format (kiro-cli 2.27.1): a JSON file in `.kiro/agents/` under the cwd is
+ * a workspace agent (`kiro-cli agent list` shows it as "Workspace", `agent validate` accepts
+ * this one). `tools: []` gives the model nothing to call, `mcpServers: {}` with
+ * `includeMcpJson: false` starts no MCP server, `resources: []` loads no steering files
+ * (yours in ~/.kiro/steering included) and `hooks: {}` runs nothing. `--trust-tools=` on the
+ * command line trusts no tool on top of that, so anything left would be refused, not run.
+ * Kiro, like agy, answers an agent name it cannot set with a warning and its default agent
+ * — so the file is rewritten whenever it drifts (`workspaceFiles`).
+ */
+const KIRO_TEXT_AGENT_NAME = 'keysmith-text';
+const KIRO_TEXT_AGENT = `${JSON.stringify(
+  {
+    name: KIRO_TEXT_AGENT_NAME,
+    description: 'Plain text completions for keysmith. No tools.',
+    prompt:
+      'You are a language model answering one request through an API. You have no tools here: you cannot run commands, read or write files, browse, or call functions. Your text is the whole answer. ' +
+      'Follow the request\'s own instructions. If it asks you to run, inspect or change something, do not refuse and do not try to do it yourself: write the commands, code or answer as text, in exactly the format the request asks for. Whoever sent the request acts on what you write. Answer once, then stop.',
+    mcpServers: {},
+    tools: [],
+    toolAliases: {},
+    allowedTools: [],
+    resources: [],
+    hooks: {},
+    toolsSettings: {},
+    includeMcpJson: false,
+    model: null,
+  },
+  null,
+  2,
+)}\n`;
+
+/**
+ * opencode's own formats (opencode 1.18.27). Its default `build` agent starts from
+ * `"*": "allow"`: bash, edit, write, read, webfetch, task and skill run without asking, and
+ * `--auto` only adds the few rules left at "ask". Two layers take that away, both files in
+ * the keysmith-owned workspace:
+ *  - `.opencode/agent/keysmith-text.md`, a workspace agent (`--agent keysmith-text`) with
+ *    `permission: {"*": deny}` and `tools: {"*": false}`;
+ *  - `opencode.json`, the project config, denying everything for every agent, so the run is
+ *    tool-less even when the agent name does not resolve — opencode answers an unknown
+ *    `--agent` with a warning and its default agent.
+ * Checked against a stub OpenAI endpoint: the default agent offered 10 tools, this one none,
+ * and a bash call the stub made anyway was refused ("unavailable tool") and ran nothing.
+ */
+const OPENCODE_TEXT_AGENT_NAME = 'keysmith-text';
+const OPENCODE_TEXT_AGENT = `---
+description: Plain text completions for keysmith. No tools.
+mode: primary
+permission:
+  "*": deny
+tools:
+  "*": false
+---
+
+You are a language model answering one request through an API. You have no tools here: you cannot run commands, read or write files, browse, or call functions. Your text is the whole answer.
+
+Follow the request's own instructions. If it asks you to run, inspect or change something, do not refuse and do not try to do it yourself: write the commands, code or answer as text, in exactly the format the request asks for. Whoever sent the request acts on what you write. Answer once, then stop.
+`;
+const OPENCODE_WORKSPACE_CONFIG = `${JSON.stringify(
+  { $schema: 'https://opencode.ai/config.json', permission: { '*': 'deny' }, tools: { '*': false }, mcp: {}, plugin: [] },
+  null,
+  2,
+)}\n`;
+
+/** Where Warp installs its agent CLI on macOS. `/usr/local/bin/warp-cli` is Cloudflare WARP, a VPN client, not this. */
+const WARP_OZ_BIN = '/Applications/Warp.app/Contents/Resources/bin/oz';
+
 export const CLI_PROFILES = {
   cmd: {
     kind: 'cli',
@@ -61,49 +129,84 @@ export const CLI_PROFILES = {
     persistSessions: false,
     parser: 'cmd-ndjson',
     modelsFrom: { args: ['--list-models'] },
+    cwd: '~/.local/share/keysmith/workspaces/cmd',
+    // Command Code keeps its tools in print mode and approves them itself: a headless run
+    // answers every tool confirmation with "allow" (1.81.0: `headlessInteraction({autoAllow:
+    // true})`), and `-p` withholds only the interactive tools (ask_user_question, plan mode,
+    // todo_write, cron, taste) — shell, read, write and edit stay. No switch on its command
+    // line removes them, and `--max-turns 1` caps the turns after a call, not the call. So
+    // this adapter is marked, ships disabled, never joins an alias, and is stopped at the
+    // first tool call it reports (`tool_queued`, before its permission check).
+    unsafeTools: true,
+    disabled: true,
+    stopAtToolCall: 'always',
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Command Code 1.66.0 — `cmd -p --output-format json` emits text_delta events then a result line',
-    note: 'cmd adds its own ~16k-token agent prompt to every call and bills it. That is the price of renting its harness; keep --max-turns 1 unless you want it editing files.',
+    provenance: 'Command Code 1.66.0 — `cmd -p --output-format json` emits text_delta events then a result line, live. Command Code 1.81.0 (its bundle, not a live run): headless runs auto-allow tool confirmations, `-p` withholds only interactive tools, tool calls are `tool_queued` / `tool_running` events.',
+    note: 'Not tool-less: a `cmd -p` run approves its own tool calls, so it can run commands and edit files, and nothing on its command line turns that off. keysmith marks it `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports — which can come after the call already ran. cmd also adds its own ~16k-token agent prompt to every call and bills it. Enable it only if you accept that: `keysmith set cmd disabled false --allow-unsafe-tools`.',
   },
   opencode: {
     kind: 'cli',
     bin: 'opencode',
-    args: ['run', '--format', 'json', '--pure', '--auto', ['--model', '{model}'], '{prompt}'],
-    resumeArgs: ['run', '--format', 'json', '--pure', '--auto', '--session', '{session}', '{prompt}'],
+    // `--agent keysmith-text` is the tool-less agent below, and the workspace's opencode.json
+    // denies every tool to any agent. No `--auto`: there is nothing left to approve.
+    // `--pure` loads no external plugin; `--` ends the options, so no prompt is read as a flag.
+    args: ['run', '--format', 'json', '--pure', '--agent', OPENCODE_TEXT_AGENT_NAME, ['--model', '{model}'], '--', '{prompt}'],
+    resumeArgs: ['run', '--format', 'json', '--pure', '--agent', OPENCODE_TEXT_AGENT_NAME, '--session', '{session}', '--', '{prompt}'],
     persistSessions: true,
     parser: 'opencode-ndjson',
     modelsFrom: { args: ['models'] },
+    cwd: '~/.local/share/keysmith/workspaces/opencode',
+    workspaceFiles: {
+      'opencode.json': OPENCODE_WORKSPACE_CONFIG,
+      [`.opencode/agent/${OPENCODE_TEXT_AGENT_NAME}.md`]: OPENCODE_TEXT_AGENT,
+    },
+    stopAtToolCall: true,
     timeoutMs: 300_000,
     maxConcurrent: 2,
-    provenance: 'opencode 1.18.27 — `opencode run --format json` emits step_start / text / step_finish',
-    note: 'Model ids are provider/model as opencode resolves them, so any provider you wired into opencode is reachable through keysmith for free — including the CLI-to-CLI case of serving opencode-configured keys to apps that only speak HTTP.',
+    provenance: 'opencode 1.18.27 — `opencode run --format json` emits step_start / text / step_finish (live). The tool-less run was checked against a stub OpenAI endpoint: `--agent keysmith-text` with the workspace config sent `tools: []` (the default agent sent bash, edit, write, read, glob, grep, task, webfetch, todowrite, skill), a bash call the stub returned anyway failed as an unavailable tool and created nothing, and an unknown agent fell back to the default agent with no tools either. Not run against a live model: opencode\'s free tier (`opencode/*`) refuses this run with a 403.',
+    note: 'Runs without tools: the `keysmith-text` agent (`permission: {"*": deny}`, `tools: {"*": false}`) plus an opencode.json that denies every tool, in an empty keysmith-owned workspace, with no `--auto`. Model ids are provider/model as opencode resolves them, so a provider you wired into opencode with your own key is reachable through keysmith. opencode\'s free models (`opencode/*`) are not: its free tier answered this run, and its default agent under the deny-all config, with 403 "can only be used from within OpenCode" — it answered only the default agent with its tools, which keysmith does not run.',
   },
   qoder: {
     kind: 'cli',
     bin: 'qodercli',
-    args: ['-p', '{noSession}', ['--model', '{model}'], '{prompt}'],
-    resumeArgs: ['-p', '--resume', '{session}', '{prompt}'],
+    // `--tools ""` removes every built-in tool and `--strict-mcp-config` (with no
+    // --mcp-config) starts no MCP server. `--tools` takes several values, so it never sits
+    // right before the prompt: it would swallow it.
+    args: ['-p', '{noSession}', '--tools', '', '--strict-mcp-config', ['--model', '{model}'], '{prompt}'],
+    resumeArgs: ['-p', '--tools', '', '--strict-mcp-config', '--resume', '{session}', '{prompt}'],
     persistSessions: false,
+    noSessionFlag: '--no-session-persistence',
     parser: 'raw',
     modelsFrom: { args: ['--list-models'] },
+    cwd: '~/.local/share/keysmith/workspaces/qoder',
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Qoder CLI 1.1.59 — `qodercli -p` prints the answer and that is the only output mode verified from here',
-    note: 'Set QODER_* entrypoint vars aside (`keysmith serve` clears them) or the CLI exits 42 before it answers. `-o json` / `-o stream-json` also exit 42 with no output inside a nested agent session — those vars are how it finds its credentials — so `raw` is the default. If you run keysmith from a plain login shell, try `-o stream-json` with parser `claude-stream-json` for token counts and resume.',
+    provenance: 'Qoder CLI 1.1.59 — `qodercli -p` prints the answer and that is the only output mode verified from here. `--no-session-persistence`, `--tools ""` and `--strict-mcp-config` are what `qodercli --help` lists, and 1.1.59 parses them; it refuses `--no-session` (unknown option). The tool-less run itself was not checked live.',
+    note: 'Runs without tools: `--tools ""` (no built-in tool) and `--strict-mcp-config` (no MCP server), in an empty keysmith-owned workspace. Set QODER_* entrypoint vars aside (`keysmith serve` clears them) or the CLI exits 42 before it answers. `-o json` / `-o stream-json` also exit 42 with no output inside a nested agent session — those vars are how it finds its credentials — so `raw` is the default. If you run keysmith from a plain login shell, try `-o stream-json` with parser `claude-stream-json` for token counts and resume. Not on the LaunchAgent PATH by default: `keysmith add qoder --bin ~/.local/bin/qodercli`.',
   },
   claude: {
     kind: 'cli',
     bin: 'claude',
-    args: ['-p', '--output-format', 'stream-json', '--verbose', '{noSession}', '--max-turns', '1', ['--model', '{model}'], '{prompt}'],
-    resumeArgs: ['-p', '--output-format', 'stream-json', '--verbose', '--resume', '{session}', '{prompt}'],
+    // Tool-less: `--tools ""` removes every built-in tool, `--strict-mcp-config` (with no
+    // --mcp-config) starts no MCP server, `--permission-prompts none` denies anything that
+    // would still ask, `--disable-slash-commands` turns skills off and `--safe-mode` leaves
+    // out CLAUDE.md, plugins, hooks and custom agents — auth and model selection stay.
+    args: ['-p', '--output-format', 'stream-json', '--verbose', '{noSession}', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', ['--model', '{model}'], '{prompt}'],
+    resumeArgs: ['-p', '--output-format', 'stream-json', '--verbose', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', '--resume', '{session}', '{prompt}'],
     persistSessions: false,
+    // Claude Code 2.1.261 refuses `--no-session` ("unknown option"); this is its spelling.
+    noSessionFlag: '--no-session-persistence',
     parser: 'claude-stream-json',
     modelsFrom: null,
+    cwd: '~/.local/share/keysmith/workspaces/claude',
+    // Every request spends your Claude subscription, so it answers only a request that names
+    // it: never an alias leg, never probed. `keysmith set claude explicitOnly false` opts out.
+    explicitOnly: true,
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Claude Code 2.1.261 — every flag here is accepted by `claude --help` (`--max-turns` is undocumented but parsed), and the stream-json `result` line carries usage/session_id',
-    note: 'Declare `models: ["sonnet", "opus"]` or pass the id through; Claude Code has no offline model listing. A failed run prints one `result` line with is_error and the reason in `errors[]` — the parser surfaces it rather than returning an empty completion.',
+    provenance: 'Claude Code 2.1.261 — every flag here is listed by `claude --help` and parsed by 2.1.261 (checked with an empty prompt, which it refuses before any request); `--max-turns` is undocumented but parsed. The stream-json `result` line carries usage/session_id. No live request was sent through this argv.',
+    note: 'Runs without tools (`--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--safe-mode`) in an empty keysmith-owned workspace. Declare `models: ["sonnet", "opus"]` or pass the id through; Claude Code has no offline model listing. A failed run prints one `result` line with is_error and the reason in `errors[]` — the parser surfaces it rather than returning an empty completion. It spends your Claude subscription, so the profile is explicit-only: it answers `claude/<model>` and is in no alias and no `doctor --probe-models`. To put it in a route anyway: `keysmith set claude explicitOnly false`.',
   },
   agy: {
     kind: 'cli',
@@ -138,13 +241,96 @@ export const CLI_PROFILES = {
   codex: {
     kind: 'cli',
     bin: 'codex',
-    args: ['exec', '--skip-git-repo-check', ['--model', '{model}'], '{prompt}'],
+    // No shell, and nothing that writes, as far as 0.163's own switches go. What a request
+    // offered the model was read off a stub Responses endpoint, with this argv:
+    //  - `--disable shell_tool` is what removes exec. `--disable unified_exec` is kept but
+    //    0.163 ignores it (`codex features list` still says true); shell_tool covers it.
+    //  - `-c web_search="disabled"` removes the server-side web_search tool, `--disable goals`
+    //    get/create/update_goal. What is left on gpt-5.5: request_user_input (nobody answers
+    //    it in exec) and apply_patch, which the read-only sandbox refuses.
+    //  - gpt-6-* models get code mode's `exec`/`wait` (JavaScript that can call only the tools
+    //    listed — no shell) and a `collaboration` namespace (spawn_agent, send_message, …) that
+    //    no switch removes: `--disable multi_agent` and `multi_agent_v2` leave it. Sub-agents
+    //    have the same tools; `agents.max_threads=1` caps them at one besides the root
+    //    (2 concurrency slots instead of 4), the lowest codex accepts.
+    // The user config (its MCP servers and profiles) and execpolicy rules are not loaded, the
+    // plugin/app/browser/computer-use features are off, and no session is written. Codex
+    // rejects an unknown feature name, so a renamed one fails loudly, not silently.
+    args: [
+      'exec',
+      '--skip-git-repo-check',
+      '--ephemeral',
+      '--ignore-user-config',
+      '--ignore-rules',
+      '--sandbox', 'read-only',
+      '-c', 'approval_policy="never"',
+      '-c', 'skills.include_instructions=false',
+      '-c', 'web_search="disabled"',
+      '-c', 'agents.max_threads=1',
+      '--disable', 'shell_tool',
+      '--disable', 'unified_exec',
+      '--disable', 'multi_agent',
+      '--disable', 'goals',
+      '--disable', 'apps',
+      '--disable', 'plugins',
+      '--disable', 'browser_use',
+      '--disable', 'computer_use',
+      '--disable', 'image_generation',
+      '--disable', 'view_image',
+      '--disable', 'hooks',
+      '--color', 'never',
+      ['--model', '{model}'],
+      '--',
+      '{prompt}',
+    ],
     parser: 'raw',
-    modelsFrom: null,
+    // `codex debug models` prints the model catalogue as JSON (slug, display_name, visibility).
+    modelsFrom: { args: ['debug', 'models'] },
+    cwd: '~/.local/share/keysmith/workspaces/codex',
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Codex CLI non-interactive exec — argv shape from its documented interface, not run against a live install',
-    note: 'No model discovery — declare models in the adapter entry. Not verified end to end: run `keysmith doctor` after adding it and expect to edit `args` once or twice.',
+    provenance: 'Codex CLI 0.163.0 — every flag here is in `codex exec --help`; the feature names were accepted by 0.163 (`codex debug prompt-input` refuses an unknown one) and `codex debug models` lists the catalogue as JSON. This argv was run against a stub Responses endpoint (scratch CODEX_HOME): gpt-5.5 was offered request_user_input and apply_patch only; gpt-6-astra code-mode exec/wait, request_user_input, clock.sleep and the collaboration (sub-agent) namespace, with 2 concurrency slots. No request reached OpenAI, so the stdout shape (`raw`: the final message) is from the stub and its documented interface.',
+    note: 'Runs with no shell tool, a read-only sandbox and no approvals, no web search, without your ~/.codex/config.toml (its MCP servers included) and with no session on disk, in an empty keysmith-owned workspace. On gpt-6-* models codex keeps its sub-agent tools whatever the switches: one request can run a second agent (same tools, same quota), capped at one by `agents.max_threads=1`. A Homebrew codex and an npm one can both be installed, and PATH decides which one runs: pin it, e.g. `keysmith add codex --bin /opt/homebrew/bin/codex`.',
+  },
+  kiro: {
+    kind: 'cli',
+    bin: 'kiro-cli',
+    // `--no-interactive` is headless; `--trust-tools=` trusts no tool; `--agent keysmith-text`
+    // is the tool-less agent below. `--` ends the options, so no prompt is read as a flag.
+    args: ['chat', '--no-interactive', '--trust-tools=', '--agent', KIRO_TEXT_AGENT_NAME, '--output-format', 'stream-json', ['--model', '{model}'], '--', '{prompt}'],
+    // Kiro keeps every run on disk per directory (`--resume-id <id>` exists), but resuming
+    // was not checked live, so each request is a fresh run and the client sends the history.
+    persistSessions: false,
+    parser: 'kiro-stream-json',
+    modelsFrom: { args: ['chat', '--list-models', '--format', 'json'] },
+    cwd: '~/.local/share/keysmith/workspaces/kiro',
+    workspaceFiles: { [`.kiro/agents/${KIRO_TEXT_AGENT_NAME}.json`]: KIRO_TEXT_AGENT },
+    stopAtToolCall: true,
+    timeoutMs: 300_000,
+    maxConcurrent: 2,
+    provenance: 'Kiro CLI 2.27.1 — `kiro-cli chat --no-interactive --output-format stream-json` prints `{type,data}` JSON lines; runStarted, metadata (sessionId) and runError were read off a live run, which the account\'s overage limit refused before any text. sessionUpdate (ACP agent_message_chunk) and runFinished (finalText) come from the binary and the ACP schema. `--list-models --format json` lists model_id / description / context_window_tokens; `agent validate` accepts the agent file.',
+    note: 'Uses your Kiro login and its credits. Runs the tool-less `keysmith-text` agent (`tools: []`, no MCP, no steering resources) with `--trust-tools=` trusting nothing, in an empty keysmith-owned workspace. The text events were not seen live yet (the run hit the overage limit): check the first real answer with `keysmith chat kiro/<model> "say hi"`. Not on the LaunchAgent PATH by default: `keysmith add kiro --bin ~/.local/bin/kiro-cli`.',
+  },
+  warp: {
+    kind: 'cli',
+    bin: WARP_OZ_BIN,
+    args: ['agent', 'run', '--output-format', 'ndjson', '--no-snapshot', ['--model', '{model}'], '--prompt', '{prompt}'],
+    persistSessions: false,
+    parser: 'warp-ndjson',
+    modelsFrom: { args: ['model', 'list', '--output-format', 'json'] },
+    cwd: '~/.local/share/keysmith/workspaces/warp',
+    // Warp's agent keeps its tools: run_command, edit_files, read_files. `oz agent run` takes
+    // an agent profile by id, profiles are made in the Warp app only, the default one lets
+    // the agent run commands and edit files, and no permission setting denies all three.
+    // So this adapter is marked, ships disabled, never joins an alias, and is stopped at
+    // the first tool call it reports — before or after any text.
+    unsafeTools: true,
+    disabled: true,
+    stopAtToolCall: 'always',
+    timeoutMs: 300_000,
+    maxConcurrent: 1,
+    provenance: 'Warp Oz CLI v0.2026.10.07 (`oz` in Warp.app) — `oz agent run --output-format ndjson --prompt …` printed system run_started (run_url) / conversation_started / agent {text} lines and no usage, live; an unknown model is an exit 1 with the reason on stderr. `oz model list --output-format json` lists ids. Message types tool_call, tool_result, agent_reasoning are from the binary.',
+    note: 'Not tool-less: Warp\'s agent can run commands, read and edit files, and nothing `oz` takes on its command line turns that off (profiles come from the Warp app, and their permission values only ask or allow). keysmith marks it `unsafeTools`: added disabled, never an alias leg, never probed, and the run is stopped at the first tool call it reports — which can come after the command already started. Every run is also recorded in your Warp account (run_url at oz.warp.dev). Enable it only if you accept that: `keysmith set warp disabled false --allow-unsafe-tools`.',
   },
   gemini: {
     kind: 'cli',
@@ -152,10 +338,17 @@ export const CLI_PROFILES = {
     args: ['-p', '{prompt}', ['--model', '{model}']],
     parser: 'raw',
     modelsFrom: null,
+    cwd: '~/.local/share/keysmith/workspaces/gemini',
+    // Never run from here, and nothing in this argv takes its tools away: print mode keeps at
+    // least the read-only ones (its documentation, not checked). Until a tool-less argv is
+    // verified against a real install it is treated like a CLI that keeps its tools. The raw
+    // parser sees no tool calls, so `stopAtToolCall` cannot stop one.
+    unsafeTools: true,
+    disabled: true,
     timeoutMs: 300_000,
     maxConcurrent: 2,
     provenance: 'Gemini CLI one-shot print mode — argv shape from its documented interface, not run against a live install',
-    note: 'Nothing but the answer reaches stdout in print mode, so `raw` is the right parser and there are no token counts. Declare `models` or rely on the CLI default.',
+    note: 'Not verified tool-less: keysmith has never run this CLI, and nothing in its argv removes the tools Gemini CLI keeps in print mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed. Nothing but the answer reaches stdout in print mode, so `raw` is the parser, there are no token counts and no tool call is seen. Enable it only if you accept that: `keysmith set gemini disabled false --allow-unsafe-tools`.',
   },
 };
 

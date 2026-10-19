@@ -25,8 +25,18 @@ Two kinds:
 | `models` | — | explicit catalogue: `["gpt-4.1","gpt-4o"]`, or `{"gpt-4o": {"contextWindow": 128000}}`. Also what an alias leg is checked against at startup — declare the subset you can actually run and a typo in a chain becomes a warning instead of a silent re-route. |
 | `defaultModel` | — | used when the request has no model part (`"cmd"` alone) |
 | `modelMap` | — | `{ "<requested>": "<upstream>" }` rewrite, HTTP only |
+| `explicitOnly` | `false` | answers only a request that names it: never an alias leg (refused by `keysmith alias`, skipped and reported when hand-edited in), never probed by `doctor --probe-models`. The `claude` profile ships it; `keysmith add <profile> --explicit-only` sets it on any other, a re-add keeps it, `keysmith set <id> explicitOnly false` drops it |
 | `note` | — | shown in listings; the place to write down what you learned |
 | `headers` | `{}` | extra request headers, HTTP only |
+
+Every field of an attached adapter can be changed with
+`keysmith set <adapter> <field> <value>` (JSON when it parses, a string otherwise; `--unset`
+removes it), so a live config is never opened by hand. The changed entry is built the way the
+gateway builds it before it is saved: a value that would keep the adapter from loading is
+refused with the gateway's own error (`--force` saves it anyway). Credentials are not resolved
+for that check. Adapter and alias names are looked up as the config's own entries, so
+`constructor` or `toString` is no adapter. The running gateway keeps the config it started
+with: `add`, `remove`, `set`, `alias` and `key` say so while one runs, with the restart command.
 
 ### Alias legs are checked against these fields, not against traffic
 
@@ -50,13 +60,15 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `args` | `["{prompt}"]` | argv template, see below |
 | `resumeArgs` | — | template used when a session id exists |
 | `persistSessions` | `false` | the CLI keeps its own threads, so `{noSession}` renders empty and `resumeArgs` becomes reachable |
-| `parser` | `raw` | one of `cmd-ndjson`, `opencode-ndjson`, `claude-stream-json`, `agy-stream-json`, `raw` |
-| `modelsFrom` | — | `{ "args": ["--list-models"], "drop": ["preview"] }` — run the binary, read stdout |
+| `noSessionFlag` | `--no-session` | what `{noSession}` renders as when the run is not resumed. Claude Code and Qoder refuse `--no-session` and take `--no-session-persistence`; their profiles say so |
+| `parser` | `raw` | one of `cmd-ndjson`, `opencode-ndjson`, `claude-stream-json`, `agy-stream-json`, `kiro-stream-json`, `warp-ndjson`, `raw` |
+| `modelsFrom` | — | `{ "args": ["--list-models"], "drop": ["preview"] }` — run the binary, read stdout: one model per line, or JSON (an array, or one under `models`/`data`; the id is `model_id`, `id`, `slug`, `model` or `name`; `visibility: "hide"` entries are left out) |
 | `promptVia` | `arg` | `"stdin"` pipes the prompt instead, for CLIs that choke on long argv |
-| `cwd` | process cwd | some agents read project context from here; a configured one is created (0700) on first spawn |
+| `cwd` | process cwd | the agent's workspace: an empty directory keysmith owns (`~/.local/share/keysmith/workspaces/<name>`), created 0700 on first spawn. Every built-in CLI profile sets one, and so does `keysmith add custom`; without it the agent runs in the gateway's own working directory (under launchd, keysmith's source tree). The child's `PWD` is set to it as well: spawn() would leave the gateway's, and opencode takes `PWD` as its project directory |
 | `workspaceFiles` | — | `{ "relative/path": "content" }` — files keysmith keeps inside a configured `cwd` (0600), put back before a spawn whenever they drift. Needs `cwd`; a path that leaves it is refused at load. See [agy as a plain text model](#agy-as-a-plain-text-model) |
 | `toolDenialRetry` | — | an instruction; when a run ends in a refused tool call and no text, the request runs once more with this text in front of the prompt, inside the same `timeoutMs` |
-| `stopAtToolCall` | `false` | for a CLI run as a text model: once the answer has text, the first tool call ends the run — the process is stopped and anything it says after that call is not part of the reply. A tool call before any text is left alone |
+| `stopAtToolCall` | `false` | for a CLI run as a text model: once the answer has text, the first tool call ends the run — the process is stopped and anything it says after that call is not part of the reply. A tool call before any text is left alone. `"always"` stops a call before any text too, and fails that request: for a CLI that kept its tools, a call is never the way to an answer |
+| `unsafeTools` | `false` | keysmith could not take this CLI's tools away: it can run commands and edit files. Implies `explicitOnly`; `keysmith set` refuses to serve it (`disabled false`), to take the mark off, or to change anything that shapes what it runs or how it is stopped (`stopAtToolCall`, `args`, `resumeArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`, …) without `--allow-unsafe-tools`; the gateway logs it at load when it is enabled. An `args`/`resumeArgs` with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`, `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`, …) is a load error unless the entry has this mark. See [Warp](#warps-oz-an-agent-that-keeps-its-tools) and [Command Code](#command-code-an-agent-that-approves-its-own-tools) |
 | `env` | `{}` | merged over the scrubbed parent env |
 | `maxConcurrent` | `1` | semaphore; each call is a real process |
 | `stripSystemPrompt` | `false` | drop system turns instead of inlining them |
@@ -125,10 +137,12 @@ yield `done` (a stream with no terminator is a client that hangs forever).
 
 | Parser | Shape | Verified against |
 |---|---|---|
-| `cmd-ndjson` | `{"type":"event","event":{"type":"text_delta",…}}` then one `{"type":"result",…}` | Command Code 1.66.0 |
-| `opencode-ndjson` | `text` parts re-send the **whole** block; the parser forwards only the new tail | opencode 1.18.27 |
+| `cmd-ndjson` | `{"type":"event","event":{"type":"text_delta",…}}` then one `{"type":"result",…}`; `tool_queued`/`tool_running` are one `tool` event per call | Command Code 1.66.0 (live); the tool events from the 1.81.0 bundle |
+| `opencode-ndjson` | `text` parts re-send the **whole** block; the parser forwards only the new tail; `tool_use` is one `tool` event per `callID`; an `error` line's reason is `error.data.message` (with its `statusCode`) | opencode 1.18.27 |
 | `claude-stream-json` | `assistant` message objects, then `result` with usage/session/`is_error` | Claude Code 2.1.261 |
 | `agy-stream-json` | `step_update` text deltas on `agent_response` steps, then `result`; usage summed per step (the `result` total re-counts a resumed thread), an auto-denied tool call with no answer is an error with code `tool_denied`, each `tool` step is reported once as a `tool` event, and a run stopped before its `result` line still reports what its steps spent | Antigravity CLI 1.3.3 |
+| `kiro-stream-json` | `{type,data}` lines: `metadata` carries the sessionId, `sessionUpdate` wraps the ACP update (`agent_message_chunk` text, `agent_thought_chunk` reasoning, `tool_call` reported once), `runFinished.finalText` answers when no chunk did, `runError.message` is an error | Kiro CLI 2.27.1 — runStarted/metadata/runError live; the text events from the binary and the ACP schema |
+| `warp-ndjson` | `agent` lines are the text, `agent_reasoning` reasoning, `tool_call` a `tool` event, `system`/`conversation_started` the session; no usage, no closing line | Oz CLI v0.2026.10.07 (a live run) |
 | `raw` | stdout *is* the answer; no usage, no session | any `-p`-style CLI |
 
 Usage is normalised across spellings (`inputTokens` / `input_tokens` / `prompt_tokens`,
@@ -189,6 +203,136 @@ Two things to know:
   and set `stopAtToolCall` to `false`. You get the harness prompt, the MCP start-up and the
   headless refusals back with it.
 
+Gemini 4 Argon through agy: the effort is part of the model id
+(`gemini-4-argon-low|medium|high`), and `high` is its maximum — agy refuses
+`--effort max`/`xhigh` for it. The API route and its `reasoning_effort` are in the README,
+under "Gemini 4 Argon at its highest effort".
+
+### Kiro as a plain text model
+
+`kiro-cli chat` is Kiro's coding agent. The `kiro` profile runs it the way `agy` runs:
+
+- `--no-interactive` (headless) and `--output-format stream-json`;
+- `--agent keysmith-text`, an agent file `workspaceFiles` writes to
+  `.kiro/agents/keysmith-text.json` in the adapter's `cwd`, where Kiro finds workspace agents
+  (`kiro-cli agent list` shows it as "Workspace", `kiro-cli agent validate` accepts it):
+  `tools: []`, `allowedTools: []`, `mcpServers: {}` with `includeMcpJson: false`,
+  `resources: []` (no steering files — yours in `~/.kiro/steering` would otherwise be part of
+  the prompt) and `hooks: {}`. Kiro answers an agent name it cannot set with a warning and its
+  default agent, so the file is put back whenever it drifts;
+- `--trust-tools=`: an empty trust list, so any tool left would be refused, never run —
+  `-a/--trust-all-tools` is the flag that must never be there;
+- `--` before the prompt, and `stopAtToolCall` in case a call shows up after the answer.
+
+Models come from `kiro-cli chat --list-models --format json` (`model_id`, `description`,
+`context_window_tokens`), `auto` included. Every request is a fresh run (`--resume-id`
+exists but resuming was not checked live), billed in Kiro credits.
+
+What was seen live, on 2026-10-19 with kiro-cli 2.27.1: `runStarted`, three `metadata` lines
+(sessionId, context use, reasoning support) and a `runError` — the account had reached its
+overage limit, which the client receives as `kiro: … You have reached the limit for
+overages.` The text events (`sessionUpdate` with an ACP `agent_message_chunk`, and
+`runFinished.finalText`) are named in the binary but were not seen, so the parser reads the
+answer from either. Check the first real answer before putting `kiro` in an alias. Kiro is
+in `~/.local/bin`, which the LaunchAgent's PATH does not include: `keysmith add kiro --bin
+~/.local/bin/kiro-cli`.
+
+### Warp's oz: an agent that keeps its tools
+
+`oz agent run --output-format ndjson --prompt …` (the `oz` inside Warp.app;
+`/usr/local/bin/warp-cli` is Cloudflare WARP, a VPN client) answered a one-line prompt with
+three lines — `system`/`run_started` (with a `run_url` on oz.warp.dev), `system`/
+`conversation_started`, `agent` `{text}` — and no usage. `--no-snapshot` keeps it from
+uploading a snapshot of the workspace at the end; models come from
+`oz model list --output-format json`.
+
+It cannot be made tool-less from here. `oz agent run` takes an agent profile by id
+(`--profile`), but profiles are created in the Warp app, the default one lets the agent read
+and write files and run commands, and a profile's permission values (`agent_decides`,
+`always_ask`, `always_allow`) only ask or allow. So the profile is marked `unsafeTools`:
+it ships `disabled: true`, is never an alias leg, is never probed, and `stopAtToolCall:
+"always"` stops a run at its first `tool_call` line — before any text, that fails the
+request. A command can already be running by then. Serve it only if you accept that:
+`keysmith set warp disabled false --allow-unsafe-tools`.
+
+### Command Code: an agent that approves its own tools
+
+`cmd -p` keeps its tools and approves them itself. In Command Code 1.81.0's bundle a headless
+run answers every tool confirmation with "allow" (`headlessInteraction({autoAllow: true})`;
+only a call flagged as risky is denied), and `-p` withholds just the interactive tools —
+ask_user_question, enter/exit plan mode, plan_review, todo_write, the cron tools, taste.
+Shell, read, write and edit stay. `--max-turns 1` caps the turns that follow a call, not the
+call, and nothing on its command line removes the tools (`--tools-all` / `--tools-enable` only
+add). So the `cmd` profile is `unsafeTools`: it ships disabled, runs in its own workspace, and
+`stopAtToolCall: "always"` stops a run at its first `tool_queued` event — emitted before the
+permission check and `tool_running`, so usually before the call runs, but not guaranteed. A
+`cmd` entry attached before this change has no mark and keeps serving until it is re-added or
+`keysmith set cmd disabled true`.
+
+### opencode as a plain text model
+
+opencode's default `build` agent starts from `"*": "allow"` — bash, edit, write, read, glob,
+grep, task, webfetch, todowrite and skill run without asking — and `--auto` only approves the
+few rules left at "ask". The `opencode` profile drops `--auto` and takes the tools away twice,
+with two files `workspaceFiles` keeps in its workspace:
+
+- `.opencode/agent/keysmith-text.md`, a workspace agent with `permission: {"*": deny}` and
+  `tools: {"*": false}`, selected by `--agent keysmith-text`;
+- `opencode.json`, the project config: `permission: {"*": "deny"}`, `tools: {"*": false}`, no
+  MCP servers, no plugins — for every agent, because opencode answers an `--agent` it cannot
+  find with a warning and its default agent.
+
+`--pure` loads no external plugin and `--` ends the options. Checked with opencode 1.18.27
+against a stub OpenAI endpoint: the default agent was offered 10 tools, this one none (`tools:
+[]`); a bash call the stub returned anyway failed as "unavailable tool" and created nothing;
+an unknown agent name fell back to the default agent, which the project config left with no
+tools either. `stopAtToolCall` ends the run at a tool call that comes after the answer.
+
+opencode's free models (`opencode/*`, e.g. `opencode/big-pickle`) refused this run with
+`403 OpenCode's free tier can only be used from within OpenCode` — and the default agent under
+the deny-all config too; the same model answered only the default agent with its tools, which
+keysmith does not run. A provider you configured in opencode with your own key is not subject
+to that check (not run live from here).
+
+### Claude Code, Qoder and Codex without tools
+
+- `claude`: `--tools ""` (no built-in tool), `--strict-mcp-config` with no `--mcp-config`
+  (no MCP server), `--permission-prompts none` (anything that would still ask is denied),
+  `--disable-slash-commands`, `--safe-mode` (no CLAUDE.md, plugins, hooks or custom agents;
+  auth and model selection stay), `--max-turns 1`. `{noSession}` is
+  `--no-session-persistence`: 2.1.261 refuses `--no-session` as an unknown option. All of it
+  parsed by 2.1.261 with an empty prompt, which it rejects before sending anything; no
+  request went through it. It spends your Claude subscription, so the profile ships
+  `explicitOnly: true`: no alias, no probe, and a re-add keeps it.
+- `qoder`: `--tools ""` and `--strict-mcp-config`; `{noSession}` is
+  `--no-session-persistence` (1.1.59 refuses `--no-session` too).
+- `codex`: `--disable shell_tool` takes the shell away (`--disable unified_exec` is passed
+  too, but 0.163 ignores it — `codex features list` still says true — and shell_tool is what
+  removes exec), `--sandbox read-only` and `approval_policy="never"` cover anything left,
+  `-c web_search="disabled"` removes the server-side web_search tool, `--disable goals` the
+  goal tools, `--ignore-user-config` drops `~/.codex/config.toml` and the MCP servers it
+  declares, `--ignore-rules`, and the `multi_agent`, `apps`, `plugins`, `browser_use`,
+  `computer_use`, `image_generation`, `view_image` and `hooks` features are off;
+  `--ephemeral` writes no session. Codex rejects an unknown feature name, so a renamed one
+  fails loudly. What is left, read off a stub Responses endpoint with this argv on 0.163.0
+  (scratch `CODEX_HOME`, `-c model_provider=…` pointing at the stub):
+  - gpt-5.5: `request_user_input` (nobody answers it in exec) and `apply_patch`, which the
+    read-only sandbox refuses ("writing is blocked by read-only sandbox");
+  - gpt-6-*: code mode's `exec`/`wait` (JavaScript that can call only the listed tools — no
+    shell), `request_user_input`, `clock.sleep`, and a `collaboration` namespace
+    (`spawn_agent`, `send_message`, `wait_agent`, …) that `--disable multi_agent` and
+    `multi_agent_v2` both leave in place. Sub-agents get the same tools; `-c
+    agents.max_threads=1`, the lowest codex accepts, caps them at one besides the root (the
+    prompt says 2 concurrency slots instead of 4). One request can still spend two agents'
+    worth of quota.
+
+  Models come from `codex debug models`. An npm codex and a Homebrew one can both be on PATH
+  (the LaunchAgent's PATH finds the fnm/npm one first); pin the one you mean with `--bin`,
+  e.g. `keysmith add codex --bin /opt/homebrew/bin/codex`.
+
+`--tools` takes several values in both Claude Code and Qoder, so the profiles never put it
+right before the prompt — it would take the prompt as a tool name.
+
 ## HTTP fields
 
 | Field | Default | Meaning |
@@ -199,6 +343,7 @@ Two things to know:
 | `rawChat` behaviour | automatic | when a request carries `tools`, keysmith forwards the body verbatim to the first HTTP candidate and streams its answer unchanged, so real `tool_calls` survive. When every candidate refuses, the client gets the refusal with the provider's own status (and `retry-after`) — an earlier leg's 429/503 over a later leg's other refusal |
 | `thoughtSignatures` | `false` | Gemini 3 (the `google` profile): remember `tool_calls[].extra_content.google.thought_signature` as answers pass through the tool relay, and put it back on a replayed call that lost it — the same call: same gateway key, id, function name and (parsed) arguments, told apart by the conversation before it when that is not enough; a call with no function name gets nothing. `true`, or `{ "maxEntries": 4096, "maxBytes": 16777216, "maxAgeMs": 21600000 }`; in memory, one store per upstream URL shared by every adapter on it (the largest limits win), never logged |
 | `stripModelPrefix` | — | dropped from ids `/models` returns: `"models/"` for Google, whose listing says `models/gemini-3.8-flash` and whose requests take `gemini-3.8-flash` |
+| `modelParams` | — | request fields sent with one upstream model: `{ "gemini-4-argon": { "reasoning_effort": "high" } }`, `"*"` for every model of the adapter. Under the fields keysmith builds (model, messages, stream… always win). On a plain completion keysmith builds the body, so this is what decides; on the tool relay the client's body goes verbatim and a field it set itself wins. A client that chose its effort in any spelling — `reasoning_effort`, `reasoning`, or Google's `thinking_config` under `extra_body.google` or `google` — gets no effort field from here at all (Google refuses `reasoning_effort` beside a thinking budget). A value that is not an object of fields is a load error, and `keysmith set` refuses it |
 
 Upstream statuses: 401/403 stay auth errors, 429 and 503 keep their status (with
 `retry-after` when the provider sent one) on the plain-completion path too; anything else
@@ -256,8 +401,14 @@ Then work out the four facts that matter, in this order:
    the parser that fits; if it has none, use `raw` and accept that there are no token
    counts. Watch out for banners, spinners and ANSI codes going to stdout — they become
    the answer.
-3. **A turn cap.** An uncapped agent will call tools and edit files in `cwd`. Pass
-   `--max-turns 1` or its equivalent, or set `cwd` somewhere boring.
+3. **No tools.** An agent with tools will call them — behind a tunnel, for whoever holds a
+   key. Find the CLI's own switch for an empty tool list (`--tools ""`, an agent file with
+   `tools: []`, a deny-all permission config, a trust list with nothing in it), never pass an
+   auto-approve flag (keysmith refuses to load one without the `unsafeTools` mark), keep `cwd`
+   an empty directory keysmith owns (`keysmith add custom` sets one), and add a turn cap
+   (`--max-turns 1`). Then check what the model is offered, not what the flags promise: point
+   the CLI at a stub endpoint and read the request's `tools`. If the CLI has no such switch,
+   mark the adapter `unsafeTools` and keep it disabled.
 4. **What it costs.** Some harnesses inject a 10–20k-token system prompt and bill it.
    `keysmith usage --hours 1` after one call tells you the truth; put it in `note`.
 
