@@ -43,20 +43,25 @@ function google(req, res) {
       res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '38' });
       return res.end(JSON.stringify([{ error: { code: 429, message: 'You exceeded your current quota.', status: 'RESOURCE_EXHAUSTED' } }]));
     }
-    if (body.stream) {
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
-      res.write(`data: ${JSON.stringify({ id: 'g-1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: 'google answer' } }] })}\n\n`);
-      res.write(`data: ${JSON.stringify({ id: 'g-1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
-      return res.end('data: [DONE]\n\n');
-    }
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ id: 'g-1', object: 'chat.completion', model: body.model, choices: [{ index: 0, message: { role: 'assistant', content: 'google answer' }, finish_reason: 'stop' }] }));
+    // `slow`: an upstream that takes longer than the stream hold to send its headers.
+    if (body.model === 'slow') return setTimeout(() => answer(body, res), 900);
+    answer(body, res);
   });
+}
+function answer(body, res) {
+  if (body.stream) {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({ id: 'g-1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: 'google answer' } }] })}\n\n`);
+    res.write(`data: ${JSON.stringify({ id: 'g-1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+    return res.end('data: [DONE]\n\n');
+  }
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ id: 'g-1', object: 'chat.completion', model: body.model, choices: [{ index: 0, message: { role: 'assistant', content: 'google answer' }, finish_reason: 'stop' }] }));
 }
 
 /* ------------------------------------------------------------------------ gateway */
 
-let dir, upstream, server, base, gateway, usageLog;
+let dir, upstream, server, base, gateway, usageLog, holding, holdBase;
 const log = [];
 
 /** The agy profile around the stub, with a toolMode (or none). */
@@ -112,6 +117,7 @@ before(async () => {
       mixed: ['google/quota', 'plain/m'],
       offonly: ['plain/m'],
       thinks: ['thinker/m', 'google/gemini-4-argon'],
+      emuthenoff: ['emu/m', 'plain/m'],
     },
   };
   gateway = new Gateway(cfg, { log: (m) => log.push(m) });
@@ -119,9 +125,14 @@ before(async () => {
   server = createServer(gateway, cfg, { usage: usageLog, log: (m) => log.push(m) });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   base = `http://127.0.0.1:${server.address().port}`;
+  // The same gateway behind the default hold (10 s): every stub run here ends well inside it.
+  holding = createServer(gateway, { ...cfg, limits: { ...cfg.limits, streamHoldMs: 10_000 } }, { usage: usageLog, log: (m) => log.push(m) });
+  await new Promise((r) => holding.listen(0, '127.0.0.1', r));
+  holdBase = `http://127.0.0.1:${holding.address().port}`;
 });
 
 after(async () => {
+  await new Promise((r) => holding.close(r));
   await new Promise((r) => server.close(r));
   await new Promise((r) => upstream.close(r));
   fs.rmSync(dir, { recursive: true, force: true });
@@ -130,10 +141,12 @@ after(async () => {
 const TOOLS = [{ type: 'function', function: { name: 'get_weather', description: 'Weather', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } } }];
 const A_TOOLS = [{ name: 'get_weather', description: 'Weather', input_schema: TOOLS[0].function.parameters }];
 
-async function post(route, body, key = KEY) {
-  const res = await fetch(base + route, { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+async function post(route, body, key = KEY, at = base) {
+  const res = await fetch(at + route, { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
   return { status: res.status, headers: res.headers, text: await res.text() };
 }
+/** The same request to the server that holds a stream's headers for 10 s. */
+const postHeld = (route, body) => post(route, body, KEY, holdBase);
 const chat = (model, content, extra = {}, key = KEY) => post('/v1/chat/completions', { model, messages: [{ role: 'user', content }], tools: TOOLS, ...extra }, key);
 const json = (r) => JSON.parse(r.text);
 const lastRow = () => usageLog.tail(1)[0];
@@ -237,6 +250,92 @@ test('argon, streamed: agy gives up after the stream opened, and Google\'s SSE c
   );
   assert.ok(!r.text.includes('could not be used'), r.text);
   assert.deepEqual([lastRow().status, lastRow().toolMode], ['ok', 'passthrough']);
+});
+
+/* ------------------------- a refusal inside the hold, what failed legs spent, the mode header */
+
+test('streamed, a refusal inside limits.streamHoldMs keeps its status: EMULATE asking again does not open the stream', async () => {
+  const body = { model: 'emu/m', stream: true, messages: [{ role: 'user', content: 'SCENARIO=prose-always' }], tools: TOOLS };
+  const t0 = Date.now();
+  let r = await postHeld('/v1/chat/completions', body);
+  assert.equal(r.status, 502, r.text);
+  assert.equal(json(r).error.type, 'tool_emulation_error', 'an HTTP 502, as the same request non-streamed: an SDK retries it like any 5xx');
+  assert.ok(Date.now() - t0 < 8_000, 'answered when the leg gave up, not when the hold ran out');
+  r = await postHeld('/v1/messages', { model: 'emu/m', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'SCENARIO=prose-always' }], tools: A_TOOLS });
+  assert.equal(r.status, 502, r.text);
+  assert.equal(json(r).error.type, 'tool_emulation_error');
+  // Asked again and right the second time: the 200 it always was, and the retry is counted.
+  r = await postHeld('/v1/chat/completions', { ...body, messages: [{ role: 'user', content: 'SCENARIO=prose-then-ok' }] });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(streamedCalls(r.text)[0].function.name, 'get_weather');
+  assert.deepEqual([lastRow().status, lastRow().toolMode, lastRow().retries], ['ok', 'emulate', 1]);
+});
+
+test('what failed EMULATE runs spent reaches the usage row: the error\'s row, and the row of the leg the route fell over to', async () => {
+  const both = { input: 2100, output: 50, cacheRead: 0, cacheWrite: 0 };
+  // One leg, refused twice: the error's row carries both runs, streamed (inside the hold) or not.
+  for (const stream of [false, true]) {
+    const r = await postHeld('/v1/chat/completions', { model: 'emu/m', stream, messages: [{ role: 'user', content: 'SCENARIO=prose-always' }], tools: TOOLS });
+    assert.equal(r.status, 502, r.text);
+    const row = lastRow();
+    assert.deepEqual([row.status, row.toolMode, row.retries, row.failedLegs], ['error', 'emulate', 1, undefined], JSON.stringify(row));
+    assert.deepEqual(row.usage, both);
+  }
+  // The stream opened first (a 400 ms hold, runs of 400 ms): an error frame, and the same row.
+  let r = await chat('emu/m', 'SCENARIO=slow-prose-always', { stream: true });
+  assert.equal(r.status, 200);
+  assert.match(r.text, /"type":"tool_emulation_error"/);
+  assert.deepEqual([lastRow().status, lastRow().toolMode, lastRow().retries, lastRow().usage], ['error', 'emulate', 1, both]);
+
+  // Refused twice, then the CLI without a toolMode answers in text: its row counts all three runs,
+  // and names the leg that failed and what it spent.
+  r = await chat('emuthenoff', 'SCENARIO=prose-always');
+  assert.equal(r.status, 200, r.text);
+  let row = lastRow();
+  assert.equal(row.toolMode, undefined, 'no tool engine answered');
+  assert.equal(row.retries, 1);
+  assert.deepEqual(row.usage, { input: 3100, output: 70, cacheRead: 0, cacheWrite: 0 });
+  assert.deepEqual(row.failedLegs, [{ target: 'emu/m', toolMode: 'emulate', status: 502, retries: 1, usage: both }]);
+  assert.equal(json(r).usage.prompt_tokens, 1000, 'the client\'s usage is the answer\'s own');
+
+  // Refused twice, then Google answers verbatim: the relay's row carries what agy spent.
+  r = await chat('argon', 'SCENARIO=prose-always');
+  assert.equal(r.status, 200, r.text);
+  row = lastRow();
+  assert.deepEqual([row.toolMode, row.via, row.retries, row.usage], ['passthrough', 'passthrough', 1, both]);
+  assert.deepEqual(row.failedLegs, [{ target: 'agy/gemini-4-argon-high', toolMode: 'emulate', status: 502, fallback: 'no_bridge', retries: 1, usage: both }]);
+
+  // Every leg refused: the error's row has the leg that failed before the last one too.
+  r = await chat('emuthenoff', 'SCENARIO=exit-1');
+  assert.equal(r.status, 502, r.text);
+  row = lastRow();
+  assert.equal(row.status, 'error');
+  assert.deepEqual(row.failedLegs, [{ target: 'emu/m', toolMode: 'emulate', status: 502 }], 'exit-1 spends nothing it reports, and is not asked again');
+});
+
+test('on a stream, x-keysmith-mode names the engine running when the headers went out: none for the plain completion after the tool walk', async () => {
+  // Google refuses (429) and the CLI without a toolMode answers in text: nothing passed through.
+  let r = await postHeld('/v1/chat/completions', { model: 'mixed', stream: true, messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: TOOLS });
+  assert.equal(r.status, 200, r.text);
+  assert.match(r.text, /plain answer/);
+  assert.equal(r.headers.get('x-keysmith-mode'), null, r.text);
+  assert.equal(lastRow().toolMode, undefined);
+  // EMULATE refused twice inside the hold, and the off leg answers: EMULATE did not answer.
+  r = await postHeld('/v1/chat/completions', { model: 'emuthenoff', stream: true, messages: [{ role: 'user', content: 'SCENARIO=prose-always' }], tools: TOOLS });
+  assert.equal(r.status, 200, r.text);
+  assert.match(r.text, /I would call get_weather now\./);
+  assert.equal(r.headers.get('x-keysmith-mode'), null);
+  assert.deepEqual([lastRow().toolMode, lastRow().failedLegs?.[0]?.toolMode], [undefined, 'emulate']);
+  // And an engine that answers still says so.
+  r = await postHeld('/v1/chat/completions', { model: 'emuthenoff', stream: true, messages: [{ role: 'user', content: 'SCENARIO=one-call' }], tools: TOOLS });
+  assert.equal(r.headers.get('x-keysmith-mode'), 'emulate');
+  // An upstream slower than the hold (400 ms here) to answer at all: the stream opens while it is
+  // being asked — passthrough is what runs — and its SSE carries on in it.
+  r = await chat('google/slow', 'hi', { stream: true });
+  assert.equal(r.status, 200, r.text);
+  assert.match(r.text, /^: stream open\n\n/);
+  assert.equal(r.headers.get('x-keysmith-mode'), 'passthrough');
+  assert.ok(frames(r.text).filter((d) => d !== '[DONE]').every((d) => d.id === 'g-1'), r.text);
 });
 
 test('a route whose every leg refused the tools answers with the refusal, and the log claims no plain completion', async () => {
@@ -441,12 +540,14 @@ test('auto with a bridge: it answers when it can; one that cannot take the reque
 
 test('a bridge failure that must not be retried another way (the foreign-tool tripwire) is the answer: no EMULATE run', async () => {
   try {
-    gateway.toolEngines.mcp = stubBridge({ fail: 'foreign_tool', noFallback: true });
+    gateway.toolEngines.mcp = stubBridge({ fail: 'foreign_tool', noFallback: true, usage: { input: 7, output: 1 } });
     const before = runs().length;
     const r = await chat('agy/m', 'SCENARIO=one-call');
     assert.equal(r.status, 502, r.text);
     assert.match(json(r).error.message, /bridge: foreign_tool/);
     assert.equal(runs().length, before);
+    // The error's row says which engine failed, and what its run spent.
+    assert.deepEqual([lastRow().status, lastRow().toolMode, lastRow().usage], ['error', 'mcp', { input: 7, output: 1 }]);
   } finally {
     gateway.toolEngines.mcp = null;
   }
@@ -477,18 +578,18 @@ test('toolMode mcp: a 503 without a bridge or with a full one, a 400 for a call 
   assert.equal(runs().length, before);
 });
 
-test('a stream whose face already wrote a frame cannot be handed to an HTTP leg: the route ends in the error frame', async () => {
+test('a stream whose face already wrote a frame cannot be handed to an HTTP leg: the route ends in the error frame, and the upstream is never asked', async () => {
   // A CLI that thinks out loud (its reasoning goes out as it comes, the client asked for it),
   // then fails without a reply.
   const before = hits.length;
   const r = await chat('thinks', 'SCENARIO=one-call', { stream: true, include_reasoning: true });
   assert.equal(r.status, 200);
-  assert.equal(hits.length, before + 1, 'Google was asked…');
+  assert.equal(hits.length, before, 'Google was not asked: its answer could not have gone out, and a request on its free tier is one of ~20 a day');
   const data = frames(r.text);
   assert.equal(data.find((d) => d !== '[DONE]').choices[0].delta.role, 'assistant');
   assert.ok(data.some((d) => d?.choices?.[0]?.delta?.reasoning_content === 'thinking about it'), r.text);
   assert.match(r.text, /"error":\{"message":"keysmith: google: the stream was already open with another leg's frames in it/);
-  assert.ok(!r.text.includes('google answer'), '…and its answer was not spliced after keysmith\'s frames');
+  assert.ok(!r.text.includes('google answer'));
 });
 
 test('pickEngine and namesFit, the rules on their own', () => {
@@ -654,6 +755,32 @@ test('keysmith add: a re-add keeps toolMode off when the entry says so, like eve
     assert.equal(r.status, 0, r.all);
     assert.equal(read().adapters.agy.toolMode, 'off');
     assert.match(r.all, /kept toolMode off from the "agy" entry this replaces: a re-add never drops a guard \(keysmith set agy toolMode auto\)/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('unsafeTools wins over a profile\'s tool engine: a re-add keeps the mark and turns toolMode off, and so does marking an entry', () => {
+  const { run, read, write, home } = sandbox();
+  try {
+    assert.equal(run('add', 'agy', '--as', 'agyfull').status, 0);
+    // What a keysmith before toolMode wrote for an agy the user marked: the mark, no toolMode.
+    const old = read();
+    old.adapters.agyfull.unsafeTools = true;
+    delete old.adapters.agyfull.toolMode;
+    write(old);
+    let r = run('add', 'agy', '--as', 'agyfull');
+    assert.equal(r.status, 0, r.all);
+    assert.deepEqual([read().adapters.agyfull.unsafeTools, read().adapters.agyfull.toolMode], [true, 'off']);
+    assert.match(r.all, /kept unsafeTools, toolMode off \(next to unsafeTools\) from the "agyfull" entry this replaces: a re-add never drops a guard \(keysmith set agyfull unsafeTools false --allow-unsafe-tools; keysmith set agyfull toolMode auto\)/);
+    // Marking an entry whose profile answers tool requests.
+    assert.equal(run('add', 'agy', '--as', 'a2').status, 0);
+    assert.equal(read().adapters.a2.toolMode, 'auto');
+    r = run('set', 'a2', 'unsafeTools', 'true', '--allow-unsafe-tools');
+    assert.equal(r.status, 0, r.all);
+    assert.deepEqual([read().adapters.a2.unsafeTools, read().adapters.a2.toolMode], [true, 'off']);
+    assert.match(r.all, /a2\.toolMode auto → off: a CLI marked unsafeTools takes no tool request/);
+    assert.doesNotThrow(() => checkAdapter('a2', read().adapters.a2), 'and it loads');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

@@ -13,6 +13,7 @@ import {
 } from './protocols.js';
 import { AnthropicStream, KEEPALIVE_MS, OpenaiChatStream, anthropicMessage, faceCall, openaiCompletion } from './tools/faces.js';
 import { MAX_TOOLS, anthropicToolMessages, anthropicToolSpec, openaiLegacy, openaiToolCount, openaiToolMessages, openaiToolSpec } from './tools/model.js';
+import { addUsage } from './tools/emulate.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { upstreamError } from './http-adapter.js';
@@ -145,7 +146,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
       const message = redactSecrets(e.message || String(e));
       const meta = res._keysmith;
       if (meta && !meta.done) {
-        record(stamped, { model: meta.model, status: e?.scopeDenied ? 'denied' : 'error', ms: Date.now() - meta.t0, stream: meta.stream, error: message, client: req.headers['user-agent'], ...(meta.via ? { via: meta.via } : {}) });
+        // A tool engine that failed still spent its runs: the error says what, and which engine.
+        record(stamped, { model: meta.model, status: e?.scopeDenied ? 'denied' : 'error', ms: Date.now() - meta.t0, stream: meta.stream, error: message, client: req.headers['user-agent'], ...(meta.via ? { via: meta.via } : {}), ...errorMarks(e) });
       }
       if (res.headersSent) {
         // A stream that already started must be closed politely, in its face's own error frame
@@ -327,7 +329,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     // Written before the row: an answer the face cannot write is the error row, not an `ok` one.
     const payload = openaiCompletion({ id, model: requested, created, text, usage: u, reasoning: body.include_reasoning ? reasoning || null : null, toolCalls: calls, legacy });
     meta.done = true;
-    record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback }) });
+    record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, ...failedMarks(out.failed, u), stream: false, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback }) });
     // The header carries the session for clients that read headers; the body carries it
     // for the ones that do not (curl, `keysmith chat`), and OpenAI SDKs ignore extras.
     if (sid) payload.keysmith = { session: sid, resumed: !!publicId };
@@ -389,7 +391,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   // engine reported after the answer began replaces that chunk with the error frame.
   face.finish({ usage: u, keysmith: sid ? { session: sid, resumed: !!publicId } : null, error: errMessage });
   meta.done = true;
-  record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback }) });
+  record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...failedMarks(out.failed, u), stream: true, error: errMessage, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback }) });
 }
 
 async function handleAnthropic(req, res, gateway, { usage, log, holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null }) {
@@ -415,7 +417,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, holdMs = STREAM_
     const { text, usage: u, session: sid, retries, cutAt, toolCalls, toolMode, fallback } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools });
     const calls = toolCalls.map((c) => faceCall(c, 'anthropic'));
     meta.done = true;
-    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback }) });
+    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, ...failedMarks(out.failed, u), stream: false, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback }) });
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
     // Session goes out as a header only: Anthropic clients schema-check the body.
     return json(res, 200, anthropicMessage({ id, model: body.model, text, usage: u, toolCalls: calls }), sid);
@@ -445,7 +447,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, holdMs = STREAM_
   }
   face.finish({ usage: u, error: errMessage });
   meta.done = true;
-  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback }) });
+  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...failedMarks(out.failed, u), stream: true, error: errMessage, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback }) });
   void log;
 }
 
@@ -544,9 +546,15 @@ async function handleEmbeddings(req, res, gateway, { usage, scope = null } = {})
  * A streamed request's headers may already be out when the walk gets here (held(): an earlier
  * leg, a CLI working on its answer, took longer than limits.streamHoldMs). As long as the client
  * has had SSE comments only, an upstream that answers in SSE carries on in that stream; once the
- * face wrote a frame of its own, this leg cannot answer, and the route moves on.
+ * face wrote a frame of its own, this leg cannot answer, and the route moves on — without asking
+ * the upstream, whose answer could not go out (a request spent for nothing, on a quota of ~20 a
+ * day for some models).
  */
 async function relayLeg({ adapter, model }, { body, req, res, out, usage, log, t0, caller = '', requested }) {
+  if (res.headersSent && (!out.face || out.face.wroteData)) throw cannotRelay(adapter.id, 'with another leg\'s frames in it');
+  // Running from here: a stream whose hold ends while the upstream is asked opens as passthrough,
+  // and its answer carries on in it. After a refusal the next leg names its own engine, and a
+  // plain completion none (gateway._toolRoute).
   out.mode = 'passthrough';
   const upstream = await adapter.rawChat({ ...body, model }, { caller });
   if (!upstream.ok) {
@@ -554,16 +562,20 @@ async function relayLeg({ adapter, model }, { body, req, res, out, usage, log, t
     throw upstreamError(adapter.id, upstream, t, { keepStatus: true });
   }
   if (res.headersSent) {
+    // The hold ended while the upstream was asked: its answer carries on in the open stream,
+    // when it is SSE (and the face, lazy, still wrote nothing but comments).
     const sse = /text\/event-stream/i.test(upstream.headers.get('content-type') || '');
     if (!sse || !out.face || out.face.wroteData) {
       await upstream.body?.cancel?.().catch(() => {});
-      throw new LlmError(`${adapter.id}: the stream was already open ${out.face?.wroteData ? 'with another leg\'s frames in it' : 'and the upstream answered without SSE'}, so its answer cannot be relayed`, { status: 502, provider: adapter.id });
+      throw cannotRelay(adapter.id, sse ? 'with another leg\'s frames in it' : 'and the upstream answered without SSE');
     }
     out.face.detach();
   } else {
     res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') || 'text/event-stream', 'x-keysmith-mode': 'passthrough' });
   }
-  const row = { model: requested, ms: 0, stream: !!body.stream, via: 'passthrough', client: req.headers['user-agent'], toolMode: 'passthrough' };
+  // This row is the request's only one: the retries of a tool leg that failed before it are counted here.
+  const retries = (out.failed || []).reduce((n, f) => n + (f.retries || 0), 0);
+  const row = { model: requested, ms: 0, stream: !!body.stream, via: 'passthrough', client: req.headers['user-agent'], toolMode: 'passthrough', ...failedMarks(out.failed, undefined), ...marks({ retries }) };
   try {
     for await (const chunk of upstream.body) res.write(chunk);
   } catch (e) {
@@ -578,7 +590,31 @@ async function relayLeg({ adapter, model }, { body, req, res, out, usage, log, t
   return true;
 }
 
+function cannotRelay(id, why) {
+  return new LlmError(`${id}: the stream was already open ${why}, so its answer cannot be relayed`, { status: 502, provider: id });
+}
+
 /* ---------------------------------------------------------------------- plumbing */
+
+/**
+ * A row's `usage` with what the tool legs that failed before the answer spent added to it
+ * (gateway._toolRoute's `state.failed`), and those legs named (`failedLegs`). Added, not merged:
+ * mergeUsage keeps the larger of two reports of one run, and these are other runs.
+ */
+function failedMarks(failed, usage) {
+  if (!failed?.length) return { usage };
+  return { usage: failed.reduce((u, f) => addUsage(u, f.usage), usage ?? null) ?? usage, failedLegs: failed.map((f) => ({ ...f })) };
+}
+
+/** What an error that ends a request says it spent (emulate.js, gateway._toolRoute), for its row. */
+function errorMarks(e) {
+  if (!e || typeof e !== 'object') return {};
+  return {
+    ...(e.usage ? { usage: e.usage } : {}),
+    ...marks({ retries: e.retries || 0, toolMode: e.toolMode || null, fallback: e.fallback || null }),
+    ...(e.failedLegs?.length ? { failedLegs: e.failedLegs } : {}),
+  };
+}
 
 function mergeUsage(a, b) {
   if (!b) return a;
@@ -661,27 +697,45 @@ function sseEvent(res, name, data) {
 }
 
 /**
- * A streamed answer's status line waits for its first event, for up to `holdMs`. A refusal
- * that comes before then — a 429, a 503, a 401: the upstream's answer to the request itself,
- * after failover had its turn — is thrown from here while the status can still say so, with
- * its retry-after. An answer slower than that (a CLI starting up, a model thinking) gets its
- * 200 and `: stream open` at `holdMs`, and a failure after that is an SSE error frame.
+ * Events that put nothing in front of the client: an engine asking its CLI again (`retry`), a
+ * run ended at a tool call (`cut`), which engine runs (`tool_mode`), a session id, a usage
+ * report. None of them is an answer, so none of them opens a held stream.
+ */
+const QUIET_EVENTS = new Set(['retry', 'cut', 'tool_mode', 'session', 'usage']);
+const HOLD_EXPIRED = Symbol('hold expired');
+
+/**
+ * A streamed answer's status line waits for the first event that is part of its answer — text,
+ * a call, reasoning, an error frame — for up to `holdMs`. A refusal that comes before then — a
+ * 429, a 503, a 401: the upstream's answer to the request itself, after failover had its turn; an
+ * EMULATE leg that could not use its CLI's reply twice — is thrown from here while the status can
+ * still say so, with its retry-after. An answer slower than that (a CLI starting up, a model
+ * thinking) gets its 200 and `: stream open` at `holdMs`, and a failure after that is an SSE
+ * error frame. Quiet events on the way (QUIET_EVENTS) are kept, and come first.
  *
- * Returns the events, the first one included; closing it early closes `events` too, so the
- * adapter's own cleanup (a process killed, a fetch aborted) runs as it did before.
+ * Returns the events, the ones it waited through included; closing it early closes `events`
+ * too, so the adapter's own cleanup (a process killed, a fetch aborted) runs as it did before.
  */
 async function held(events, holdMs) {
   const it = events[Symbol.asyncIterator]();
-  const first = it.next();
+  const kept = [];
+  let next = it.next();
   let timer;
+  const expired = new Promise((resolve) => (timer = setTimeout(resolve, holdMs, HOLD_EXPIRED)));
   try {
-    await Promise.race([first, new Promise((resolve) => (timer = setTimeout(resolve, holdMs)))]);
+    for (;;) {
+      const r = await Promise.race([next, expired]);
+      if (r === HOLD_EXPIRED || r.done || !QUIET_EVENTS.has(r.value?.type)) break;
+      kept.push(r.value);
+      next = it.next();
+    }
   } finally {
     clearTimeout(timer);
   }
   return (async function* () {
     try {
-      for (let r = await first; !r.done; r = await it.next()) yield r.value;
+      for (const evt of kept) yield evt;
+      for (let r = await next; !r.done; r = await it.next()) yield r.value;
     } finally {
       await it.return?.();
     }

@@ -226,10 +226,19 @@ leg is asked, on both faces.
 A streamed request holds its headers for `limits.streamHoldMs` (below). An EMULATE turn on
 Argon takes 9–44 s, so the stream usually opens before its answer is known; an HTTP leg that
 the route falls over to after that carries on in the open stream, as long as the client has
-had SSE comments only. `x-keysmith-mode` says `passthrough`, `emulate` or `mcp` — on a stream,
-the engine that was running when the headers went out. The usage row says which engine
-answered (`toolMode`), how many calls it handed over (`toolCalls`), `retries`, and why the
-engine is not the one `auto` picks first (`fallback`); never an argument or a result.
+had SSE comments only — once keysmith wrote a frame of its own (reasoning the client asked
+for), that leg is not asked at all, since its answer could not go out. A `tool_emulation_error`
+inside the hold is an HTTP 502, streamed or not; after the stream opened it is the stream's
+error frame (an error chunk and `[DONE]`; an `error` event on `/v1/messages`), which the
+`openai` SDK raises as an `APIError` with no status and does not retry on its own.
+`x-keysmith-mode` says `passthrough`, `emulate` or `mcp` — on a stream, the engine that was
+running when the headers went out, and none when the route fell back to a plain completion.
+The usage row says which engine answered (`toolMode`), how many calls it handed over
+(`toolCalls`), `retries`, and why the engine is not the one `auto` picks first (`fallback`);
+never an argument or a result. What a tool engine spent is in the row even when it failed: a
+502's row has its `usage`, `toolMode` and `retries`; when a tool leg failed and a later leg
+answered (or failed too), `usage` and `retries` count every leg, and `failedLegs` names each
+tool leg that failed before — target, engine, status, its own `retries` and `usage`.
 `GET /v1/keysmith/routes` lists each adapter's `tool_mode`, and the status page marks it.
 
 `keysmith set <adapter> toolMode auto` (or `emulate`) on an adapter attached before toolMode
@@ -242,9 +251,11 @@ An upstream's 429 and 503 keep their status on every path, with its `retry-after
 sent one, so a client backs off the way it would talking to the provider directly. When
 failover moved on from a 429/503 and the next leg refused for a reason of its own, the
 client gets the 429/503: that is why the route failed. A streamed request holds its headers
-until its first event, for up to `limits.streamHoldMs` (10 s), so a refusal in that time
-keeps its status too; one that comes later — a CLI or a model slower than that, an error in
-the middle of an answer — is an SSE error frame on a 200. Auth failures stay 401/403; other
+until the first event that is part of its answer (text, a call, reasoning, an error) — an
+engine asking its CLI again, or saying which engine runs, does not end the hold — for up to
+`limits.streamHoldMs` (10 s), so a refusal in that time keeps its status too; one that comes
+later — a CLI or a model slower than that, an error in the middle of an answer — is an SSE
+error frame on a 200. Auth failures stay 401/403; other
 upstream failures are a 502.
 
 ## Gemini with tools: the `google` profile
@@ -386,7 +397,9 @@ never handed a tool request. A config written by an older keysmith — the `open
 used to pass `--auto` — stops there; `keysmith add opencode --as <id>` copies the tool-less
 argv over it. A re-add never drops a guard: `explicitOnly`, `unsafeTools`, `disabled` and a
 `toolMode: "off"` on the entry it replaces are kept, and it says so — taking one off is a
-`keysmith set`.
+`keysmith set`. The mark brings `toolMode: "off"` with it: a re-add that keeps `unsafeTools`
+over a profile with a tool engine (agy's `auto`), and `keysmith set <id> unsafeTools true`,
+turn the engine off and say so.
 
 **Warp (`oz`) is the `unsafeTools` one.** `oz agent run` takes an agent profile by id;
 profiles are made in the Warp app, the default one lets the agent run commands and edit
@@ -467,7 +480,7 @@ An agent gets a key of its own instead, written to a file only it reads:
 |---|---|---|
 | `launchd-gateway.log` | launchd: `serve`'s stdout + stderr | start banner (address, adapters, the key redacted, tunnel URL); with `KEYSMITH_VERBOSE=1`, adapter failures, retries and skipped alias legs |
 | `keysmith.log` | `keysmith start`: the same stream | the same, for a gateway started without launchd |
-| `usage.jsonl` | the gateway, one line per request | time, model, status, duration, token counts, stream flag, user agent, error message, `retries`/`cutAt`; the key's fingerprint (`key: "fp:…"`) and its scope's decision (`scope`, `skipped`) |
+| `usage.jsonl` | the gateway, one line per request | time, model, status, duration, token counts, stream flag, user agent, error message, `retries`/`cutAt`; for a tool request `toolMode`, `toolCalls`, `fallback` and `failedLegs` (see [Tool calls](#tool-calls-thinking)); the key's fingerprint (`key: "fp:…"`) and its scope's decision (`scope`, `skipped`) |
 | `launchd-tunnel.log` | launchd: cloudflared | cloudflared's own output |
 
 keysmith does not log prompts, answers, request headers or request URLs, and a request

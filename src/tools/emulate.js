@@ -150,8 +150,12 @@ export function parseReply(text, spec) {
   if (!s) return bad('the reply is empty');
   let body = s;
   if (s.startsWith('```')) {
+    // The fence is the first line and the last (anchored: the body runs to the last fence), and
+    // JSON.parse says whether what is between is one object. A ``` inside it is no second fence
+    // when it sits in a JSON string (a final answer that holds a Markdown code block); a second
+    // fenced object, or text between two fences, is not JSON and fails there.
     const m = s.match(/^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n?```$/i);
-    if (!m || m[1].includes('```')) return bad('the reply is not one JSON object: a code fence with text around it, or more than one');
+    if (!m) return bad('the reply is not one JSON object: a code fence with text around it, or more than one');
     body = m[1].trim();
   }
   if (!body.startsWith('{')) return bad('the reply is not one JSON object: it starts with prose');
@@ -217,9 +221,24 @@ export function correction(reason) {
  *
  * Throws an LlmError before anything is yielded but reasoning, retry and cut: 400 for a prompt over
  * `maxPromptChars`, the CLI's own failure (502, or 504 for a run killed at `timeoutMs`), 499 for a
- * client that left, 502 `tool_emulation_error` for a second invalid reply.
+ * client that left, 502 `tool_emulation_error` for a second invalid reply. What the runs spent is
+ * spent all the same, so the error carries it: `usage` (every run added up, `carried` included)
+ * and `retries` (how many times the reply was asked for again), for the usage row that reports it.
  */
-export async function* emulate(adapter, { model, spec, messages, signal, carried = null, minRetryBudgetMs = MIN_RETRY_BUDGET_MS, newNonce: make = newNonce } = {}) {
+export async function* emulate(adapter, opts = {}) {
+  const spent = { usage: opts.carried ?? null, retries: 0 };
+  try {
+    yield* engine(adapter, opts, spent);
+  } catch (e) {
+    if (e && typeof e === 'object') {
+      if (spent.usage) e.usage = spent.usage;
+      if (spent.retries) e.retries = spent.retries;
+    }
+    throw e;
+  }
+}
+
+async function* engine(adapter, { model, spec, messages, signal, minRetryBudgetMs = MIN_RETRY_BUDGET_MS, newNonce: make = newNonce }, spent) {
   adapter.ready();
   const prompt = renderPrompt({ spec, messages, newNonce: make });
   if (prompt.length > adapter.maxPromptChars) {
@@ -232,9 +251,9 @@ export async function* emulate(adapter, { model, spec, messages, signal, carried
   try {
     // A second run spends the same budget as the first: one request never takes longer than timeoutMs.
     const deadline = Date.now() + adapter.timeoutMs;
-    let usage = carried;
     let reason = null;
     for (let attempt = 0; ; attempt++) {
+      spent.retries = attempt;
       const text = attempt === 0 ? prompt : `${correction(reason)}\n\n${prompt}`;
       const run = adapter.emulateRun({ text, model, timeoutMs: Math.max(1_000, deadline - Date.now()), signal });
       let reply = '';
@@ -262,7 +281,7 @@ export async function* emulate(adapter, { model, spec, messages, signal, carried
         // `session` and `done` mean nothing here: this path resumes no CLI session.
       }
       const outcome = await run.done;
-      usage = addUsage(usage, runUsage);
+      spent.usage = addUsage(spent.usage, runUsage);
       if (signal?.aborted) throw new LlmError(`adapter "${adapter.id}": client disconnected`, { status: 499, provider: adapter.id });
       if (outcome.killed && !cut) {
         throw new LlmError(`${adapter.id} was stopped before its reply was complete: ${truncate(outcome.stderr || 'killed', 300)}`, { status: 504, provider: adapter.id, retriable: true });
@@ -270,7 +289,7 @@ export async function* emulate(adapter, { model, spec, messages, signal, carried
       if (reply.trim()) {
         const parsed = parseReply(reply, spec);
         if (parsed.ok) {
-          yield* answer(parsed, usage);
+          yield* answer(parsed, spent.usage);
           return;
         }
         reason = parsed.reason;

@@ -206,8 +206,14 @@ LangChain's `ChatOpenAI(base_url="http://127.0.0.1:8787/v1", api_key="ks_…",
 model="agy/gemini-4-argon-high").bind_tools([...])` reads them the same way, streamed or not.
 An EMULATE turn on Argon takes tens of seconds; a streamed one sends keepalive comments until
 the calls are ready, so leave the client's read timeout at its default (600 s for the
-`openai` SDK) or above. A reply the model got wrong twice is an HTTP 502 whose error type is
-`tool_emulation_error` — retry it like any 5xx.
+`openai` SDK) or above. A reply the model got wrong twice is an error whose type is
+`tool_emulation_error`. Not streamed — or streamed, when it comes inside `limits.streamHoldMs`
+(10 s) — it is an HTTP 502: retry it like any 5xx. A streamed turn that takes longer has
+already opened its stream (`: stream open`, keepalives), so the error is the stream's last
+frame — `data: {"error":{…,"type":"tool_emulation_error"}}`, then `data: [DONE]` (an `error`
+event on `/v1/messages`). The `openai` SDK raises that in the middle of the iteration as an
+`APIError` with no `status_code`, and does not retry it: catch it around the loop and send the
+request again if you want the retry.
 
 ## curl
 

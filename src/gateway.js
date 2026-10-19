@@ -7,6 +7,7 @@ import { redactSecrets, registerSecrets } from './redact.js';
 import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { adapterReach, aliasDecision, requestDecision } from './keys.js';
 import { describeUnsupported, toolEvents, toolPath } from './tools/router.js';
+import { addUsage } from './tools/emulate.js';
 
 /**
  * The gateway: config in, one model catalogue + one streaming `complete()` out.
@@ -463,7 +464,8 @@ export class Gateway {
 
   /** A leg's failure as the LlmError the route keeps, logged; rethrown when it must end the route. */
   _legFailed({ adapter, model: upstreamModel }, e, state, signal, next) {
-    const err = e instanceof LlmError ? e : new LlmError(e.message, { status: 502, provider: adapter.id });
+    // Wrapped, a failure keeps what a tool engine marked it with: which engine, and what it spent.
+    const err = e instanceof LlmError ? e : Object.assign(new LlmError(e.message, { status: 502, provider: adapter.id }), engineMarks(e));
     if (signal?.aborted) throw err;
     if (state.emitted) {
       this.log(`${adapter.id}/${truncate(upstreamModel, 60)} failed after it had started answering, so no other leg is tried: ${truncate(e.message, 160)}`);
@@ -480,8 +482,24 @@ export class Gateway {
    * failing over while nothing went out. When none answered: a plain completion from the legs not
    * tried, for tool_choice auto or none; an error for one that asks for a call, or for tools no
    * CLI can honour. `tools`: `{ spec, messages (canonical), face, relay, state }`.
+   *
+   * `state.mode` names the engine running now, for a stream's headers: each leg sets its own as it
+   * starts, and the plain completion after the walk none, so its stream opens without one. `state.failed`
+   * lists the tool-engine legs that failed before the answer — target, engine, status, and what
+   * each spent (`usage`, `retries`) — for the row of the leg that answers; an error that ends the
+   * route carries the same (`failedLegs`, with their spend added to its `usage` and `retries`).
    */
   async *_toolRoute(requested, chain, args, run, tools) {
+    const failed = [];
+    if (tools.state) tools.state.failed = failed;
+    try {
+      yield* this._toolWalk(requested, chain, args, run, tools, failed);
+    } catch (e) {
+      throw withFailedLegs(e, failed);
+    }
+  }
+
+  async *_toolWalk(requested, chain, args, run, tools, failed) {
     const { spec, face, relay = null, state = null } = tools;
     let lastError = null;
     const tried = new Set();
@@ -524,6 +542,7 @@ export class Gateway {
         return;
       } catch (e) {
         const err = this._legFailed(leg, e, st, args.signal, more);
+        if (err.toolMode) failed.push(failedLeg(leg, err));
         lastError = routeError(lastError, err);
         refused.push({ target: leg.target, status: err.status });
       }
@@ -552,6 +571,8 @@ export class Gateway {
     } else {
       this.log(`tools requested but no leg of "${requested}" takes them (an HTTP upstream on the openai wire, or a CLI with a toolMode) — running as a plain completion`);
     }
+    // No tool engine answers from here: a stream that opens now names none.
+    if (state) state.mode = null;
     yield* this._failover(rest, args, run, lastError);
   }
 
@@ -602,6 +623,48 @@ function mergeUsage(a, b) {
     cacheWrite: Math.max(a.cacheWrite || 0, b.cacheWrite || 0),
     ...(a.total || b.total ? { total: Math.max(a.total || 0, b.total || 0) } : {}),
   };
+}
+
+/** The marks a tool engine puts on its failure (router.js, emulate.js), as own fields of `e`. */
+function engineMarks(e) {
+  const out = {};
+  for (const k of ['toolMode', 'fallback', 'usage', 'retries']) if (e && typeof e === 'object' && e[k] != null) out[k] = e[k];
+  return out;
+}
+
+/**
+ * A tool-engine leg that failed before the route's answer, as a usage row names it: its target,
+ * the engine, the status, and what it spent. Names and numbers only — never a message, which can
+ * quote the model's reply. The error itself rides along unenumerated (never written).
+ */
+function failedLeg(leg, err) {
+  const entry = {
+    target: leg.target,
+    toolMode: err.toolMode,
+    status: err.status,
+    ...(err.fallback ? { fallback: err.fallback } : {}),
+    ...(err.retries ? { retries: err.retries } : {}),
+    ...(err.usage ? { usage: err.usage } : {}),
+  };
+  Object.defineProperty(entry, 'error', { value: err, enumerable: false });
+  return entry;
+}
+
+/**
+ * The error that ends a tool route, with the tool legs that failed before it (other than itself):
+ * named in `failedLegs`, their usage added to its `usage` and their retries to its `retries`.
+ * Each run was spent, and a 502 row with no usage would say it was not.
+ */
+function withFailedLegs(e, failed) {
+  if (!e || typeof e !== 'object') return e;
+  const others = failed.filter((f) => f.error !== e);
+  if (!others.length) return e;
+  e.failedLegs = others.map((f) => ({ ...f }));
+  const usage = others.reduce((u, f) => addUsage(u, f.usage), e.usage ?? null);
+  if (usage) e.usage = usage;
+  const retries = others.reduce((n, f) => n + (f.retries || 0), e.retries || 0);
+  if (retries) e.retries = retries;
+  return e;
 }
 
 /** A request the key's scope does not cover: 403, marked so the usage log says `denied`. */

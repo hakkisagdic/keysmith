@@ -129,6 +129,19 @@ test('two invalid replies are a 502 tool_emulation_error that says why — and n
   assert.equal(runs(dir).length, 2, 'exactly one retry');
 });
 
+test('a failed turn still spent its runs: the error carries their usage, added up, and the retry', async () => {
+  let r = await drive(emu(tmp()), { spec: spec(), messages: ask('prose-always') });
+  assert.equal(r.error?.type, 'tool_emulation_error');
+  assert.deepEqual(r.error.usage, { input: 2100, output: 50, cacheRead: 0, cacheWrite: 0 }, 'both runs, as a turn that succeeds reports them');
+  assert.equal(r.error.retries, 1);
+  // What an engine before it spent (the bridge's failed run) is on it too; a CLI that failed at
+  // once reported nothing of its own, and was not asked again.
+  r = await drive(emu(tmp()), { spec: spec(), messages: ask('exit-1'), carried: { input: 5, output: 1 } });
+  assert.equal(r.error?.status, 502);
+  assert.deepEqual(r.error.usage, { input: 5, output: 1 });
+  assert.equal(r.error.retries, undefined);
+});
+
 test('each rule of the request is a reason to ask again: a final answer under required, the wrong tool, two calls when parallel is off, an unknown tool, arguments the schema refuses', async () => {
   const cases = [
     ['required-final', spec({ choice: { mode: 'required' } }), /a final answer is not allowed here/],
@@ -306,6 +319,11 @@ test('parseReply: one object, alone or in one fence — nothing else', () => {
   assert.deepEqual(ok('  \n{"tool_calls":[{"name":"get_time"}]}\n'), { ok: true, calls: [{ name: 'get_time', args: {} }] }, 'whitespace around it; arguments left out is {}');
   assert.equal(ok('```json\n{"final":"x"}\n```').ok, true);
   assert.equal(ok('```\n{"final":"x"}\n```').ok, true);
+  // A final answer that holds a Markdown code block, in one fence: the ``` are inside a JSON string.
+  const md = 'Run:\n```bash\nls\n```';
+  assert.deepEqual(ok('```json\n' + JSON.stringify({ final: md }) + '\n```'), { ok: true, final: md });
+  assert.deepEqual(ok(JSON.stringify({ final: md })), { ok: true, final: md });
+  assert.deepEqual(ok('```json\n' + JSON.stringify({ tool_calls: [{ name: 'get_weather', arguments: { city: '```' } }] }) + '\n```'), { ok: true, calls: [{ name: 'get_weather', args: { city: '```' } }] });
   for (const [text, why] of [
     ['', /empty/],
     ['Here it is: {"final":"x"}', /starts with prose/],
@@ -313,6 +331,8 @@ test('parseReply: one object, alone or in one fence — nothing else', () => {
     ['{"final":"x"}{"final":"y"}', /more than one object/],
     ['```json\n{"final":"x"}\n```\nDone.', /a code fence with text around it/],
     ['```json\n{"final":"x"}\n```\n```json\n{"final":"y"}\n```', /more than one/],
+    ['```json\n{"final":"x"}\n```\nDone.\n```', /more than one|text after it/],
+    ['```json\n{"final":"x"}\n{"final":"y"}\n```', /more than one/],
     ['[{"final":"x"}]', /starts with prose|not a JSON object/],
     ['{"final":"x","tool_calls":[]}', /exactly one key/],
     ['{"answer":"x"}', /exactly one key, tool_calls or final; it holds "answer"/],

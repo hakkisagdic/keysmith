@@ -71,7 +71,7 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `toolMode` | `off` | how this CLI answers a request that offers tools: `off` (it is passed by, as before toolMode existed), `emulate` (EMULATE: the model writes its calls as JSON, keysmith hands them to the client — see [agy and tool requests](#agy-and-tool-requests-emulate)), `mcp` (the MCP bridge: not part of keysmith yet, a 503 until it is) or `auto` (the bridge where it can, EMULATE otherwise and when the bridge fails before any call). The `agy` profile ships `auto`; `claude` and `kiro` say `off`. A load error on an `unsafeTools` entry and on an HTTP adapter. `keysmith set <id> toolMode <mode>` fills in the templates below from the entry's built-in profile when it lacks them |
 | `emulateArgs` | `args` | the argv template of an EMULATE run, same placeholders as `args`; no session is resumed on that path, so `{session}` is always empty. agy's names the `keysmith-tools` agent |
 | `bridge` | — | the MCP bridge's settings (design U6/U7); `bridge.args` is its argv template, with `{printTimeout}` and `{agent}` filled in per session. Read by the auto-approve check below, used once the bridge exists |
-| `unsafeTools` | `false` | keysmith could not take this CLI's tools away: it can run commands and edit files. Implies `explicitOnly`; `keysmith set` refuses to serve it (`disabled false`), to take the mark off, or to change anything that shapes what it runs or how it is stopped (`stopAtToolCall`, `args`, `resumeArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`, …) without `--allow-unsafe-tools`; the gateway logs it at load when it is enabled. An argv template — `args`, `resumeArgs`, `emulateArgs`, `bridge.args` — with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`, `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`, agy's `--mode auto` / `--mode accept-edits`, …) is a load error unless the entry has this mark; with it, `toolMode` must be `off`. See [Warp](#warps-oz-an-agent-that-keeps-its-tools) and [Command Code](#command-code-an-agent-that-approves-its-own-tools) |
+| `unsafeTools` | `false` | keysmith could not take this CLI's tools away: it can run commands and edit files. Implies `explicitOnly`; `keysmith set` refuses to serve it (`disabled false`), to take the mark off, or to change anything that shapes what it runs or how it is stopped (`stopAtToolCall`, `args`, `resumeArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`, …) without `--allow-unsafe-tools`; the gateway logs it at load when it is enabled. An argv template — `args`, `resumeArgs`, `emulateArgs`, `bridge.args` — with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`, `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`, agy's `--mode auto` / `--mode accept-edits`, …) is a load error unless the entry has this mark; with it, `toolMode` must be `off` (`keysmith set <id> unsafeTools true`, and a re-add that keeps the mark, turn it off). See [Warp](#warps-oz-an-agent-that-keeps-its-tools) and [Command Code](#command-code-an-agent-that-approves-its-own-tools) |
 | `env` | `{}` | merged over the scrubbed parent env |
 | `maxConcurrent` | `1` | semaphore; each call is a real process |
 | `stripSystemPrompt` | `false` | drop system turns instead of inlining them |
@@ -244,8 +244,11 @@ write it into. Do not hand-write `emulateArgs` naming `keysmith-tools` without t
   calls"). An invalid reply is asked for once more, with the reason in front of the same
   prompt, inside the same `timeoutMs` and only when at least 15 s of it are left; the gateway
   log says `retried after invalid_reply: <reason>` and the usage row counts it. A second
-  invalid reply is a 502 `tool_emulation_error`. A run that agy itself fails (an unknown agent,
-  a quota error, a non-zero exit) is the leg failing, and an alias moves on.
+  invalid reply is a 502 `tool_emulation_error` (an error frame instead, once the stream
+  opened); its usage row has both runs' `usage`, `toolMode: "emulate"` and `retries: 1`. A run
+  that agy itself fails (an unknown agent, a quota error, a non-zero exit) is the leg failing
+  too. Either way an alias moves on, and the row of the leg that answers names the failed one
+  in `failedLegs`, with what it spent added to the row's `usage`.
 - A tool call of agy's own refused by headless mode, with no reply, is an invalid reply like
   any other; `toolDenialRetry` is for the text path and does not run here. A `manage_task` call
   after the JSON ends the run (`stopAtToolCall`): the JSON stands, the usage row says `cutAt`.
@@ -413,8 +416,8 @@ right before the prompt — it would take the prompt as a tool name.
 Upstream statuses: 401/403 stay auth errors, 429 and 503 keep their status (with
 `retry-after` when the provider sent one) on the plain-completion path too; anything else
 there is a 502. A streamed request holds its headers until its first event, for up to
-`limits.streamHoldMs` (default 10000), so a refusal in that time keeps its status; one after
-that is an SSE error frame on a 200 (an `error` event on `/v1/messages`). An open stream that has
+`limits.streamHoldMs` (default 10000) — an EMULATE leg asking agy again does not end the hold —
+so a refusal in that time keeps its status; one after that is an SSE error frame on a 200 (an `error` event on `/v1/messages`). An open stream that has
 nothing to say for `limits.streamKeepaliveMs` (default 15000; 0 turns it off) gets a keepalive —
 an SSE comment on `/v1/chat/completions`, a `ping` event on `/v1/messages` — so a slow CLI or a
 buffered tool answer is not cut by a proxy's idle timeout. When failover moved on from a 429/503 and a later leg

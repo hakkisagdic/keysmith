@@ -211,11 +211,15 @@ function cmdAdd(flags) {
     const kept = ['explicitOnly', 'unsafeTools', 'disabled'].filter((k) => prev[k] && !entry[k]);
     for (const k of kept) entry[k] = true;
     // `toolMode: "off"` written on the entry is a choice too: the profile's tool engine stays off.
-    const toolsOff = prev.toolMode === 'off' && entry.toolMode && entry.toolMode !== 'off';
+    // So is unsafeTools: a CLI that kept its own tools never takes a tool request (router.js), so
+    // the profile's engine is turned off with the mark kept — not the re-add refused.
+    const offByMark = !!entry.unsafeTools && !!entry.toolMode && entry.toolMode !== 'off';
+    const toolsOff = (prev.toolMode === 'off' || offByMark) && entry.toolMode && entry.toolMode !== 'off';
     if (toolsOff) entry.toolMode = 'off';
     if (kept.length || toolsOff) {
       const undo = (k) => `keysmith set ${id} ${k} false${k === 'unsafeTools' || (k === 'disabled' && entry.unsafeTools) ? ' --allow-unsafe-tools' : ''}`;
-      const all = [...kept, ...(toolsOff ? ['toolMode off'] : [])];
+      const all = [...kept, ...(toolsOff ? [offByMark ? 'toolMode off (next to unsafeTools)' : 'toolMode off'] : [])];
+      // With the mark, the engine comes back only after the mark goes: the unsafeTools undo comes first.
       const undos = [...kept.map(undo), ...(toolsOff ? [`keysmith set ${id} toolMode ${getProfile(name)?.toolMode || 'auto'}`] : [])];
       out(`  kept ${all.join(', ')} from the "${id}" entry this replaces: a re-add never drops a guard (${undos.join('; ')})`);
     }
@@ -336,6 +340,10 @@ function cmdSet(flags) {
   const next = { ...entry };
   if (flags.unset) delete next[field];
   else next[field] = value;
+  // The mark comes with its consequence: a CLI that kept its own tools takes no tool request, so
+  // marking it turns its tool engine off — the way a re-add keeps the mark — rather than failing.
+  const engineOff = field === 'unsafeTools' && next.unsafeTools === true && typeof next.toolMode === 'string' && next.toolMode !== 'off' ? next.toolMode : null;
+  if (engineOff) next.toolMode = 'off';
   // A tool engine needs its templates: an entry attached before they existed gets the ones its
   // built-in profile has and it lacks (never one it has), when the profile is the same CLI.
   const filled = field === 'toolMode' && !flags.unset && typeof value === 'string' && value !== 'off' && kindOf(next) === 'cli' ? fillToolTemplates(id, next) : null;
@@ -361,6 +369,7 @@ function cmdSet(flags) {
   saveConfig(cfg);
   out(`${flags.unset ? 'removed' : 'set'} ${id}.${field} → ${rel(configPath())}`);
   if (filled) out(`  ${filled}`);
+  if (engineOff) out(`  and ${id}.toolMode ${engineOff} → off: a CLI marked unsafeTools takes no tool request (after unsafeTools false: keysmith set ${id} toolMode ${engineOff})`);
   if (unsafe) out(`! "${id}": ${unsafe}, with --allow-unsafe-tools. It can run commands and edit files on this machine${next.disabled ? ' once it is enabled' : ''}; it is still never an alias leg.`);
   noteRestart(`${id}.${field}`);
 }

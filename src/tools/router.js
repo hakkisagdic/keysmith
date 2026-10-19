@@ -115,6 +115,9 @@ export function pickEngine(adapter, spec, mcp) {
  * answer is known. In auto, a bridge that fails before any call or text went out hands the same
  * request to EMULATE — unless the failure is one that must never be retried another way
  * (`noFallback`: the bridge's foreign-tool tripwire is a security event, not a slow engine).
+ *
+ * A failure says which engine failed (`toolMode`, and `fallback` when it was not auto's first
+ * pick) next to what the engine spent (`usage`, `retries`: emulate.js), for the usage row.
  */
 export async function* toolEvents({ adapter, model }, { spec, messages, plain, signal, includeReasoning = false, maxTokens, state = null, mcp = null, log = () => {} }) {
   const pick = pickEngine(adapter, spec, mcp);
@@ -154,10 +157,13 @@ export async function* toolEvents({ adapter, model }, { spec, messages, plain, s
       }
       return;
     } catch (e) {
-      if (started || (adapter.toolMode || 'off') !== 'auto' || signal?.aborted || e?.noFallback) throw e;
-      fallback = typeof e?.fallbackReason === 'string' && e.fallbackReason ? e.fallbackReason.slice(0, 40) : 'bridge_failed';
-      // What the bridge's run spent is spent: it goes into EMULATE's usage.
+      // What the bridge's run spent is spent: it goes into EMULATE's usage, or onto the error.
       for (const evt of held) if (evt.type === 'usage') carried = sumUsage(carried, evt.usage);
+      if (started || (adapter.toolMode || 'off') !== 'auto' || signal?.aborted || e?.noFallback) {
+        if (carried && e && typeof e === 'object' && !e.usage) e.usage = carried;
+        throw engineFailed(e, 'mcp', fallback);
+      }
+      fallback = typeof e?.fallbackReason === 'string' && e.fallbackReason ? e.fallbackReason.slice(0, 40) : 'bridge_failed';
       log(`${adapter.id}/${model}: the MCP bridge failed before any call (${fallback}: ${String(e?.message || e).slice(0, 160)}); this request runs as EMULATE`);
     }
   }
@@ -165,16 +171,28 @@ export async function* toolEvents({ adapter, model }, { spec, messages, plain, s
   yield* withMode(emulate(adapter, { model, spec, messages, signal, carried }), 'emulate', fallback);
 }
 
-/** `tool_mode` in front of the first event that is part of the answer (or its end). */
+/** `tool_mode` in front of the first event that is part of the answer (or its end); a failure marked with the engine's mode. */
 async function* withMode(events, mode, fallback) {
   let said = false;
-  for await (const evt of events) {
-    if (!said && !['reasoning', 'retry', 'cut'].includes(evt.type)) {
-      said = true;
-      yield { type: 'tool_mode', mode, ...(fallback ? { fallback } : {}) };
+  try {
+    for await (const evt of events) {
+      if (!said && !['reasoning', 'retry', 'cut'].includes(evt.type)) {
+        said = true;
+        yield { type: 'tool_mode', mode, ...(fallback ? { fallback } : {}) };
+      }
+      yield evt;
     }
-    yield evt;
+  } catch (e) {
+    throw engineFailed(e, mode, fallback);
   }
+}
+
+/** `e`, marked with the engine that failed (and why it was not auto's first pick). */
+function engineFailed(e, mode, fallback) {
+  if (!e || typeof e !== 'object') return e;
+  e.toolMode ??= mode;
+  if (fallback) e.fallback ??= fallback;
+  return e;
 }
 
 async function* dropSessions(events) {
