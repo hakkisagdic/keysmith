@@ -140,7 +140,8 @@ with no `models` declared) can't be checked without spawning it — that's what
 Per-adapter knobs that shape a route: `priority` (orders the flat listing), `disabled`,
 `timeoutMs`, `maxConcurrent` (a semaphore, so five browser tabs cannot fork five agents),
 `stripSystemPrompt`, `maxPromptChars`, `headers`, `modelMap`, `modelParams`, `defaultModel`,
-`explicitOnly`. One field of an attached adapter changes with
+`explicitOnly`, and `toolMode` (whether a CLI leg takes tool requests, see
+[Tool calls](#tool-calls-thinking)). One field of an attached adapter changes with
 `keysmith set <adapter> <field> <value>` (the value is JSON when it parses, a string
 otherwise; `--unset` removes the field; nothing is echoed back, since the field may be
 `apiKey`). A value the gateway would refuse to load — a `modelParams` that is not an object
@@ -158,14 +159,84 @@ caching. Sessions live in memory: restart the gateway and clients start fresh.
 
 ## Tool calls, thinking
 
-`tools`/`tool_choice` pass straight through to the first HTTP candidate in the chain.
-If none can take them, keysmith logs it and runs a plain completion rather than
-pretending a CLI produced `tool_calls`. If every leg could take them and each one refused
-(a 429, a 400), the client gets the refusal with the provider's status and message — not
-the same request again without its tools. In a route that also has CLI legs, the legs that
-refused are not asked a second time: the CLI legs answer, without tools, and the log names
-each leg that refused and its status. A request that offers more than 128 tools (`tools`
-and the older `functions` together; OpenAI's own limit) is a 400 before any leg is asked.
+A request that offers tools — `tools` (or the older `functions`) on `/v1/chat/completions`,
+`tools` on `/v1/messages` — walks its route in the order the route was declared, and each leg
+takes the tools the way it can:
+
+- **An HTTP upstream** on the openai wire gets the client's body verbatim (`passthrough`), on
+  `/v1/chat/completions`; its answer comes back byte for byte. `/v1/messages` has no verbatim
+  relay, so there its HTTP legs are passed by.
+- **A CLI with a `toolMode`** answers through a tool engine. The CLI runs without tools of its
+  own, as it does for text; the model writes its calls, and keysmith hands them to the client
+  as `tool_calls` (`tool_use` blocks on `/v1/messages`), streamed or not, with keysmith's own
+  ids. keysmith never runs a tool: the client does, behind its own approvals, and sends the
+  result back on its next request.
+- **A CLI without one** (`toolMode` absent or `off`: every built-in profile but `agy`) is
+  passed by.
+
+That is a change of order for a route that mixes the two: a CLI leg with a `toolMode` now takes
+tools where it stands in the chain. In `argon` (`agy/gemini-4-argon-high`, then
+`google/gemini-4-argon`) a tool request goes to agy first, and to Google when agy fails before
+answering. `keysmith set agy toolMode off` puts it back the way it was.
+
+`toolMode`, per CLI adapter:
+
+| Mode | What answers a tool request |
+|---|---|
+| `off` (absent) | nothing: the leg is passed by |
+| `emulate` | EMULATE, below |
+| `mcp` | the MCP bridge — not part of keysmith yet (design U6/U7): until it is, a 503 |
+| `auto` | the bridge where it can take the request, EMULATE otherwise, and EMULATE in the same request when the bridge fails before any call went out. `tool_choice: "none"` is a text answer; `required` or a named tool is EMULATE (MCP cannot make a model call a tool); tool names too long for the bridge, a full bridge — or, today, no bridge at all — is EMULATE, with the reason in the usage row (`fallback`) |
+
+There is no mode that runs both engines at once and takes the faster: it would spend the
+CLI's quota twice per turn for what the fallback gives anyway.
+
+**EMULATE.** The request's tools (their schemas as sent), the rules its `tool_choice` and
+`parallel_tool_calls` set, and the whole conversation — earlier calls and their results
+included — are written into one prompt that asks for exactly one JSON object back:
+`{"tool_calls":[{"name":…,"arguments":{…}}]}` or `{"final":"…"}`. The reply is read strictly:
+that object alone, or alone in one ```` ```json ```` fence. Prose around it, a second object,
+another key, a call the client's own schema refuses (unknown tool, missing or extra
+arguments, a wrong type), a final answer where `tool_choice` asks for a call, two calls where
+parallel calls are off — each is an invalid reply, asked for once more with the reason in
+front (not the reply), inside the same `timeoutMs`. A second invalid reply is a 502
+`tool_emulation_error` that says why; a reply is never passed on as text in place of a call.
+On a stream nothing of the answer goes out until the JSON is whole and checked — the client
+gets keepalives meanwhile — and calls then arrive the way a provider streams them. Every turn
+renders the whole transcript again: no CLI session is resumed on this path, and no
+`x-keysmith-session` is handed back. A tool result is the least trusted text in the prompt:
+it is fenced with a per-request nonce no text of the request contains, and the prompt says it
+is data, not instructions. The most an instruction hidden in one can do is make the model
+write a call — checked against the client's schema, then the client's to approve, as a
+provider's would be.
+
+**When no leg answers with tools.** A leg that fails before anything reached the client hands
+the request to the next one; a call handed to the client is an answer, never retried
+elsewhere. If every leg could take the tools and each one refused (a 429, a 400), the client
+gets the refusal with the provider's status and message — not the same request again without
+its tools. Otherwise, for `tool_choice` `auto` or `none`, the legs that were not tried answer
+as a plain completion, without tools, and the log names each leg that refused and its status;
+for `required` or a named tool the client gets an error — the last leg's refusal, or a 400
+saying no leg takes tools — never text in place of the call it asked for. A tool no CLI can
+honour (an OpenAI `custom` tool, an Anthropic server tool such as `web_search_*`) passes every
+CLI leg by and is a 400 naming it when no HTTP leg relays it. A request that offers more than
+128 tools (`tools` and the older `functions` together; OpenAI's own limit) is a 400 before any
+leg is asked, on both faces.
+
+A streamed request holds its headers for `limits.streamHoldMs` (below). An EMULATE turn on
+Argon takes 9–44 s, so the stream usually opens before its answer is known; an HTTP leg that
+the route falls over to after that carries on in the open stream, as long as the client has
+had SSE comments only. `x-keysmith-mode` says `passthrough`, `emulate` or `mcp` — on a stream,
+the engine that was running when the headers went out. The usage row says which engine
+answered (`toolMode`), how many calls it handed over (`toolCalls`), `retries`, and why the
+engine is not the one `auto` picks first (`fallback`); never an argument or a result.
+`GET /v1/keysmith/routes` lists each adapter's `tool_mode`, and the status page marks it.
+
+`keysmith set <adapter> toolMode auto` (or `emulate`) on an adapter attached before toolMode
+existed fills in what the engine needs and the entry lacks — `emulateArgs`, `bridge`, and
+agy's `keysmith-tools` agent file — from the built-in profile that runs the same binary with
+the same parser; it never replaces a field the entry has. A CLI marked `unsafeTools` never
+takes a `toolMode` (a load error), and neither does an HTTP adapter.
 
 An upstream's 429 and 503 keep their status on every path, with its `retry-after` when it
 sent one, so a client backs off the way it would talking to the provider directly. When
@@ -230,7 +301,9 @@ Two routes reach it, and they spell the effort differently:
 - **agy** puts the effort in the model id: `agy/gemini-4-argon-low|medium|high`. `high` is
   Argon's maximum — agy refuses `--effort max` and `--effort xhigh` for it. Through the
   tool-less `keysmith-text` agent, `agy/gemini-4-argon-high` answered "Reply with exactly: OK"
-  in 3.2 s. No tools: a CLI leg answers in text.
+  in 3.2 s. A request with tools is answered too (`toolMode: "auto"` in the profile): the
+  tool-less `keysmith-tools` agent writes the calls, EMULATE hands them over (see
+  [Tool calls](#tool-calls-thinking)).
 - **google** (the API) lists `gemini-4-argon`, takes tools, and takes OpenAI's
   `reasoning_effort` field. keysmith builds the body of a plain completion itself, so the
   effort goes in the adapter's `modelParams`, which is sent with that model and no other:
@@ -253,10 +326,12 @@ So one alias drives Argon both ways, agy first:
 keysmith alias argon agy/gemini-4-argon-high google/gemini-4-argon
 ```
 
-A plain request is answered by agy and fails over to the API; a request with `tools` goes
-to the API leg, the one that can return `tool_calls`. Each leg spends its own quota: your
-Antigravity login for agy, the API key's (free tier: about 20 requests a day per model) for
-google.
+A plain request is answered by agy and fails over to the API. A request with `tools` goes to
+agy as well when its adapter has a `toolMode` (`keysmith add agy` brings `auto`), and to the
+API leg when agy fails before answering; an agy entry with no `toolMode` (one attached before
+it existed) passes tool requests to the API leg, as it always did. Each leg spends its own
+quota: your Antigravity login for agy, the API key's (free tier: about 20 requests a day per
+model) for google.
 
 ## Agents that could act on this machine
 
@@ -271,7 +346,7 @@ hand-written adapter one too.
 
 | Profile | How its tools are taken away | Checked |
 |---|---|---|
-| `agy` | `--agent keysmith-text`: an agent file with `tools: []`, no MCP, no customizations; `stopAtToolCall` for the one tool agy keeps | live, agy 1.3.3 |
+| `agy` | `--agent keysmith-text`: an agent file with `tools: []`, no MCP, no customizations; `stopAtToolCall` for the one tool agy keeps. A tool request (EMULATE) runs `--agent keysmith-tools`, the same `tools: []` agent with the JSON protocol as its prompt: the calls go to the client, agy runs none | live, agy 1.3.3; the tool protocol probed on agy 1.4.2 |
 | `kiro` | `--agent keysmith-text`: `tools: []`, `mcpServers: {}`, `includeMcpJson: false`, `resources: []`; `--trust-tools=` trusts nothing; `stopAtToolCall` | argv and agent file accepted by kiro-cli 2.27.1; its first live run was refused for quota before any text |
 | `claude` | `--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--disable-slash-commands`, `--safe-mode`, `--max-turns 1` | parsed by Claude Code 2.1.261; no live request sent |
 | `qoder` | `--tools ""`, `--strict-mcp-config` | parsed by qodercli 1.1.59 |
@@ -302,12 +377,16 @@ Two marks keep an adapter out of routes it was not asked for by name:
 
 An argv with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`,
 `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`,
-…) does not load unless the entry is marked `unsafeTools`: the gateway reports it as a load
-error (`doctor`, `/v1/models`, the routes endpoint) and a request to it is a 503 naming the
-flag. A config written by an older keysmith — the `opencode` profile used to pass `--auto` —
-stops there; `keysmith add opencode --as <id>` copies the tool-less argv over it. A re-add
-never drops a guard: `explicitOnly`, `unsafeTools` and `disabled` on the entry it replaces
-are kept, and it says so — taking one off is a `keysmith set`.
+agy's `--mode auto` and `--mode accept-edits`, …) — in any of its templates: `args`,
+`resumeArgs`, `emulateArgs`, the bridge's `args` — does not load unless the entry is marked
+`unsafeTools`: the gateway reports it as a load error (`doctor`, `/v1/models`, the routes
+endpoint) and a request to it is a 503 naming the flag. An entry marked `unsafeTools`, in turn,
+never takes a `toolMode` other than `off` (a load error too): a CLI that kept its own tools is
+never handed a tool request. A config written by an older keysmith — the `opencode` profile
+used to pass `--auto` — stops there; `keysmith add opencode --as <id>` copies the tool-less
+argv over it. A re-add never drops a guard: `explicitOnly`, `unsafeTools`, `disabled` and a
+`toolMode: "off"` on the entry it replaces are kept, and it says so — taking one off is a
+`keysmith set`.
 
 **Warp (`oz`) is the `unsafeTools` one.** `oz agent run` takes an agent profile by id;
 profiles are made in the Warp app, the default one lets the agent run commands and edit
@@ -582,7 +661,7 @@ again to rewrite it.
 | `opencode` | cli | verified live against opencode 1.18.27; tool-less agent checked against a stub endpoint (no `--auto`); its free `opencode/*` models refuse the tool-less run (403) |
 | `qoder` | cli | verified with `-p`; its `-o json/stream-json` modes fail inside a nested agent session; tool-less flags parsed by 1.1.59 |
 | `claude` | cli | tool-less flags and stream-json shape checked against Claude Code 2.1.261; no live request; explicit-only as shipped |
-| `agy` | cli | verified live against Antigravity CLI 1.3.3 — your Google login, no key; runs as a tool-less text agent (~600-token prompt instead of ~20k), see [docs/adapters.md](docs/adapters.md#agy-as-a-plain-text-model) |
+| `agy` | cli | verified live against Antigravity CLI 1.3.3 — your Google login, no key; runs as a tool-less text agent (~600-token prompt instead of ~20k), see [docs/adapters.md](docs/adapters.md#agy-as-a-plain-text-model); answers tool requests too (`toolMode: "auto"`: EMULATE, see [docs/adapters.md](docs/adapters.md#agy-and-tool-requests-emulate)) |
 | `kiro` | cli | Kiro CLI 2.27.1 — tool-less agent, `stream-json`, model list as JSON; the first live run was refused for quota before any text, see [docs/adapters.md](docs/adapters.md#kiro-as-a-plain-text-model) |
 | `codex` | cli | argv run against a stub Responses endpoint with codex 0.163.0 (read-only, no shell, no web search); gpt-6-* keep sub-agent tools; no request reached OpenAI |
 | `warp` | cli | Warp's `oz` agent CLI, ndjson verified live — **`unsafeTools`**: ships disabled, never an alias leg, see [above](#agents-that-could-act-on-this-machine) |
@@ -612,7 +691,7 @@ Warp, Claude Code, opencode, Codex, Qoder, `openai` Python — copy-paste config
 ## Development
 
 ```bash
-npm test          # 202 tests: parsers, routing, key scopes, HTTP suites against stub CLIs and stub upstreams, and no key reaching a log
+npm test          # 313 tests: parsers, routing, key scopes, tool routing and EMULATE, HTTP suites against stub CLIs and stub upstreams, and no key reaching a log
 node src/cli.js doctor --probe-models   # the truth about which models answer (spends quota)
 ```
 

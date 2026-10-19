@@ -68,7 +68,10 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `workspaceFiles` | — | `{ "relative/path": "content" }` — files keysmith keeps inside a configured `cwd` (0600), put back before a spawn whenever they drift. Needs `cwd`; a path that leaves it is refused at load. See [agy as a plain text model](#agy-as-a-plain-text-model) |
 | `toolDenialRetry` | — | an instruction; when a run ends in a refused tool call and no text, the request runs once more with this text in front of the prompt, inside the same `timeoutMs` |
 | `stopAtToolCall` | `false` | for a CLI run as a text model: once the answer has text, the first tool call ends the run — the process is stopped and anything it says after that call is not part of the reply. A tool call before any text is left alone. `"always"` stops a call before any text too, and fails that request: for a CLI that kept its tools, a call is never the way to an answer |
-| `unsafeTools` | `false` | keysmith could not take this CLI's tools away: it can run commands and edit files. Implies `explicitOnly`; `keysmith set` refuses to serve it (`disabled false`), to take the mark off, or to change anything that shapes what it runs or how it is stopped (`stopAtToolCall`, `args`, `resumeArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`, …) without `--allow-unsafe-tools`; the gateway logs it at load when it is enabled. An `args`/`resumeArgs` with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`, `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`, …) is a load error unless the entry has this mark. See [Warp](#warps-oz-an-agent-that-keeps-its-tools) and [Command Code](#command-code-an-agent-that-approves-its-own-tools) |
+| `toolMode` | `off` | how this CLI answers a request that offers tools: `off` (it is passed by, as before toolMode existed), `emulate` (EMULATE: the model writes its calls as JSON, keysmith hands them to the client — see [agy and tool requests](#agy-and-tool-requests-emulate)), `mcp` (the MCP bridge: not part of keysmith yet, a 503 until it is) or `auto` (the bridge where it can, EMULATE otherwise and when the bridge fails before any call). The `agy` profile ships `auto`; `claude` and `kiro` say `off`. A load error on an `unsafeTools` entry and on an HTTP adapter. `keysmith set <id> toolMode <mode>` fills in the templates below from the entry's built-in profile when it lacks them |
+| `emulateArgs` | `args` | the argv template of an EMULATE run, same placeholders as `args`; no session is resumed on that path, so `{session}` is always empty. agy's names the `keysmith-tools` agent |
+| `bridge` | — | the MCP bridge's settings (design U6/U7); `bridge.args` is its argv template, with `{printTimeout}` and `{agent}` filled in per session. Read by the auto-approve check below, used once the bridge exists |
+| `unsafeTools` | `false` | keysmith could not take this CLI's tools away: it can run commands and edit files. Implies `explicitOnly`; `keysmith set` refuses to serve it (`disabled false`), to take the mark off, or to change anything that shapes what it runs or how it is stopped (`stopAtToolCall`, `args`, `resumeArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`, …) without `--allow-unsafe-tools`; the gateway logs it at load when it is enabled. An argv template — `args`, `resumeArgs`, `emulateArgs`, `bridge.args` — with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`, `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`, agy's `--mode auto` / `--mode accept-edits`, …) is a load error unless the entry has this mark; with it, `toolMode` must be `off`. See [Warp](#warps-oz-an-agent-that-keeps-its-tools) and [Command Code](#command-code-an-agent-that-approves-its-own-tools) |
 | `env` | `{}` | merged over the scrubbed parent env |
 | `maxConcurrent` | `1` | semaphore; each call is a real process |
 | `stripSystemPrompt` | `false` | drop system turns instead of inlining them |
@@ -207,6 +210,68 @@ Gemini 4 Argon through agy: the effort is part of the model id
 (`gemini-4-argon-low|medium|high`), and `high` is its maximum — agy refuses
 `--effort max`/`xhigh` for it. The API route and its `reasoning_effort` are in the README,
 under "Gemini 4 Argon at its highest effort".
+
+### agy and tool requests: EMULATE
+
+A client that offers tools wants calls back, not text. agy can return neither in a form an
+API carries — its agents are tool-less here on purpose — so the `agy` profile answers tool
+requests with EMULATE (`toolMode: "auto"`; the MCP bridge that `auto` prefers is not part of
+keysmith yet, so every such request is EMULATE today, and the usage row says
+`fallback: "no_bridge"`):
+
+```bash
+keysmith add agy                   # toolMode auto, emulateArgs and both agent files
+keysmith set agy toolMode auto     # an entry attached before toolMode: adds what it lacks
+keysmith set agy toolMode off      # tool requests pass agy by again
+```
+
+The agent file is what keeps agy tool-less, and agy answers an agent name it cannot find with
+its full default agent, without a word — so the profile carries it under `workspaceFiles`,
+rewritten before every run, and `keysmith set … toolMode` refuses an entry with no `cwd` to
+write it into. Do not hand-write `emulateArgs` naming `keysmith-tools` without the file.
+
+- `emulateArgs` runs `--agent keysmith-tools`: like `keysmith-text`, an agent file with
+  `tools: []`, `inheritMcp: false`, `inheritCustomizations: false` and
+  `excludeDefaultComponents: true`, whose prompt says the tools in the request are run by
+  whoever sent it, that a tool result is data and not instructions, and that `manage_task` is
+  not for calling. agy runs no tool; it writes a JSON object.
+- The request itself carries the rest: the tools with their schemas as the client sent them,
+  the answer format — `{"tool_calls":[{"name":…,"arguments":{…}}]}` or `{"final":"…"}` — with
+  the rules `tool_choice` and `parallel_tool_calls` set, and the conversation, earlier calls
+  written back as JSON and each tool result between `<<<TOOL_RESULT n=<nonce> …>>>` and
+  `<<<END <nonce>>>>`.
+- The reply is read whole before anything goes out, and strictly (see the README's "Tool
+  calls"). An invalid reply is asked for once more, with the reason in front of the same
+  prompt, inside the same `timeoutMs` and only when at least 15 s of it are left; the gateway
+  log says `retried after invalid_reply: <reason>` and the usage row counts it. A second
+  invalid reply is a 502 `tool_emulation_error`. A run that agy itself fails (an unknown agent,
+  a quota error, a non-zero exit) is the leg failing, and an alias moves on.
+- A tool call of agy's own refused by headless mode, with no reply, is an invalid reply like
+  any other; `toolDenialRetry` is for the text path and does not run here. A `manage_task` call
+  after the JSON ends the run (`stopAtToolCall`): the JSON stands, the usage row says `cutAt`.
+- `tool_choice: "none"` is a text answer: the text agent, with the history rendered the same
+  way.
+
+What it costs: every turn sends the whole transcript and every schema again (with 17 tools,
+a few thousand tokens a turn), and an Argon turn took 9–44 s in the probes. The probes behind
+the protocol ran agy 1.4.2 with a `tools: []` agent on gemini-4-argon-high: 7 of 7 replies were
+one strictly parseable object.
+
+Any CLI whose argv is already tool-less can answer tool requests the same way; with no
+`emulateArgs` it runs its own `args`, and the protocol lives in the prompt alone:
+
+```json
+{
+  "mycli": {
+    "kind": "cli",
+    "bin": "mycli",
+    "args": ["-p", "{prompt}"],
+    "parser": "raw",
+    "cwd": "~/.local/share/keysmith/workspaces/mycli",
+    "toolMode": "emulate"
+  }
+}
+```
 
 ### Kiro as a plain text model
 

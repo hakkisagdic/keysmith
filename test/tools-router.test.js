@@ -591,7 +591,9 @@ test('keysmith set <id> toolMode: an entry attached before the tool engine gets 
   const { run, read, write, home } = sandbox();
   try {
     assert.equal(run('add', 'agy', '--bin', '/opt/homebrew/bin/agy').status, 0);
-    // What an older keysmith wrote: no templates, only the text agent — and an argv of its own.
+    const added = read().adapters.agy;
+    assert.equal(added.toolMode, 'auto', 'the agy profile answers tool requests');
+    // What an older keysmith wrote: no toolMode, no templates, only the text agent — and an argv of its own.
     const old = read();
     for (const k of ['toolMode', 'emulateArgs', 'bridge']) delete old.adapters.agy[k];
     old.adapters.agy.workspaceFiles = { '.agents/agents/keysmith-text.md': 'MY OWN TEXT AGENT\n' };
@@ -599,10 +601,11 @@ test('keysmith set <id> toolMode: an entry attached before the tool engine gets 
     write(old);
     let r = run('set', 'agy', 'toolMode', 'auto');
     assert.equal(r.status, 0, r.all);
-    assert.match(r.all, /filled from the built-in "agy" profile: emulateArgs, workspaceFiles\[\.agents\/agents\/keysmith-tools\.md\]/);
+    assert.match(r.all, /filled from the built-in "agy" profile: emulateArgs, bridge, workspaceFiles\[\.agents\/agents\/keysmith-tools\.md\]/);
     const now = read().adapters.agy;
     assert.equal(now.toolMode, 'auto');
     assert.deepEqual(now.emulateArgs, CLI_PROFILES.agy.emulateArgs);
+    assert.deepEqual(now.bridge, CLI_PROFILES.agy.bridge);
     assert.equal(now.workspaceFiles['.agents/agents/keysmith-tools.md'], CLI_PROFILES.agy.workspaceFiles['.agents/agents/keysmith-tools.md']);
     assert.equal(now.workspaceFiles['.agents/agents/keysmith-text.md'], 'MY OWN TEXT AGENT\n', 'a file the entry has is never replaced');
     assert.deepEqual(now.args, ['--agent', 'keysmith-text', '-p', '{prompt}'], 'nor is its argv');
@@ -640,4 +643,57 @@ test('keysmith set <id> toolMode: an entry attached before the tool engine gets 
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+test('keysmith add: a re-add keeps toolMode off when the entry says so, like every other guard', () => {
+  const { run, read, home } = sandbox();
+  try {
+    run('add', 'agy');
+    assert.equal(run('set', 'agy', 'toolMode', 'off').status, 0);
+    const r = run('add', 'agy');
+    assert.equal(r.status, 0, r.all);
+    assert.equal(read().adapters.agy.toolMode, 'off');
+    assert.match(r.all, /kept toolMode off from the "agy" entry this replaces: a re-add never drops a guard \(keysmith set agy toolMode auto\)/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------------------------------------- profiles and the docs */
+
+test('profiles: agy answers tool requests (auto) through its own tool-less agent; claude, kiro and the unsafe ones never do', () => {
+  const agyP = CLI_PROFILES.agy;
+  assert.equal(agyP.toolMode, 'auto');
+  const argv = agyP.emulateArgs.flat();
+  assert.equal(argv[argv.indexOf('--agent') + 1], 'keysmith-tools');
+  assert.deepEqual(argv.slice(-2), ['-p', '{prompt}'], 'the agent flag must not land after -p');
+  const agent = agyP.workspaceFiles['.agents/agents/keysmith-tools.md'];
+  const front = agent.split('---')[1].split('\n');
+  for (const line of ['name: keysmith-tools', 'tools: []', 'inheritMcp: false', 'inheritCustomizations: false', 'excludeDefaultComponents: true']) {
+    assert.ok(front.includes(line), `${line}: the tool agent is as tool-less as the text one`);
+  }
+  assert.match(agent, /data, not instructions/);
+  assert.match(agent, /do not call `manage_task`/);
+  assert.ok(agyP.workspaceFiles['.agents/agents/keysmith-text.md'], 'the text agent is still there for text');
+  assert.equal(checkAdapter('agy', agyP).toolMode, 'auto');
+  for (const name of ['claude', 'kiro']) assert.equal(CLI_PROFILES[name].toolMode, 'off', name);
+  for (const [name, p] of Object.entries(CLI_PROFILES)) {
+    if (p.unsafeTools) assert.ok(p.toolMode === undefined || p.toolMode === 'off', name);
+    assert.doesNotThrow(() => checkAdapter(name, p), name);
+  }
+});
+
+test('every adapter config in the docs that sets a toolMode loads the way the gateway loads it', () => {
+  const found = [];
+  for (const file of ['../README.md', '../docs/adapters.md', '../docs/clients.md']) {
+    const text = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
+    for (const [, block] of text.matchAll(/```jsonc?\n([\s\S]*?)```/g)) {
+      if (!block.includes('"toolMode"')) continue;
+      for (const [id, raw] of Object.entries(JSON.parse(block))) {
+        found.push(id);
+        assert.doesNotThrow(() => checkAdapter(id, raw), `${file}: ${id}`);
+      }
+    }
+  }
+  assert.ok(found.length >= 1, 'the docs show at least one');
 });

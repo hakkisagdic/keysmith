@@ -210,9 +210,14 @@ function cmdAdd(flags) {
   if (prev && typeof prev === 'object') {
     const kept = ['explicitOnly', 'unsafeTools', 'disabled'].filter((k) => prev[k] && !entry[k]);
     for (const k of kept) entry[k] = true;
-    if (kept.length) {
+    // `toolMode: "off"` written on the entry is a choice too: the profile's tool engine stays off.
+    const toolsOff = prev.toolMode === 'off' && entry.toolMode && entry.toolMode !== 'off';
+    if (toolsOff) entry.toolMode = 'off';
+    if (kept.length || toolsOff) {
       const undo = (k) => `keysmith set ${id} ${k} false${k === 'unsafeTools' || (k === 'disabled' && entry.unsafeTools) ? ' --allow-unsafe-tools' : ''}`;
-      out(`  kept ${kept.join(', ')} from the "${id}" entry this replaces: a re-add never drops a guard (${kept.map(undo).join('; ')})`);
+      const all = [...kept, ...(toolsOff ? ['toolMode off'] : [])];
+      const undos = [...kept.map(undo), ...(toolsOff ? [`keysmith set ${id} toolMode ${getProfile(name)?.toolMode || 'auto'}`] : [])];
+      out(`  kept ${all.join(', ')} from the "${id}" entry this replaces: a re-add never drops a guard (${undos.join('; ')})`);
     }
   }
   // Refused here what the gateway would refuse to load: an auto-approving argv, a malformed

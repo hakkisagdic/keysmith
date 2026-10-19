@@ -233,6 +233,8 @@ export const CLI_PROFILES = {
     // Every request spends your Claude subscription, so it answers only a request that names
     // it: never an alias leg, never probed. `keysmith set claude explicitOnly false` opts out.
     explicitOnly: true,
+    // Nor does it take a request that offers tools: no tool engine spends the subscription.
+    toolMode: 'off',
     timeoutMs: 300_000,
     maxConcurrent: 1,
     provenance: 'Claude Code 2.1.261 — every flag here is listed by `claude --help` and parsed by 2.1.261 (checked with an empty prompt, which it refuses before any request); `--max-turns` is undocumented but parsed. The stream-json `result` line carries usage/session_id. No live request was sent through this argv.',
@@ -266,13 +268,19 @@ export const CLI_PROFILES = {
     // agy keeps `manage_task` on every agent; after the answer, a call to it is the model
     // starting over. The answer ends there.
     stopAtToolCall: true,
-    // An EMULATE run (src/tools/emulate.js): the tool-less `keysmith-tools` agent writes the
-    // calls a request's tools ask for as JSON, and runs none of them.
+    // A request that offers tools: agy answers it (design §4: Argon first), through the MCP
+    // bridge where it can and EMULATE otherwise — the tool-less `keysmith-tools` agent writing
+    // its calls as JSON (src/tools/emulate.js). Until the bridge is part of keysmith (U6/U7),
+    // auto is EMULATE, and the usage log says why (`fallback: "no_bridge"`).
+    toolMode: 'auto',
     emulateArgs: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '280s', '--agent', AGY_TOOLS_AGENT_NAME, ['--model', '{model}'], '-p', '{prompt}'],
+    // The bridge's argv (design U7): the agent and the print timeout are the bridge's own per
+    // session. No `--mode auto|accept-edits`: that would run agy's tools unasked.
+    bridge: { args: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '{printTimeout}', '--agent', '{agent}', ['--model', '{model}'], '-p', '{prompt}'] },
     timeoutMs: 300_000,
     maxConcurrent: 2,
-    provenance: 'Antigravity CLI (agy) 1.3.3 — `agy --output-format stream-json -p` emits init / step_update (agent_response text_delta, per-step usage) / result; `agy models` prints id<TAB>name; `--conversation <id>` resumes; `--agent <name>` loads a markdown agent from `.agents/agents/` (unknown names fall back to the default agent without an error)',
-    note: 'Uses your Antigravity login, no key. Runs agy as the tool-less `keysmith-text` agent: ~600 input tokens for a one-word answer instead of the default agent\'s ~20k, no MCP servers booted, no tools to be refused. If a model still answers with a refused tool call, keysmith retries once with a stricter instruction (logged, and counted as `retries` in the usage log). agy keeps one tool, `manage_task`, on every agent: once the answer has text, a call to it ends the run (`stopAtToolCall`, `cutAt` in the usage log) instead of producing a second answer. For agy\'s full coding agent drop `--agent keysmith-text` from args/resumeArgs and set `stopAtToolCall` to false — you get its harness prompt, MCP start-up and headless tool refusals back. Each run leaves a conversation under ~/.gemini/antigravity-cli/conversations.',
+    provenance: 'Antigravity CLI (agy) 1.3.3 — `agy --output-format stream-json -p` emits init / step_update (agent_response text_delta, per-step usage) / result; `agy models` prints id<TAB>name; `--conversation <id>` resumes; `--agent <name>` loads a markdown agent from `.agents/agents/` (unknown names fall back to the default agent without an error). agy 1.4.2 (the tool-bridge probes, design §2): a `tools: []` agent answered the JSON tool protocol (`tool_calls` / `final`) on gemini-4-argon-high, 7 of 7 strictly parseable, in 9–44 s a turn; `--mode auto|accept-edits` approves tool calls.',
+    note: 'Uses your Antigravity login, no key. Runs agy as the tool-less `keysmith-text` agent: ~600 input tokens for a one-word answer instead of the default agent\'s ~20k, no MCP servers booted, no tools to be refused. If a model still answers with a refused tool call, keysmith retries once with a stricter instruction (logged, and counted as `retries` in the usage log). agy keeps one tool, `manage_task`, on every agent: once the answer has text, a call to it ends the run (`stopAtToolCall`, `cutAt` in the usage log) instead of producing a second answer. A request that offers tools is answered too (`toolMode: "auto"`): the tool-less `keysmith-tools` agent writes the calls as JSON and keysmith hands them to the client as tool_calls — agy runs none of them. For agy\'s full coding agent drop `--agent keysmith-text` from args/resumeArgs and set `stopAtToolCall` to false — you get its harness prompt, MCP start-up and headless tool refusals back. Each run leaves a conversation under ~/.gemini/antigravity-cli/conversations.',
   },
   codex: {
     kind: 'cli',
@@ -342,6 +350,9 @@ export const CLI_PROFILES = {
     cwd: '~/.local/share/keysmith/workspaces/kiro',
     workspaceFiles: { [`.kiro/agents/${KIRO_TEXT_AGENT_NAME}.json`]: KIRO_TEXT_AGENT },
     stopAtToolCall: true,
+    // Kiro's text events were never seen live (the run hit the overage limit), so no tool engine
+    // is put on it yet: a request that offers tools passes it by.
+    toolMode: 'off',
     timeoutMs: 300_000,
     maxConcurrent: 2,
     provenance: 'Kiro CLI 2.27.1 — `kiro-cli chat --no-interactive --output-format stream-json` prints `{type,data}` JSON lines; runStarted, metadata (sessionId) and runError were read off a live run, which the account\'s overage limit refused before any text. sessionUpdate (ACP agent_message_chunk) and runFinished (finalText) come from the binary and the ACP schema. `--list-models --format json` lists model_id / description / context_window_tokens; `agent validate` accepts the agent file.',

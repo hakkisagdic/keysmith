@@ -181,6 +181,34 @@ for chunk in c.chat.completions.create(model="cmd/gpt-5", stream=True,
 `keysmith.models.list()` is what the CLI's `models` command calls; `?refresh=1` re-queries
 the upstreams instead of using the 10-minute cache.
 
+Tools work the way they do against OpenAI: the model asks, your code runs the tool and sends
+the result back. Through a CLI leg with a `toolMode` (agy, EMULATE) the calls come back in the
+same shape as from an HTTP upstream — keysmith runs none of them:
+
+```python
+import json
+tools = [{"type": "function", "function": {
+    "name": "get_weather", "description": "Current weather for a city",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+messages = [{"role": "user", "content": "Weather in Ankara?"}]
+
+r = c.chat.completions.create(model="agy/gemini-4-argon-high", messages=messages, tools=tools)
+msg = r.choices[0].message                     # finish_reason "tool_calls"
+messages.append(msg)
+for call in msg.tool_calls:                    # ids are keysmith's: call_<24 hex>
+    args = json.loads(call.function.arguments)
+    messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"temp": 21})})
+r = c.chat.completions.create(model="agy/gemini-4-argon-high", messages=messages, tools=tools)
+print(r.choices[0].message.content)
+```
+
+LangChain's `ChatOpenAI(base_url="http://127.0.0.1:8787/v1", api_key="ks_…",
+model="agy/gemini-4-argon-high").bind_tools([...])` reads them the same way, streamed or not.
+An EMULATE turn on Argon takes tens of seconds; a streamed one sends keepalive comments until
+the calls are ready, so leave the client's read timeout at its default (600 s for the
+`openai` SDK) or above. A reply the model got wrong twice is an HTTP 502 whose error type is
+`tool_emulation_error` — retry it like any 5xx.
+
 ## curl
 
 ```bash
