@@ -101,16 +101,36 @@ export function openaiCompletion({ id, model, created, text, usage, reasoning = 
   return payload;
 }
 
-/** A streamed chat completion, one event at a time. */
+/**
+ * A streamed chat completion, one event at a time.
+ *
+ * `lazy`: the opening chunk (role) waits for the first thing the answer has, so until then the
+ * client has had SSE comments only (`: stream open`, keepalives). A tool request's route can still
+ * hand such a stream to an HTTP leg further on, whose own SSE carries on from there (server.js,
+ * the relay): `wroteData` says whether that is still possible, `detach()` hands it over.
+ */
 export class OpenaiChatStream {
-  constructor(res, { id, model, created, includeUsage = false, legacy = false, keepaliveMs = KEEPALIVE_MS, timers } = {}) {
-    Object.assign(this, { res, id, model, created, includeUsage, legacy, keepaliveMs, timers });
+  constructor(res, { id, model, created, includeUsage = false, legacy = false, keepaliveMs = KEEPALIVE_MS, timers, lazy = false } = {}) {
+    Object.assign(this, { res, id, model, created, includeUsage, legacy, keepaliveMs, timers, lazy });
     this.calls = 0;
     this.ka = null;
+    this.opened = false; // the role chunk went out
+    this.wroteData = false;
+    this.detached = false;
   }
 
   _data(obj) {
+    if (this.detached) return;
+    if (!this.opened) {
+      this.opened = true;
+      this._write(this._chunk({ role: 'assistant', content: '' }));
+    }
+    this._write(obj);
+  }
+
+  _write(obj) {
     this.ka?.touch();
+    this.wroteData = true;
     this.res.write(`data: ${JSON.stringify(obj)}\n\n`);
   }
 
@@ -119,8 +139,17 @@ export class OpenaiChatStream {
   }
 
   open() {
-    this._data(this._chunk({ role: 'assistant', content: '' }));
+    if (!this.lazy) {
+      this.opened = true;
+      this._write(this._chunk({ role: 'assistant', content: '' }));
+    }
     this.ka = keepalive(this.res, ': keepalive\n\n', { intervalMs: this.keepaliveMs, timers: this.timers });
+  }
+
+  /** The stream is someone else's from here (an HTTP leg's verbatim SSE): no keepalive, no frame of this face's. */
+  detach() {
+    this.detached = true;
+    this.ka?.stop();
   }
 
   text(text) {
@@ -155,6 +184,7 @@ export class OpenaiChatStream {
    * as fail() writes them, the way the Anthropic face writes its `error` event.
    */
   finish({ usage = null, keysmith = null, error = null } = {}) {
+    if (this.detached) return;
     if (error) return this.fail(error);
     const closing = this._chunk({}, !this.calls ? 'stop' : this.legacy ? FINISH_FUNCTION_CALL : FINISH_TOOL_CALLS);
     if (keysmith) closing.keysmith = keysmith;
@@ -167,7 +197,9 @@ export class OpenaiChatStream {
 
   /** A stream that failed after it started: an error frame and [DONE], which is how an OpenAI SDK learns of it. */
   fail(message, type = 'upstream_error') {
-    this._data({ error: { message: `keysmith: ${message}`, type } });
+    if (this.detached) return;
+    // An error frame is no part of an answer: it goes out without an opening chunk in front.
+    this._write({ error: { message: `keysmith: ${message}`, type } });
     this._end('data: [DONE]\n\n');
   }
 

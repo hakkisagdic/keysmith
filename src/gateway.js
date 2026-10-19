@@ -6,6 +6,7 @@ import { resolveSecret } from './config.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { adapterReach, aliasDecision, requestDecision } from './keys.js';
+import { describeUnsupported, toolEvents, toolPath } from './tools/router.js';
 
 /**
  * The gateway: config in, one model catalogue + one streaming `complete()` out.
@@ -28,6 +29,10 @@ export class Gateway {
     // Upstream URL -> the one thought-signature store every adapter on it shares, so a
     // failover leg to a second key on the same endpoint can put back what the first leg saw.
     this.signatureStores = new Map();
+    // The tool engines a CLI leg can run besides EMULATE (src/tools/router.js): the MCP bridge,
+    // `{ check(adapter, spec), run(adapter, opts) }`, once there is one (design U6/U7). Without it
+    // toolMode auto is EMULATE, and toolMode mcp a 503.
+    this.toolEngines = { mcp: null };
     for (const [id, raw] of Object.entries(cfg.adapters || {})) {
       try {
         const prepared = prepareAdapter(id, raw);
@@ -354,84 +359,44 @@ export class Gateway {
    * upstream session, so a chat app gets genuine multi-turn (and prompt-cache)
    * behaviour out of a tool that was never meant to answer HTTP.
    */
-  async *complete({ model, messages, session, signal, maxTokens, temperature, includeReasoning = false, exclude = null, scope = null }) {
+  async *complete({ model, messages, session, signal, maxTokens, temperature, includeReasoning = false, exclude = null, scope = null, tools = null }) {
     const chain = this.resolve(model, { exclude, scope });
     const publicId = session || newSessionId();
     const known = session ? this.sessions.get(publicId) : null;
-    let reportedSession = false;
-    let lastError = null;
+    const run = { publicId, known, reportedSession: false, includeReasoning, signal };
+    const args = { messages, maxTokens, temperature, includeReasoning, signal };
+    if (tools) return yield* this._toolRoute(model, chain, args, run, tools);
+    yield* this._failover(chain, args, run, null);
+  }
 
-    for (const { adapter, model: upstreamModel } of chain) {
+  /**
+   * The legs of `chain` in order as plain completions, each tried only while nothing of an answer
+   * reached the client. `carried` is a failure from before (the tool walk's), kept by the rule
+   * routeError() states: a 429/503 is the answer over a later leg's other refusal.
+   */
+  async *_failover(chain, args, run, carried) {
+    let lastError = carried;
+    for (const leg of chain) {
+      const { adapter, model: upstreamModel } = leg;
+      const canResume = !!run.known && run.known.upstreamSession && adapterOf(run.known.target) === adapter.id && !!adapter.resumable;
       // Outside the try: a leg that throws after part of its answer went out (text, or a tool
       // call the client may already be running) is not restarted on the next leg either.
-      let emitted = false;
+      const state = { emitted: false };
       try {
-        const canResume = !!known && known.upstreamSession && adapterOf(known.target) === adapter.id && !!adapter.resumable;
-        for await (const evt of adapter.complete({
+        const events = adapter.complete({
           model: upstreamModel,
-          messages,
-          session: canResume ? known.upstreamSession : null,
-          signal,
-          maxTokens,
-          temperature,
-          includeReasoning,
-        })) {
-          // One rule for both adapter kinds: chain-of-thought is only ever forwarded to
-          // a client that asked for it. Providers and CLIs emit it freely; a UI that
-          // shows it unasked is a surprise, and it costs output tokens.
-          if (evt.type === 'reasoning' && !includeReasoning) continue;
-          if (evt.type === 'retry') {
-            // The adapter is already trying again on its own; say so, never silently.
-            this.log(`${adapter.id}/${truncate(upstreamModel, 60)} retried after ${evt.reason}: ${truncate(evt.message, 160)}`);
-            yield evt;
-            continue;
-          }
-          if (evt.type === 'cut') {
-            // Same rule for an answer the adapter ended early: it is in the log and the
-            // usage log, so a harness that keeps calling tools is a number, not a mystery.
-            this.log(`${adapter.id}/${truncate(upstreamModel, 60)} answer ended at a call to ${truncate(evt.tool, 60)}: the process was stopped`);
-            yield evt;
-            continue;
-          }
-          // A tool call handed to the client is an answer as much as text is: from here on this
-          // leg is the one answering, and a failure is reported, never retried on the next leg.
-          if (evt.type === 'delta' || evt.type === 'tool_call') emitted = true;
-          if (evt.type === 'error') {
-            // Every streamed face writes this message to its client (an error chunk, an `error`
-            // event, response.failed), so it is redacted here: an adapter that let a provider's
-            // quoted key through is not the last line of defence. collect() keeps what came
-            // before it — a non-streamed answer is the text or calls, as it always was.
-            const message = redactSecrets(evt.message);
-            if (emitted) {
-              yield { ...evt, message };
-              return;
-            }
-            throw new LlmError(message, { status: 502, provider: adapter.id });
-          }
-          if (evt.type === 'session' && evt.id) {
-            this._remember(publicId, { target: `${adapter.id}/${upstreamModel}`, upstreamSession: evt.id });
-            if (!reportedSession) {
-              reportedSession = true;
-              yield { type: 'session', id: publicId, resumed: canResume };
-            }
-            continue;
-          }
-          yield evt;
-        }
-        if (!reportedSession && known) {
-          reportedSession = true;
-          yield { type: 'session', id: publicId, resumed: true };
-        }
+          messages: args.messages,
+          session: canResume ? run.known.upstreamSession : null,
+          signal: args.signal,
+          maxTokens: args.maxTokens,
+          temperature: args.temperature,
+          includeReasoning: args.includeReasoning,
+        });
+        yield* this._leg(leg, events, run, state, { canResume, sessions: true });
         return;
       } catch (e) {
-        const err = e instanceof LlmError ? e : new LlmError(e.message, { status: 502, provider: adapter.id });
-        if (signal?.aborted) throw err;
-        if (emitted) {
-          this.log(`${adapter.id}/${truncate(upstreamModel, 60)} failed after it had started answering, so no other leg is tried: ${truncate(e.message, 160)}`);
-          throw err;
-        }
-        this.log(`${adapter.id}/${truncate(upstreamModel, 60)} failed, ${chain.length > 1 ? 'trying next candidate' : 'giving up'}: ${truncate(e.message, 160)}`);
-        if (chain.length === 1) throw err;
+        const err = this._legFailed(leg, e, state, args.signal, chain.length > 1 ? 'trying next candidate' : 'giving up');
+        if (chain.length === 1) throw lastError ? routeError(lastError, err) : err;
         lastError = routeError(lastError, err);
       }
     }
@@ -439,9 +404,163 @@ export class Gateway {
   }
 
   /**
+   * One leg's events on their way to a face. Throws when the leg fails before any text or call of
+   * its answer went out (`state.emitted` says whether one did). `sessions`: a tool leg resumes no
+   * CLI session and maps none.
+   */
+  async *_leg({ adapter, model: upstreamModel }, events, run, state, { canResume = false, sessions = true } = {}) {
+    for await (const evt of events) {
+      // One rule for both adapter kinds: chain-of-thought is only ever forwarded to
+      // a client that asked for it. Providers and CLIs emit it freely; a UI that
+      // shows it unasked is a surprise, and it costs output tokens.
+      if (evt.type === 'reasoning' && !run.includeReasoning) continue;
+      if (evt.type === 'retry') {
+        // The adapter is already trying again on its own; say so, never silently.
+        this.log(`${adapter.id}/${truncate(upstreamModel, 60)} retried after ${evt.reason}: ${truncate(evt.message, 160)}`);
+        yield evt;
+        continue;
+      }
+      if (evt.type === 'cut') {
+        // Same rule for an answer the adapter ended early: it is in the log and the
+        // usage log, so a harness that keeps calling tools is a number, not a mystery.
+        this.log(`${adapter.id}/${truncate(upstreamModel, 60)} answer ended at a call to ${truncate(evt.tool, 60)}: the process was stopped`);
+        yield evt;
+        continue;
+      }
+      // A tool call handed to the client is an answer as much as text is: from here on this
+      // leg is the one answering, and a failure is reported, never retried on the next leg.
+      if (evt.type === 'delta' || evt.type === 'tool_call') state.emitted = true;
+      if (evt.type === 'error') {
+        // Every streamed face writes this message to its client (an error chunk, an `error`
+        // event, response.failed), so it is redacted here: an adapter that let a provider's
+        // quoted key through is not the last line of defence. collect() keeps what came
+        // before it — a non-streamed answer is the text or calls, as it always was.
+        const message = redactSecrets(evt.message);
+        if (state.emitted) {
+          yield { ...evt, message };
+          return;
+        }
+        throw new LlmError(message, { status: 502, provider: adapter.id });
+      }
+      if (evt.type === 'session') {
+        if (!sessions) continue;
+        if (evt.id) {
+          this._remember(run.publicId, { target: `${adapter.id}/${upstreamModel}`, upstreamSession: evt.id });
+          if (!run.reportedSession) {
+            run.reportedSession = true;
+            yield { type: 'session', id: run.publicId, resumed: canResume };
+          }
+          continue;
+        }
+      }
+      yield evt;
+    }
+    if (sessions && !run.reportedSession && run.known) {
+      run.reportedSession = true;
+      yield { type: 'session', id: run.publicId, resumed: true };
+    }
+  }
+
+  /** A leg's failure as the LlmError the route keeps, logged; rethrown when it must end the route. */
+  _legFailed({ adapter, model: upstreamModel }, e, state, signal, next) {
+    const err = e instanceof LlmError ? e : new LlmError(e.message, { status: 502, provider: adapter.id });
+    if (signal?.aborted) throw err;
+    if (state.emitted) {
+      this.log(`${adapter.id}/${truncate(upstreamModel, 60)} failed after it had started answering, so no other leg is tried: ${truncate(e.message, 160)}`);
+      throw err;
+    }
+    this.log(`${adapter.id}/${truncate(upstreamModel, 60)} failed, ${next}: ${truncate(e.message, 160)}`);
+    return err;
+  }
+
+  /**
+   * A request that offers tools (src/tools/router.js): the route's legs in declared order, each
+   * taking the tools the way it can — an HTTP upstream verbatim through `tools.relay` (the face's,
+   * which writes the upstream's answer itself), a CLI with a toolMode through a tool engine — and
+   * failing over while nothing went out. When none answered: a plain completion from the legs not
+   * tried, for tool_choice auto or none; an error for one that asks for a call, or for tools no
+   * CLI can honour. `tools`: `{ spec, messages (canonical), face, relay, state }`.
+   */
+  async *_toolRoute(requested, chain, args, run, tools) {
+    const { spec, face, relay = null, state = null } = tools;
+    let lastError = null;
+    const tried = new Set();
+    const refused = [];
+    for (let i = 0; i < chain.length; i++) {
+      const leg = chain[i];
+      const path = toolPath(leg.adapter, spec, face);
+      if (path === 'skip' || (path === 'passthrough' && !relay)) continue;
+      tried.add(i);
+      const more = chain.slice(i + 1).some((l) => toolPath(l.adapter, spec, face) !== 'skip') ? 'trying the next leg that takes tools' : 'no other leg takes tools';
+      if (path === 'passthrough') {
+        try {
+          if (await relay(leg)) {
+            yield { type: 'relayed', target: leg.target };
+            return;
+          }
+        } catch (e) {
+          const err = e instanceof LlmError ? e : new LlmError(`${leg.adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: leg.adapter.id });
+          if (args.signal?.aborted) throw err;
+          lastError = routeError(lastError, err);
+          refused.push({ target: leg.target, status: err.status });
+          this.log(`passthrough via ${leg.adapter.id} failed: ${truncate(e.message, 300)}`);
+        }
+        continue;
+      }
+      const st = { emitted: false };
+      try {
+        const events = toolEvents(leg, {
+          spec,
+          messages: tools.messages,
+          plain: args.messages,
+          signal: args.signal,
+          includeReasoning: args.includeReasoning,
+          maxTokens: args.maxTokens,
+          state,
+          mcp: this.toolEngines.mcp,
+          log: this.log,
+        });
+        yield* this._leg(leg, events, run, st, { sessions: false });
+        return;
+      } catch (e) {
+        const err = this._legFailed(leg, e, st, args.signal, more);
+        lastError = routeError(lastError, err);
+        refused.push({ target: leg.target, status: err.status });
+      }
+    }
+    // No leg answered with tools.
+    if (spec.unsupported?.length) {
+      throw lastError || new LlmError(`"${requested}" has no leg that can take ${describeUnsupported(spec)}: only an HTTP upstream relays those (on /v1/chat/completions), and a CLI leg takes plain function tools only`, { status: 400, type: 'invalid_request_error' });
+    }
+    const choice = spec.choice?.mode;
+    if (choice === 'required' || choice === 'named') {
+      // A text answer is not what was asked for: say so, never hand one over in its place.
+      throw lastError || new LlmError(`tool_choice ${choice === 'named' ? `names "${String(spec.choice.name).slice(0, 64)}"` : 'is required'}: the request needs a tool call, and no leg of "${requested}" takes tools — an HTTP upstream on the openai wire does, and so does a CLI with a toolMode (keysmith set <adapter> toolMode auto)`, {
+        status: 400,
+        type: 'invalid_request_error',
+      });
+    }
+    const rest = chain.filter((_, i) => !tried.has(i));
+    // Every leg could take the tools, and each one refused. Running the route again as a plain
+    // completion would ask the same upstream a second time, drop the tools without a word and turn
+    // a 429 into a 502: answer with what the leg said instead.
+    if (!rest.length) throw lastError || new LlmError(`every leg of "${requested}" has already refused this request`, { status: 502 });
+    if (refused.length) {
+      // Those legs already said no to this very request: asking them again without the tools
+      // spends their quota twice and can turn their refusal into a tool-less answer.
+      this.log(`tools requested; ${refused.map((r) => `${r.target} refused (${r.status})`).join(', ')} — the rest of "${requested}" runs as a plain completion, without tools`);
+    } else {
+      this.log(`tools requested but no leg of "${requested}" takes them (an HTTP upstream on the openai wire, or a CLI with a toolMode) — running as a plain completion`);
+    }
+    yield* this._failover(rest, args, run, lastError);
+  }
+
+  /**
    * Non-streaming convenience used by the faces when stream=false: the text, and the tool calls
    * an engine handed back for the client to run (`toolCalls`, canonical `tool_call` events), with
-   * which engine answered (`toolMode`) and why not the one picked first (`fallback`).
+   * which engine answered (`toolMode`) and why not the one picked first (`fallback`). `relayed`:
+   * an HTTP leg's answer went to the client verbatim (the face's relay wrote it), so there is
+   * nothing here to write.
    */
   async collect(opts) {
     let text = '';
@@ -454,8 +573,10 @@ export class Gateway {
     const toolCalls = [];
     let toolMode = null;
     let fallback = null;
+    let relayed = false;
     for await (const evt of this.complete(opts)) {
-      if (evt.type === 'retry') retries++;
+      if (evt.type === 'relayed') relayed = true;
+      else if (evt.type === 'retry') retries++;
       else if (evt.type === 'cut') cutAt = evt.tool;
       else if (evt.type === 'delta') text += evt.text;
       else if (evt.type === 'tool_call') toolCalls.push(evt);
@@ -466,7 +587,7 @@ export class Gateway {
       else if (evt.type === 'error') err = evt.message;
     }
     if (err && !text && !toolCalls.length) throw new LlmError(err, { status: 502 });
-    return { text, reasoning, usage, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback };
+    return { text, reasoning, usage, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, relayed };
   }
 }
 

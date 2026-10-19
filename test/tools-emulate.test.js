@@ -1,10 +1,10 @@
 /**
  * The EMULATE engine (src/tools/emulate.js): the prompt it writes, the strict reading of the
  * reply, the one retry inside the same time budget, the explicit 502, the usage of every run,
- * and the agent it runs. Against test/stubs/agy-emu.mjs, which prints
+ * and nothing streamed before the JSON is whole. Against test/stubs/agy-emu.mjs, which prints
  * agy's stream-json and answers from a script named in its prompt: nothing here spends a token.
  */
-import { after, test } from 'node:test';
+import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -13,11 +13,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CliAdapter } from '../src/cli-adapter.js';
 import { CLI_PROFILES } from '../src/profiles.js';
-import { checkAdapter } from '../src/gateway.js';
+import { Gateway, checkAdapter } from '../src/gateway.js';
+import { createServer } from '../src/server.js';
+import { UsageLog } from '../src/usage.js';
 import { MIN_RETRY_BUDGET_MS, correction, emulate, parseReply, renderPrompt } from '../src/tools/emulate.js';
 import { anthropicToolMessages, openaiToolMessages, openaiToolSpec } from '../src/tools/model.js';
 
 const STUB = fileURLToPath(new URL('./stubs/agy-emu.mjs', import.meta.url));
+const KEY = 'ks_' + crypto.randomBytes(24).toString('base64url');
 
 const dirs = [];
 after(() => {
@@ -339,4 +342,69 @@ test('a reason never quotes a value the model wrote, nor a key that is not an id
     assert.equal(r.ok, false);
     assert.ok(!r.reason.includes(SECRET), r.reason);
   }
+});
+
+/* --------------------------------------------------------------- through the gateway */
+
+let server, base, usageLog, gwDir;
+before(async () => {
+  gwDir = tmp();
+  const cfg = { auth: { enabled: true, keys: [KEY] }, limits: { streamHoldMs: 50, streamKeepaliveMs: 100 }, adapters: {} };
+  const gateway = new Gateway(cfg);
+  gateway.adapters.set('agy', emu(gwDir));
+  usageLog = new UsageLog(path.join(gwDir, 'usage.jsonl'));
+  server = createServer(gateway, cfg, { usage: usageLog });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  base = `http://127.0.0.1:${server.address().port}`;
+});
+after(() => new Promise((r) => server.close(r)));
+
+const TOOLS = [{ type: 'function', function: WEATHER }];
+const chat = (content, extra = {}) =>
+  fetch(`${base}/v1/chat/completions`, { method: 'POST', headers: { authorization: `Bearer ${KEY}`, 'content-type': 'application/json' }, body: JSON.stringify({ model: 'agy/m', messages: [{ role: 'user', content }], tools: TOOLS, ...extra }) });
+
+test('streamed, nothing of the answer leaves before the JSON is whole and checked; keepalives meanwhile', async () => {
+  const res = await chat('Weather? SCENARIO=slow-deltas', { stream: true });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-keysmith-mode'), 'emulate');
+  // Read the stream as it comes, with the time each data frame arrived.
+  const frames = [];
+  const decoder = new TextDecoder();
+  let buf = '';
+  for await (const chunk of res.body) {
+    buf += decoder.decode(chunk, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n\n')) >= 0) {
+      const block = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      frames.push({ at: Date.now(), block });
+    }
+  }
+  const run = runs(gwDir).find((r) => r.scenario === 'slow-deltas');
+  const lastDelta = Math.max(...run.deltas);
+  const data = frames.filter((f) => f.block.startsWith('data: '));
+  assert.ok(data[0].at >= lastDelta, `the first data frame (${data[0].at}) came after the stub's last delta (${lastDelta})`);
+  assert.ok(frames.some((f) => f.block === ': keepalive' && f.at < lastDelta), 'the client heard from the stream while the JSON was being written');
+  const chunks = data.map((f) => f.block.slice(6)).filter((d) => d !== '[DONE]').map((d) => JSON.parse(d));
+  const call = chunks.flatMap((c) => c.choices?.[0]?.delta?.tool_calls || []);
+  assert.equal(call[0].function.name, 'get_weather');
+  assert.equal(call[1].function.arguments, '{"city":"Ankara"}');
+  assert.match(call[0].id, /^call_[0-9a-f]{24}$/);
+  assert.equal(chunks.at(-1).choices[0].finish_reason, 'tool_calls');
+});
+
+test('a 502 tool_emulation_error reaches the client as one, streamed or not, and the usage row counts the retry', async () => {
+  const plain = await chat('SCENARIO=prose-always');
+  assert.equal(plain.status, 502);
+  const body = await plain.json();
+  assert.equal(body.error.type, 'tool_emulation_error');
+  assert.match(body.error.message, /could not be used, twice/);
+  const streamed = await (await chat('SCENARIO=prose-always', { stream: true })).text();
+  assert.match(streamed, /"type":"tool_emulation_error"/);
+  assert.doesNotMatch(streamed, /"content":"/, 'no prose reached the client as an answer');
+  const ok = await chat('SCENARIO=prose-then-ok');
+  assert.equal(ok.status, 200);
+  const row = usageLog.tail(1)[0];
+  assert.deepEqual([row.status, row.toolMode, row.toolCalls, row.retries], ['ok', 'emulate', 1, 1]);
+  assert.deepEqual(row.usage, { input: 2100, output: 50, cacheRead: 0, cacheWrite: 0 });
 });

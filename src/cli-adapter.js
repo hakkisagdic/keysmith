@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { getParser, toLines } from './parsers.js';
 import { expand } from './config.js';
 import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, agentCleanEnv } from './util.js';
+import { checkToolMode } from './tools/router.js';
 
 /**
  * Run a coding CLI once per request and turn its stdout into a chat completion.
@@ -55,14 +56,18 @@ export class CliAdapter {
     // A CLI whose tools keysmith could not take away: it can run commands and edit files.
     // Never an alias leg, never probed by `doctor --probe-models` (see Gateway.resolve).
     this.unsafeTools = !!cfg.unsafeTools;
-    // The argv of an EMULATE run (src/tools/emulate.js; `args` when there is none): agy's names
-    // the `keysmith-tools` agent.
+    // How this CLI answers a request that offers tools (src/tools/router.js): never ('off', the
+    // default), EMULATE, the MCP bridge, or `auto`. Never on a CLI that kept its own tools.
+    this.toolMode = checkToolMode(id, cfg);
+    // The argv of an EMULATE run (`args` when there is none): agy's names the `keysmith-tools`
+    // agent. And the MCP bridge's own settings, its argv among them (design U7).
     this.emulateArgs = checkTemplate(id, 'emulateArgs', cfg.emulateArgs);
+    this.bridge = checkBridge(id, cfg.bridge);
     // An argv that auto-approves the agent's tool calls (`opencode --auto`, `--yolo`, …) is an
     // agent that acts on this machine for whoever holds a key. That is never a default: it
     // loads only when the entry says so with `unsafeTools`, which keeps it out of every alias
     // and every probe. A config copied from an older profile stops here, with the way out.
-    // Every template is read: `args`, `resumeArgs` and `emulateArgs`.
+    // Every template is read: `args`, `resumeArgs`, `emulateArgs` and the bridge's `args`.
     const approving = autoApproveFlag(cfg);
     if (approving && !this.unsafeTools) {
       throw new Error(
@@ -170,10 +175,14 @@ export class CliAdapter {
     return { events: getParser(this.parser)(toLines(run.stdout)), stop: run.stop, done: run.done };
   }
 
-  async *complete({ model, messages, session, signal, maxTokens }) {
+  /**
+   * One completion. `rendered` ({ system, prompt }) is a prompt a tool engine wrote itself in
+   * place of the flattened `messages` (router.js, tool_choice none); such a run is never resumed.
+   */
+  async *complete({ model, messages, session, signal, maxTokens, rendered = null }) {
     this.ready();
 
-    const { system, prompt } = flattenMessages(messages);
+    const { system, prompt } = rendered || flattenMessages(messages);
     if (!prompt && !system) throw new LlmError('nothing to send: the message list is empty after flattening', { status: 400, provider: this.id });
     if (prompt.length > this.maxPromptChars) {
       throw new LlmError(
@@ -183,7 +192,7 @@ export class CliAdapter {
     }
     const keepSystem = !this.stripSystemPrompt;
     const body = keepSystem && system && !this.systemFlag ? `<system>\n${system}\n</system>\n\n${prompt}` : prompt;
-    const useResume = !!(session && this.resumable);
+    const useResume = !!(session && this.resumable) && !rendered;
     const argvFor = (text) => {
       const argv = joinArgs(useResume ? this.resumeArgs : this.args, {
         model: model || '',
@@ -410,19 +419,25 @@ const AUTO_APPROVE_FLAGS = new Set([
   '--accept-edits',
   '--approve-for-me',
 ]);
-/** A mode switch whose value is the auto-approving one. */
+/**
+ * A mode switch whose value is the auto-approving one. agy's `--mode auto` and
+ * `--mode accept-edits` (agy 1.4.2) run the agent's tool calls without asking.
+ */
 const AUTO_APPROVE_MODES = {
   '--permission-mode': ['yolo', 'bypassPermissions', 'bypass_permissions', 'acceptEdits', 'accept-edits'],
   '--approval-mode': ['yolo', 'auto_edit', 'auto-edit'],
   '--sandbox': ['danger-full-access'],
+  '--mode': ['auto', 'accept-edits'],
 };
 
 /**
- * The first auto-approving switch in an adapter's `args`, `resumeArgs` or `emulateArgs`
- * (`--auto`, `--permission-mode yolo`, `--sandbox=danger-full-access`), or null.
+ * The first auto-approving switch in any argv template of an adapter — `args`, `resumeArgs`,
+ * `emulateArgs`, the bridge's `args` — (`--auto`, `--permission-mode yolo`,
+ * `--sandbox=danger-full-access`, `--mode auto`), or null.
  */
 export function autoApproveFlag(cfg) {
-  for (const tpl of [cfg?.args, cfg?.resumeArgs, cfg?.emulateArgs]) {
+  const bridge = cfg?.bridge && typeof cfg.bridge === 'object' && !Array.isArray(cfg.bridge) ? cfg.bridge : null;
+  for (const tpl of [cfg?.args, cfg?.resumeArgs, cfg?.emulateArgs, bridge?.args]) {
     if (!Array.isArray(tpl)) continue;
     const tokens = tpl.flat(Infinity).filter((t) => typeof t === 'string');
     for (let i = 0; i < tokens.length; i++) {
@@ -478,6 +493,14 @@ function checkTemplate(id, field, tpl) {
     throw new Error(`adapter "${id}": ${field} must be an argv template — a list of strings and [flag, value] groups, like args`);
   }
   return tpl;
+}
+
+/** The MCP bridge's settings on a CLI entry: an object; its `args` an argv template. */
+function checkBridge(id, bridge) {
+  if (bridge == null) return null;
+  if (typeof bridge !== 'object' || Array.isArray(bridge)) throw new Error(`adapter "${id}": bridge must be an object of the MCP bridge's settings`);
+  checkTemplate(id, 'bridge.args', bridge.args);
+  return bridge;
 }
 
 function checkWorkspaceFiles(id, files, ownsCwd) {

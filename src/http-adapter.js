@@ -33,6 +33,10 @@ export class HttpAdapter {
     // Answers only a request that names it: never an alias leg, never probed (Gateway.resolve).
     this.explicitOnly = !!cfg.explicitOnly;
     this.unsafeTools = false;
+    // An HTTP upstream takes tools one way: verbatim (the chat face's relay). toolMode is a CLI's.
+    if (cfg.toolMode != null && cfg.toolMode !== 'off') {
+      throw new Error(`adapter "${id}": toolMode is a CLI adapter's field — an HTTP upstream on the openai wire is handed tool requests verbatim`);
+    }
     // Request fields sent with one upstream model unless the client set them itself:
     // `{ "gemini-4-argon": { "reasoning_effort": "high" } }`, `"*"` for every model.
     this.modelParams = checkModelParams(id, cfg.modelParams);

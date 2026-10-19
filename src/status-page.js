@@ -38,7 +38,7 @@ ${viewer && viewer.scope && !/^unscoped/.test(viewer.scope) ? `<div class="sub">
 </div>
 <h2>Adapters</h2>
 ${adapters.length ? `<div class="grid">${adapters
-    .map(([id, a]) => `<div class="card"><b>${esc(id)}</b><small>${a.kind === 'cli' ? `cli · ${esc(a.bin || id)} · ${esc(a.parser || 'raw')}` : `http · ${esc(a.wire || 'openai')}`}<br><span class="pill">${a.disabled ? 'disabled' : a.priority ?? 100}</span>${Object.hasOwn(loadErrors, id) ? ' <span class="bad">did not load</span>' : ''}</small></div>`)
+    .map(([id, a]) => `<div class="card"><b>${esc(id)}</b><small>${a.kind === 'cli' ? `cli · ${esc(a.bin || id)} · ${esc(a.parser || 'raw')}` : `http · ${esc(a.wire || 'openai')}`}<br><span class="pill">${a.disabled ? 'disabled' : a.priority ?? 100}</span>${a.toolMode && a.toolMode !== 'off' ? ` <span class="pill">tools: ${esc(a.toolMode)}</span>` : ''}${Object.hasOwn(loadErrors, id) ? ' <span class="bad">did not load</span>' : ''}</small></div>`)
     .join('')}</div>` : '<div class="muted">none configured — run <code>keysmith add &lt;profile&gt;</code></div>'}
 ${failed.length ? `<h2>Configured but did not load</h2><table><thead><tr><th>adapter</th><th>why</th></tr></thead><tbody>${failed
     .map(([id, msg]) => `<tr><td class="bad">${esc(id)}</td><td>${esc(msg)}</td></tr>`)

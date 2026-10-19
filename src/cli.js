@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { loadConfig, saveConfig, configPath, dataDir, newApiKey, newUniqueApiKey, configExists, expand, resolveSecret } from './config.js';
-import { Gateway, checkAdapter, own } from './gateway.js';
+import { Gateway, checkAdapter, kindOf, own } from './gateway.js';
 import { createServer } from './server.js';
 import { UsageLog } from './usage.js';
 import { CLI_PROFILES, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
@@ -331,6 +331,9 @@ function cmdSet(flags) {
   const next = { ...entry };
   if (flags.unset) delete next[field];
   else next[field] = value;
+  // A tool engine needs its templates: an entry attached before they existed gets the ones its
+  // built-in profile has and it lacks (never one it has), when the profile is the same CLI.
+  const filled = field === 'toolMode' && !flags.unset && typeof value === 'string' && value !== 'off' && kindOf(next) === 'cli' ? fillToolTemplates(id, next) : null;
   // A tool-capable CLI is served only by someone who said so: turning it on, taking the mark
   // off, or changing what it runs and how it is stopped needs the flag that names what it means.
   const unsafe = unsafeChange(entry, next, field);
@@ -352,8 +355,53 @@ function cmdSet(flags) {
   cfg.adapters[id] = next;
   saveConfig(cfg);
   out(`${flags.unset ? 'removed' : 'set'} ${id}.${field} → ${rel(configPath())}`);
+  if (filled) out(`  ${filled}`);
   if (unsafe) out(`! "${id}": ${unsafe}, with --allow-unsafe-tools. It can run commands and edit files on this machine${next.disabled ? ' once it is enabled' : ''}; it is still never an alias leg.`);
   noteRestart(`${id}.${field}`);
+}
+
+/**
+ * The built-in CLI profile an entry was made from, judged by what it runs: the same binary name
+ * and the same parser. `[name, profile]`, or null.
+ */
+function profileFor(id, entry) {
+  const bin = path.basename(String(entry.bin || id));
+  const parser = entry.parser || 'raw';
+  for (const [name, p] of Object.entries(CLI_PROFILES)) {
+    if (path.basename(String(p.bin)) === bin && (p.parser || 'raw') === parser) return [name, p];
+  }
+  return null;
+}
+
+/**
+ * `keysmith set <id> toolMode <mode>`: the tool engine's templates the entry lacks — emulateArgs,
+ * the bridge's settings, the workspace files they name (agy's `keysmith-tools` agent) — copied in
+ * from its built-in profile. Never over one the entry has. What was done, in one line.
+ */
+function fillToolTemplates(id, next) {
+  const found = profileFor(id, next);
+  if (!found) {
+    return `no built-in profile runs "${path.basename(String(next.bin || id))}" with parser ${next.parser || 'raw'}: EMULATE runs this adapter's own args (set emulateArgs for another argv)`;
+  }
+  const [name, p] = found;
+  const done = [];
+  if (p.emulateArgs && !next.emulateArgs) {
+    next.emulateArgs = structuredClone(p.emulateArgs);
+    done.push('emulateArgs');
+  }
+  if (p.bridge && !next.bridge) {
+    next.bridge = structuredClone(p.bridge);
+    done.push('bridge');
+  }
+  const files = Object.entries(p.workspaceFiles || {}).filter(([rel]) => !Object.hasOwn(next.workspaceFiles || {}, rel));
+  if (files.length) {
+    // An agent the argv names and agy cannot find is agy's full harness, without a word: the
+    // file is written by keysmith into a workspace it owns, or the change is not made.
+    if (!next.cwd) fail(`not saved: "${id}" has no cwd, and its ${name} profile's ${files.map(([rel]) => rel).join(', ')} must be written into one keysmith owns — keysmith add ${name} --as ${id} brings the whole profile`);
+    next.workspaceFiles = { ...(next.workspaceFiles || {}), ...Object.fromEntries(files) };
+    done.push(...files.map(([rel]) => `workspaceFiles[${rel}]`));
+  }
+  return done.length ? `filled from the built-in "${name}" profile: ${done.join(', ')}` : `the entry already has the "${name}" profile's tool templates`;
 }
 
 /**
@@ -478,7 +526,7 @@ function cmdAdapters() {
   if (!attached.length) lines.push('  (none — keysmith add <profile>)');
   for (const [id, a] of attached) {
     const state = a.kind === 'cli' ? (which(a.bin || id) ? 'binary ok' : `MISSING ${a.bin || id}`) : `key ${maskRef(a.apiKey)}`;
-    const marks = `${a.disabled ? ' · disabled' : ''}${a.unsafeTools ? ' · unsafeTools' : a.explicitOnly ? ' · explicit-only' : ''}`;
+    const marks = `${a.disabled ? ' · disabled' : ''}${a.unsafeTools ? ' · unsafeTools' : a.explicitOnly ? ' · explicit-only' : ''}${a.toolMode && a.toolMode !== 'off' ? ` · toolMode ${a.toolMode}` : ''}`;
     lines.push(`  ${id.padEnd(14)} ${String(a.kind).padEnd(5)} ${a.wire || a.parser || ''}  ${state}${marks}`);
   }
   lines.push('');

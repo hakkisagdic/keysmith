@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { LlmError, routeError } from './util.js';
+import { LlmError } from './util.js';
 import {
   chatId,
   openaiMessages,
@@ -12,7 +12,7 @@ import {
   errorBody,
 } from './protocols.js';
 import { AnthropicStream, KEEPALIVE_MS, OpenaiChatStream, anthropicMessage, faceCall, openaiCompletion } from './tools/faces.js';
-import { MAX_TOOLS, openaiLegacy, openaiToolCount } from './tools/model.js';
+import { MAX_TOOLS, anthropicToolMessages, anthropicToolSpec, openaiLegacy, openaiToolCount, openaiToolMessages, openaiToolSpec } from './tools/model.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { upstreamError } from './http-adapter.js';
@@ -276,6 +276,8 @@ function describeAdapters(gateway) {
     timeoutMs: a.timeoutMs,
     explicit_only: !!a.explicitOnly,
     unsafe_tools: !!a.unsafeTools,
+    // How it takes a request that offers tools: a CLI's toolMode, an HTTP upstream's relay.
+    tool_mode: a.kind === 'cli' ? a.toolMode || 'off' : (a.wire || 'openai') === 'openai' ? 'passthrough' : 'off',
   }));
 }
 
@@ -301,28 +303,26 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   // A client that offered the older `functions` reads a call back as message.function_call.
   const legacy = openaiLegacy(body);
 
-  // Tool calls need verbatim upstream deltas. A CLI harness would run the tools
-  // itself rather than hand them back, so pass through only to HTTP upstreams.
-  let exclude = null;
-  if (Array.isArray(body.tools) && body.tools.length) {
-    const relay = await tryPassthrough(gateway, requested, body, req, res, { usage, log, t0, caller, scope });
-    if (relay.done) return;
-    if (relay.refused.length) {
-      // Those legs already said no to this very request: asking them again without the tools
-      // spends their quota twice and can turn their refusal into a tool-less answer.
-      exclude = new Set(relay.refused.map((r) => r.target));
-      log(`tools requested; ${relay.refused.map((r) => `${r.target} refused (${r.status})`).join(', ')} — the rest of "${requested}" runs as a plain completion, without tools`);
-    } else {
-      log(`tools requested but no HTTP upstream matched for "${requested}" — running as a plain completion`);
-    }
-  }
+  // A request that offers tools walks its route for a leg that takes them, in declared order
+  // (gateway._toolRoute, tools/router.js): an HTTP upstream gets the body verbatim (the relay
+  // below writes its answer), a CLI with a toolMode answers through a tool engine. `out` is what
+  // the relay and the stream share: which engine is running, and the stream's face once it opened.
+  const out = { mode: null, face: null };
+  const tools = offered
+    ? { spec: openaiToolSpec(body), messages: openaiToolMessages(body), face: 'openai', state: out, relay: (leg) => relayLeg(leg, { body, req, res, out, usage, log, t0, caller, requested }) }
+    : null;
 
-  const chain = gateway.resolve(requested, { exclude, scope });
+  const chain = gateway.resolve(requested, { scope });
   const publicId = session || null;
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
   if (!stream) {
-    const { text, reasoning, usage: u, session: sid, retries, cutAt, toolCalls, toolMode, fallback } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, exclude, scope });
+    const { text, reasoning, usage: u, session: sid, retries, cutAt, toolCalls, toolMode, fallback, relayed } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, scope, tools });
+    if (relayed) {
+      // An HTTP leg's answer went out verbatim, with its own usage row.
+      meta.done = true;
+      return;
+    }
     const calls = toolCalls.map((c) => faceCall(c, 'openai'));
     // Written before the row: an answer the face cannot write is the error row, not an `ok` one.
     const payload = openaiCompletion({ id, model: requested, created, text, usage: u, reasoning: body.include_reasoning ? reasoning || null : null, toolCalls: calls, legacy });
@@ -331,13 +331,23 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     // The header carries the session for clients that read headers; the body carries it
     // for the ones that do not (curl, `keysmith chat`), and OpenAI SDKs ignore extras.
     if (sid) payload.keysmith = { session: sid, resumed: !!publicId };
+    if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
     return json(res, 200, payload, sid);
   }
 
-  const events = await held(gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, exclude, scope }), holdMs);
-  startSse(res, 'text/event-stream');
-  const face = new OpenaiChatStream(res, { id, model: requested, created, includeUsage: !!body.stream_options?.include_usage, legacy, keepaliveMs });
+  const events = await held(gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, scope, tools }), holdMs);
+  if (res.headersSent) {
+    // An HTTP leg is answering verbatim — its status, its headers, its bytes — and writes its
+    // own usage row: what is left here is waiting for it to finish.
+    meta.done = true;
+    for await (const evt of events) void evt;
+    return;
+  }
+  // A stream's headers go out before its answer is known: the mode is the engine running now.
+  startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
+  const face = new OpenaiChatStream(res, { id, model: requested, created, includeUsage: !!body.stream_options?.include_usage, legacy, keepaliveMs, lazy: !!tools });
   meta.face = face;
+  out.face = face;
   face.open();
   let u = null;
   let sid = null;
@@ -347,7 +357,11 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   let toolMode = null;
   let fallback = null;
   for await (const evt of events) {
-    if (evt.type === 'retry') {
+    if (evt.type === 'relayed') {
+      // An HTTP leg took the open stream over (relayLeg) and finished it, row and all.
+      meta.done = true;
+      return;
+    } else if (evt.type === 'retry') {
       retries++;
     } else if (evt.type === 'cut') {
       cutAt = evt.tool;
@@ -388,17 +402,26 @@ async function handleAnthropic(req, res, gateway, { usage, log, holdMs = STREAM_
   const session = sessionFrom(req, body);
   const meta = track(res, body.model, stream, t0, '/v1/messages');
   if (scope) meta.skipped = gateway.resolve(body.model, { scope }).skipped;
+  // The same bound as the chat face's: what an engine is handed (a prompt, a tools/list) has one.
+  const offered = Array.isArray(body.tools) ? body.tools.length : 0;
+  if (offered > MAX_TOOLS) throw new LlmError(`this request offers ${offered} tools; at most ${MAX_TOOLS} are taken`, { status: 400, type: 'invalid_request_error' });
+  // Tools on this face reach a CLI leg with a toolMode; an HTTP leg is not handed them (there is
+  // no verbatim relay for the Messages wire), so a route of those answers in text — or, when
+  // tool_choice asks for a call, with an error.
+  const out = { mode: null };
+  const tools = offered ? { spec: anthropicToolSpec(body), messages: anthropicToolMessages(body), face: 'anthropic', state: out, relay: null } : null;
   // The Messages API defaults to a single JSON reply; SSE only when asked.
   if (!stream) {
-    const { text, usage: u, session: sid, retries, cutAt, toolCalls, toolMode, fallback } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope });
+    const { text, usage: u, session: sid, retries, cutAt, toolCalls, toolMode, fallback } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools });
     const calls = toolCalls.map((c) => faceCall(c, 'anthropic'));
     meta.done = true;
     record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback }) });
+    if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
     // Session goes out as a header only: Anthropic clients schema-check the body.
     return json(res, 200, anthropicMessage({ id, model: body.model, text, usage: u, toolCalls: calls }), sid);
   }
-  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope }), holdMs);
-  startSse(res, 'text/event-stream');
+  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools }), holdMs);
+  startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
   const face = new AnthropicStream(res, { id, model: body.model, keepaliveMs });
   meta.face = face;
   face.open();
@@ -514,52 +537,45 @@ async function handleEmbeddings(req, res, gateway, { usage, scope = null } = {})
 }
 
 /**
- * Straight pipe to an HTTP upstream, byte for byte, used when the client asked for
- * tools. Only candidates that can honour that are tried, so a mixed route degrades
- * to the API-backed model instead of returning a tool-free answer.
+ * One HTTP leg of a tool request's route: the client's body to the upstream, byte for byte both
+ * ways (gateway._toolRoute calls it, in the route's order). `true` once the upstream's answer —
+ * or a broken one — went out; a refusal before that is thrown, and the route moves on.
  *
- * `{ done: true }` once an answer (or a broken one) went out; otherwise `{ done: false,
- * refused }`, the legs that refused this request, which the plain completion leaves out.
+ * A streamed request's headers may already be out when the walk gets here (held(): an earlier
+ * leg, a CLI working on its answer, took longer than limits.streamHoldMs). As long as the client
+ * has had SSE comments only, an upstream that answers in SSE carries on in that stream; once the
+ * face wrote a frame of its own, this leg cannot answer, and the route moves on.
  */
-async function tryPassthrough(gateway, requested, body, req, res, { usage, log, t0, caller = '', scope = null }) {
-  let chain;
-  try {
-    chain = gateway.resolve(requested, { scope });
-  } catch {
-    return { done: false, refused: [] };
+async function relayLeg({ adapter, model }, { body, req, res, out, usage, log, t0, caller = '', requested }) {
+  out.mode = 'passthrough';
+  const upstream = await adapter.rawChat({ ...body, model }, { caller });
+  if (!upstream.ok) {
+    const t = await upstream.text().catch(() => '');
+    throw upstreamError(adapter.id, upstream, t, { keepStatus: true });
   }
-  const candidates = chain.filter((c) => c.adapter.kind === 'http' && c.adapter.wire === 'openai');
-  let lastError = null;
-  const refused = [];
-  for (const { adapter, model, target } of candidates) {
-    try {
-      const upstream = await adapter.rawChat({ ...body, model }, { caller });
-      if (!upstream.ok) {
-        const t = await upstream.text().catch(() => '');
-        throw upstreamError(adapter.id, upstream, t, { keepStatus: true });
-      }
-      res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') || 'text/event-stream', 'x-keysmith-mode': 'passthrough' });
-      for await (const chunk of upstream.body) res.write(chunk);
-      res.end();
-      record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, stream: !!body.stream, via: 'passthrough', client: req.headers['user-agent'], toolMode: 'passthrough' });
-      return { done: true };
-    } catch (e) {
-      const err = e instanceof LlmError ? e : new LlmError(`${adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: adapter.id });
-      lastError = routeError(lastError, err);
-      refused.push({ target, status: err.status });
-      log(`passthrough via ${adapter.id} failed: ${e.message}`);
-      if (res.headersSent) {
-        res.end();
-        return { done: true };
-      }
+  if (res.headersSent) {
+    const sse = /text\/event-stream/i.test(upstream.headers.get('content-type') || '');
+    if (!sse || !out.face || out.face.wroteData) {
+      await upstream.body?.cancel?.().catch(() => {});
+      throw new LlmError(`${adapter.id}: the stream was already open ${out.face?.wroteData ? 'with another leg\'s frames in it' : 'and the upstream answered without SSE'}, so its answer cannot be relayed`, { status: 502, provider: adapter.id });
     }
+    out.face.detach();
+  } else {
+    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') || 'text/event-stream', 'x-keysmith-mode': 'passthrough' });
   }
-  // Every leg of this route could take the tools, and each one refused. Running the route
-  // again as a plain completion would ask the same upstream a second time, drop the tools
-  // without a word and turn a 429 into a 502: answer with what the provider said instead.
-  // (A route with a CLI leg still falls back to that leg, tool-less, and only to it.)
-  if (lastError && candidates.length === chain.length) throw lastError;
-  return { done: false, refused };
+  const row = { model: requested, ms: 0, stream: !!body.stream, via: 'passthrough', client: req.headers['user-agent'], toolMode: 'passthrough' };
+  try {
+    for await (const chunk of upstream.body) res.write(chunk);
+  } catch (e) {
+    // Part of the answer is out: it is the answer, broken, and no other leg is asked.
+    log(`passthrough via ${adapter.id} failed after it had started answering: ${e.message}`);
+    res.end();
+    record(usage, { ...row, status: 'error', ms: Date.now() - t0, error: redactSecrets(e.message || String(e)) });
+    return true;
+  }
+  res.end();
+  record(usage, { ...row, status: 'ok', ms: Date.now() - t0 });
+  return true;
 }
 
 /* ---------------------------------------------------------------------- plumbing */
@@ -672,8 +688,8 @@ async function held(events, holdMs) {
   })();
 }
 
-function startSse(res, type) {
-  res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' });
+function startSse(res, type, extra = {}) {
+  res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no', ...extra });
   res.write(': stream open\n\n');
 }
 
