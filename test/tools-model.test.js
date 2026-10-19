@@ -277,15 +277,36 @@ test('the canonical tool_call event: keysmith\'s own id per face, arguments as J
 const SNAPSHOT = JSON.parse(fs.readFileSync(new URL('./fixtures/flatten-snapshot.json', import.meta.url), 'utf8'));
 
 test('a tool-less request reads, and flattens, byte for byte as it did before the tool bridge (snapshot)', () => {
-  assert.ok(SNAPSHOT.cases.length >= 25);
-  for (const c of SNAPSHOT.cases) {
+  const plain = SNAPSHOT.cases.filter((c) => !c.toolHistory);
+  assert.ok(plain.length >= 25);
+  for (const c of plain) {
     const where = `${c.wire}: ${c.name}`;
     const today = c.wire === 'openai' ? openaiMessages(c.body) : anthropicMessages(c.body);
     assert.deepEqual(today, c.messages, `${where}: protocols.js`);
     assert.deepEqual(flattenMessages(today), c.flat, `${where}: flattenMessages`);
     const canonical = c.wire === 'openai' ? openaiToolMessages(c.body) : anthropicToolMessages(c.body);
     assert.ok(canonical.every((m) => !m.toolCalls && m.toolCallId === undefined), `${where}: no tool turn appears from nowhere`);
+    assert.equal(c.canonical, undefined, `${where}: a body without tool history has one reading`);
     assert.deepEqual(plainMessages(canonical), c.messages, `${where}: the canonical reading`);
     assert.deepEqual(flattenMessages(plainMessages(canonical)), c.flat, `${where}: the canonical reading, flattened`);
+  }
+});
+
+test('a body that offers no tools but carries a tool exchange: protocols.js as it was, the canonical reading as recorded — a function or tool_result is Tool output, never User or dropped (snapshot)', () => {
+  const withHistory = SNAPSHOT.cases.filter((c) => c.toolHistory);
+  assert.deepEqual(withHistory.map((c) => c.wire), ['openai', 'openai', 'openai', 'anthropic', 'anthropic']);
+  for (const c of withHistory) {
+    const where = `${c.wire}: ${c.name}`;
+    const today = c.wire === 'openai' ? openaiMessages(c.body) : anthropicMessages(c.body);
+    assert.deepEqual(today, c.messages, `${where}: protocols.js is unchanged`);
+    assert.deepEqual(flattenMessages(today), c.flat, `${where}: flattenMessages is unchanged`);
+    assert.equal(openaiToolSpec(c.body) ?? anthropicToolSpec(c.body), null, `${where}: no tool is offered`);
+    const canonical = c.wire === 'openai' ? openaiToolMessages(c.body) : anthropicToolMessages(c.body);
+    assert.ok(canonical.some((m) => m.toolCalls || m.role === 'tool'), `${where}: the tool exchange is read as one`);
+    const want = c.canonical ?? c;
+    if (c.canonical) assert.ok(typeof c.canonical.why === 'string' && c.canonical.why.length > 40, `${where}: a reading that differs says why`);
+    assert.deepEqual(plainMessages(canonical), want.messages, `${where}: the canonical reading`);
+    assert.deepEqual(flattenMessages(plainMessages(canonical)), want.flat, `${where}: the canonical reading, flattened`);
+    assert.doesNotMatch(want.flat.prompt, /User: (sunny|r|boom)$/m, `${where}: a tool result never reads as the user`);
   }
 });

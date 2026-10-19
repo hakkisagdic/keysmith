@@ -1,5 +1,5 @@
 {
-  "_provenance": "Recorded from keysmith 4dce929 (src/protocols.js openaiMessages/anthropicMessages, then src/util.js flattenMessages with the CLI adapter defaults), before the tool bridge existed. It is what a tool-less request turned into on that day: never regenerate it from newer code.",
+  "_provenance": "Recorded from keysmith 4dce929 (src/protocols.js openaiMessages/anthropicMessages, then src/util.js flattenMessages with the CLI adapter defaults), before the tool bridge existed. It is what a tool-less request turned into on that day: never regenerate it from newer code. The cases marked toolHistory (a body that offers no tools but carries a tool exchange in its history) were added in the G1 review: their messages and flat were recorded the same way, from 4dce929's own protocols.js and util.js (git archive 4dce929); their canonical part, where present, is what the tool-aware reading (src/tools/model.js) gives instead, written by hand, and differs on purpose for the reason in why.",
   "cases": [
     {
       "name": "system and user",
@@ -870,6 +870,345 @@
         "system": "Türkçe yanıt ver.",
         "prompt": "User: satır 1\nsatır 2\nson",
         "history": "User: satır 1\nsatır 2\nson"
+      }
+    },
+    {
+      "name": "legacy function call and function result, no functions offered",
+      "wire": "openai",
+      "toolHistory": true,
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "weather?"
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "function_call": {
+              "name": "f",
+              "arguments": "{}"
+            }
+          },
+          {
+            "role": "function",
+            "name": "f",
+            "content": "sunny"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        },
+        {
+          "role": "assistant",
+          "content": ""
+        },
+        {
+          "role": "function",
+          "content": "sunny"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: weather?\n\nUser: sunny",
+        "history": "User: weather?\n\nUser: sunny"
+      },
+      "canonical": {
+        "why": "A function result is a tool result: the tool-aware reading labels it Tool output, where protocols.js reads role \"function\" as User — untrusted output never reads as the user's own words.",
+        "messages": [
+          {
+            "role": "user",
+            "content": "weather?"
+          },
+          {
+            "role": "assistant",
+            "content": ""
+          },
+          {
+            "role": "tool",
+            "content": "sunny"
+          }
+        ],
+        "flat": {
+          "system": "",
+          "prompt": "User: weather?\n\nTool output: sunny",
+          "history": "User: weather?\n\nTool output: sunny"
+        }
+      }
+    },
+    {
+      "name": "a function result alone, no functions offered",
+      "wire": "openai",
+      "toolHistory": true,
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "function",
+            "name": "f",
+            "content": "r"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        },
+        {
+          "role": "function",
+          "content": "r"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: hi\n\nUser: r",
+        "history": "User: hi\n\nUser: r"
+      },
+      "canonical": {
+        "why": "A function result is a tool result: the tool-aware reading labels it Tool output, where protocols.js reads role \"function\" as User — untrusted output never reads as the user's own words.",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "tool",
+            "content": "r"
+          }
+        ],
+        "flat": {
+          "system": "",
+          "prompt": "User: hi\n\nTool output: r",
+          "history": "User: hi\n\nTool output: r"
+        }
+      }
+    },
+    {
+      "name": "tool_calls and a tool result, no tools offered",
+      "wire": "openai",
+      "toolHistory": true,
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "q"
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                  "name": "f",
+                  "arguments": "{\"a\":1}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "r"
+          },
+          {
+            "role": "assistant",
+            "content": "done"
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "q"
+        },
+        {
+          "role": "assistant",
+          "content": ""
+        },
+        {
+          "role": "tool",
+          "content": "r"
+        },
+        {
+          "role": "assistant",
+          "content": "done"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: q\n\nTool output: r\n\nAssistant: done",
+        "history": "User: q\n\nTool output: r\n\nAssistant: done"
+      }
+    },
+    {
+      "name": "tool_use with text and a tool_result next to text, no tools offered",
+      "wire": "anthropic",
+      "toolHistory": true,
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "q"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Checking."
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "f",
+                "input": {
+                  "a": 1
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "r"
+              },
+              {
+                "type": "text",
+                "text": "thanks"
+              }
+            ]
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "q"
+        },
+        {
+          "role": "assistant",
+          "content": "Checking."
+        },
+        {
+          "role": "user",
+          "content": "thanks"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: q\n\nAssistant: Checking.\n\nUser: thanks",
+        "history": "User: q\n\nAssistant: Checking.\n\nUser: thanks"
+      },
+      "canonical": {
+        "why": "protocols.js drops a tool_result block's content; the tool-aware reading keeps it as a tool turn (Tool output), as the tool bridge needs it.",
+        "messages": [
+          {
+            "role": "user",
+            "content": "q"
+          },
+          {
+            "role": "assistant",
+            "content": "Checking."
+          },
+          {
+            "role": "tool",
+            "content": "r"
+          },
+          {
+            "role": "user",
+            "content": "thanks"
+          }
+        ],
+        "flat": {
+          "system": "",
+          "prompt": "User: q\n\nAssistant: Checking.\n\nTool output: r\n\nUser: thanks",
+          "history": "User: q\n\nAssistant: Checking.\n\nTool output: r\n\nUser: thanks"
+        }
+      }
+    },
+    {
+      "name": "a tool_use-only turn and its tool_result, no tools offered",
+      "wire": "anthropic",
+      "toolHistory": true,
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "q"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "f",
+                "input": {}
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "is_error": true,
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "boom"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "q"
+        }
+      ],
+      "flat": {
+        "system": "",
+        "prompt": "User: q",
+        "history": "User: q"
+      },
+      "canonical": {
+        "why": "protocols.js drops a tool_result block's content; the tool-aware reading keeps it as a tool turn (Tool output), as the tool bridge needs it. The assistant turn that held only the call stays, empty (calls are left out of the plain list), and flattenMessages skips it.",
+        "messages": [
+          {
+            "role": "user",
+            "content": "q"
+          },
+          {
+            "role": "assistant",
+            "content": ""
+          },
+          {
+            "role": "tool",
+            "content": "boom"
+          }
+        ],
+        "flat": {
+          "system": "",
+          "prompt": "User: q\n\nTool output: boom",
+          "history": "User: q\n\nTool output: boom"
+        }
       }
     }
   ]

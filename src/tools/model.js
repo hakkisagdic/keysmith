@@ -28,8 +28,18 @@ import { contentToText } from '../util.js';
  *     toolCallId?, name?, isError? }                       a tool result
  *
  * `arguments` is the JSON text as the client sent it, `args` the object it parses to (null when
- * it does not). Text is read the way protocols.js reads it, so a tool-less request's messages
- * are the ones keysmith has always built (test/tools-model.test.js holds that to a snapshot).
+ * it does not). Text is read the way protocols.js reads it, so a request with no tool exchange
+ * in it reads, byte for byte, as keysmith has always read it (test/tools-model.test.js holds
+ * that to a snapshot of 4dce929).
+ *
+ * A tool exchange in the history is read as one even when the request offers no tools — and so
+ * differs from protocols.js on purpose (design U1 promises byte identity for any tool-less
+ * request; this is the recorded exception, and the snapshot holds both readings): a legacy
+ * `function` result is a `tool` turn (protocols.js keeps role "function", which
+ * flattenMessages labels User — untrusted tool output speaking as the user), and an Anthropic
+ * `tool_result` is a `tool` turn (protocols.js drops its content). The prompt of today's
+ * tool-less path, which reads protocols.js, does not change. (A message that is not an object,
+ * which protocols.js fails on with a TypeError, is skipped here.)
  *
  * Events — what an engine yields, next to the canonical events of parsers.js:
  *
@@ -205,7 +215,8 @@ function nameOf(name) {
 /**
  * OpenAI chat messages, tool-aware: an assistant's `tool_calls` (and the older `function_call`)
  * become `toolCalls`, a `tool` message (and the older `function` one) a tool result. Text is read
- * exactly as protocols.openaiMessages reads it.
+ * exactly as protocols.openaiMessages reads it; a `function` message's role is not (see the
+ * header: it is a tool result, never a user turn).
  */
 export function openaiToolMessages(body) {
   const list = Array.isArray(body?.messages) ? body.messages.filter((m) => m && typeof m === 'object') : [];
@@ -288,8 +299,9 @@ export function anthropicToolMessages(body) {
 
 /**
  * Canonical messages as the `{role, content}` list adapters take today: tool calls left out, tool
- * results kept as `tool` turns. For a tool-less request this is, byte for byte, what
- * protocols.js has always built.
+ * results kept as `tool` turns. For a request with no tool exchange in it this is, byte for
+ * byte, what protocols.js has always built; with one, it differs as the header says (a tool
+ * result is a `tool` turn; an assistant turn that held only calls stays, with empty content).
  */
 export function plainMessages(messages) {
   return (messages || []).map((m) => ({ role: m.role, content: m.text }));
