@@ -12,6 +12,7 @@ import {
   errorBody,
 } from './protocols.js';
 import { AnthropicStream, KEEPALIVE_MS, OpenaiChatStream, anthropicMessage, faceCall, openaiCompletion } from './tools/faces.js';
+import { openaiToolSpec } from './tools/model.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { upstreamError } from './http-adapter.js';
@@ -293,6 +294,8 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   const meta = track(res, requested, stream, t0);
   // A scoped key's request is decided before anything runs — the tool relay included.
   if (scope) meta.skipped = gateway.resolve(requested, { scope }).skipped;
+  // A client that offered the older `functions` reads a call back as message.function_call.
+  const legacy = openaiToolSpec(body)?.legacy === true;
 
   // Tool calls need verbatim upstream deltas. A CLI harness would run the tools
   // itself rather than hand them back, so pass through only to HTTP upstreams.
@@ -317,18 +320,19 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   if (!stream) {
     const { text, reasoning, usage: u, session: sid, retries, cutAt, toolCalls, toolMode, fallback } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, exclude, scope });
     const calls = toolCalls.map((c) => faceCall(c, 'openai'));
+    // Written before the row: an answer the face cannot write is the error row, not an `ok` one.
+    const payload = openaiCompletion({ id, model: requested, created, text, usage: u, reasoning: body.include_reasoning ? reasoning || null : null, toolCalls: calls, legacy });
     meta.done = true;
     record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback }) });
     // The header carries the session for clients that read headers; the body carries it
     // for the ones that do not (curl, `keysmith chat`), and OpenAI SDKs ignore extras.
-    const payload = openaiCompletion({ id, model: requested, created, text, usage: u, reasoning: body.include_reasoning ? reasoning || null : null, toolCalls: calls });
     if (sid) payload.keysmith = { session: sid, resumed: !!publicId };
     return json(res, 200, payload, sid);
   }
 
   const events = await held(gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, exclude, scope }), holdMs);
   startSse(res, 'text/event-stream');
-  const face = new OpenaiChatStream(res, { id, model: requested, created, includeUsage: !!body.stream_options?.include_usage, keepaliveMs });
+  const face = new OpenaiChatStream(res, { id, model: requested, created, includeUsage: !!body.stream_options?.include_usage, legacy, keepaliveMs });
   meta.face = face;
   face.open();
   let u = null;
@@ -363,8 +367,9 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   }
   // Headers are already on the wire at this point, so the session id rides in the
   // closing chunk as an extra field — unknown keys are ignored by every client,
-  // and `x-keysmith-session` is still set on non-streaming responses.
-  face.finish({ usage: u, keysmith: sid ? { session: sid, resumed: !!publicId } : null });
+  // and `x-keysmith-session` is still set on non-streaming responses. An error the
+  // engine reported after the answer began replaces that chunk with the error frame.
+  face.finish({ usage: u, keysmith: sid ? { session: sid, resumed: !!publicId } : null, error: errMessage });
   meta.done = true;
   record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback }) });
 }

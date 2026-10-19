@@ -193,9 +193,14 @@ test('OpenAI tool spec: tools, every tool_choice spelling, parallel_tool_calls',
   assert.equal(openaiToolSpec({ tools: [] }), null);
 });
 
-test('OpenAI tool spec: the older functions/function_call map onto the same spec', () => {
+test('OpenAI tool spec: the older functions/function_call map onto the same spec, marked legacy: one call per answer', () => {
   const functions = [{ name: 'get_weather', description: 'Weather', parameters: WEATHER }];
-  assert.deepEqual(openaiToolSpec({ functions }), { tools: [{ name: 'get_weather', description: 'Weather', parameters: WEATHER }], choice: { mode: 'auto' }, parallel: true, unsupported: [] });
+  assert.deepEqual(openaiToolSpec({ functions }), { tools: [{ name: 'get_weather', description: 'Weather', parameters: WEATHER }], choice: { mode: 'auto' }, parallel: false, unsupported: [], legacy: true });
+  assert.equal(openaiToolSpec({ functions, parallel_tool_calls: true }).parallel, false, 'a function_call message holds one call, whatever the request says');
+  // `tools` next to `functions`: a client that knows tool_calls reads them.
+  const both = openaiToolSpec({ tools: [fn('now')], functions });
+  assert.deepEqual([both.legacy, both.parallel, both.tools.map((t) => t.name)], [undefined, true, ['now', 'get_weather']]);
+  assert.equal(openaiToolSpec({ tools: [fn('now')] }).legacy, undefined);
   assert.deepEqual(openaiToolSpec({ functions, function_call: 'none' }).choice, { mode: 'none' });
   assert.deepEqual(openaiToolSpec({ functions, function_call: 'auto' }).choice, { mode: 'auto' });
   assert.deepEqual(openaiToolSpec({ functions, function_call: { name: 'get_weather' } }).choice, { mode: 'named', name: 'get_weather' });

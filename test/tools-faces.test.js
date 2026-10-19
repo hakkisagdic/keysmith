@@ -80,6 +80,11 @@ const SCRIPTS = {
     yield call('get_weather', { city: 'Ankara' });
     yield { type: 'error', message: 'late failure' };
   },
+  'error-after-text': async function* () {
+    yield delta('The answer is 4');
+    yield usage;
+    yield { type: 'error', message: 'agy exited 1 mid-answer' };
+  },
   'slow-call': async function* () {
     await sleep(400);
     yield call('get_weather', { city: 'Ankara' });
@@ -184,9 +189,12 @@ const REF = {
   anthropicStream: sse(fixture('anthropic-messages-tool-use.sse')),
 };
 
-/** What an OpenAI SDK's stream accumulator does with chunks: concatenate strings, keep index and type, merge tool calls by index. */
+/**
+ * What an OpenAI SDK's stream accumulator does with chunks: concatenate strings, keep index and
+ * type, merge tool calls by index — and the older function_call by concatenation, as it has one.
+ */
 function openaiAccumulate(frames) {
-  const message = { role: null, content: null, tool_calls: [] };
+  const message = { role: null, content: null, tool_calls: [], function_call: null };
   let finish = null;
   let usageSeen = null;
   for (const { data } of frames) {
@@ -204,6 +212,11 @@ function openaiAccumulate(frames) {
       if (tc.type) slot.type = tc.type;
       if (tc.function?.name) slot.function.name += tc.function.name;
       if (tc.function?.arguments) slot.function.arguments += tc.function.arguments;
+    }
+    if (d.function_call) {
+      message.function_call ??= { name: '', arguments: '' };
+      if (d.function_call.name) message.function_call.name += d.function_call.name;
+      if (d.function_call.arguments) message.function_call.arguments += d.function_call.arguments;
     }
     if (c.finish_reason) finish = c.finish_reason;
   }
@@ -281,6 +294,8 @@ function openaiKind({ data }) {
   if (c.delta.role) return 'role';
   if (c.delta.tool_calls?.[0]?.id) return 'tool-head';
   if (c.delta.tool_calls) return 'tool-args';
+  if (c.delta.function_call?.name) return 'function-head';
+  if (c.delta.function_call) return 'function-args';
   if (c.delta.reasoning_content) return 'reasoning';
   return 'content';
 }
@@ -376,6 +391,40 @@ test('OpenAI, streamed: parallel calls get index 0 and 1; a text answer still en
   assert.equal(openaiAccumulate(text).finish, 'stop');
 });
 
+const FUNCTIONS = [TOOLS[0].function];
+const legacyChat = (model, extra = {}) => post('/v1/chat/completions', { model, messages: ASK, functions: FUNCTIONS, function_call: 'auto', ...extra });
+
+test('OpenAI, the older functions shape: the call comes back as message.function_call, finish_reason function_call, as a legacy client reads it', async () => {
+  const r = await legacyChat('fake/one-call');
+  assert.equal(r.status, 200, r.text);
+  const choice = JSON.parse(r.text).choices[0];
+  assert.deepEqual(choice.message.function_call, { name: 'get_weather', arguments: '{"city":"Ankara"}' });
+  assert.equal(choice.message.content, null);
+  assert.equal(choice.message.tool_calls, undefined, 'no tool_calls next to it: the request did not offer tools');
+  assert.equal(choice.finish_reason, 'function_call');
+  const pre = JSON.parse((await legacyChat('fake/preamble')).text).choices[0];
+  assert.deepEqual([pre.message.content, pre.message.function_call.name, pre.finish_reason], ['Let me check.', 'get_weather', 'function_call']);
+  const text = JSON.parse((await legacyChat('fake/text')).text).choices[0];
+  assert.deepEqual([text.message.content, text.message.function_call, text.finish_reason], ['just text', undefined, 'stop']);
+
+  const frames = sse((await legacyChat('fake/preamble', { stream: true })).text);
+  assert.deepEqual(runs(frames, openaiKind), ['role', 'content', 'function-head', 'function-args', 'finish', 'done']);
+  const acc = openaiAccumulate(frames);
+  assert.deepEqual(acc.message.function_call, { name: 'get_weather', arguments: '{"city":"Ankara"}' });
+  assert.deepEqual([acc.message.content, acc.message.tool_calls, acc.finish], ['Let me check.', [], 'function_call']);
+  assert.equal(usageLog.tail(1)[0].toolCalls, 1);
+
+  // One function_call per message: a second call is the engine's mistake, said out loud — never
+  // two calls merged into one by the client's accumulator.
+  const two = await legacyChat('fake/two-calls');
+  assert.equal(two.status, 502, two.text);
+  assert.match(JSON.parse(two.text).error.message, /one function_call per answer; the engine produced 2/);
+  assert.equal(usageLog.tail(1)[0].status, 'error', 'and its usage row says so');
+  const twoStream = sse((await legacyChat('fake/two-calls', { stream: true })).text);
+  assert.deepEqual(runs(twoStream, openaiKind), ['role', 'function-head', 'function-args', 'error', 'done']);
+  assert.throws(() => openaiAccumulate(twoStream), /one function_call per answer/);
+});
+
 /* ------------------------------------------------------------------ Anthropic face */
 
 test('Anthropic, not streamed: the preamble as a text block, a tool_use block, stop_reason tool_use — the reference shape', async () => {
@@ -455,14 +504,23 @@ test('a failure after the stream opened but before any content (an engine buffer
   assert.deepEqual(af[1].data, { type: 'error', error: { type: 'tool_emulation_error', message: 'keysmith: the model answered twice with something that is not a tool call' } });
 });
 
-test('an error event after a call: the calls stay, the answer is marked as failed', async () => {
-  const o = sse((await chat('fake/error-after-call', { stream: true })).text);
-  assert.equal(openaiAccumulate(o).message.tool_calls.length, 1);
-  const a = sse((await messages('fake/error-after-call', { stream: true })).text);
-  assert.deepEqual(runs(a, anthropicKind), ['message_start', 'content_block_start:tool_use', 'ping', 'content_block_delta:input_json_delta', 'content_block_stop', 'error', 'message_delta', 'message_stop']);
-  assert.equal(a.at(-2).data.delta.stop_reason, 'error');
-  const rows = usageLog.tail(4).filter((e) => e.stream);
-  assert.ok(rows.some((e) => e.status === 'error' && e.error === 'late failure' && e.toolCalls === 1), JSON.stringify(rows));
+test('an error event after a call or text: streamed, both faces end in their error frame, so no SDK takes the start for the whole answer', async () => {
+  const cases = [
+    ['fake/error-after-call', 'late failure', ['role', 'tool-head', 'tool-args', 'error', 'done'], ['message_start', 'content_block_start:tool_use', 'ping', 'content_block_delta:input_json_delta', 'content_block_stop', 'error', 'message_delta', 'message_stop'], 1],
+    ['fake/error-after-text', 'agy exited 1 mid-answer', ['role', 'content', 'error', 'done'], ['message_start', 'content_block_start:text', 'ping', 'content_block_delta:text_delta', 'error', 'content_block_stop', 'message_delta', 'message_stop'], 0],
+  ];
+  for (const [model, message, openaiRuns, anthropicRuns, toolCalls] of cases) {
+    const o = sse((await chat(model, { stream: true, stream_options: { include_usage: true } })).text);
+    assert.deepEqual(runs(o, openaiKind), openaiRuns, `${model}: no closing chunk, no usage chunk — the error chunk and [DONE] in their place`);
+    assert.deepEqual(o.at(-2).data, { error: { message: `keysmith: ${message}`, type: 'upstream_error' } });
+    assert.throws(() => openaiAccumulate(o), new RegExp(`stream error: keysmith: ${message}`), `${model}: an OpenAI SDK raises on it`);
+    const a = sse((await messages(model, { stream: true })).text);
+    assert.deepEqual(runs(a, anthropicKind), anthropicRuns, model);
+    assert.equal(a.at(-2).data.delta.stop_reason, 'error');
+    assert.throws(() => anthropicAccumulate(a), new RegExp(`stream error: ${message}`), `${model}: an Anthropic SDK raises on it`);
+    const rows = usageLog.tail(2);
+    assert.deepEqual(rows.map((e) => [e.stream, e.status, e.error, e.toolCalls ?? 0]), [[true, 'error', message, toolCalls], [true, 'error', message, toolCalls]], JSON.stringify(rows));
+  }
   // Not streamed: the call went out as the answer, as text that came before an error always did.
   const plain = await chat('fake/error-after-call');
   assert.equal(plain.status, 200, plain.text);
@@ -595,6 +653,27 @@ test('keepalive, on a fake clock: one frame per quiet interval, none after a wri
   const off = fakeTimers();
   keepalive(fakeRes(), ': k\n\n', { intervalMs: 0, timers: off });
   assert.equal(off.live.size, 0);
+});
+
+test('OpenaiChatStream.finish with an error: the error chunk and [DONE] in place of the closing and usage chunks, and the keepalive stops', () => {
+  const res = fakeRes();
+  const clock = fakeTimers();
+  const face = new OpenaiChatStream(res, { id: 'x', model: 'm', created: 1, includeUsage: true, timers: clock });
+  face.open();
+  face.text('partial ');
+  face.finish({ usage: { input: 1, output: 2 }, keysmith: { session: 's' }, error: 'it broke' });
+  const frames = sse(res.out.join(''));
+  assert.deepEqual(runs(frames, openaiKind), ['role', 'content', 'error', 'done']);
+  assert.deepEqual(frames[2].data, { error: { message: 'keysmith: it broke', type: 'upstream_error' } });
+  assert.equal(res.writableEnded, true);
+  assert.equal(clock.live.size, 0);
+  // Without one, the answer closes as it always did.
+  const ok = fakeRes();
+  const plain = new OpenaiChatStream(ok, { id: 'x', model: 'm', created: 1, timers: fakeTimers() });
+  plain.open();
+  plain.text('whole');
+  plain.finish({ error: null });
+  assert.deepEqual(runs(sse(ok.out.join('')), openaiKind), ['role', 'content', 'finish', 'done']);
 });
 
 test('keepalive on the wire: while an engine is quiet the stream gets SSE comments (OpenAI) and ping events (Anthropic)', async () => {

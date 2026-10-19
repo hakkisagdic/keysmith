@@ -397,8 +397,10 @@ export class Gateway {
           // leg is the one answering, and a failure is reported, never retried on the next leg.
           if (evt.type === 'delta' || evt.type === 'tool_call') emitted = true;
           if (evt.type === 'error') {
-            // Every face writes this message to its client: an adapter that let a provider's
-            // quoted key through is not the last line of defence.
+            // Every streamed face writes this message to its client (an error chunk, an `error`
+            // event, response.failed), so it is redacted here: an adapter that let a provider's
+            // quoted key through is not the last line of defence. collect() keeps what came
+            // before it — a non-streamed answer is the text or calls, as it always was.
             const message = redactSecrets(evt.message);
             if (emitted) {
               yield { ...evt, message };

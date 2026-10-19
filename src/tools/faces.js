@@ -7,7 +7,9 @@ import { FINISH_TOOL_CALLS, isPlainObject, newToolCallId } from './model.js';
  * `tool_call` events an engine yields (model.js), streamed or not.
  *
  *   /v1/chat/completions  message.tool_calls, finish_reason "tool_calls"; streamed, two chunks
- *                         per call (index + id + name, then the arguments), as OpenAI sends them
+ *                         per call (index + id + name, then the arguments), as OpenAI sends them.
+ *                         A request in the older `functions` shape (`legacy`) is answered in it:
+ *                         one message.function_call, finish_reason "function_call"
  *   /v1/messages          tool_use content blocks, stop_reason "tool_use"; streamed, blocks open
  *                         when they have something in them, a call is content_block_start +
  *                         one input_json_delta + content_block_stop
@@ -15,7 +17,10 @@ import { FINISH_TOOL_CALLS, isPlainObject, newToolCallId } from './model.js';
  * Text that comes before a call (a preamble) stays in the same answer. While nothing is written
  * — an engine buffering a whole answer to check it — a stream gets a keepalive every
  * KEEPALIVE_MS (an SSE comment; Anthropic's `ping` event), so no proxy or client gives up on
- * a quiet connection. A stream that fails after it started ends in its face's own error frame.
+ * a quiet connection. A stream that fails after it started — a thrown error, or an engine's
+ * `error` event after text or a call went out — ends in its face's own error frame (an OpenAI
+ * error chunk and [DONE]; an Anthropic `error` event), so an SDK raises instead of taking what
+ * came so far for the whole answer.
  */
 
 export const KEEPALIVE_MS = 15_000;
@@ -69,21 +74,37 @@ export function keepalive(res, frame, { intervalMs = KEEPALIVE_MS, timers = glob
 
 /* ------------------------------------------------------------------ OpenAI chat */
 
-/** A non-streamed chat completion: with calls, `content` is the preamble or null, `finish_reason` "tool_calls". */
-export function openaiCompletion({ id, model, created, text, usage, reasoning = null, toolCalls = [] }) {
-  const payload = openaiResult({ id, model, created, text, usage, reasoning, finishReason: toolCalls.length ? FINISH_TOOL_CALLS : 'stop' });
+const FINISH_FUNCTION_CALL = 'function_call';
+
+/**
+ * A legacy (`functions`) answer carries one call: a second is an engine that ignored the spec's
+ * parallel false, and writing it would merge two calls into one in the client's accumulator.
+ */
+function oneLegacyCall(n) {
+  if (n > 1) throw new LlmError(`a request in the older functions shape takes one function_call per answer; the engine produced ${n}`, { status: 502 });
+}
+
+/**
+ * A non-streamed chat completion: with calls, `content` is the preamble or null, `finish_reason`
+ * "tool_calls". `legacy`: the one call as `message.function_call`, finish_reason "function_call".
+ */
+export function openaiCompletion({ id, model, created, text, usage, reasoning = null, toolCalls = [], legacy = false }) {
+  if (legacy) oneLegacyCall(toolCalls.length);
+  const finishReason = !toolCalls.length ? 'stop' : legacy ? FINISH_FUNCTION_CALL : FINISH_TOOL_CALLS;
+  const payload = openaiResult({ id, model, created, text, usage, reasoning, finishReason });
   if (toolCalls.length) {
     const message = payload.choices[0].message;
     message.content = text ? text : null;
-    message.tool_calls = toolCalls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } }));
+    if (legacy) message.function_call = { name: toolCalls[0].name, arguments: toolCalls[0].arguments };
+    else message.tool_calls = toolCalls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } }));
   }
   return payload;
 }
 
 /** A streamed chat completion, one event at a time. */
 export class OpenaiChatStream {
-  constructor(res, { id, model, created, includeUsage = false, keepaliveMs = KEEPALIVE_MS, timers } = {}) {
-    Object.assign(this, { res, id, model, created, includeUsage, keepaliveMs, timers });
+  constructor(res, { id, model, created, includeUsage = false, legacy = false, keepaliveMs = KEEPALIVE_MS, timers } = {}) {
+    Object.assign(this, { res, id, model, created, includeUsage, legacy, keepaliveMs, timers });
     this.calls = 0;
     this.ka = null;
   }
@@ -110,16 +131,32 @@ export class OpenaiChatStream {
     this._data(this._chunk({ reasoning_content: text }));
   }
 
-  /** Two chunks, as OpenAI streams a call: who (index, id, type, name, empty arguments), then the arguments. */
+  /**
+   * Two chunks, as OpenAI streams a call: who (index, id, type, name, empty arguments), then the
+   * arguments. `legacy`: the same two as `function_call` (name, then arguments), one call only.
+   */
   toolCall(call) {
+    if (this.legacy) {
+      oneLegacyCall(this.calls + 1);
+      this.calls++;
+      this._data(this._chunk({ function_call: { name: call.name, arguments: '' } }));
+      this._data(this._chunk({ function_call: { arguments: call.arguments } }));
+      return;
+    }
     const index = this.calls++;
     this._data(this._chunk({ tool_calls: [{ index, id: call.id, type: 'function', function: { name: call.name, arguments: '' } }] }));
     this._data(this._chunk({ tool_calls: [{ index, function: { arguments: call.arguments } }] }));
   }
 
-  /** The closing chunk (finish_reason, and keysmith's session as an extra field), the usage chunk when asked for, [DONE]. */
-  finish({ usage = null, keysmith = null } = {}) {
-    const closing = this._chunk({}, this.calls ? FINISH_TOOL_CALLS : 'stop');
+  /**
+   * The closing chunk (finish_reason, and keysmith's session as an extra field), the usage chunk
+   * when asked for, [DONE]. With `error` — the engine reported a failure after the answer began —
+   * the answer is not finished: the error chunk and [DONE] go out in place of the closing chunk,
+   * as fail() writes them, the way the Anthropic face writes its `error` event.
+   */
+  finish({ usage = null, keysmith = null, error = null } = {}) {
+    if (error) return this.fail(error);
+    const closing = this._chunk({}, !this.calls ? 'stop' : this.legacy ? FINISH_FUNCTION_CALL : FINISH_TOOL_CALLS);
     if (keysmith) closing.keysmith = keysmith;
     this._data(closing);
     if (this.includeUsage) {

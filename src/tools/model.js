@@ -11,7 +11,10 @@ import { contentToText } from '../util.js';
  *   { tools:   [{ name, description, parameters }],      parameters: the client's JSON Schema, as sent
  *     choice:  { mode: 'auto'|'none'|'required'|'named', name? },
  *     parallel: boolean,                                   may one answer hold several calls
- *     unsupported: [{ type, name?, reason? }] }            what no CLI leg can honour
+ *     unsupported: [{ type, name?, reason? }],             what no CLI leg can honour
+ *     legacy?: true }                                      OpenAI's older `functions` (no `tools`):
+ *                                                          one call per answer (parallel false),
+ *                                                          written back as `function_call`
  *
  * `unsupported` is anything that is not a plain function tool — OpenAI `custom` tools, Anthropic
  * server tools (`web_search_*`, `bash_*`, `text_editor_*`, `computer_*` …), a `tool_choice` this
@@ -76,7 +79,13 @@ export function toolCallEvent({ id = null, name, args = {}, face = 'openai' }) {
 
 /* ------------------------------------------------------------------- tool specs */
 
-/** OpenAI chat: `tools` (and the older `functions`), `tool_choice` / `function_call`, `parallel_tool_calls`. Null when the request offers no tool. */
+/**
+ * OpenAI chat: `tools` (and the older `functions`), `tool_choice` / `function_call`,
+ * `parallel_tool_calls`. Null when the request offers no tool. A request that offers only
+ * `functions` is a legacy one: its client reads one `message.function_call` with finish_reason
+ * "function_call" and has no word for a second call, so the spec says `legacy` and parallel false
+ * whatever parallel_tool_calls says, and the chat face answers in that shape.
+ */
 export function openaiToolSpec(body) {
   const listed = Array.isArray(body?.tools) ? body.tools : [];
   const legacy = Array.isArray(body?.functions) ? body.functions : [];
@@ -94,7 +103,12 @@ export function openaiToolSpec(body) {
     else spec.unsupported.push({ type: typeName(f) });
   }
   spec.choice = openaiChoice(body.tool_choice !== undefined ? body.tool_choice : body.function_call, spec);
-  spec.parallel = body.parallel_tool_calls !== false;
+  if (!listed.length) {
+    spec.legacy = true;
+    spec.parallel = false;
+  } else {
+    spec.parallel = body.parallel_tool_calls !== false;
+  }
   return spec;
 }
 
