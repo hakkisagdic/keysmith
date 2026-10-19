@@ -10,10 +10,13 @@ import { anthropicMessages, openaiMessages } from '../src/protocols.js';
 import { flattenMessages } from '../src/util.js';
 import {
   FINISH_TOOL_CALLS,
+  MAX_TOOLS,
   anthropicToolMessages,
   anthropicToolSpec,
   newToolCallId,
   newToolItemId,
+  openaiLegacy,
+  openaiToolCount,
   openaiToolMessages,
   openaiToolSpec,
   plainMessages,
@@ -204,6 +207,14 @@ test('OpenAI tool spec: the older functions/function_call map onto the same spec
   assert.deepEqual(openaiToolSpec({ functions, function_call: 'none' }).choice, { mode: 'none' });
   assert.deepEqual(openaiToolSpec({ functions, function_call: 'auto' }).choice, { mode: 'auto' });
   assert.deepEqual(openaiToolSpec({ functions, function_call: { name: 'get_weather' } }).choice, { mode: 'named', name: 'get_weather' });
+
+  // The chat face asks openaiLegacy and openaiToolCount, which never build a spec: they say what it would.
+  for (const body of [{}, null, { tools: [] }, { functions: [] }, { functions }, { tools: [], functions }, { tools: 'x', functions }, { tools: [fn('now')], functions }, { tools: [fn('now')] }, { tools: [fn('now')], functions: {} }, { functions: [null] }]) {
+    assert.equal(openaiLegacy(body), openaiToolSpec(body)?.legacy === true, JSON.stringify(body));
+    const spec = openaiToolSpec(body);
+    assert.equal(openaiToolCount(body), spec ? spec.tools.length + spec.unsupported.length : 0, JSON.stringify(body));
+  }
+  assert.equal(MAX_TOOLS, 128, 'OpenAI\'s limit on tools');
 });
 
 test('what no CLI leg can honour lands in unsupported: custom and server tools, an unknown tool_choice, a name twice', () => {
@@ -249,6 +260,35 @@ test('Anthropic tool spec: input_schema, tool_choice auto/any/tool/none, disable
   assert.equal(spec({ type: 'any', disable_parallel_tool_use: false }).parallel, true);
   assert.deepEqual(spec({ type: 'sometimes' }).unsupported, [{ type: 'tool_choice', reason: 'tool_choice of type "sometimes" is not one keysmith knows' }]);
   assert.equal(anthropicToolSpec({ messages: [] }), null);
+});
+
+test('a long tool list is read in linear time: tens of thousands of names, distinct or repeated, each well under a second', () => {
+  // The chat face reads every request this way on the gateway's one event loop, so the cost of a
+  // list is every other client's wait. A duplicate check that scans the tools read so far made
+  // 40,000 distinct names take seconds (n²/2 comparisons); a linear read takes milliseconds.
+  const N = 40_000;
+  const names = Array.from({ length: N }, (_, i) => 'f' + i);
+  const timed = (what, read) => {
+    const t0 = performance.now();
+    const spec = read();
+    const ms = performance.now() - t0;
+    assert.ok(ms < 1000, `${what}: ${N} tools read in ${ms.toFixed(0)} ms`);
+    return spec;
+  };
+  const legacy = timed('functions', () => openaiToolSpec({ functions: names.map((name) => ({ name })), function_call: { name: names.at(-1) } }));
+  assert.deepEqual([legacy.tools.length, legacy.legacy, legacy.choice, legacy.unsupported], [N, true, { mode: 'named', name: names.at(-1) }, []]);
+  const tools = timed('tools', () => openaiToolSpec({ tools: names.map((name) => fn(name)) }));
+  assert.deepEqual([tools.tools.length, tools.tools.at(-1).name, tools.unsupported], [N, names.at(-1), []]);
+  const anthropic = timed('Anthropic tools', () => anthropicToolSpec({ tools: names.map((name) => ({ name })), tool_choice: { type: 'tool', name: 'f0' } }));
+  assert.deepEqual([anthropic.tools.length, anthropic.choice, anthropic.unsupported], [N, { mode: 'named', name: 'f0' }, []]);
+  // The same name N times: one tool, and every repeat is said once, in order.
+  const repeated = timed('one name repeated', () => openaiToolSpec({ tools: names.map(() => fn('f')), tool_choice: { type: 'function', function: { name: 'g' } } }));
+  assert.deepEqual([repeated.tools.length, repeated.unsupported.length, repeated.unsupported[0], repeated.unsupported.at(-1)], [
+    1,
+    N,
+    { type: 'function', name: 'f', reason: 'offered twice' },
+    { type: 'tool_choice', name: 'g', reason: 'names a tool the request does not offer' },
+  ]);
 });
 
 /* -------------------------------------------------------------- events and ids */

@@ -12,7 +12,7 @@ import {
   errorBody,
 } from './protocols.js';
 import { AnthropicStream, KEEPALIVE_MS, OpenaiChatStream, anthropicMessage, faceCall, openaiCompletion } from './tools/faces.js';
-import { openaiToolSpec } from './tools/model.js';
+import { MAX_TOOLS, openaiLegacy, openaiToolCount } from './tools/model.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { upstreamError } from './http-adapter.js';
@@ -294,8 +294,12 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   const meta = track(res, requested, stream, t0);
   // A scoped key's request is decided before anything runs — the tool relay included.
   if (scope) meta.skipped = gateway.resolve(requested, { scope }).skipped;
+  // OpenAI's own limit, checked before the list is read: a body may be 32 MB, and a read of its
+  // tools runs on the event loop every other client of this gateway shares.
+  const offered = openaiToolCount(body);
+  if (offered > MAX_TOOLS) throw new LlmError(`this request offers ${offered} tools; at most ${MAX_TOOLS} are taken (OpenAI's limit)`, { status: 400, type: 'invalid_request_error' });
   // A client that offered the older `functions` reads a call back as message.function_call.
-  const legacy = openaiToolSpec(body)?.legacy === true;
+  const legacy = openaiLegacy(body);
 
   // Tool calls need verbatim upstream deltas. A CLI harness would run the tools
   // itself rather than hand them back, so pass through only to HTTP upstreams.

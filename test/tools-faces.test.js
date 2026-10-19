@@ -425,6 +425,48 @@ test('OpenAI, the older functions shape: the call comes back as message.function
   assert.throws(() => openaiAccumulate(twoStream), /one function_call per answer/);
 });
 
+test('more tools than OpenAI takes (128, `tools` and `functions` together) is a 400 before any leg runs — and a huge list is refused at once, never parsed on the shared event loop', async () => {
+  const fns = (n, from = 0) => Array.from({ length: n }, (_, i) => ({ name: 'f' + (from + i) }));
+  const tools = (n) => fns(n).map((f) => ({ type: 'function', function: f }));
+  const ask = (extra) => post('/v1/chat/completions', { model: 'fake/text', messages: ASK, ...extra });
+  const ran = calls.length;
+
+  // One key holder's 700 KiB body once held every other client of the gateway for seconds.
+  for (const [what, extra, n] of [
+    ['functions', { functions: fns(40_000) }, 40_000],
+    ['tools', { tools: tools(30_000) }, 30_000],
+  ]) {
+    const t0 = performance.now();
+    const r = await ask(extra);
+    const ms = performance.now() - t0;
+    assert.equal(r.status, 400, `${what}: ${r.text.slice(0, 200)}`);
+    assert.ok(ms < 1500, `${what}: ${n} tools answered in ${ms.toFixed(0)} ms`);
+    const err = JSON.parse(r.text).error;
+    assert.equal(err.type, 'invalid_request_error');
+    const said = `this request offers ${n} tools; at most 128 are taken (OpenAI's limit)`;
+    assert.equal(err.message, `keysmith: ${said}`);
+    const row = usageLog.tail(1)[0];
+    assert.deepEqual([row.model, row.status, row.error], ['fake/text', 'error', said], 'the refusal has its usage row');
+  }
+  assert.equal((await ask({ tools: tools(100), functions: fns(29, 100) })).status, 400, '100 tools and 29 functions are 129');
+  assert.equal((await ask({ tools: tools(129), stream: true })).status, 400, 'streamed or not');
+  assert.equal(calls.length, ran, 'no leg was asked');
+
+  // The limit itself is fine, in either shape; `tools: []` next to `functions` is still the older shape.
+  assert.equal((await ask({ tools: tools(128) })).status, 200);
+  const legacy = await post('/v1/chat/completions', { model: 'fake/one-call', messages: ASK, tools: [], functions: fns(128) });
+  assert.equal(legacy.status, 200, legacy.text);
+  const choice = JSON.parse(legacy.text).choices[0];
+  assert.deepEqual([choice.message.function_call?.name, choice.message.tool_calls, choice.finish_reason], ['get_weather', undefined, 'function_call']);
+  // Only `functions` without `tools` is the older shape: with `tools`, or with neither, a call is a tool_call.
+  for (const extra of [{ tools: tools(1), functions: fns(1, 1) }, {}]) {
+    const r = await post('/v1/chat/completions', { model: 'fake/one-call', messages: ASK, ...extra });
+    const c = JSON.parse(r.text).choices[0];
+    assert.deepEqual([c.message.function_call, c.message.tool_calls?.[0]?.function.name, c.finish_reason], [undefined, 'get_weather', 'tool_calls'], JSON.stringify(Object.keys(extra)));
+  }
+  assert.equal(calls.length, ran + 4);
+});
+
 /* ------------------------------------------------------------------ Anthropic face */
 
 test('Anthropic, not streamed: the preamble as a text block, a tool_use block, stop_reason tool_use — the reference shape', async () => {

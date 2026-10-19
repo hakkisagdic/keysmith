@@ -164,7 +164,8 @@ pretending a CLI produced `tool_calls`. If every leg could take them and each on
 (a 429, a 400), the client gets the refusal with the provider's status and message — not
 the same request again without its tools. In a route that also has CLI legs, the legs that
 refused are not asked a second time: the CLI legs answer, without tools, and the log names
-each leg that refused and its status.
+each leg that refused and its status. A request that offers more than 128 tools (`tools`
+and the older `functions` together; OpenAI's own limit) is a 400 before any leg is asked.
 
 An upstream's 429 and 503 keep their status on every path, with its `retry-after` when it
 sent one, so a client backs off the way it would talking to the provider directly. When

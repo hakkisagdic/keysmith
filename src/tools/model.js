@@ -90,6 +90,26 @@ export function toolCallEvent({ id = null, name, args = {}, face = 'openai' }) {
 /* ------------------------------------------------------------------- tool specs */
 
 /**
+ * The most tools one request may offer: OpenAI's own limit on `tools`, and so on what an OpenAI
+ * client sends. The chat face refuses more with a 400 before any leg runs (server.js), counting
+ * `tools` and the older `functions` together (openaiToolCount). Not in the design: a review
+ * found one request with 40,000 functions holding every client of the gateway for seconds. The
+ * read below is linear, so this is a bound on what an engine is later handed (a prompt, an MCP
+ * tools/list), not what keeps the parse cheap.
+ */
+export const MAX_TOOLS = 128;
+
+/** How many tools an OpenAI chat body offers, `tools` and `functions` together, without reading one. */
+export function openaiToolCount(body) {
+  return listLength(body?.tools) + listLength(body?.functions);
+}
+
+/** Whether an OpenAI chat body is a legacy one (`functions`, no `tools`): openaiToolSpec(body)?.legacy, without building the spec. */
+export function openaiLegacy(body) {
+  return !listLength(body?.tools) && listLength(body?.functions) > 0;
+}
+
+/**
  * OpenAI chat: `tools` (and the older `functions`), `tool_choice` / `function_call`,
  * `parallel_tool_calls`. Null when the request offers no tool. A request that offers only
  * `functions` is a legacy one: its client reads one `message.function_call` with finish_reason
@@ -101,19 +121,20 @@ export function openaiToolSpec(body) {
   const legacy = Array.isArray(body?.functions) ? body.functions : [];
   if (!listed.length && !legacy.length) return null;
   const spec = emptySpec();
+  const names = new Set();
   for (const t of listed) {
     if (t && typeof t === 'object' && t.type === 'function' && t.function && typeof t.function === 'object') {
-      addTool(spec, t.function.name, t.function.description, t.function.parameters, 'function');
+      addTool(spec, names, t.function.name, t.function.description, t.function.parameters, 'function');
     } else {
       spec.unsupported.push({ type: typeName(t), ...nameOf(t?.function?.name ?? t?.custom?.name ?? t?.name) });
     }
   }
   for (const f of legacy) {
-    if (f && typeof f === 'object') addTool(spec, f.name, f.description, f.parameters, 'function');
+    if (f && typeof f === 'object') addTool(spec, names, f.name, f.description, f.parameters, 'function');
     else spec.unsupported.push({ type: typeName(f) });
   }
-  spec.choice = openaiChoice(body.tool_choice !== undefined ? body.tool_choice : body.function_call, spec);
-  if (!listed.length) {
+  spec.choice = openaiChoice(body.tool_choice !== undefined ? body.tool_choice : body.function_call, spec, names);
+  if (openaiLegacy(body)) {
     spec.legacy = true;
     spec.parallel = false;
   } else {
@@ -127,12 +148,13 @@ export function anthropicToolSpec(body) {
   const listed = Array.isArray(body?.tools) ? body.tools : [];
   if (!listed.length) return null;
   const spec = emptySpec();
+  const names = new Set();
   for (const t of listed) {
     // A custom tool has no `type` or `type: "custom"`; every typed one (`web_search_20250305`,
     // `bash_20250124`, `text_editor_…`, `computer_…`, `code_execution_…`) is run by Anthropic's
     // servers, which no CLI leg is.
     if (t && typeof t === 'object' && (t.type == null || t.type === 'custom')) {
-      addTool(spec, t.name, t.description, t.input_schema, 'custom');
+      addTool(spec, names, t.name, t.description, t.input_schema, 'custom');
     } else {
       spec.unsupported.push({ type: typeName(t), ...nameOf(t?.name) });
     }
@@ -142,7 +164,7 @@ export function anthropicToolSpec(body) {
   else if (tc && typeof tc === 'object' && tc.type === 'auto') spec.choice = { mode: 'auto' };
   else if (tc && typeof tc === 'object' && tc.type === 'any') spec.choice = { mode: 'required' };
   else if (tc && typeof tc === 'object' && tc.type === 'none') spec.choice = { mode: 'none' };
-  else if (tc && typeof tc === 'object' && tc.type === 'tool' && typeof tc.name === 'string' && tc.name) spec.choice = named(tc.name, spec);
+  else if (tc && typeof tc === 'object' && tc.type === 'tool' && typeof tc.name === 'string' && tc.name) spec.choice = named(tc.name, spec, names);
   else {
     spec.choice = { mode: 'auto' };
     spec.unsupported.push({ type: 'tool_choice', reason: `tool_choice ${describeChoice(tc)} is not one keysmith knows` });
@@ -156,15 +178,21 @@ function emptySpec() {
   return { tools: [], choice: { mode: 'auto' }, parallel: true, unsupported: [] };
 }
 
-function addTool(spec, name, description, parameters, type) {
+/**
+ * One offered tool into the spec. `names` holds the names taken so far, so a list is read in one
+ * pass: the request is read on the gateway's one event loop, and a list that cost n² to read
+ * would hold every other client while it was (see MAX_TOOLS).
+ */
+function addTool(spec, names, name, description, parameters, type) {
   if (typeof name !== 'string' || !name) {
     spec.unsupported.push({ type, reason: 'a tool without a name' });
     return;
   }
-  if (spec.tools.some((t) => t.name === name)) {
+  if (names.has(name)) {
     spec.unsupported.push({ type, name, reason: 'offered twice' });
     return;
   }
+  names.add(name);
   spec.tools.push({
     name,
     description: typeof description === 'string' ? description : '',
@@ -172,7 +200,7 @@ function addTool(spec, name, description, parameters, type) {
   });
 }
 
-function openaiChoice(tc, spec) {
+function openaiChoice(tc, spec, names) {
   if (tc === undefined || tc === null || tc === 'auto') return { mode: 'auto' };
   if (tc === 'none') return { mode: 'none' };
   if (tc === 'required') return { mode: 'required' };
@@ -180,16 +208,16 @@ function openaiChoice(tc, spec) {
     // Chat: `{type: "function", function: {name}}`. Responses: `{type: "function", name}`.
     // The older `function_call`: `{name}`.
     const name = tc.type === 'function' ? (tc.function?.name ?? tc.name) : tc.type == null ? tc.name : undefined;
-    if (typeof name === 'string' && name) return named(name, spec);
+    if (typeof name === 'string' && name) return named(name, spec, names);
   }
   spec.unsupported.push({ type: 'tool_choice', reason: `tool_choice ${describeChoice(tc)} is not one keysmith knows` });
   return { mode: 'auto' };
 }
 
-function named(name, spec) {
+function named(name, spec, names) {
   // Naming a tool the request does not offer is the client's mistake; the provider would refuse
-  // it, and so does every CLI leg.
-  if (!spec.tools.some((t) => t.name === name) && !spec.unsupported.some((u) => u.name === name)) {
+  // it, and so does every CLI leg. (One pass over `unsupported`, once per request.)
+  if (!names.has(name) && !spec.unsupported.some((u) => u.name === name)) {
     spec.unsupported.push({ type: 'tool_choice', name, reason: 'names a tool the request does not offer' });
   }
   return { mode: 'named', name };
@@ -208,6 +236,10 @@ function typeName(t) {
 
 function nameOf(name) {
   return typeof name === 'string' && name ? { name: name.slice(0, 128) } : {};
+}
+
+function listLength(v) {
+  return Array.isArray(v) ? v.length : 0;
 }
 
 /* --------------------------------------------------------------------- messages */
