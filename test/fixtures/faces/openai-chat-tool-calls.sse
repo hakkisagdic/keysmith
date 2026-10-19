@@ -1,0 +1,18 @@
+: provenance: the shape of a streamed OpenAI Chat Completions answer with a preamble and one function call, stream_options.include_usage on, written out by hand from the Chat Completions API reference (streaming, function calling), ids and values replaced. Not a recording. Checked once against the openai Python SDK 2.54.0 (ChatCompletionChunk.model_validate, ChatCompletionStreamState) on 2026-10-19.
+
+data: {"id":"chatcmpl-Rf3kq0aVt8xL2pNw7mYc1Zb9Ud4Ef","object":"chat.completion.chunk","created":1760870400,"model":"gpt-4.1-2025-04-14","service_tier":"default","system_fingerprint":"fp_7d1c2b3a4e","choices":[{"index":0,"delta":{"role":"assistant","content":"","refusal":null},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-Rf3kq0aVt8xL2pNw7mYc1Zb9Ud4Ef","object":"chat.completion.chunk","created":1760870400,"model":"gpt-4.1-2025-04-14","service_tier":"default","system_fingerprint":"fp_7d1c2b3a4e","choices":[{"index":0,"delta":{"content":"Let me check."},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-Rf3kq0aVt8xL2pNw7mYc1Zb9Ud4Ef","object":"chat.completion.chunk","created":1760870400,"model":"gpt-4.1-2025-04-14","service_tier":"default","system_fingerprint":"fp_7d1c2b3a4e","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_q8Vb3nT1sLx0Ka7dWm2Yp5Rz","type":"function","function":{"name":"get_weather","arguments":""}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-Rf3kq0aVt8xL2pNw7mYc1Zb9Ud4Ef","object":"chat.completion.chunk","created":1760870400,"model":"gpt-4.1-2025-04-14","service_tier":"default","system_fingerprint":"fp_7d1c2b3a4e","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"ci"}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-Rf3kq0aVt8xL2pNw7mYc1Zb9Ud4Ef","object":"chat.completion.chunk","created":1760870400,"model":"gpt-4.1-2025-04-14","service_tier":"default","system_fingerprint":"fp_7d1c2b3a4e","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\":\"Ankara\"}"}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-Rf3kq0aVt8xL2pNw7mYc1Zb9Ud4Ef","object":"chat.completion.chunk","created":1760870400,"model":"gpt-4.1-2025-04-14","service_tier":"default","system_fingerprint":"fp_7d1c2b3a4e","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"tool_calls"}],"usage":null}
+
+data: {"id":"chatcmpl-Rf3kq0aVt8xL2pNw7mYc1Zb9Ud4Ef","object":"chat.completion.chunk","created":1760870400,"model":"gpt-4.1-2025-04-14","service_tier":"default","system_fingerprint":"fp_7d1c2b3a4e","choices":[],"usage":{"prompt_tokens":82,"completion_tokens":21,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":0,"audio_tokens":0},"completion_tokens_details":{"reasoning_tokens":0,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0}}}
+
+data: [DONE]
+

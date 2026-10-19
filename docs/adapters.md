@@ -349,7 +349,10 @@ Upstream statuses: 401/403 stay auth errors, 429 and 503 keep their status (with
 `retry-after` when the provider sent one) on the plain-completion path too; anything else
 there is a 502. A streamed request holds its headers until its first event, for up to
 `limits.streamHoldMs` (default 10000), so a refusal in that time keeps its status; one after
-that is an SSE error frame on a 200. When failover moved on from a 429/503 and a later leg
+that is an SSE error frame on a 200 (an `error` event on `/v1/messages`). An open stream that has
+nothing to say for `limits.streamKeepaliveMs` (default 15000; 0 turns it off) gets a keepalive —
+an SSE comment on `/v1/chat/completions`, a `ping` event on `/v1/messages` — so a slow CLI or a
+buffered tool answer is not cut by a proxy's idle timeout. When failover moved on from a 429/503 and a later leg
 refused for another reason, the 429/503 is what the client gets. A route with CLI legs does
 not ask a leg that refused the tools again; its CLI legs answer without them. Google wraps
 its errors in a one-element array; the message the client sees is `<adapter> <status>: <STATUS>: <provider message>`, e.g.

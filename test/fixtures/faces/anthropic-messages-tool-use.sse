@@ -1,0 +1,41 @@
+: provenance: the shape of a streamed Anthropic Messages answer with a preamble and one tool_use block, written out by hand from the Messages API reference (streaming, tool use: input_json_delta), ids and values replaced. Not a recording. Checked once against the anthropic Python SDK 1.2.0 (its stream accumulator) on 2026-10-19.
+
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_01Hq7vK2mR8sT3nX4bY5cZ6e","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":472,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":2}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: ping
+data: {"type": "ping"}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" check."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01Ab2Cd3Ef4Gh5Ij6Kl7Mn8P","name":"get_weather","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\": \"An"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"kara\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":89}}
+
+event: message_stop
+data: {"type":"message_stop"}
+

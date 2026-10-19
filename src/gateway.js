@@ -362,9 +362,11 @@ export class Gateway {
     let lastError = null;
 
     for (const { adapter, model: upstreamModel } of chain) {
+      // Outside the try: a leg that throws after part of its answer went out (text, or a tool
+      // call the client may already be running) is not restarted on the next leg either.
+      let emitted = false;
       try {
         const canResume = !!known && known.upstreamSession && adapterOf(known.target) === adapter.id && !!adapter.resumable;
-        let emitted = false;
         for await (const evt of adapter.complete({
           model: upstreamModel,
           messages,
@@ -391,7 +393,9 @@ export class Gateway {
             yield evt;
             continue;
           }
-          if (evt.type === 'delta') emitted = true;
+          // A tool call handed to the client is an answer as much as text is: from here on this
+          // leg is the one answering, and a failure is reported, never retried on the next leg.
+          if (evt.type === 'delta' || evt.type === 'tool_call') emitted = true;
           if (evt.type === 'error') {
             // Every face writes this message to its client: an adapter that let a provider's
             // quoted key through is not the last line of defence.
@@ -420,6 +424,10 @@ export class Gateway {
       } catch (e) {
         const err = e instanceof LlmError ? e : new LlmError(e.message, { status: 502, provider: adapter.id });
         if (signal?.aborted) throw err;
+        if (emitted) {
+          this.log(`${adapter.id}/${truncate(upstreamModel, 60)} failed after it had started answering, so no other leg is tried: ${truncate(e.message, 160)}`);
+          throw err;
+        }
         this.log(`${adapter.id}/${truncate(upstreamModel, 60)} failed, ${chain.length > 1 ? 'trying next candidate' : 'giving up'}: ${truncate(e.message, 160)}`);
         if (chain.length === 1) throw err;
         lastError = routeError(lastError, err);
@@ -428,7 +436,11 @@ export class Gateway {
     throw lastError || new LlmError('no candidate in this route succeeded', { status: 502 });
   }
 
-  /** Non-streaming convenience used by /chat/completions when stream=false. */
+  /**
+   * Non-streaming convenience used by the faces when stream=false: the text, and the tool calls
+   * an engine handed back for the client to run (`toolCalls`, canonical `tool_call` events), with
+   * which engine answered (`toolMode`) and why not the one picked first (`fallback`).
+   */
   async collect(opts) {
     let text = '';
     let reasoning = '';
@@ -437,17 +449,22 @@ export class Gateway {
     let err = null;
     let retries = 0;
     let cutAt = null;
+    const toolCalls = [];
+    let toolMode = null;
+    let fallback = null;
     for await (const evt of this.complete(opts)) {
       if (evt.type === 'retry') retries++;
       else if (evt.type === 'cut') cutAt = evt.tool;
       else if (evt.type === 'delta') text += evt.text;
+      else if (evt.type === 'tool_call') toolCalls.push(evt);
+      else if (evt.type === 'tool_mode') [toolMode, fallback] = [evt.mode || null, evt.fallback || null];
       else if (evt.type === 'reasoning') reasoning += evt.text;
       else if (evt.type === 'usage') usage = mergeUsage(usage, evt.usage);
       else if (evt.type === 'session') sessionId = sessionId || evt.id;
       else if (evt.type === 'error') err = evt.message;
     }
-    if (err && !text) throw new LlmError(err, { status: 502 });
-    return { text, reasoning, usage, session: sessionId, retries, cutAt };
+    if (err && !text && !toolCalls.length) throw new LlmError(err, { status: 502 });
+    return { text, reasoning, usage, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback };
   }
 }
 

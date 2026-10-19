@@ -4,15 +4,14 @@ import { LlmError, routeError } from './util.js';
 import {
   chatId,
   openaiMessages,
-  openaiChunk,
   openaiResult,
   anthropicMessages,
   anthropicStreamEvents,
-  anthropicResult,
   responsesMessages,
   responsesResult,
   errorBody,
 } from './protocols.js';
+import { AnthropicStream, KEEPALIVE_MS, OpenaiChatStream, anthropicMessage, faceCall, openaiCompletion } from './tools/faces.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { upstreamError } from './http-adapter.js';
@@ -42,6 +41,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
   const pages = pageSessions();
   // How long a streamed answer's headers wait for its first event (see `held`).
   const holdMs = Number.isFinite(cfg.limits?.streamHoldMs) && cfg.limits.streamHoldMs >= 0 ? cfg.limits.streamHoldMs : STREAM_HOLD_MS;
+  // How long an open stream may go without a byte before it gets a keepalive (faces.js); 0: never.
+  const keepaliveMs = Number.isFinite(cfg.limits?.streamKeepaliveMs) && cfg.limits.streamKeepaliveMs >= 0 ? cfg.limits.streamKeepaliveMs : KEEPALIVE_MS;
 
   // Whatever one request does, it never takes the process down: launchd would restart it
   // every 10 s for as long as somebody keeps sending the request, and Node's own crash
@@ -130,8 +131,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
         const filter = usageFilterFor(gateway, who);
         return json(res, 200, { summary: usage?.summarize(Number(url.searchParams.get('hours') || 24) * 3600_000, filter), ...(n ? { entries: usage.tail(n, filter) } : {}) });
       }
-      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, scope });
-      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, holdMs, scope });
+      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope });
+      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, holdMs, keepaliveMs, scope });
       if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, holdMs, scope });
       if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope });
       return json(res, 404, errorBody(`no route ${req.method} ${route}`, 'invalid_request_error', 404));
@@ -146,8 +147,13 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
         record(stamped, { model: meta.model, status: e?.scopeDenied ? 'denied' : 'error', ms: Date.now() - meta.t0, stream: meta.stream, error: message, client: req.headers['user-agent'], ...(meta.via ? { via: meta.via } : {}) });
       }
       if (res.headersSent) {
-        // A stream that already started must be closed politely: an SSE error frame
-        // and [DONE], or clients hang waiting for a terminator that never comes.
+        // A stream that already started must be closed politely, in its face's own error frame
+        // (an OpenAI error chunk and [DONE]; an Anthropic `error` event), or clients hang waiting
+        // for a terminator that never comes — or take what came so far for the whole answer.
+        if (meta?.face && !res.writableEnded) {
+          meta.face.fail(message, e.type || 'upstream_error');
+          return;
+        }
         if ((res.getHeader('content-type') || '').includes('text/event-stream')) {
           res.write(`data: ${JSON.stringify({ error: { message: `keysmith: ${message}`, type: e.type || 'upstream_error' } })}\n\n`);
           res.write('data: [DONE]\n\n');
@@ -274,7 +280,7 @@ function describeAdapters(gateway) {
 
 /* ---------------------------------------------------------------------- handlers */
 
-async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, scope = null }) {
+async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null }) {
   const body = await readJson(req);
   const messages = openaiMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -309,37 +315,42 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
   if (!stream) {
-    const { text, reasoning, usage: u, session: sid, retries, cutAt } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, exclude, scope });
+    const { text, reasoning, usage: u, session: sid, retries, cutAt, toolCalls, toolMode, fallback } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, exclude, scope });
+    const calls = toolCalls.map((c) => faceCall(c, 'openai'));
     meta.done = true;
-    record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: req.headers['user-agent'], ...marks(retries, cutAt) });
+    record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback }) });
     // The header carries the session for clients that read headers; the body carries it
     // for the ones that do not (curl, `keysmith chat`), and OpenAI SDKs ignore extras.
-    const payload = openaiResult({ id, model: requested, created, text, usage: u, reasoning: body.include_reasoning ? reasoning || null : null });
+    const payload = openaiCompletion({ id, model: requested, created, text, usage: u, reasoning: body.include_reasoning ? reasoning || null : null, toolCalls: calls });
     if (sid) payload.keysmith = { session: sid, resumed: !!publicId };
     return json(res, 200, payload, sid);
   }
 
   const events = await held(gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, exclude, scope }), holdMs);
   startSse(res, 'text/event-stream');
-  res.write(`data: ${JSON.stringify(openaiChunk(id, requested, created, { role: 'assistant', content: '' }))}\n\n`);
-  let text = '';
+  const face = new OpenaiChatStream(res, { id, model: requested, created, includeUsage: !!body.stream_options?.include_usage, keepaliveMs });
+  meta.face = face;
+  face.open();
   let u = null;
   let sid = null;
   let errMessage = null;
-  let reasoning = '';
   let retries = 0;
   let cutAt = null;
+  let toolMode = null;
+  let fallback = null;
   for await (const evt of events) {
     if (evt.type === 'retry') {
       retries++;
     } else if (evt.type === 'cut') {
       cutAt = evt.tool;
     } else if (evt.type === 'reasoning') {
-      reasoning += evt.text;
-      res.write(`data: ${JSON.stringify(openaiChunk(id, requested, created, { reasoning_content: evt.text }))}\n\n`);
+      face.reasoning(evt.text);
     } else if (evt.type === 'delta') {
-      text += evt.text;
-      res.write(`data: ${JSON.stringify(openaiChunk(id, requested, created, { content: evt.text }))}\n\n`);
+      face.text(evt.text);
+    } else if (evt.type === 'tool_call') {
+      face.toolCall(faceCall(evt, 'openai'));
+    } else if (evt.type === 'tool_mode') {
+      [toolMode, fallback] = [evt.mode || null, evt.fallback || null];
     } else if (evt.type === 'usage') {
       u = mergeUsage(u, evt.usage);
     } else if (evt.type === 'session') {
@@ -353,19 +364,12 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   // Headers are already on the wire at this point, so the session id rides in the
   // closing chunk as an extra field — unknown keys are ignored by every client,
   // and `x-keysmith-session` is still set on non-streaming responses.
-  const closing = openaiChunk(id, requested, created, {}, 'stop');
-  if (sid) closing.keysmith = { session: sid, resumed: !!publicId };
-  res.write(`data: ${JSON.stringify(closing)}\n\n`);
-  if (body.stream_options?.include_usage) {
-    res.write(`data: ${JSON.stringify({ ...openaiChunk(id, requested, created, null), choices: [], usage: openaiResult({ id, model: requested, created, text: '', usage: u }).usage })}\n\n`);
-  }
-  res.write('data: [DONE]\n\n');
-  res.end();
+  face.finish({ usage: u, keysmith: sid ? { session: sid, resumed: !!publicId } : null });
   meta.done = true;
-  record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: req.headers['user-agent'], ...marks(retries, cutAt) });
+  record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback }) });
 }
 
-async function handleAnthropic(req, res, gateway, { usage, log, holdMs = STREAM_HOLD_MS, scope = null }) {
+async function handleAnthropic(req, res, gateway, { usage, log, holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null }) {
   const body = await readJson(req);
   const messages = anthropicMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -377,41 +381,40 @@ async function handleAnthropic(req, res, gateway, { usage, log, holdMs = STREAM_
   if (scope) meta.skipped = gateway.resolve(body.model, { scope }).skipped;
   // The Messages API defaults to a single JSON reply; SSE only when asked.
   if (!stream) {
-    const { text, usage: u, session: sid, retries, cutAt } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope });
+    const { text, usage: u, session: sid, retries, cutAt, toolCalls, toolMode, fallback } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope });
+    const calls = toolCalls.map((c) => faceCall(c, 'anthropic'));
     meta.done = true;
-    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: 'anthropic', via: '/v1/messages', ...marks(retries, cutAt) });
+    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback }) });
     // Session goes out as a header only: Anthropic clients schema-check the body.
-    return json(res, 200, anthropicResult({ id, model: body.model, text, usage: u }), sid);
+    return json(res, 200, anthropicMessage({ id, model: body.model, text, usage: u, toolCalls: calls }), sid);
   }
   const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope }), holdMs);
   startSse(res, 'text/event-stream');
-  writeAnthicHead(res, { id, model: body.model });
+  const face = new AnthropicStream(res, { id, model: body.model, keepaliveMs });
+  meta.face = face;
+  face.open();
   // Headers are on the wire by now, so a streamed response cannot advertise the session
   // id — use stream=false (or /v1/chat/completions) when you need to continue a CLI thread.
   let u = null;
-  let text = '';
   let errMessage = null;
   let retries = 0;
   let cutAt = null;
+  let toolMode = null;
+  let fallback = null;
   for await (const evt of events) {
     if (evt.type === 'retry') retries++;
     else if (evt.type === 'cut') cutAt = evt.tool;
-    else if (evt.type === 'delta') {
-      text += evt.text;
-      sseEvent(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: evt.text } });
-    } else if (evt.type === 'usage') u = mergeUsage(u, evt.usage);
+    else if (evt.type === 'delta') face.text(evt.text);
+    else if (evt.type === 'tool_call') face.toolCall(faceCall(evt, 'anthropic'));
+    else if (evt.type === 'tool_mode') [toolMode, fallback] = [evt.mode || null, evt.fallback || null];
+    else if (evt.type === 'usage') u = mergeUsage(u, evt.usage);
     else if (evt.type === 'error') errMessage = redactSecrets(evt.message); // written to the client below
     else if (evt.type === 'done') break;
   }
-  if (errMessage) sseEvent(res, 'error', { type: 'error', error: { type: 'overloaded_error', message: errMessage } });
-  sseEvent(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
-  sseEvent(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: errMessage ? 'error' : 'end_turn', stop_sequence: null }, usage: { output_tokens: u?.output || 0 } });
-  sseEvent(res, 'message_stop', { type: 'message_stop' });
-  res.end();
+  face.finish({ usage: u, error: errMessage });
   meta.done = true;
-  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: 'anthropic', via: '/v1/messages', ...marks(retries, cutAt) });
+  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback }) });
   void log;
-  void text;
 }
 
 async function handleResponses(req, res, gateway, { usage, log, holdMs = STREAM_HOLD_MS, scope = null }) {
@@ -426,9 +429,10 @@ async function handleResponses(req, res, gateway, { usage, log, holdMs = STREAM_
   const meta = track(res, body.model, stream, t0, '/v1/responses');
   if (scope) meta.skipped = gateway.resolve(body.model, { scope }).skipped;
   if (!stream) {
-    const { text, usage: u, session: sid, retries, cutAt } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), scope });
+    const { text, usage: u, session: sid, retries, cutAt, toolCalls } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), scope });
+    if (toolCalls.length) throw noResponsesToolCalls();
     meta.done = true;
-    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, via: '/v1/responses', ...marks(retries, cutAt) });
+    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, usage: u, stream: false, via: '/v1/responses', ...marks({ retries, cutAt }) });
     return json(res, 200, responsesResult({ id, model: body.model, text, usage: u, created }), sid);
   }
   const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), scope }), holdMs);
@@ -445,7 +449,8 @@ async function handleResponses(req, res, gateway, { usage, log, holdMs = STREAM_
     else if (evt.type === 'delta') {
       full += evt.text;
       sseEvent(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: `msg_${id}`, output_index: 0, content_index: 0, delta: evt.text });
-    } else if (evt.type === 'usage') u = mergeUsage(u, evt.usage);
+    } else if (evt.type === 'tool_call') throw noResponsesToolCalls();
+    else if (evt.type === 'usage') u = mergeUsage(u, evt.usage);
     else if (evt.type === 'error') errMessage = redactSecrets(evt.message); // written to the client below
     else if (evt.type === 'done') break;
   }
@@ -454,8 +459,17 @@ async function handleResponses(req, res, gateway, { usage, log, holdMs = STREAM_
   sseEvent(res, 'response.completed', { type: 'response.completed', response: { id: `resp_${id}`, object: 'response', model: body.model, status: errMessage ? 'failed' : 'completed', usage: { input_tokens: u?.input || 0, output_tokens: u?.output || 0 } } });
   res.end();
   meta.done = true;
-  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, via: '/v1/responses', ...marks(retries, cutAt) });
+  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, usage: u, stream: true, error: errMessage, via: '/v1/responses', ...marks({ retries, cutAt }) });
   void log;
+}
+
+/**
+ * The Responses face has no writer for a tool call yet (function_call output items come with the
+ * Responses tools, design U12). Until then an answer that is a call fails out loud: dropping it
+ * would hand the client an empty answer that looks finished.
+ */
+function noResponsesToolCalls() {
+  return new LlmError('this answer is a tool call, and /v1/responses does not carry tool calls yet — use /v1/chat/completions or /v1/messages', { status: 501, type: 'invalid_request_error' });
 }
 
 async function handleEmbeddings(req, res, gateway, { usage, scope = null } = {}) {
@@ -518,7 +532,7 @@ async function tryPassthrough(gateway, requested, body, req, res, { usage, log, 
       res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') || 'text/event-stream', 'x-keysmith-mode': 'passthrough' });
       for await (const chunk of upstream.body) res.write(chunk);
       res.end();
-      record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, stream: !!body.stream, via: 'passthrough', client: req.headers['user-agent'] });
+      record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, stream: !!body.stream, via: 'passthrough', client: req.headers['user-agent'], toolMode: 'passthrough' });
       return { done: true };
     } catch (e) {
       const err = e instanceof LlmError ? e : new LlmError(`${adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: adapter.id });
@@ -571,10 +585,19 @@ function stamp(entry, who, res) {
 
 /**
  * A request the adapter had to run twice, or whose answer it ended at a tool call, says so
- * in the usage log; one that went straight through stays as it was.
+ * in the usage log; one that went straight through stays as it was. A tool request says which
+ * engine answered (`toolMode`), how many calls it handed the client (`toolCalls`) and, when it
+ * is not the engine picked first, why (`fallback`) — names and counts only: never a tool's
+ * arguments or result, which are the client's data.
  */
-function marks(retries, cutAt) {
-  return { ...(retries ? { retries } : {}), ...(cutAt ? { cutAt } : {}) };
+function marks({ retries = 0, cutAt = null, toolMode = null, toolCalls = 0, fallback = null } = {}) {
+  return {
+    ...(retries ? { retries } : {}),
+    ...(cutAt ? { cutAt } : {}),
+    ...(toolMode ? { toolMode } : {}),
+    ...(toolCalls ? { toolCalls } : {}),
+    ...(fallback ? { fallback } : {}),
+  };
 }
 
 /**
@@ -598,15 +621,6 @@ function sessionFrom(req, body) {
 function track(res, model, stream, t0, via = null) {
   res._keysmith = { model, stream, t0, done: false, via };
   return res._keysmith;
-}
-
-function writeAnthicHead(res, { id, model }) {
-  sseEvent(res, 'message_start', {
-    type: 'message_start',
-    message: { id: `msg_${id}`, type: 'message', role: 'assistant', model, content: [], usage: { input_tokens: 0, output_tokens: 0 } },
-  });
-  sseEvent(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-  sseEvent(res, 'ping', { type: 'ping' });
 }
 
 function responsesStreamEventsHead({ id, model }) {

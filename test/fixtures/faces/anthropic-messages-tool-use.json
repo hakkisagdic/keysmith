@@ -1,0 +1,16 @@
+{
+  "_provenance": "The shape of an Anthropic Messages answer with a preamble and one tool_use block, written out by hand from the Messages API reference (tool use), ids and values replaced. Not a recording: keysmith's tests never reach a provider, and no agent may reach claude-api. Checked once against the anthropic Python SDK 1.2.0 (Message.model_validate) on 2026-10-19.",
+  "body": {
+    "id": "msg_01Hq7vK2mR8sT3nX4bY5cZ6d",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-5",
+    "content": [
+      { "type": "text", "text": "Let me check." },
+      { "type": "tool_use", "id": "toolu_01Ab2Cd3Ef4Gh5Ij6Kl7Mn8O", "name": "get_weather", "input": { "city": "Ankara" } }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": { "input_tokens": 472, "output_tokens": 91, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "service_tier": "standard" }
+  }
+}

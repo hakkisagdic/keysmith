@@ -1,0 +1,38 @@
+{
+  "_provenance": "The shape of an OpenAI Chat Completions answer that calls a function (no preamble: content null), written out by hand from the Chat Completions API reference for function calling, ids and values replaced. Not a recording: keysmith's tests never reach a provider. Checked once against the openai Python SDK 2.54.0 (ChatCompletion.model_validate) on 2026-10-19.",
+  "body": {
+    "id": "chatcmpl-Rf3kq0aVt8xL2pNw7mYc1Zb9Ud4Ee",
+    "object": "chat.completion",
+    "created": 1760870400,
+    "model": "gpt-4.1-2025-04-14",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_q8Vb3nT1sLx0Ka7dWm2Yp5Rz",
+              "type": "function",
+              "function": { "name": "get_weather", "arguments": "{\"city\":\"Ankara\"}" }
+            }
+          ],
+          "refusal": null,
+          "annotations": []
+        },
+        "logprobs": null,
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 82,
+      "completion_tokens": 17,
+      "total_tokens": 99,
+      "prompt_tokens_details": { "cached_tokens": 0, "audio_tokens": 0 },
+      "completion_tokens_details": { "reasoning_tokens": 0, "audio_tokens": 0, "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0 }
+    },
+    "service_tier": "default",
+    "system_fingerprint": "fp_7d1c2b3a4e"
+  }
+}
