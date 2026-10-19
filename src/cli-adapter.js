@@ -55,10 +55,14 @@ export class CliAdapter {
     // A CLI whose tools keysmith could not take away: it can run commands and edit files.
     // Never an alias leg, never probed by `doctor --probe-models` (see Gateway.resolve).
     this.unsafeTools = !!cfg.unsafeTools;
+    // The argv of an EMULATE run (src/tools/emulate.js; `args` when there is none): agy's names
+    // the `keysmith-tools` agent.
+    this.emulateArgs = checkTemplate(id, 'emulateArgs', cfg.emulateArgs);
     // An argv that auto-approves the agent's tool calls (`opencode --auto`, `--yolo`, …) is an
     // agent that acts on this machine for whoever holds a key. That is never a default: it
     // loads only when the entry says so with `unsafeTools`, which keeps it out of every alias
     // and every probe. A config copied from an older profile stops here, with the way out.
+    // Every template is read: `args`, `resumeArgs` and `emulateArgs`.
     const approving = autoApproveFlag(cfg);
     if (approving && !this.unsafeTools) {
       throw new Error(
@@ -129,9 +133,45 @@ export class CliAdapter {
     return list;
   }
 
-  async *complete({ model, messages, session, signal, maxTokens }) {
+  /** Throws the 503 a request to this adapter gets when it cannot run at all: disabled, or its binary is not on PATH. */
+  ready() {
     if (this.disabled) throw new LlmError(`adapter "${this.id}" is disabled`, { status: 503, provider: this.id });
     if (!which(this.bin)) throw new LlmError(`adapter "${this.id}": "${this.bin}" is not on PATH`, { status: 503, provider: this.id });
+  }
+
+  /**
+   * A process slot (`maxConcurrent`) for an engine that runs the CLI itself; the release function.
+   * A request whose client left while it waited never gets one: its abort already fired.
+   */
+  async acquire(signal) {
+    const release = await this._sem.acquire();
+    if (signal?.aborted) {
+      release();
+      throw new LlmError(`adapter "${this.id}": client disconnected while queued for a free process`, { status: 499, provider: this.id });
+    }
+    return release;
+  }
+
+  /**
+   * One run for the EMULATE engine (src/tools/emulate.js): `text` is the whole prompt, the argv
+   * is `emulateArgs` (or `args`), and nothing is resumed. `{ events, stop, done }`: the parser's
+   * events, a stop switch, and the process outcome. The caller holds a slot (acquire()).
+   */
+  emulateRun({ text, model, timeoutMs, signal }) {
+    const argv = joinArgs(this.emulateArgs || this.args, {
+      model: model || '',
+      prompt: this.promptVia === 'stdin' ? '' : text,
+      system: '',
+      session: '',
+      noSession: this.persistSessions ? '' : this.noSessionFlag,
+      maxTokens: '',
+    });
+    const run = this._spawnStream({ args: argv, stdin: this.promptVia === 'stdin' ? text : null, timeoutMs, signal });
+    return { events: getParser(this.parser)(toLines(run.stdout)), stop: run.stop, done: run.done };
+  }
+
+  async *complete({ model, messages, session, signal, maxTokens }) {
+    this.ready();
 
     const { system, prompt } = flattenMessages(messages);
     if (!prompt && !system) throw new LlmError('nothing to send: the message list is empty after flattening', { status: 400, provider: this.id });
@@ -157,14 +197,10 @@ export class CliAdapter {
       return argv;
     };
 
-    const release = await this._sem.acquire();
     // A request can wait here longer than its client does (a curl --speed-time guard, a
     // closed tab). Its abort already fired, and an AbortSignal does not re-fire for a late
     // listener — spawning now would run a whole agent for nobody while holding the slot.
-    if (signal?.aborted) {
-      release();
-      throw new LlmError(`adapter "${this.id}": client disconnected while queued for a free process`, { status: 499, provider: this.id });
-    }
+    const release = await this.acquire(signal);
     try {
       const parse = getParser(this.parser);
       // A retry spends the same budget as the first run: one request never takes longer
@@ -382,11 +418,11 @@ const AUTO_APPROVE_MODES = {
 };
 
 /**
- * The first auto-approving switch in an adapter's `args` or `resumeArgs` (`--auto`,
- * `--permission-mode yolo`, `--sandbox=danger-full-access`), or null.
+ * The first auto-approving switch in an adapter's `args`, `resumeArgs` or `emulateArgs`
+ * (`--auto`, `--permission-mode yolo`, `--sandbox=danger-full-access`), or null.
  */
 export function autoApproveFlag(cfg) {
-  for (const tpl of [cfg?.args, cfg?.resumeArgs]) {
+  for (const tpl of [cfg?.args, cfg?.resumeArgs, cfg?.emulateArgs]) {
     if (!Array.isArray(tpl)) continue;
     const tokens = tpl.flat(Infinity).filter((t) => typeof t === 'string');
     for (let i = 0; i < tokens.length; i++) {
@@ -433,6 +469,15 @@ function jsonModelList(text) {
     list.push({ id: id.trim(), ...(name ? { name: name.trim() } : {}), ...(ctx ? { contextWindow: ctx } : {}) });
   }
   return list;
+}
+
+/** An argv template other than `args`: a list (of strings, and of groups), or absent. */
+function checkTemplate(id, field, tpl) {
+  if (tpl == null) return null;
+  if (!Array.isArray(tpl) || tpl.some((t) => typeof t !== 'string' && !(Array.isArray(t) && t.every((g) => typeof g === 'string')))) {
+    throw new Error(`adapter "${id}": ${field} must be an argv template — a list of strings and [flag, value] groups, like args`);
+  }
+  return tpl;
 }
 
 function checkWorkspaceFiles(id, files, ownsCwd) {
