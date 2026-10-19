@@ -5,6 +5,7 @@ import { LlmError, routeError, truncate } from './util.js';
 import { resolveSecret } from './config.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
+import { adapterReach, aliasDecision, requestDecision } from './keys.js';
 
 /**
  * The gateway: config in, one model catalogue + one streaming `complete()` out.
@@ -71,8 +72,17 @@ export class Gateway {
    * @returns {Record<string, string[]>} alias id -> one line per unusable leg
    */
   get aliasIssues() {
+    return this.aliasIssuesFor(null);
+  }
+
+  /**
+   * `aliasIssues` as one key sees them: an alias it may not name is left out, and so is a leg
+   * outside its scope — that leg is never part of this key's route, broken or not.
+   */
+  aliasIssuesFor(scope = null) {
     const out = {};
     for (const [alias, targets] of Object.entries(this.cfg.aliases || {})) {
+      if (scope && !aliasDecision(scope, alias).ok) continue;
       const problems = [];
       if (!Array.isArray(targets) || targets.length === 0) {
         problems.push('has no targets, so requesting it can only fail');
@@ -85,6 +95,7 @@ export class Gateway {
           const slash = leg.indexOf('/');
           const adapterId = slash < 0 ? leg : leg.slice(0, slash);
           const model = slash < 0 ? '' : leg.slice(slash + 1);
+          if (scope && !this.checkTarget(adapterId, model, scope).ok) continue;
           const adapter = this.adapters.get(adapterId);
           if (!adapter && slash < 0 && own(this.cfg.aliases, leg)) {
             problems.push(`${leg}: aliases cannot nest — name the adapter/model directly`);
@@ -134,17 +145,68 @@ export class Gateway {
     return [...this.adapters.values()].filter((a) => !a.disabled);
   }
 
-  /** @returns {Promise<{models: Array<object>, errors: Array<string>}>} */
-  async listModels({ refresh = false } = {}) {
+  /**
+   * May a key with `scope` reach `adapterId` for `model` (as requested; '' for "the adapter's
+   * own model")? `{ ok }`, or `{ ok: false, reason }` naming the adapter — never the key.
+   * Unscoped (`scope` null) is always ok: a key with no scope reaches what it always did.
+   */
+  checkTarget(adapterId, model, scope) {
+    if (!scope) return { ok: true };
+    const adapter = this.adapters.get(adapterId) ?? (own(this.cfg.adapters, adapterId) ? this.cfg.adapters[adapterId] : null);
+    return requestDecision(scope, adapterId, adapter, model);
+  }
+
+  /** May a key with `scope` name `requested` at all — an alias it may use, or a target it may reach? */
+  mayName(requested, scope) {
+    if (!scope) return true;
+    if (typeof requested !== 'string' || !requested) return false;
+    if (own(this.cfg.aliases, requested)) {
+      // An alias it may name, with a leg it may run: what /v1/models lists for it.
+      const legs = this.cfg.aliases[requested];
+      return aliasDecision(scope, requested).ok && Array.isArray(legs) && legs.some((leg) => typeof leg === 'string' && leg && this.checkTarget(adapterOf(leg), modelOf(leg), scope).ok);
+    }
+    return this.checkTarget(adapterOf(requested), modelOf(requested), scope).ok;
+  }
+
+  /** Can a key with `scope` reach any part of adapter `id`? (Listings: models, routes, the status page.) */
+  adapterVisible(id, scope) {
+    return !scope || adapterReach(scope, id) !== 'none';
+  }
+
+  /**
+   * The aliases one key may name, each with only the legs it may run: `cfg.aliases` itself
+   * for an unscoped key.
+   */
+  aliasesFor(scope = null) {
+    const aliases = this.cfg.aliases || {};
+    if (!scope) return aliases;
+    const out = {};
+    for (const [alias, legs] of Object.entries(aliases)) {
+      if (!aliasDecision(scope, alias).ok) continue;
+      const usable = (Array.isArray(legs) ? legs : []).filter((leg) => typeof leg === 'string' && leg && this.checkTarget(adapterOf(leg), modelOf(leg), scope).ok);
+      if (usable.length) out[alias] = usable;
+    }
+    return out;
+  }
+
+  /**
+   * The catalogue, or one key's share of it: with a `scope`, an adapter the key cannot reach is
+   * not even asked for its list, a model outside the scope is left out, and an alias is listed
+   * with the legs the key may run (and not at all when it may run none).
+   *
+   * @returns {Promise<{models: Array<object>, errors: Array<string>}>}
+   */
+  async listModels({ refresh = false, scope = null } = {}) {
     const models = [];
     const errors = [];
-    for (const [id, msg] of Object.entries(this.loadErrors)) errors.push(`${id}: configured but did not load — ${msg}`);
+    for (const [id, msg] of Object.entries(this.loadErrors)) if (this.adapterVisible(id, scope)) errors.push(`${id}: configured but did not load — ${msg}`);
     await Promise.all(
-      this.publicAdapters.map(async (a) => {
+      this.publicAdapters.filter((a) => this.adapterVisible(a.id, scope)).map(async (a) => {
         if (refresh) a._modelCache = null;
         try {
           for (const m of await a.models()) {
             if (!m?.id) continue;
+            if (scope && !this.checkTarget(a.id, m.id, scope).ok) continue;
             models.push({
               id: `${a.id}/${m.id}`,
               object: 'model',
@@ -166,18 +228,19 @@ export class Gateway {
         }
       }),
     );
-    for (const [alias, targets] of Object.entries(this.cfg.aliases || {})) {
+    const issues = this.aliasIssuesFor(scope);
+    for (const [alias, targets] of Object.entries(this.aliasesFor(scope))) {
       models.push({
         id: alias,
         object: 'model',
         owned_by: 'keysmith:alias',
-        keysmith: { adapter: 'alias', kind: 'alias', routes: targets, priority: -1, ...(this.aliasIssues[alias] ? { warnings: this.aliasIssues[alias] } : {}) },
+        keysmith: { adapter: 'alias', kind: 'alias', routes: targets, priority: -1, ...(issues[alias] ? { warnings: issues[alias] } : {}) },
       });
     }
     // After the fetches above: `knownModels` can only check a dynamic catalogue once the
     // adapter has actually read one, so an alias leg pointing at a wrong evren/CLI model
     // becomes knowable right here — report it in the same call that learned it.
-    for (const [alias, problems] of Object.entries(this.aliasIssues)) {
+    for (const [alias, problems] of Object.entries(issues)) {
       for (const p of problems) errors.push(`alias "${alias}" ${p}`);
     }
     models.sort((x, y) => x.id.localeCompare(y.id));
@@ -201,17 +264,27 @@ export class Gateway {
    *
    * `exclude` takes out legs (by `adapter/model` target) that already answered this request:
    * the tool relay's refusals, which a plain completion must not ask a second time.
+   *
+   * `scope` is the requesting key's (keys.js): a target outside it is a 403 that names the
+   * adapter; inside an alias such a leg is skipped — never run — and the alias is a 403 only
+   * when no leg is left. The legs skipped that way ride on the result as `skipped`.
    */
-  resolve(requested, { exclude = null } = {}) {
+  resolve(requested, { exclude = null, scope = null } = {}) {
     if (!requested) throw new LlmError('missing "model"', { status: 400 });
     if (typeof requested !== 'string') throw new LlmError('"model" must be a string', { status: 400 });
     const aliases = this.cfg.aliases || {};
     // Own names only: a model called `constructor` or `toString` is not an alias, and an
     // alias that is not a list of legs is an alias with no legs.
     const isAlias = own(aliases, requested);
+    if (isAlias && scope) {
+      const d = aliasDecision(scope, requested);
+      if (!d.ok) throw scopeError(d.reason, null);
+    }
     const chain = isAlias ? (Array.isArray(aliases[requested]) ? [...aliases[requested]] : []) : [requested];
     if (isAlias && !chain.length) throw new LlmError(`alias "${requested}" has no legs`, { status: 503 });
     const out = [];
+    const skipped = [];
+    let excluded = 0;
     let firstError = null;
     for (const entry of chain) {
       if (typeof entry !== 'string' || !entry) {
@@ -222,11 +295,23 @@ export class Gateway {
       const slash = entry.indexOf('/');
       const adapterId = slash < 0 ? entry : entry.slice(0, slash);
       const modelName = slash < 0 ? '' : entry.slice(slash + 1);
+      // The key's scope comes before anything about the adapter: a key that may not reach it
+      // learns nothing about it — not whether it exists, loaded or is switched off.
+      if (scope) {
+        const d = this.checkTarget(adapterId, modelName, scope);
+        if (!d.ok) {
+          if (!isAlias) throw scopeError(d.reason, adapterId);
+          skipped.push(entry);
+          this.log(`alias "${requested}" skipped ${entry}: outside the requesting key's scope`);
+          continue;
+        }
+      }
       const adapter = this.adapters.get(adapterId);
       let err = null;
       if (!adapter) {
         const why = this.loadError(adapterId);
-        err = new LlmError(why ? `adapter "${adapterId}" is configured but did not load: ${why}` : `no adapter named "${adapterId}" — try one of: ${[...this.adapters.keys()].join(', ')}`, { status: why ? 503 : 404, provider: adapterId });
+        const live = [...this.adapters.keys()].filter((id) => this.adapterVisible(id, scope));
+        err = new LlmError(why ? `adapter "${adapterId}" is configured but did not load: ${why}` : `no adapter named "${adapterId}" — try one of: ${live.join(', ')}`, { status: why ? 503 : 404, provider: adapterId });
       } else if (adapter.disabled) {
         err = new LlmError(`adapter "${adapterId}" is disabled`, { status: 503, provider: adapterId });
       } else if (isAlias && adapter.explicitOnly) {
@@ -242,12 +327,21 @@ export class Gateway {
         }
         throw err;
       }
-      if (exclude?.has(entry)) continue;
+      if (exclude?.has(entry)) {
+        excluded++;
+        continue;
+      }
       out.push({ adapter, model: modelName || adapter.defaultModel || '', target: entry });
     }
-    if (!out.length) throw firstError || new LlmError(`every leg of "${requested}" has already refused this request`, { status: 502 });
+    if (!out.length) {
+      if (skipped.length && !excluded) {
+        throw scopeError(`alias "${requested}" has no leg this key may use: ${skipped.join(', ')} ${skipped.length > 1 ? 'are' : 'is'} outside its scope`, adapterOf(skipped[0]));
+      }
+      throw firstError || new LlmError(`every leg of "${requested}" has already refused this request`, { status: 502 });
+    }
     // Declared order wins in an alias: you wrote the chain, you know which leg should
     // be tried first. `priority` only orders the flat model listing.
+    out.skipped = skipped;
     return out;
   }
 
@@ -260,8 +354,8 @@ export class Gateway {
    * upstream session, so a chat app gets genuine multi-turn (and prompt-cache)
    * behaviour out of a tool that was never meant to answer HTTP.
    */
-  async *complete({ model, messages, session, signal, maxTokens, temperature, includeReasoning = false, exclude = null }) {
-    const chain = this.resolve(model, { exclude });
+  async *complete({ model, messages, session, signal, maxTokens, temperature, includeReasoning = false, exclude = null, scope = null }) {
+    const chain = this.resolve(model, { exclude, scope });
     const publicId = session || newSessionId();
     const known = session ? this.sessions.get(publicId) : null;
     let reportedSession = false;
@@ -370,6 +464,13 @@ function mergeUsage(a, b) {
   };
 }
 
+/** A request the key's scope does not cover: 403, marked so the usage log says `denied`. */
+export function scopeError(reason, adapterId) {
+  const e = new LlmError(reason, { status: 403, type: 'permission_error', provider: adapterId || null });
+  e.scopeDenied = true;
+  return e;
+}
+
 /** Why an adapter never answers through an alias, in one clause. */
 export function keptOutOfAliases(id, adapter) {
   return adapter.unsafeTools
@@ -397,6 +498,11 @@ export function checkAdapter(id, raw) {
 function adapterOf(target) {
   const i = String(target).indexOf('/');
   return i < 0 ? target : target.slice(0, i);
+}
+
+function modelOf(target) {
+  const i = String(target).indexOf('/');
+  return i < 0 ? '' : target.slice(i + 1);
 }
 
 /**

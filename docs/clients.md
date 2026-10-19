@@ -12,6 +12,14 @@ Behind a named tunnel the base URL is `https://llm.example.com/v1` and the key i
 only thing standing between the internet and your agent's quota — see
 [tunnel.md](tunnel.md).
 
+An agent is better off with a key of its own, with a scope, written to a file it reads:
+`keysmith key add <label> --deny claude-api --out <file>` (or `--allow agy,alias:argon`). It sees
+only the models that key may reach, and a request outside them is a 403 naming the adapter — see
+"Keys with a scope" in the [README](../README.md#keys-with-a-scope-what-each-key-may-reach). The
+scope binds only an agent that cannot read keysmith's config: one running as the same OS user,
+with a shell, can read the unscoped key there. Give it its own OS user, a sandbox, or a CI job that
+holds its key and nothing else.
+
 ---
 
 ## Warp (Bring-your-own-key / custom endpoint)

@@ -216,7 +216,11 @@ test('key list, piped: one redacted line per key, and a note on stderr saying wh
   const list = sb.run('key', 'list');
   assert.equal(list.status, 0, list.stderr);
   assertNoKey(list.stdout + list.stderr, KEY, 'key list');
-  assert.equal(list.stdout.trim(), redactKey(KEY));
+  const lines = list.stdout.trim().split('\n');
+  assert.equal(lines.length, 1, list.stdout);
+  // The redacted key, then its label (none: "-") and its scope (none: it reaches everything).
+  assert.equal(lines[0].split(/\s+/).slice(0, 2).join(' '), redactKey(KEY), list.stdout);
+  assert.match(lines[0], /\s-\s+unscoped/);
   assert.match(list.stderr, /not an interactive terminal/);
 });
 

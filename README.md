@@ -72,7 +72,9 @@ that is the interesting part.
 
 Everything under `/v1` needs `Authorization: Bearer <key>`, `x-api-key`, or `?api_key=` (the
 last for clients that cannot set a header; a URL is kept by shell history, browsers and a
-tunnel's request logs, so prefer the header).
+tunnel's request logs, so prefer the header). A key can carry a scope — the adapters, models
+and aliases it may reach — and every route above answers it with that share only; see
+[Keys with a scope](#keys-with-a-scope-what-each-key-may-reach).
 CORS is open, so browser apps can call it directly.
 
 ## Models are namespaced
@@ -119,11 +121,11 @@ whether it is marked or not. After a change the same checks `doctor` runs are pr
 model the adapter does not list is said then, not discovered as a slow failover later.
 
 The gateway reads its config once, when it starts. `add`, `remove`, `set`, `alias` and
-`key add|revoke` change the file, not the running gateway: while one runs they say so, with
+`key add|scope|revoke` change the file, not the running gateway: while one runs they say so, with
 the restart command (`launchctl kickstart -k gui/$UID/dev.keysmith.gateway` under launchd,
 `keysmith stop && keysmith start` otherwise), and `keysmith status` says when the config is
-newer than the gateway. Until then a new alias is a 404, a disabled adapter keeps answering
-and a revoked key keeps working.
+newer than the gateway. Until then a new alias is a 404, a disabled adapter keeps answering,
+a revoked key keeps working and a key keeps the scope it had.
 
 Which is also why a typo in a chain is invisible at request time: a leg naming an adapter
 you do not have gets skipped, and a leg naming a model the adapter never heard of gets
@@ -361,7 +363,7 @@ out even when nothing here registered it.
 
 The key clients send (`ks_…`) is printed in full by `keysmith init --reveal` and
 `keysmith key list|add --reveal` only, and only when stdin and stdout are an interactive
-terminal. A terminal alone is not enough: a coding agent's terminal tool (tmux, expect,
+terminal; `keysmith key add <label> --out <file>` writes a new one to a new 0600 file instead. A terminal alone is not enough: a coding agent's terminal tool (tmux, expect,
 `script`) opens a real one, and what it reads lands in a transcript — `--reveal` is the word
 it has to type on purpose. Without it, piped, redirected or under launchd, those commands
 print the redacted form instead, and so does everything else keysmith writes:
@@ -375,14 +377,17 @@ command line is in shell history and in every local user's `ps`. A script that n
 key itself reads it from the config into a variable, never onto stdout:
 
 ```bash
-KEY=$(jq -r '.auth.keys[0]' ~/.config/keysmith/config.json)
+KEY=$(jq -r '.auth.keys[0] | .key? // .' ~/.config/keysmith/config.json)   # a bare key, or one with a scope
 ```
+
+An agent gets a key of its own instead, written to a file only it reads:
+`keysmith key add <label> --deny … --out <file>` (see [Keys with a scope](#keys-with-a-scope-what-each-key-may-reach)).
 
 | file (in `~/.local/share/keysmith/`) | written by | holds |
 |---|---|---|
 | `launchd-gateway.log` | launchd: `serve`'s stdout + stderr | start banner (address, adapters, the key redacted, tunnel URL); with `KEYSMITH_VERBOSE=1`, adapter failures, retries and skipped alias legs |
 | `keysmith.log` | `keysmith start`: the same stream | the same, for a gateway started without launchd |
-| `usage.jsonl` | the gateway, one line per request | time, model, status, duration, token counts, stream flag, user agent, error message, `retries`/`cutAt` |
+| `usage.jsonl` | the gateway, one line per request | time, model, status, duration, token counts, stream flag, user agent, error message, `retries`/`cutAt`; the key's fingerprint (`key: "fp:…"`) and its scope's decision (`scope`, `skipped`) |
 | `launchd-tunnel.log` | launchd: cloudflared | cloudflared's own output |
 
 keysmith does not log prompts, answers, request headers or request URLs, and a request
@@ -409,6 +414,127 @@ cannot — backups, rotated archives, an agent's transcript — so when `scrub-l
 configured key it says to rotate it: `keysmith key add --reveal` in a terminal, move the
 clients over, `keysmith key revoke fp:<old>`, restart the gateway. `keysmith status` says
 when the running gateway is older than the code or the config on disk and needs that restart.
+
+## Keys with a scope: what each key may reach
+
+A bare key in `auth.keys` reaches every adapter and every alias. That is what every key did
+before scopes, and what a key nobody scoped still does. A key can instead carry an `allow`
+list, a `deny` list, or both:
+
+```json
+"auth": {
+  "enabled": true,
+  "keys": [
+    "ks_…",
+    { "key": "ks_…", "label": "ada",   "deny":  ["claude-api"] },
+    { "key": "ks_…", "label": "scout", "allow": ["agy", "alias:argon"] }
+  ]
+}
+```
+
+| pattern | matches |
+|---|---|
+| `claude-api` | an adapter id: every model of that adapter |
+| `agy/*`, `google/gemini-3.8-*` | a glob over `adapter/model`; `*` is any run of characters, `/` included |
+| `alias:argon`, `alias:*` | an alias, by name |
+
+- No `allow` list means everything that is not denied. An `allow` list means only what it
+  names, aliases included: an allow-listed key names each alias it may use (`alias:argon`).
+- `deny` wins over `allow`.
+- An alias is checked twice: the key may name it, and then each leg on its own. A leg outside
+  the scope is **skipped** — never run, so its provider never hears of the request — and the
+  next leg answers; the request is refused only when no leg is left. It is the leg that is
+  checked, not the alias, so a leg added to an alias later cannot take a key past its scope.
+- A glob is checked against the model as requested and, when the adapter's `modelMap` rewrites
+  it, as sent upstream. A bare adapter id (`claude-api`) is checked with its `defaultModel`; with
+  none, a key whose scope covers only some of that adapter's models is refused — it has to name
+  the model, since the upstream would otherwise pick one.
+- A glob is a string match on the id as written, not a spending limit. keysmith knows one other
+  spelling and checks a deny against it too: an adapter with `stripModelPrefix` (Google's
+  `models/`) answers `google/models/gemini-4-argon` as `gemini-4-argon`, so `google/gemini-4-*`
+  keeps both out. What else an upstream treats as the same model — a dated snapshot and its
+  undated alias, say — it cannot know. To keep a credit out, deny the adapter id
+  (`claude-api`), or give the key an allow-list.
+- A request outside the scope is a **403** (`permission_error`) whose message names the adapter
+  and never the key. Every face enforces it the same way: `/v1/chat/completions` (the tool relay
+  included), `/v1/messages`, `/v1/responses`, `/v1/embeddings`.
+- What a scoped key can list is its share: `/v1/models` (an alias with only the legs it may
+  run), `/v1/keysmith/routes`, `/v1/keysmith/usage` and the status page, whether it is opened by
+  header or by the cookie its own login set. An adapter the key cannot reach is not even asked
+  for its model list. Its usage is its own: the rows it wrote (for what it may still name), and
+  a summary whose `keys` holds its own fingerprint only — never another key's requests, not even
+  for a model both may name.
+- Every usage row says which key it came with and what the scope decided:
+  `"key": "fp:3f9a0c12"`, `"scope": "unscoped" | "allowed" | "denied"`, and `"skipped": […]` for
+  alias legs it left out. Opened by an unscoped key, the status page lists every key by
+  fingerprint, label and scope, with its requests and refusals of the last 24 h.
+- It fails closed. An entry with a field keysmith does not know (`"alow"` would otherwise read
+  as "no allow list"), a list that is not a list of patterns, or one key listed twice with two
+  different scopes leaves that key reaching nothing — every request a 403 that says why — and
+  `doctor`, `key list`, the gateway log and the status page name it. A key list whose entries
+  are all unreadable opens nothing; it never turns into a keyless gateway.
+- A pattern that names nothing configured — `"deny": ["Claude-API"]` written by hand, when the
+  adapter is `claude-api` — is not an error (it may name an adapter you add later), but it keeps
+  nothing out, so `serve`, `doctor`, `key list` and the status page (to an unscoped key) warn
+  about it, with a hint when a configured name differs only in case or `_`/`-`.
+- With `auth.enabled` false no key is asked for, so no scope applies: `key add`, `key scope` and
+  `key list` say so.
+
+From the command line, by fingerprint (a key on the command line is in shell history and `ps`):
+
+```bash
+keysmith key add ada --deny claude-api --out ~/.config/ada/keysmith.key   # a new key with a scope, in a new 0600 file
+keysmith key add scout --allow agy,alias:argon     # comma-separated, or the flag repeated
+keysmith key scope fp:3f9a0c12 --deny claude-api   # narrow a key that exists; --allow/--deny replace that list
+keysmith key scope fp:3f9a0c12 --no-allow          # drop one list; --clear drops both (unscoped again)
+keysmith key scope fp:3f9a0c12                     # show it
+keysmith key list                                  # each key redacted, with its label and its scope
+keysmith key who-can claude-api                    # the fingerprints that reach an adapter, and the ones kept out
+keysmith key who-can alias:argon                   # …or an alias, or one adapter/model
+```
+
+`key add` prints the new key the way it always has: in full only with `--reveal`, to an
+interactive terminal (with its fingerprint, which `key scope` and `key revoke` take). `--out
+<file>` writes it to a new file, mode 0600, for an agent to read (`{file:…}` in its config, or
+`KEY=$(cat …)`). An existing file is not overwritten (`--force` replaces it), and when the file
+cannot be written no key is added. A pattern that names no configured adapter or alias is
+refused, because a deny-list typo keeps nothing out; `--allow-unknown` saves it anyway (for an
+adapter you are about to add). `--force` does not: a script that rotates an agent's key into
+the same file passes `--force` every time. Quote a glob, or the shell expands it.
+`key add` with neither a label nor a scope still writes a bare key. Like every key change, a
+scope takes effect when the gateway restarts, and `who-can` warns when the running gateway is
+older than the config.
+
+`explicitOnly` and a scope answer different questions: `explicitOnly` keeps an adapter out of
+aliases for every key; a scope keeps one key away from an adapter however it asks for it.
+
+### Recipe: an agent key that cannot reach claude-api
+
+Say `claude-api` is an Anthropic HTTP adapter that spends a credit you use on purpose. An agent
+that gets a key of its own must not be able to spend it — not by naming it, and not through an
+alias that has, or later gains, a `claude-api` leg.
+
+A scope binds only an agent that cannot read keysmith's config. The config is `0600` and its
+owner's; an agent that runs as the same OS user, with a shell, reads the unscoped key out of it
+the way the scripts above do (`KEY=$(jq …)`) and reaches `claude-api` with that.
+Run the agent as another OS user, in a sandbox, or in CI given its own key and nothing else — the
+`--out` file, or a secret holding it — and keep every unscoped key where the agent cannot read it.
+
+```bash
+keysmith key add ada --deny claude-api --out ~/.config/ada/keysmith.key
+keysmith key who-can claude-api                          # ada's fingerprint is under "not reachable by"
+launchctl kickstart -k gui/$UID/dev.keysmith.gateway     # or: keysmith stop && keysmith start
+```
+
+The agent reads its key from that file. Asked for `claude-api/…` it gets a 403 that names
+`claude-api`; asked for an alias whose first leg is `claude-api`, it is answered by the next leg,
+and its usage row says `"skipped": ["claude-api/…"]`; `/v1/models` does not list `claude-api`
+for it. For an agent that should reach only routes you name, use an allow-list instead, where an
+adapter added later stays out until you add it to the list:
+
+```bash
+keysmith key add ada --allow agy,alias:argon --out ~/.config/ada/keysmith.key
+```
 
 ## Publishing it safely
 
@@ -485,7 +611,7 @@ Warp, Claude Code, opencode, Codex, Qoder, `openai` Python — copy-paste config
 ## Development
 
 ```bash
-npm test          # 182 tests: parsers, routing, HTTP suites against stub CLIs and a stub Gemini, and no key reaching a log
+npm test          # 202 tests: parsers, routing, key scopes, HTTP suites against stub CLIs and stub upstreams, and no key reaching a log
 node src/cli.js doctor --probe-models   # the truth about which models answer (spends quota)
 ```
 

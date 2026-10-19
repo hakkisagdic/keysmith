@@ -70,7 +70,12 @@ const GOOGLE_KEY_PREFIX = /^A(?:I(?:z(?:a[0-9A-Za-z_-]{0,35})?)?)?$/;
  * the log, usage.jsonl, error messages, the status page.
  */
 export function registerSecrets(keys) {
-  for (const k of keys || []) if (typeof k === 'string' && k.length >= MIN_REGISTERED) known.add(k);
+  // `auth.keys` entries come in two forms: a bare key, or `{ key, label, allow, deny }` for a
+  // key with a scope (keys.js). Both are the same secret.
+  for (const entry of Array.isArray(keys) ? keys : []) {
+    const k = typeof entry === 'string' ? entry : entry && typeof entry === 'object' && typeof entry.key === 'string' ? entry.key : null;
+    if (k && k.length >= MIN_REGISTERED) known.add(k);
+  }
 }
 
 export function knownSecrets() {

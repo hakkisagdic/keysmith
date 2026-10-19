@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { redactKey, registerSecrets } from './redact.js';
+import { fingerprint, redactKey, registerSecrets } from './redact.js';
 
 /**
  * Config & data locations.
@@ -127,6 +127,18 @@ export function newApiKey() {
   return 'ks_' + crypto.randomBytes(24).toString('base64url');
 }
 
+/**
+ * A new key whose fingerprint no key in `existing` has: `key scope` and `key revoke` find a key
+ * by that fingerprint, so two keys sharing one would make both ambiguous.
+ */
+export function newUniqueApiKey(existingFingerprints) {
+  const taken = new Set(existingFingerprints);
+  for (;;) {
+    const key = newApiKey();
+    if (!taken.has(fingerprint(key))) return key;
+  }
+}
+
 export const DEFAULTS = {
   host: '127.0.0.1',
   port: 8787,
@@ -155,7 +167,11 @@ export function configExists() {
   return fs.existsSync(configPath());
 }
 
-export function loadConfig() {
+/**
+ * `mint: false` is for commands that only read (`key list`, `key who-can`): they say there
+ * is no key rather than writing one into the config.
+ */
+export function loadConfig({ mint = true } = {}) {
   const p = configPath();
   if (!fs.existsSync(p)) return structuredClone(DEFAULTS);
   let raw;
@@ -166,9 +182,10 @@ export function loadConfig() {
   }
   const cfg = deepMerge(structuredClone(DEFAULTS), raw);
   cfg._path = p;
+  // A key with a scope is an object ({ key, label, allow, deny }); registerSecrets takes both forms.
   registerSecrets(cfg.auth?.keys);
   // A gateway that listens on a tunnel must not be keyless; refuse silently-defaulting.
-  if (cfg.auth.enabled && (!cfg.auth.keys || cfg.auth.keys.length === 0)) {
+  if (mint && cfg.auth.enabled && (!cfg.auth.keys || cfg.auth.keys.length === 0)) {
     cfg.auth.keys = [newApiKey()];
     registerSecrets(cfg.auth.keys);
     saveConfig(cfg);

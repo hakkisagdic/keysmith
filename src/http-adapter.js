@@ -21,7 +21,7 @@ export class HttpAdapter {
     this.timeoutMs = cfg.timeoutMs ?? 120_000;
     this.priority = cfg.priority ?? 100;
     this.disabled = !!cfg.disabled;
-    this.modelMap = cfg.modelMap || {};
+    this.modelMap = cfg.modelMap && typeof cfg.modelMap === 'object' && !Array.isArray(cfg.modelMap) ? cfg.modelMap : {};
     this._apiKey = cfg._apiKey ?? null;
     this._declared = cfg.models;
     // Google lists `models/gemini-3.8-flash` and answers to `gemini-3.8-flash`: the listing
@@ -61,14 +61,20 @@ export class HttpAdapter {
     return this.wire === 'anthropic' ? { 'x-api-key': this._apiKey, 'anthropic-version': '2023-06-01' } : { authorization: `Bearer ${this._apiKey}` };
   }
 
+  /**
+   * The id sent upstream for `model`: its `modelMap` entry, or the model itself. Own entries
+   * only — `constructor` or `toString` is a model name like any other, not something every
+   * object inherits (that sent a function, which JSON drops, and the upstream picked the model).
+   */
   upstreamModel(model) {
-    return this.modelMap[model] ?? model;
+    return typeof model === 'string' && Object.hasOwn(this.modelMap, model) ? this.modelMap[model] : model;
   }
 
-  /** `modelParams` for one upstream model id: the `"*"` entry, then the model's own on top. */
+  /** `modelParams` for one upstream model id: the `"*"` entry, then the model's own on top (own entries only). */
   paramsFor(upstream) {
     if (!this.modelParams) return {};
-    return { ...(this.modelParams['*'] || {}), ...(this.modelParams[upstream] || {}) };
+    const entry = (id) => (typeof id === 'string' && Object.hasOwn(this.modelParams, id) ? this.modelParams[id] : null);
+    return { ...(entry('*') || {}), ...(entry(upstream) || {}) };
   }
 
   async models() {

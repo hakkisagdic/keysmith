@@ -9,8 +9,10 @@ import { redactSecrets } from './redact.js';
  * quietly eating your quota. Kept as one line per request so `tail -f` is a dashboard.
  *
  * A line holds the time, model, status, duration, token counts, stream flag, user agent
- * and — for a failure — the error message. Never the prompt, the answer, a header or the
- * request URL. An error message can still quote anything (a CLI that echoes its argv
+ * and — for a failure — the error message; with auth on, the fingerprint of the gateway key
+ * the request came with (`key: "fp:3f9a0c12"`) and what its scope decided (`scope`:
+ * `unscoped`, `allowed` or `denied`, with `skipped` naming alias legs it left out). Never the
+ * key, the prompt, the answer, a header or the request URL. An error message can still quote anything (a CLI that echoes its argv
  * quotes the prompt), so every string in a line goes through the same redaction as
  * stdout: a gateway key in it is written as `ks_Q…35 fp:…`. Each field is redacted before
  * the line is JSON-encoded, not after: JSON spells a key holding `"` or `\` differently
@@ -34,26 +36,33 @@ export class UsageLog {
     }
   }
 
-  tail(n = 50) {
+  /** The latest `n` entries, newest first; with `filter`, the latest `n` it keeps (of the last 5000). */
+  tail(n = 50, filter = null) {
     if (!fs.existsSync(this.file)) return [];
     const lines = fs.readFileSync(this.file, 'utf8').split('\n').filter(Boolean);
-    return lines.slice(-n).reverse().map((l) => {
-      try {
-        return JSON.parse(l);
-      } catch {
-        return { raw: l };
-      }
-    });
+    const rows = lines
+      .slice(filter ? -5000 : -n)
+      .reverse()
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return { raw: l };
+        }
+      });
+    return filter ? rows.filter(filter).slice(0, n) : rows;
   }
 
-  summarize(windowMs = 24 * 3600 * 1000) {
+  /** Counts per model and per gateway key over `windowMs`; `filter` keeps only the entries it accepts. */
+  summarize(windowMs = 24 * 3600 * 1000, filter = null) {
     const since = Date.now() - windowMs;
     const byModel = new Map();
+    const byKey = new Map();
     let requests = 0;
     let failures = 0;
     let tokensIn = 0;
     let tokensOut = 0;
-    for (const e of this.tail(5000)) {
+    for (const e of this.tail(5000, filter)) {
       const t = Date.parse(e.ts || '');
       if (!Number.isFinite(t) || t < since) continue;
       requests++;
@@ -68,6 +77,12 @@ export class UsageLog {
       row.output += e.usage?.output || 0;
       row.msTotal += e.ms || 0;
       byModel.set(k, row);
+      if (typeof e.key === 'string') {
+        const kr = byKey.get(e.key) || { key: e.key, requests: 0, denied: 0 };
+        kr.requests++;
+        if (e.status === 'denied') kr.denied++;
+        byKey.set(e.key, kr);
+      }
     }
     return {
       window: `${Math.round(windowMs / 3600000)}h`,
@@ -76,6 +91,7 @@ export class UsageLog {
       tokensIn,
       tokensOut,
       models: [...byModel.values()].sort((a, b) => b.requests - a.requests),
+      keys: [...byKey.values()].sort((a, b) => b.requests - a.requests),
     };
   }
 }
