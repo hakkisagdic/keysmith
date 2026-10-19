@@ -3,19 +3,27 @@
  * dependency, no network, no code generation.
  *
  * Checked: `type` (one name or a list; `null`, and `integer` apart from `number`), `properties`,
- * `required`, `additionalProperties` (false or a schema; `patternProperties` keys are not
- * "additional"), `enum`, `const`, `items` (a schema, or a list: positional), `prefixItems`,
- * `anyOf` / `oneOf` / `allOf`, `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum`,
- * `minLength` / `maxLength` (code points), `minItems` / `maxItems`, `pattern` (a `u` RegExp), and
- * local `$ref` (`#`, `#/$defs/…`, `#/definitions/…`, any JSON pointer into the same document),
- * with its siblings checked too. OpenAPI's `nullable: true` lets null through. Every other
- * keyword — `format`, `default`, `description`, `if`, `not`, remote refs — is ignored: a
- * keyword this file does not know can only make it accept more, never refuse a valid call.
+ * `required`, `additionalProperties` (false or a schema), `enum`, `const`, `items` (a schema, or
+ * a list: positional), `prefixItems`, `anyOf` / `oneOf` / `allOf` (every one present, each on
+ * its own), `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum`, `minLength` /
+ * `maxLength` (code points), `minItems` / `maxItems`, and local `$ref` (`#`, `#/$defs/…`,
+ * `#/definitions/…`, any JSON pointer into the same document), with its siblings checked too.
+ * OpenAPI's `nullable: true` lets null through. Every other keyword — `format`, `default`,
+ * `description`, `if`, `not`, remote refs — is ignored: a keyword this file does not check can
+ * only make it accept more, never refuse a valid call.
+ *
+ * Regular expressions are never run. A `pattern` or a `patternProperties` key is the client's
+ * own regular expression, and this check runs inside the gateway, on the one event loop every
+ * client shares: a backtracking one (`^(a+)+$` against forty characters, the subject written by
+ * the model) would stop them all for minutes. So `pattern` refuses nothing, and where
+ * `patternProperties` is present a property that `properties` does not name is checked against
+ * nothing — it might match a pattern — and never counts as additional. The client checks the
+ * call against its own schema anyway. (Design §1 lists `pattern` as checked; this is a
+ * deliberate departure from it.)
  *
  * Bounded: a `$ref` chain that consumes no data stops after MAX_REF_HOPS (a schema that is its
  * own definition), data nested deeper than MAX_DEPTH is refused, and one check takes at most
- * MAX_STEPS steps (a schema whose alternatives multiply). A `pattern` is the client's own
- * regular expression and runs as one: a pathological pattern costs what it costs.
+ * MAX_STEPS steps (a schema whose alternatives multiply).
  *
  * A reason names the place (`arguments.limit`), what the schema wanted, and the JSON type it
  * got — never a value from the arguments. It goes back to the model to correct itself and may
@@ -35,7 +43,7 @@ const ANNOTATIONS = new Set(['title', 'description', 'default', 'examples', 'dep
  * the reason. Local `$ref`s are resolved against `schema` itself.
  */
 export function validate(schema, value, { path = 'value' } = {}) {
-  const ctx = { root: schema, steps: 0, patterns: new Map() };
+  const ctx = { root: schema, steps: 0 };
   const reason = check(schema, value, path, ctx, 0, 0);
   return reason ? { ok: false, reason: clip(reason) } : { ok: true };
 }
@@ -174,10 +182,7 @@ function check(s, v, path, ctx, hops, depth) {
     const len = typeof s.minLength === 'number' || typeof s.maxLength === 'number' ? [...v].length : 0;
     if (typeof s.minLength === 'number' && len < s.minLength) return `${path}: shorter than ${s.minLength} characters`;
     if (typeof s.maxLength === 'number' && len > s.maxLength) return `${path}: longer than ${s.maxLength} characters`;
-    if (typeof s.pattern === 'string') {
-      const re = compiled(ctx, s.pattern);
-      if (re && !re.test(v)) return `${path}: does not match the pattern ${s.pattern}`;
-    }
+    // `pattern` is not run: see the header.
   }
   if (Array.isArray(v)) {
     if (depth >= MAX_DEPTH) return `${path}: nested too deeply`;
@@ -198,23 +203,17 @@ function check(s, v, path, ctx, hops, depth) {
     for (const name of Array.isArray(s.required) ? s.required : []) {
       if (typeof name === 'string' && (!Object.hasOwn(v, name) || v[name] === undefined)) return `${path}: missing required property ${quoteName(name)}`;
     }
-    const patterns = s.patternProperties && typeof s.patternProperties === 'object' ? Object.entries(s.patternProperties) : [];
+    // Whether a key matches a patternProperties pattern is not asked (see the header): with any
+    // pattern present, a key `properties` does not name is neither checked nor additional.
+    const patterned = !!s.patternProperties && typeof s.patternProperties === 'object' && Object.keys(s.patternProperties).length > 0;
     for (const [key, value] of Object.entries(v)) {
-      const at = childPath(path, key);
-      let known = false;
       if (Object.hasOwn(props, key)) {
-        known = true;
-        const r = check(props[key], value, at, ctx, 0, depth + 1);
+        const r = check(props[key], value, childPath(path, key), ctx, 0, depth + 1);
         if (r) return r;
+        continue;
       }
-      for (const [pattern, sub] of patterns) {
-        const re = compiled(ctx, pattern);
-        if (!re || !re.test(key)) continue;
-        known = true;
-        const r = check(sub, value, at, ctx, 0, depth + 1);
-        if (r) return r;
-      }
-      if (known) continue;
+      if (patterned) continue;
+      const at = childPath(path, key);
       if (s.additionalProperties === false) return `${path}: unexpected property ${quoteName(key)}`;
       if (s.additionalProperties && typeof s.additionalProperties === 'object') {
         const r = check(s.additionalProperties, value, at, ctx, 0, depth + 1);
@@ -230,14 +229,20 @@ function check(s, v, path, ctx, hops, depth) {
     }
   }
   if (Array.isArray(s.anyOf) && s.anyOf.length) {
+    // The first alternative that fits settles anyOf — and only anyOf: a oneOf next to it is
+    // still checked below, so this block must never answer for the whole schema.
     const reasons = [];
+    let matched = false;
     for (const sub of s.anyOf) {
       const r = check(sub, v, path, ctx, hops, depth);
       if (ctx.aborted) return ctx.aborted;
-      if (!r) return null;
+      if (!r) {
+        matched = true;
+        break;
+      }
       reasons.push(r);
     }
-    return noneOf(s.anyOf, v, path, reasons);
+    if (!matched) return noneOf(s.anyOf, v, path, reasons);
   }
   if (Array.isArray(s.oneOf) && s.oneOf.length) {
     const reasons = [];
@@ -306,17 +311,6 @@ function same(a, b) {
   if (Array.isArray(a)) return a.length === b.length && a.every((x, i) => same(x, b[i]));
   const ka = Object.keys(a);
   return ka.length === Object.keys(b).length && ka.every((k) => Object.hasOwn(b, k) && same(a[k], b[k]));
-}
-
-function compiled(ctx, pattern) {
-  if (!ctx.patterns.has(pattern)) {
-    let re = null;
-    try {
-      re = new RegExp(pattern, 'u');
-    } catch {}
-    ctx.patterns.set(pattern, re);
-  }
-  return ctx.patterns.get(pattern);
 }
 
 /**

@@ -70,7 +70,8 @@ test('pydantic-shaped schemas: $defs, anyOf with null, nested arrays, integer ap
   bad(PYDANTIC, { ...base, foo: 1 }, /^arguments: unexpected property "foo"$/);
   bad(PYDANTIC, { ...base, target: { ids: [], extra: true } }, /arguments\.target: unexpected property "extra"/);
   ok(PYDANTIC, { ...base, code: 'ABC-12' });
-  bad(PYDANTIC, { ...base, code: 'abc-12' }, /does not match the pattern/);
+  ok(PYDANTIC, { ...base, code: 'abc-12' }, 'a pattern is not run (the client checks it)');
+  bad(PYDANTIC, { ...base, code: 12 }, /^arguments\.code: expected string, got integer$/);
   ok(PYDANTIC, { ...base, targets: [{ ids: [] }, { kind: 'low', ids: [[7]] }] });
   bad(PYDANTIC, { ...base, targets: [{ ids: 5 }] }, /^arguments\.targets\[0\]\.ids: expected array, got integer$/, 'the alternative of the right type says why');
   bad({ anyOf: [{ $ref: '#/$defs/X' }, { type: 'null' }], $defs: { X: { type: 'string', minLength: 3 } } }, 'ab', /^arguments: matches none of the alternatives \(shorter than 3 characters; expected null, got string\)$/);
@@ -84,7 +85,7 @@ test('a reason says where and what was wanted, never the value the call sent', (
     { ...base, limit: secret },
     { ...base, target: { kind: secret, ids: [] } },
     { ...base, target: { ids: [[secret]] } },
-    { ...base, code: secret },
+    { ...base, code: 4711 },
     { ...base, ratio: 4711.5 },
   ]) {
     const reason = bad(PYDANTIC, args);
@@ -124,12 +125,44 @@ test('the rest of the subset: type lists, const, oneOf, allOf, boolean schemas, 
   bad({ exclusiveMinimum: 0 }, 0, /greater than 0/);
   bad({ exclusiveMaximum: 10 }, 10, /less than 10/);
   bad({ minimum: 0, exclusiveMinimum: true }, 0, /below the minimum/);
-  const pp = { type: 'object', patternProperties: { '^x-': { type: 'string' } }, additionalProperties: false };
-  ok(pp, { 'x-a': 'b' });
-  bad(pp, { 'x-a': 1 }, /expected string/);
-  bad(pp, { y: 'b' }, /unexpected property "y"/);
+  // patternProperties: a named property is checked; an unnamed one is neither checked nor
+  // additional, since whether it matches a pattern is not asked (no client regex is run).
+  const pp = { type: 'object', properties: { id: { type: 'integer' } }, patternProperties: { '^x-': { type: 'string' } }, additionalProperties: false };
+  ok(pp, { id: 1, 'x-a': 'b', 'x-b': 1, y: 'b' });
+  bad(pp, { id: 'one', 'x-a': 'b' }, /^arguments\.id: expected integer, got string$/);
+  bad({ type: 'object', patternProperties: {}, additionalProperties: false }, { y: 1 }, /unexpected property "y"/);
   ok({ type: 'object', additionalProperties: { type: 'integer' } }, { a: 1, b: 2 });
   bad({ type: 'object', additionalProperties: { type: 'integer' } }, { a: 'x' }, /arguments\.a: expected integer/);
+});
+
+test('anyOf and oneOf on one schema: both are checked — an anyOf that fits does not answer for the oneOf next to it', () => {
+  const s = { anyOf: [{ type: 'integer' }], oneOf: [{ minimum: 10 }, { maximum: 5 }] };
+  bad(s, 7, /^arguments: matches none of the alternatives \(below the minimum 10; above the maximum 5\)$/);
+  ok(s, 12);
+  ok(s, 3);
+  bad(s, 'x', /expected integer, got string/);
+  bad({ anyOf: [{ type: 'string' }, { type: 'number' }], oneOf: [{ type: 'number' }, { type: 'integer' }] }, 3, /more than one of the alternatives/);
+  bad({ anyOf: [{ type: 'integer' }, { type: 'string' }], allOf: [{ minimum: 0 }] }, -1, /below the minimum 0/);
+  // A call the client's own schema refuses is refused here too.
+  const tools = [{ name: 'f', parameters: { type: 'object', properties: { n: s } } }];
+  assert.match(validateCall(tools, { name: 'f', args: { n: 7 } }).reason, /^f\.arguments\.n: matches none of the alternatives/);
+  assert.equal(validateCall(tools, { name: 'f', args: { n: 12 } }).ok, true);
+});
+
+test('a client\'s regular expression is never run in the gateway: pattern refuses nothing, and a backtracking one costs nothing', () => {
+  ok({ type: 'string', pattern: '^a$' }, 'b');
+  ok({ type: 'string', pattern: '([' }, 'an invalid one neither');
+  const evil = 'a'.repeat(40) + '!'; // ^(a+)+$ against this backtracks for hours
+  const tools = [{ name: 'f', parameters: { type: 'object', properties: { q: { type: 'string', pattern: '^(a+)+$' } }, required: ['q'] } }];
+  let t0 = performance.now();
+  assert.deepEqual(validateCall(tools, { name: 'f', args: { q: evil } }), { ok: true, args: { q: evil } });
+  assert.ok(performance.now() - t0 < 200, `pattern: ${performance.now() - t0} ms`);
+  // The key is written by the model: a pattern over keys is not run either.
+  t0 = performance.now();
+  ok({ type: 'object', patternProperties: { '^(a|aa)+$': { type: 'integer' } }, additionalProperties: false }, { [evil]: 'not an integer' });
+  assert.ok(performance.now() - t0 < 200, `patternProperties: ${performance.now() - t0} ms`);
+  // What the property is is still checked.
+  assert.match(validateCall(tools, { name: 'f', args: { q: 40 } }).reason, /^f\.arguments\.q: expected string, got integer$/);
 });
 
 test('a keyword the subset does not know refuses nothing; OpenAPI nullable lets null through', () => {
