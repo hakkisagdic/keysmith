@@ -82,53 +82,133 @@ export function validateCall(tools, call) {
   return r.ok ? { ok: true, args } : r;
 }
 
+/** How large a written-out schema may get, in characters of its JSON text: one tool's inputSchema in a tools/list. */
+export const DEREF_MAX_CHARS = 256 * 1024;
+
 /**
  * `schema` with every local `$ref` written out in place, for a client that cannot follow one
  * (an MCP `tools/list`). A reference that points back into its own expansion (a tree of nodes),
  * one that does not resolve, and anything past `maxNodes` expanded nodes is written as `{}`
- * (any value), keeping its own description; `$defs` / `definitions` are dropped once nothing
- * refers to them. A call is still checked against the original schema, so a looser listing
- * never lets a wrong call through. The input is not changed.
+ * (any value), keeping its own description. A call is still checked against the original
+ * schema, so a looser listing never lets a wrong call through. The input is not changed.
+ *
+ * Every keyword that holds a schema is walked — `dependencies` (a schema per property, or a
+ * list of names) and `contentSchema` included — so `$defs` / `definitions` are dropped: nothing
+ * written out refers to them. A `$ref` inside a keyword this file does not know as one that holds
+ * schemas (an `x-…` extension) is kept as it is, and so are `$defs` / `definitions`, at every
+ * level, so that reference still resolves. Data keywords (`const`, `enum`, `default`,
+ * `examples`) hold values, not schemas: a `$ref` key in them is data.
+ *
+ * Bounded in size as well as in nodes: a few $refs that fan out (ten properties referring to a
+ * definition with ten properties referring to …) multiply a small schema thousands of times.
+ * A result longer than `maxChars` characters of JSON is refused — deref throws a RangeError with
+ * code ERR_SCHEMA_TOO_LARGE — and one that would grow far past it stops being built at twice
+ * that, so the refusal costs about as much as the cap. A caller then lists the tool another way
+ * (the bridge falls back to EMULATE, which sends the schema as the client wrote it).
  */
-export function deref(schema, { maxNodes = 20_000 } = {}) {
+export function deref(schema, { maxNodes = 20_000, maxChars = DEREF_MAX_CHARS } = {}) {
+  // While it builds, a pass counts what it writes and stops well before memory is at stake (an
+  // estimate: a comma or an allOf wrapper too many); the cap itself is on the JSON text.
+  const opts = { maxNodes, maxChars, stopAt: 2 * maxChars };
+  const first = derefPass(schema, { ...opts, keepDefs: false });
+  const out = first.foreignRef ? derefPass(schema, { ...opts, keepDefs: true }).out : first.out;
+  if (out !== undefined && JSON.stringify(out).length > maxChars) throw schemaTooLarge(maxChars);
+  return out;
+}
+
+function derefPass(schema, { maxNodes, maxChars, stopAt, keepDefs }) {
   const root = schema;
   let budget = maxNodes;
+  let size = 0;
+  let foreignRef = false;
+  const charge = (n) => {
+    size += n;
+    if (size > stopAt) throw schemaTooLarge(maxChars);
+  };
+  /** A value written as it is: cloned, and counted at its JSON length. */
+  const leaf = (v) => {
+    if (v === undefined) return v;
+    const text = JSON.stringify(v);
+    charge(text.length);
+    return JSON.parse(text);
+  };
   const walk = (s, stack) => {
-    if (typeof s === 'boolean') return s;
-    if (!s || typeof s !== 'object' || Array.isArray(s)) return clone(s);
+    if (!s || typeof s !== 'object' || Array.isArray(s)) return leaf(s);
     budget--;
     const { $ref, ...rest } = s;
     if (typeof $ref === 'string') {
       const target = budget > 0 && !stack.includes($ref) ? resolveRef(root, $ref) : undefined;
       const inlined = target === undefined ? {} : walk(target, [...stack, $ref]);
-      return withSiblings(inlined, walkKeywords(rest, stack));
+      const siblings = walkKeywords(rest, stack);
+      if (Object.keys(siblings).length) charge(16); // an allOf around the two, at most
+      return withSiblings(inlined, siblings);
     }
     return walkKeywords(s, stack);
   };
+  const walkMap = (v, each) => {
+    charge(2);
+    return Object.fromEntries(
+      Object.entries(v).map(([name, sub]) => {
+        charge(JSON.stringify(name).length + 2);
+        return [name, each(sub)];
+      }),
+    );
+  };
+  const walkList = (v, stack) => {
+    charge(2 + v.length);
+    return v.map((sub) => walk(sub, stack));
+  };
   const walkKeywords = (s, stack) => {
+    charge(2);
     const out = {};
     for (const [k, v] of Object.entries(s)) {
-      if (k === '$defs' || k === 'definitions' || k === '$ref') continue;
-      if (SCHEMA_MAPS.has(k) && v && typeof v === 'object' && !Array.isArray(v)) {
-        out[k] = Object.fromEntries(Object.entries(v).map(([name, sub]) => [name, walk(sub, stack)]));
+      if (k === '$ref') continue;
+      if ((k === '$defs' || k === 'definitions') && !keepDefs) continue;
+      charge(JSON.stringify(k).length + 2);
+      if (k === '$defs' || k === 'definitions') {
+        out[k] = leaf(v); // kept for a reference this walk leaves in place: as they are
+      } else if (SCHEMA_MAPS.has(k) && isObject(v)) {
+        out[k] = walkMap(v, (sub) => walk(sub, stack)); // a list in `dependencies` is a leaf to walk()
       } else if (SCHEMA_LISTS.has(k) && Array.isArray(v)) {
-        out[k] = v.map((sub) => walk(sub, stack));
+        out[k] = walkList(v, stack);
       } else if (SCHEMA_ONE.has(k) || (k === 'items' && !Array.isArray(v))) {
         out[k] = walk(v, stack);
       } else if (k === 'items' && Array.isArray(v)) {
-        out[k] = v.map((sub) => walk(sub, stack));
+        out[k] = walkList(v, stack);
       } else {
-        out[k] = clone(v);
+        if (!DATA.has(k) && hasLocalRef(v)) foreignRef = true;
+        out[k] = leaf(v);
       }
     }
     return out;
   };
-  return walk(schema, []);
+  return { out: walk(schema, []), foreignRef };
 }
 
-const SCHEMA_MAPS = new Set(['properties', 'patternProperties', 'dependentSchemas']);
+/** Keywords that hold a schema per name (`dependencies`, draft 7: a schema, or a list of names). */
+const SCHEMA_MAPS = new Set(['properties', 'patternProperties', 'dependentSchemas', 'dependencies']);
 const SCHEMA_LISTS = new Set(['anyOf', 'oneOf', 'allOf', 'prefixItems']);
-const SCHEMA_ONE = new Set(['additionalProperties', 'additionalItems', 'contains', 'not', 'if', 'then', 'else', 'propertyNames', 'unevaluatedProperties', 'unevaluatedItems']);
+const SCHEMA_ONE = new Set(['additionalProperties', 'additionalItems', 'contains', 'not', 'if', 'then', 'else', 'propertyNames', 'unevaluatedProperties', 'unevaluatedItems', 'contentSchema']);
+/** Keywords whose value is data, not a schema: a `$ref` key inside one is not a reference. */
+const DATA = new Set(['const', 'enum', 'default', 'examples']);
+
+function isObject(v) {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** Does `v` hold, at any depth, an object whose `$ref` is a local reference (`#…`)? */
+function hasLocalRef(v) {
+  if (!v || typeof v !== 'object') return false;
+  if (Array.isArray(v)) return v.some(hasLocalRef);
+  if (typeof v.$ref === 'string' && v.$ref.startsWith('#')) return true;
+  return Object.values(v).some(hasLocalRef);
+}
+
+function schemaTooLarge(maxChars) {
+  const e = new RangeError(`the schema, its references written out, is larger than ${maxChars} characters`);
+  e.code = 'ERR_SCHEMA_TOO_LARGE';
+  return e;
+}
 
 function withSiblings(inlined, siblings) {
   const keys = Object.keys(siblings);
@@ -137,10 +217,6 @@ function withSiblings(inlined, siblings) {
   if (inlined && typeof inlined === 'object' && keys.every((k) => ANNOTATIONS.has(k))) return { ...inlined, ...siblings };
   if (inlined && typeof inlined === 'object' && !Object.keys(inlined).length) return siblings;
   return { allOf: [inlined], ...siblings };
-}
-
-function clone(v) {
-  return v === undefined ? v : JSON.parse(JSON.stringify(v));
 }
 
 /* ------------------------------------------------------------------ the checker */

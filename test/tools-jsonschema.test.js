@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { deref, resolveRef, validate, validateCall } from '../src/tools/jsonschema.js';
+import { DEREF_MAX_CHARS, deref, resolveRef, validate, validateCall } from '../src/tools/jsonschema.js';
 
 const ok = (schema, value) => assert.deepEqual(validate(schema, value), { ok: true }, `${JSON.stringify(value)} should pass`);
 const bad = (schema, value, re) => {
@@ -246,6 +246,73 @@ test('deref of a schema that refers back into itself ends: the point of return i
   assert.ok(Date.now() - t0 < 5_000);
   assert.ok(JSON.stringify(out).length < 2_000_000);
   assert.ok(!JSON.stringify(out).includes('$ref'));
+});
+
+/** Every `$ref` string under a `$ref` key in `v` (data keywords included: a test wants to see them all). */
+function refsIn(v, out = []) {
+  if (Array.isArray(v)) v.forEach((x) => refsIn(x, out));
+  else if (v && typeof v === 'object') {
+    if (typeof v.$ref === 'string') out.push(v.$ref);
+    Object.values(v).forEach((x) => refsIn(x, out));
+  }
+  return out;
+}
+
+test('deref walks every keyword that holds a schema — dependencies, contentSchema — so no reference is left pointing at the $defs it dropped', () => {
+  const owner = { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] };
+  const deps = { type: 'object', properties: { pet: { type: 'string' } }, dependencies: { pet: { properties: { owner: { $ref: '#/$defs/Owner' } } }, name: ['pet'] }, $defs: { Owner: owner } };
+  const flat = deref(deps);
+  const text = JSON.stringify(flat);
+  assert.ok(!text.includes('#/$defs/') && !text.includes('#/definitions/'), text);
+  assert.equal(flat.$defs, undefined);
+  assert.deepEqual(flat.dependencies, { pet: { properties: { owner } }, name: ['pet'] }, 'a schema is written out, a list of names stays a list');
+  const content = { type: 'string', contentMediaType: 'application/json', contentSchema: { $ref: '#/definitions/Doc' }, definitions: { Doc: owner } };
+  const flatContent = deref(content);
+  assert.deepEqual(flatContent, { type: 'string', contentMediaType: 'application/json', contentSchema: owner });
+  assert.ok(!JSON.stringify(flatContent).includes('#/definitions/'));
+  // Every keyword that holds a schema, at once.
+  const every = { $defs: { S: { type: 'string' } } };
+  const r = { $ref: '#/$defs/S' };
+  Object.assign(every, { properties: { a: r }, patternProperties: { '^x': r }, dependentSchemas: { a: r }, dependencies: { a: r }, anyOf: [r], oneOf: [r], allOf: [r], prefixItems: [r], items: r, additionalProperties: r, additionalItems: r, contains: r, not: r, if: r, then: r, else: r, propertyNames: r, unevaluatedProperties: r, unevaluatedItems: r, contentSchema: r });
+  assert.deepEqual(refsIn(deref(every)), []);
+  assert.deepEqual(refsIn(deref({ items: [r, r], $defs: every.$defs })), []);
+});
+
+test('a $ref deref cannot write out (inside an extension keyword) keeps the $defs it points into, so it still resolves; a $ref in data is data', () => {
+  const s = { type: 'object', properties: { a: { $ref: '#/$defs/A' } }, 'x-shape': { kind: { $ref: '#/$defs/A' } }, $defs: { A: { type: 'integer' } } };
+  const flat = deref(s);
+  assert.deepEqual(flat.properties.a, { type: 'integer' }, 'what deref knows is still written out');
+  assert.deepEqual(flat['x-shape'], s['x-shape']);
+  for (const ref of refsIn(flat)) assert.notEqual(resolveRef(flat, ref), undefined, `${ref} resolves in the result`);
+  assert.deepEqual(flat.$defs, s.$defs);
+  // A $ref key inside const/enum/default/examples is a value: nothing is kept for it.
+  const data = { type: 'object', properties: { a: { $ref: '#/$defs/A' } }, default: { $ref: '#/$defs/A' }, examples: [{ $ref: '#/$defs/A' }], $defs: { A: { type: 'integer' } } };
+  assert.equal(deref(data).$defs, undefined);
+});
+
+test('deref is bounded in size: refs that fan out throw ERR_SCHEMA_TOO_LARGE at the cap instead of building the whole expansion', () => {
+  // 11 KB of schema: ten properties, each a $ref to ten properties, … four levels down to a
+  // 10,000-character description — 90 MB written out in full.
+  const level = (next) => ({ type: 'object', properties: Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`p${i}`, { $ref: `#/$defs/${next}` }])) });
+  const fan = { ...level('a'), $defs: { a: level('b'), b: level('c'), c: level('leaf'), leaf: { type: 'string', description: 'x'.repeat(10_000) } } };
+  assert.ok(JSON.stringify(fan).length < 12_000);
+  const heap = process.memoryUsage().heapUsed;
+  const t0 = performance.now();
+  assert.throws(() => deref(fan), (e) => e instanceof RangeError && e.code === 'ERR_SCHEMA_TOO_LARGE' && /larger than 262144 characters/.test(e.message));
+  assert.ok(performance.now() - t0 < 1_000, `${performance.now() - t0} ms`);
+  assert.ok(process.memoryUsage().heapUsed - heap < 20e6, 'nothing near the full expansion was built');
+  assert.equal(DEREF_MAX_CHARS, 256 * 1024);
+  // The same shape with a short leaf fits: written out, and under the cap.
+  const small = { ...level('a'), $defs: { a: level('b'), b: level('leaf'), leaf: { type: 'string', description: 'x' } } };
+  const out = deref(small);
+  assert.ok(JSON.stringify(out).length <= DEREF_MAX_CHARS);
+  assert.deepEqual(out.properties.p9.properties.p0.properties.p3, { type: 'string', description: 'x' });
+  // The cap is on the result, whatever made it large; a caller may set its own.
+  assert.throws(() => deref({ type: 'string', description: 'x'.repeat(DEREF_MAX_CHARS) }), { code: 'ERR_SCHEMA_TOO_LARGE' });
+  assert.throws(() => deref(PYDANTIC, { maxChars: 200 }), { code: 'ERR_SCHEMA_TOO_LARGE' });
+  const exact = JSON.stringify(deref(PYDANTIC)).length;
+  assert.equal(JSON.stringify(deref(PYDANTIC, { maxChars: exact })).length, exact, 'a result exactly at the cap is returned');
+  assert.throws(() => deref(PYDANTIC, { maxChars: exact - 1 }), { code: 'ERR_SCHEMA_TOO_LARGE' });
 });
 
 test('deref reads keywords as keywords: a property called "$ref" or "$defs" is a property', () => {
