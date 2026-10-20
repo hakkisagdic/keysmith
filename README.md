@@ -294,7 +294,9 @@ running when the headers went out, and none when the route fell back to a plain 
 The usage row says which engine answered (`toolMode`), how many calls it handed over
 (`toolCalls`), `retries`, and why the engine is not the one `auto` picks first (`fallback`);
 never an argument or a result. What a tool engine spent is in the row even when it failed: a
-502's row has its `usage`, `toolMode` and `retries`; when a tool leg failed and a later leg
+502's row has its `usage`, `toolMode` and `retries`; a bridge turn that spent a model step and
+then failed before any call (`auto` answering the same request with EMULATE) is counted in that
+answer's `usage`, the client's included; when a tool leg failed and a later leg
 answered (or failed too), `usage` and `retries` count every leg, and `failedLegs` names each
 tool leg that failed before — target, engine, status, its own `retries` and `usage`.
 `GET /v1/keysmith/routes` lists each adapter's `tool_mode`, and the status page marks it.

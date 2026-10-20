@@ -405,7 +405,8 @@ export class McpBridge {
         } else if (type === 'broken') {
           throw fail(evt.reason || 'broken', 502, evt.reason === 'cancelled' ? `${adapter.id} cancelled the call it was waiting on` : `${adapter.id}'s MCP connection dropped`);
         } else if (type === 'abort') {
-          throw Object.assign(new LlmError(`adapter "${adapter.id}": client disconnected`, { status: 499, provider: adapter.id }), { fallbackReason: 'client_left' });
+          // What the turn spent before the client left is spent all the same: it rides on the error.
+          throw bridgeError(adapter, 'client_left', 499, `adapter "${adapter.id}": client disconnected`, { usage });
         } else if (type === 'closed' || type === 'expired') {
           throw fail(evt.reason || 'closed', evt.reason === 'shutdown' ? 503 : 502, `the session was closed (${evt.reason || 'closed'})`);
         }

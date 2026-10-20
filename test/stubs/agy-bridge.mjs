@@ -252,6 +252,12 @@ async function bridge() {
       await call('get_weather', { city: 'Ankara' }, { cancel: true });
       return void (await sleep(60_000));
     }
+    case 'step-then-hang': {
+      // A model step spent (its usage reported), then nothing: no text, no call.
+      respond('', usage1);
+      note({ event: 'hang' });
+      return void (await sleep(60_000));
+    }
     case 'text-then-hang': {
       const at = stepIndex++;
       step({ step_index: at, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Thinking out loud, ' });

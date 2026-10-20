@@ -474,7 +474,7 @@ test('auto: tool_choice none is a text answer with the history rendered as such;
  * A stand-in for the MCP bridge (design U6/U7): `check` says whether it takes the request,
  * `run` answers with a call, or fails the way it is told to.
  */
-function stubBridge({ answer = false, refuse = null, fail = null, noFallback = false, usage = null, errorEvent = null } = {}) {
+function stubBridge({ answer = false, refuse = null, fail = null, noFallback = false, usage = null, errorUsage = null, routeEnd = false, errorEvent = null } = {}) {
   const seen = { checks: 0, runs: 0 };
   return {
     seen,
@@ -486,7 +486,7 @@ function stubBridge({ answer = false, refuse = null, fail = null, noFallback = f
     async *run() {
       seen.runs++;
       if (usage) yield { type: 'usage', usage };
-      if (fail) throw Object.assign(new Error(`bridge: ${fail}`), { fallbackReason: fail, noFallback });
+      if (fail) throw Object.assign(new Error(`bridge: ${fail}`), { fallbackReason: fail, noFallback, ...(errorUsage ? { usage: errorUsage } : {}), ...(routeEnd ? { routeEnd } : {}) });
       if (errorEvent) yield { type: 'error', message: `bridge said: ${errorEvent}`, code: errorEvent };
       if (answer) {
         yield { type: 'tool_call', name: 'get_weather', arguments: '{"city":"Bridge"}', args: { city: 'Bridge' } };
@@ -533,6 +533,28 @@ test('auto with a bridge: it answers when it can; one that cannot take the reque
     r = await chat('agy/m', 'SCENARIO=one-call');
     assert.equal(r.status, 200, r.text);
     assert.deepEqual([lastRow().toolMode, lastRow().fallback], ['emulate', 'unknown_agent']);
+  } finally {
+    gateway.toolEngines.mcp = null;
+  }
+});
+
+test('what a bridge turn spent before it failed reaches EMULATE\'s usage: the failure\'s own usage, and a usage event before it counted once', async () => {
+  try {
+    // The bridge's spend rides on its failure (a turn that spent a model step, then timed out).
+    gateway.toolEngines.mcp = stubBridge({ fail: 'timeout', errorUsage: { input: 9, output: 2 } });
+    let r = await chat('agy/m', 'SCENARIO=one-call');
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual([lastRow().toolMode, lastRow().fallback, lastRow().usage.input, lastRow().usage.output], ['emulate', 'timeout', 1009, 22]);
+    assert.equal(json(r).usage.prompt_tokens, 1009);
+    // A usage event and the failure's usage are two reports of one turn's spend: the larger, not their sum.
+    gateway.toolEngines.mcp = stubBridge({ fail: 'timeout', usage: { input: 7, output: 3 }, errorUsage: { input: 9, output: 2 } });
+    r = await chat('agy/m', 'SCENARIO=one-call');
+    assert.deepEqual([lastRow().usage.input, lastRow().usage.output], [1009, 23]);
+    // toolMode mcp: no EMULATE, and the error's row holds what the bridge spent.
+    gateway.toolEngines.mcp = stubBridge({ fail: 'timeout', errorUsage: { input: 9, output: 2 } });
+    r = await chat('bridged/m', 'SCENARIO=one-call');
+    assert.equal(r.status, 502, r.text);
+    assert.deepEqual(lastRow().usage, { input: 9, output: 2 });
   } finally {
     gateway.toolEngines.mcp = null;
   }

@@ -171,10 +171,14 @@ export async function* toolEvents({ adapter, model, target = null }, { spec, mes
       }
       return;
     } catch (e) {
-      // What the bridge's run spent is spent: it goes into EMULATE's usage, or onto the error.
+      // What the bridge's run spent is spent: it goes into EMULATE's usage, or onto the error. The
+      // bridge reports a turn's spend on its failure (`usage`: every model step of the turn so
+      // far), or in a usage event before it: two reports of one turn, so per field the larger
+      // (the gateway's rule for one run), never their sum.
       for (const evt of held) if (evt.type === 'usage') carried = sumUsage(carried, evt.usage);
+      if (e && typeof e === 'object' && e.usage) carried = maxUsage(carried, e.usage);
       if (started || (adapter.toolMode || 'off') !== 'auto' || signal?.aborted || e?.noFallback) {
-        if (carried && e && typeof e === 'object' && !e.usage) e.usage = carried;
+        if (carried && e && typeof e === 'object') e.usage = carried;
         throw engineFailed(e, 'mcp', fallback);
       }
       fallback = typeof e?.fallbackReason === 'string' && e.fallbackReason ? e.fallbackReason.slice(0, 40) : 'bridge_failed';
@@ -217,6 +221,13 @@ function sumUsage(a, b) {
   if (!b) return a;
   const out = { ...(a || {}) };
   for (const [k, v] of Object.entries(b)) if (typeof v === 'number') out[k] = (out[k] || 0) + v;
+  return out;
+}
+
+function maxUsage(a, b) {
+  if (!b) return a;
+  const out = { ...(a || {}) };
+  for (const [k, v] of Object.entries(b)) if (typeof v === 'number') out[k] = Math.max(out[k] || 0, v);
   return out;
 }
 

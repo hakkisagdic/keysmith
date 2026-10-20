@@ -367,6 +367,9 @@ test('three calls the schema refuses in one turn fail the turn; auto answers the
   assert.equal(one.r.headers.get('x-keysmith-mode'), 'emulate');
   assert.deepEqual([lastRow().toolMode, lastRow().fallback], ['emulate', 'invalid_calls']);
   assert.equal(emuRuns().length, before + 1);
+  // The bridge's model step (1000/20) was spent before the turn failed, and so was EMULATE's run (1000/20).
+  assert.deepEqual([lastRow().usage.input, lastRow().usage.output], [2000, 40], 'the row counts both engines');
+  assert.deepEqual([json(one.r).usage.prompt_tokens, json(one.r).usage.completion_tokens], [2000, 40], 'and so does the answer\'s usage');
   const [run] = runsOf(t);
   assert.ok(await until(() => clean([run.pid, shimOf(run.pid)])));
 });
@@ -414,6 +417,21 @@ test('a client that leaves in the middle of a streamed turn: agy is stopped, the
   assert.ok(alive(run.pid));
   ctrl.abort();
   assert.ok(await until(() => clean(groupOf(run.pid))), 'the client left: agy, its helper and its shim were stopped');
+});
+
+test('a client that leaves after the turn spent a model step: agy is stopped, and the row holds what the step cost', async () => {
+  const t = tag();
+  const ctrl = new AbortController();
+  const asked = post('/v1/chat/completions', { model: 'agym/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather? SCENARIO=step-then-hang ${t}` }] }, KEY, ctrl.signal).catch(() => null);
+  assert.ok(await until(() => stub().some((e) => e.event === 'hang' && e.pid === runsOf(t)[0]?.pid)), 'the step was spent');
+  const rowsBefore = rows().length;
+  ctrl.abort();
+  await asked;
+  const [run] = runsOf(t);
+  assert.ok(await until(() => clean(groupOf(run.pid))));
+  assert.ok(await until(() => rows().length > rowsBefore));
+  const row = lastRow();
+  assert.deepEqual([row.status, row.toolMode, row.usage?.input, row.usage?.output], ['error', 'mcp', 1000, 20]);
 });
 
 test('a result sent with another key is not attached: that request is a new one, and the session waits for its own key', async () => {
