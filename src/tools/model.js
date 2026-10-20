@@ -190,25 +190,42 @@ export function responsesToolMessages(body) {
     out.push({ role: 'user', text: input });
     return out;
   }
-  let turn = null; // the assistant turn a function_call joins, until a result or another turn comes
+  // A run: function_call and function_call_output items with no message between them. The Responses
+  // API takes a step's calls with their outputs after all of them, or each call followed by its
+  // output — and a client's loop that appends each call and its output writes the second. Either
+  // way the run's calls are one assistant turn (the one right before them, or a new one), and its
+  // outputs follow that turn in the calls' order: the canonical shape of a step, which a bridge
+  // session waiting on two calls of one answer reads as their continuation (bridge/index.js).
+  let turn = null; // the assistant turn the run's calls join
+  let results = []; // the run's outputs, written after its turn
+  const endRun = () => {
+    if (results.length) {
+      // In the calls' order (an output for no call of this turn first, as it came); one pass each,
+      // on the gateway's one event loop.
+      const pos = new Map();
+      (turn?.toolCalls || []).forEach((c, i) => pos.has(c.id) || pos.set(c.id, i));
+      const at = (r) => pos.get(r.toolCallId) ?? -1;
+      for (const [, , r] of results.map((r, i) => [at(r), i, r]).sort((x, y) => x[0] - y[0] || x[1] - y[1])) out.push(r);
+    }
+    results = [];
+    turn = null;
+  };
   for (const item of Array.isArray(input) ? input : []) {
     if (typeof item === 'string') {
+      endRun();
       out.push({ role: 'user', text: item });
-      turn = null;
       continue;
     }
     if (!item || typeof item !== 'object') continue;
     const type = item.type ?? (typeof item.role === 'string' ? 'message' : null);
     if (type === 'message') {
+      endRun();
       const role = item.role === 'assistant' ? 'assistant' : item.role === 'system' || item.role === 'developer' ? 'system' : 'user';
       const text = typeof item.content === 'string' ? item.content : contentToText(item.content);
       if (role === 'assistant') {
         turn = { role, text };
         out.push(turn);
-      } else {
-        if (text) out.push({ role, text });
-        turn = null;
-      }
+      } else if (text) out.push({ role, text });
     } else if (type === 'function_call' || type === 'custom_tool_call') {
       const call = callFrom(item.call_id, item.name, type === 'function_call' ? item.arguments : item.input);
       if (!turn) {
@@ -217,10 +234,10 @@ export function responsesToolMessages(body) {
       }
       (turn.toolCalls ??= []).push(call);
     } else if (type === 'function_call_output' || type === 'custom_tool_call_output') {
-      out.push({ role: 'tool', text: typeof item.output === 'string' ? item.output : contentToText(item.output), toolCallId: typeof item.call_id === 'string' ? item.call_id : null });
-      turn = null;
+      results.push({ role: 'tool', text: typeof item.output === 'string' ? item.output : contentToText(item.output), toolCallId: typeof item.call_id === 'string' ? item.call_id : null });
     }
   }
+  endRun();
   return out;
 }
 

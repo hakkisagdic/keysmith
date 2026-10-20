@@ -22,8 +22,10 @@ import { startFailure } from '../cli-adapter.js';
  * `tool_calls`) and the HTTP answer ends there, while the CLI process stays where it is, waiting
  * on its tools/call. The client runs the tool and comes back with the result in its next request:
  *
- *   continuation   the request's last assistant turn holds exactly the call that session waits
- *                  for, followed by its result and nothing else (a user turn after the result is
+ *   continuation   the request's last assistant turn ends in exactly the calls that session waits
+ *                  for (its earlier calls, if any, are the session's earlier ones: a Responses
+ *                  input that follows each call with its output reads as one turn), followed by
+ *                  one result for each of its calls and nothing else (a user turn after the result is
  *                  the cold path: agy takes a result while it waits, not a user turn), from the
  *                  same gateway key, to the same target, with the same tools and the same
  *                  system/user turns before it, and every call id of the conversation in the
@@ -41,7 +43,7 @@ import { startFailure } from '../cli-adapter.js';
  * CLI's stream shows it, so text written before it goes first). opencode runs them at once
  * (`gather`): the calls that arrive within the driver's `settleMs` of each other go out in one
  * answer, and the next request brings all their results (a request with parallel_tool_calls false
- * is handed one, the rest in the requests after it). A continuation holds exactly the calls its
+ * is handed one, the rest in the requests after it). A continuation ends in exactly the calls its
  * session waits for, each with its result.
  *
  * Nothing reaches the client before the CLI listed the bridge's tools (the readiness gate), so a
@@ -188,13 +190,20 @@ export class McpBridge {
       : null;
     if (differs) return { kind: 'new', why: differs, late: false };
     if (s.state === 'generating') return { kind: 'busy', session: s };
-    if (s.state !== 'waiting' || !s.outs.length || !sameList(tail.ids, s.outs.map((o) => o.id))) return { kind: 'new', why: 'not the calls its session waits for', late: false };
-    // One result for each call out, and none for a call it does not wait for.
+    // The calls out are the last calls of the request's last assistant turn: all of them, or — a
+    // Responses input where each call is followed by its output reads as one turn holding every call
+    // since the last message (model.js) — the last of them, the turn's earlier calls being ones
+    // this session handed out in earlier answers (a serial driver's) or read in its history: the
+    // history's ids are the session's, in order (idSeq, above).
+    const outIds = s.outs.map((o) => o.id);
+    if (s.state !== 'waiting' || !outIds.length || !sameList(tail.ids.slice(-outIds.length), outIds)) return { kind: 'new', why: 'not the calls its session waits for', late: false };
+    // One result for each call of the turn, and none for a call it does not hold; the results of
+    // the calls out go to the CLI.
     const results = [];
     for (const id of tail.ids) {
       const mine = tail.results.filter((r) => r.toolCallId === id);
-      if (mine.length !== 1) return { kind: 'new', why: mine.length ? 'two results for one call' : 'no result for a call its session waits for', late: false };
-      results.push({ id, text: String(mine[0].text ?? ''), isError: mine[0].isError === true });
+      if (mine.length !== 1) return { kind: 'new', why: mine.length ? 'two results for one call' : outIds.includes(id) ? 'no result for a call its session waits for' : 'no result for an earlier call of its turn', late: false };
+      if (outIds.includes(id)) results.push({ id, text: String(mine[0].text ?? ''), isError: mine[0].isError === true });
     }
     if (tail.results.some((r) => !tail.ids.includes(r.toolCallId))) return { kind: 'new', why: 'a result for a call its session does not wait for', late: false };
     // The client's own words after the result: agy can be given the call's result, but not a user

@@ -16,7 +16,7 @@ import { Gateway } from '../src/gateway.js';
 import { createServer } from '../src/server.js';
 import { UsageLog } from '../src/usage.js';
 import { CLI_PROFILES } from '../src/profiles.js';
-import { responsesToolMessages, responsesToolSpec } from '../src/tools/model.js';
+import { responsesStateRefusal, responsesToolMessages, responsesToolSpec } from '../src/tools/model.js';
 
 const EMU = fileURLToPath(new URL('./stubs/cli-emu.mjs', import.meta.url));
 const AGY = fileURLToPath(new URL('./stubs/agy-bridge.mjs', import.meta.url));
@@ -89,9 +89,14 @@ function conversation(model, user, { stream = false } = {}) {
       const output = outputOf(stream, r);
       return { r, output, calls: output.filter((o) => o.type === 'function_call'), text: output.filter((o) => o.type === 'message').map((o) => o.content.map((c) => c.text).join('')).join('') };
     },
-    results(output, textFor = (c) => `RESULT for ${JSON.parse(c.arguments).city}`) {
-      for (const item of output) input.push(item);
-      for (const c of output.filter((o) => o.type === 'function_call')) input.push({ type: 'function_call_output', call_id: c.call_id, output: textFor(c) });
+    /** The answer's items, and an output for each call: after all of them, or (`interleave`) right after each one. */
+    results(output, textFor = (c) => `RESULT for ${JSON.parse(c.arguments).city}`, { interleave = false } = {}) {
+      const result = (c) => ({ type: 'function_call_output', call_id: c.call_id, output: textFor(c) });
+      for (const item of output) {
+        input.push(item);
+        if (interleave && item.type === 'function_call') input.push(result(item));
+      }
+      if (!interleave) for (const c of output.filter((o) => o.type === 'function_call')) input.push(result(c));
     },
   };
 }
@@ -111,7 +116,7 @@ test('a Responses body\'s tools: function tools taken; custom (freeform apply_pa
   assert.equal(responsesToolSpec({ input: 'hi' }), null);
 });
 
-test('Responses input, tool-aware: function_call items are their assistant turn\'s calls, function_call_output items tool results by call_id; reasoning and references left out', () => {
+test('Responses input, tool-aware: function_call items are their assistant turn\'s calls, function_call_output items tool results by call_id; reasoning items left out (an item reference too: the server refuses it first)', () => {
   const messages = responsesToolMessages({
     instructions: 'Be brief.',
     input: [
@@ -133,14 +138,49 @@ test('Responses input, tool-aware: function_call items are their assistant turn\
     ['system', 'Be brief.', [], null],
     ['system', 'Use tools.', [], null],
     ['user', 'Weather in two cities?', [], null],
-    ['assistant', 'Checking.', ['call_a', 'call_b'], null],
+    // One run of calls and outputs, no message between them: one turn.
+    ['assistant', 'Checking.', ['call_a', 'call_b', 'call_c', 'call_d'], null],
     ['tool', 'sunny', [], 'call_a'],
     ['tool', 'rainy', [], 'call_b'],
-    ['assistant', '', ['call_c', 'call_d'], null],
     ['tool', 'applied', [], 'call_d'],
   ]);
+  assert.match(responsesStateRefusal({ input: [{ type: 'item_reference', id: 'msg_old' }] }), /item_reference \(msg_old\)/);
   assert.deepEqual(messages[3].toolCalls[0].args, { city: 'Ankara' });
   assert.deepEqual(responsesToolMessages({ input: 'hello' }), [{ role: 'user', text: 'hello' }]);
+});
+
+test('Responses input: the calls of an unbroken run of function_call and function_call_output items are one assistant turn, its outputs after it in the calls\' order, whichever order the client used; a message ends the run', () => {
+  const fc = (id) => ({ type: 'function_call', call_id: id, name: 'get_weather', arguments: '{"city":"X"}' });
+  const fco = (id) => ({ type: 'function_call_output', call_id: id, output: `out ${id}` });
+  const shape = (input) => responsesToolMessages({ input }).map((m) => [m.role, m.text, (m.toolCalls || []).map((c) => c.id), m.toolCallId ?? null]);
+  const both = [
+    ['user', 'Two cities?', [], null],
+    ['assistant', 'Checking.', ['a', 'b'], null],
+    ['tool', 'out a', [], 'a'],
+    ['tool', 'out b', [], 'b'],
+  ];
+  const head = [{ role: 'user', content: 'Two cities?' }, { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Checking.' }] }];
+  assert.deepEqual(shape([...head, fc('a'), fc('b'), fco('a'), fco('b')]), both);
+  assert.deepEqual(shape([...head, fc('a'), fco('a'), fc('b'), fco('b')]), both, 'each call followed by its output');
+  assert.deepEqual(shape([...head, fc('a'), fc('b'), fco('b'), fco('a')]), both, 'the outputs in another order');
+  // A reasoning item inside the run does not end it; a message does, and so does a plain string.
+  assert.deepEqual(shape([...head, fc('a'), fco('a'), { type: 'reasoning', id: 'rs_1', summary: [] }, fc('b'), fco('b')]), both);
+  assert.deepEqual(shape([...head, fc('a'), fco('a'), { role: 'user', content: 'and Izmir?' }, fc('b'), fco('b')]), [
+    ['user', 'Two cities?', [], null],
+    ['assistant', 'Checking.', ['a'], null],
+    ['tool', 'out a', [], 'a'],
+    ['user', 'and Izmir?', [], null],
+    ['assistant', '', ['b'], null],
+    ['tool', 'out b', [], 'b'],
+  ]);
+  assert.deepEqual(shape([...head, fc('a'), fco('a'), { type: 'message', role: 'assistant', content: 'Now Izmir.' }, fc('b'), fco('b')]).map((m) => m.slice(0, 3)), [
+    ['user', 'Two cities?', []],
+    ['assistant', 'Checking.', ['a']],
+    ['tool', 'out a', []],
+    ['assistant', 'Now Izmir.', ['b']],
+    ['tool', 'out b', []],
+  ]);
+  assert.deepEqual(shape([...head, fc('a'), fco('a'), 'and Izmir?', fco('a')]).map((m) => m[0]), ['user', 'assistant', 'tool', 'user', 'tool']);
 });
 
 test('/v1/responses: a request whose only tool no CLI can honour (Codex\'s freeform apply_patch) is a 400 that names it; more than 128 tools is a 400 before any leg runs', async () => {
@@ -272,4 +312,61 @@ test('the MCP bridge through /v1/responses (opencode, streamed): a step\'s two c
   const a2 = await c.ask();
   assert.equal(a2.text, 'Ankara RESULT for Ankara; Izmir RESULT for Izmir', 'the whole answer after the results, not cut by the text before the calls');
   assert.equal(lines(path.join(dir, 'oc.jsonl')).filter((e) => e.event === 'start' && e.argv.at(-1).includes(t)).length, 1);
+});
+
+for (const stream of [false, true]) {
+  test(`the MCP bridge through /v1/responses (opencode${stream ? ', streamed' : ''}): two calls of one answer sent back each followed by its output still continue the session`, async () => {
+    const t = tag();
+    const c = conversation('oc/m', `Two cities ${t} SCENARIO=two-calls`, { stream });
+    const a1 = await c.ask();
+    assert.equal(a1.r.status, 200, a1.r.text);
+    assert.equal(a1.calls.length, 2);
+    c.results(a1.output, undefined, { interleave: true });
+    assert.deepEqual(c.input.map((i) => i.type ?? i.role).slice(1), ['message', 'function_call', 'function_call_output', 'function_call', 'function_call_output']);
+    const a2 = await c.ask();
+    assert.equal(a2.r.status, 200, a2.r.text);
+    assert.equal(a2.text, 'Ankara RESULT for Ankara; Izmir RESULT for Izmir');
+    assert.equal(lastRow().bridge.path, 'attached', 'the results went into the process that waits for them');
+    assert.equal(lines(path.join(dir, 'oc.jsonl')).filter((e) => e.event === 'start' && e.argv.at(-1).includes(t)).length, 1, 'one opencode process');
+    const hub = gateway.toolEngines.mcp.hub;
+    assert.ok(![...hub.sessions.values()].some((s) => a1.calls.some((x) => s.idSeq.includes(x.call_id)) && s.state === 'waiting'), 'no session left waiting on those calls');
+  });
+}
+
+test('the MCP bridge through /v1/responses (agy): a step\'s three calls, one per answer, each sent back followed by its output, go into one agy process', async () => {
+  // agy runs a step's calls one after the other: each answer holds one call, and a Responses client
+  // appends each call and its output. The input then reads as one run of calls and outputs.
+  const t = tag();
+  const c = conversation('agy/m', `Three ${t} SCENARIO=three-calls`);
+  const cities = [];
+  let a = await c.ask();
+  for (let i = 0; i < 3; i++) {
+    assert.equal(a.r.status, 200, a.r.text);
+    assert.equal(a.calls.length, 1, `answer ${i + 1}: one call`);
+    cities.push(JSON.parse(a.calls[0].arguments).city);
+    c.results(a.output, undefined, { interleave: true });
+    a = await c.ask();
+    assert.equal(lastRow().bridge.path, 'attached', `turn ${i + 2}`);
+  }
+  assert.deepEqual(cities, ['Ankara', 'Izmir', 'Bursa']);
+  assert.equal(a.text, 'Ankara RESULT for Ankara; Izmir RESULT for Izmir; Bursa RESULT for Bursa');
+  assert.equal(lines(path.join(dir, 'agy.jsonl')).filter((e) => e.event === 'start' && e.prompt.includes(t)).length, 1, 'one agy process for four turns');
+});
+
+test('the MCP bridge through /v1/responses (agy): a run whose earlier call has lost its output is no continuation — every call of the run needs its one output', async () => {
+  const t = tag();
+  const c = conversation('agy/m', `Three ${t} SCENARIO=three-calls`);
+  const a1 = await c.ask();
+  c.results(a1.output, undefined, { interleave: true });
+  const a2 = await c.ask();
+  assert.equal(lastRow().bridge.path, 'attached');
+  const [start] = lines(path.join(dir, 'agy.jsonl')).filter((e) => e.event === 'start' && e.prompt.includes(t));
+  // The client drops the first call's output: the second call's output is the one the session waits for.
+  c.input.splice(c.input.findIndex((i) => i.type === 'function_call_output'), 1);
+  c.results(a2.output, undefined, { interleave: true });
+  const a3 = await c.ask();
+  assert.equal(a3.r.status, 200, a3.r.text);
+  assert.equal(lastRow().bridge.path, 'cold');
+  assert.equal(lines(path.join(dir, 'agy.jsonl')).filter((e) => e.pid === start.pid && e.event === 'result').length, 1, 'the waiting agy got only the first result');
+  await Promise.all([...gateway.toolEngines.mcp.hub.sessions.values()].map((s) => s.close('test_done')));
 });

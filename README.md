@@ -176,7 +176,9 @@ On `/v1/responses` the tools are `{"type": "function", "name", "parameters"}`; a
 (a freeform one, such as Codex's `apply_patch`) and the hosted ones (`web_search`,
 `file_search`, `computer_use_preview`, `code_interpreter`, `mcp`, …) are what no CLI can honour.
 The history is read from `input`: `function_call` items are their assistant turn's calls,
-`function_call_output` items their results by `call_id`; reasoning items are left out.
+`function_call_output` items their results by `call_id` — a step's calls with their outputs after
+all of them, or each call followed by its output, read alike, as one assistant turn and its
+results; reasoning items are left out.
 keysmith stores no response, so send the whole input, as Codex's `store: false` requests do: a
 request that names `previous_response_id`, a `conversation` or an `item_reference`, or holds a
 `function_call_output` with no `function_call` before it, is a 400 (with tools or without), as
