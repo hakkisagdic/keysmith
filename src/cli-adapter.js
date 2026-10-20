@@ -337,8 +337,8 @@ export class CliAdapter {
 
   _spawn({ args, timeoutMs }) {
     this._ensureCwd();
+    const child = spawnCli(this.id, which(this.bin) || this.bin, args, { cwd: this.cwd, env: this._childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
     return new Promise((resolve) => {
-      const child = spawn(which(this.bin) || this.bin, args, { cwd: this.cwd, env: this._childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';
       const timer = setTimeout(() => terminate(child, 'timeout'), timeoutMs);
@@ -357,7 +357,7 @@ export class CliAdapter {
 
   _spawnStream({ args, stdin, timeoutMs, signal }) {
     this._ensureCwd();
-    const child = spawn(which(this.bin) || this.bin, args, {
+    const child = spawnCli(this.id, which(this.bin) || this.bin, args, {
       cwd: this.cwd,
       env: this._childEnv(),
       stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
@@ -399,6 +399,43 @@ export class CliAdapter {
 
 /** Below this much of `timeoutMs` left, a refused run is reported instead of retried. */
 const MIN_RETRY_BUDGET_MS = 15_000;
+
+/**
+ * spawn() for an adapter's CLI (the text path, EMULATE, the MCP bridge's driver). spawn() refuses
+ * an argv holding a NUL character (U+0000) with an error that quotes the argv — the prompt with
+ * it — and that message would reach the client, the gateway log and the usage row, none of which
+ * may hold a prompt (design §5). So a NUL in the argv is a 400 here, before anything starts, and
+ * any other error spawn() throws at once is reported by its code (startFailure), never its text.
+ */
+export function spawnCli(adapterId, bin, argv, opts) {
+  refuseNul(adapterId, argv);
+  try {
+    return spawn(bin, argv, opts);
+  } catch (e) {
+    throw new LlmError(`adapter "${adapterId}": could not start ${path.basename(String(bin))} (${startFailure(e)})`, { status: 502, provider: adapterId });
+  }
+}
+
+/** A 400 for an argv a command line cannot carry: one with a NUL character in it (from the request: a prompt, a system prompt). */
+export function refuseNul(adapterId, argv) {
+  if (argv.some((a) => String(a).includes('\0'))) {
+    throw new LlmError(`adapter "${adapterId}": the request holds a NUL character (U+0000), which a command line cannot carry — take it out, or send the request to an HTTP upstream`, {
+      status: 400,
+      type: 'invalid_request_error',
+      provider: adapterId,
+    });
+  }
+}
+
+/**
+ * An error from starting a process, as a log line may print it: an error's code (with the
+ * syscall and path of an fs or spawn error), never its message — Node's argument errors quote the
+ * value they refused. An error with no code (a bug) is its message, cut short.
+ */
+export function startFailure(e) {
+  if (e && typeof e === 'object' && typeof e.code === 'string' && e.code) return [e.code, e.syscall, e.path].filter((x) => typeof x === 'string' && x).join(' ');
+  return truncate(String(e?.message || e), 200);
+}
 
 /**
  * Switches that hand an agent permission to act without asking, as their CLIs spell them:

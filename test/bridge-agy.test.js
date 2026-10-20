@@ -64,6 +64,8 @@ before(async () => {
       agyt: agy('auto', { toolResultTimeoutMs: 1_200, readyTimeoutMs: 1_000 }),
       agy2: agy('auto', { maxTurns: 2 }),
       agys: agy('auto', {}, { maxConcurrent: 1 }),
+      // An env value spawn() refuses at once (a NUL): a CLI that cannot be started.
+      agyz: agy('mcp', {}, { env: { AGY_BRIDGE_LOG: path.join(dir, 'bridge.jsonl'), STUB_MCP_CACHE: cache, BROKEN: 'x\u0000y' } }),
     },
     aliases: { pair: ['agy/m', 'agy1/m'] },
   };
@@ -576,6 +578,37 @@ test('the usage rows and the gateway log: names, counts and short session ids â€
   const written = fs.readFileSync(path.join(dir, 'usage.jsonl'), 'utf8') + '\n' + log.join('\n');
   for (const s of [token, token.slice(0, 16), 'RESULT-MARKER-4f2a', 'Ankara', KEY]) assert.ok(!written.includes(s), `${s.slice(0, 10)}â€¦ in ${written.split('\n').filter((l) => l.includes(s)).slice(0, 3).join('\n')}`);
   assert.ok(rows().some((r) => r.bridge?.session === `ks${run.agent.slice(5, 11)}`));
+});
+
+test('a NUL character in the conversation is a 400 that quotes none of it, before a file is written or a process started: the bridge, EMULATE and the text path alike', async () => {
+  const before = stub().length;
+  const emuBefore = emuRuns().length;
+  const marker = `PROMPT-MARKER-${crypto.randomBytes(3).toString('hex')}`;
+  for (const [model, extra] of [
+    ['agym/m', { tools: TOOLS }], // the bridge (toolMode mcp)
+    ['agy/m', { tools: TOOLS }], // auto: EMULATE would refuse it the same way, so it is not asked
+    ['agy/m', { tools: TOOLS, tool_choice: 'required' }], // EMULATE
+    ['agy/m', {}], // the text path
+  ]) {
+    const r = await post('/v1/chat/completions', { model, ...extra, messages: [{ role: 'user', content: `${marker} hello\u0000world SCENARIO=one-call` }] });
+    assert.equal(r.status, 400, `${model} ${JSON.stringify(Object.keys(extra))}: ${r.text}`);
+    assert.match(json(r).error.message, /a NUL character \(U\+0000\), which a command line cannot carry/);
+    assert.ok(!r.text.includes(marker));
+  }
+  assert.equal(stub().length, before, 'no agy run was started');
+  assert.equal(emuRuns().length, emuBefore);
+  assert.ok(clean(), 'no session agent file was written');
+  const written = fs.readFileSync(path.join(dir, 'usage.jsonl'), 'utf8') + '\n' + log.join('\n');
+  assert.ok(!written.includes(marker), written.split('\n').filter((l) => l.includes(marker)).slice(0, 2).join('\n'));
+});
+
+test('a CLI that cannot be started at all (spawn() throws at once): no agent file left, and the 502 names the error by its code', async () => {
+  const r = await post('/v1/chat/completions', { model: 'agyz/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather? SCENARIO=one-call ${tag()}` }] });
+  assert.equal(r.status, 502, r.text);
+  assert.match(json(r).error.message, /could not start agy-bridge\.mjs \(ERR_INVALID_ARG_VALUE\)/);
+  assert.ok(!r.text.includes('BROKEN'), 'what spawn() quoted stays out of the message');
+  assert.ok(await until(() => clean()), 'the session\'s agent file (with its token) was removed');
+  assert.equal(gateway.toolEngines.mcp.hub.stats().sessions, 0);
 });
 
 test('the start-up sweep: an earlier gateway\'s agent files and schema dirs older than an hour go, anything else stays', async () => {

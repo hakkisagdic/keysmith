@@ -8,6 +8,7 @@ import { namesFit } from '../tools/router.js';
 import { HUB_DEFAULTS, Hub, SESSION_DEFAULTS } from './hub.js';
 import { MAX_INVALID_CALLS, toolListing } from './mcp.js';
 import { DRIVERS, KILL_GRACE_MS } from './agy.js';
+import { startFailure } from '../cli-adapter.js';
 
 /**
  * The MCP bridge (design §3, U6/U7): the tool engine the gateway hands a tool request to on a CLI
@@ -236,20 +237,24 @@ export class McpBridge {
         limits,
         prefix: (server) => driver.prefix(server),
       });
-      const proc = driver.spawn(adapter, { session: s, model: o.model, prompt, killGraceMs: this.killGraceMs });
-      s.proc = proc;
+      // The cleanup first: a spawn that fails after the session's files were written leaves none.
       const opened = s;
       s.onClose(async () => {
-        await proc.stop('session closed');
+        await opened.proc?.stop('session closed');
         driver.cleanup(adapter, opened);
       });
+      const proc = driver.spawn(adapter, { session: s, model: o.model, prompt, killGraceMs: this.killGraceMs });
+      s.proc = proc;
       this._pump(s, proc);
     } catch (e) {
       release();
       s?.close('spawn_failed');
-      // No room (503), a workspace file that cannot be written (500): as they are.
-      if (e instanceof LlmError) throw Object.assign(e, { fallbackReason: e.fallbackReason || 'spawn_failed' });
-      throw bridgeError(adapter, 'spawn_failed', 502, `bridge: could not start ${adapter.id}: ${e.message}`);
+      // No room (503), a workspace file that cannot be written (500), a CLI that cannot be started
+      // (502): as they are. A request no command line can carry (400) is refused by EMULATE on the
+      // same CLI too, so auto does not ask it.
+      if (e instanceof LlmError) throw Object.assign(e, { fallbackReason: e.fallbackReason || (e.status === 400 ? 'invalid_request' : 'spawn_failed') }, e.status === 400 ? { noFallback: true } : {});
+      // Its code, never its message: an error from starting a process can quote the argv, the prompt in it.
+      throw bridgeError(adapter, 'spawn_failed', 502, `bridge: could not start ${adapter.id} (${startFailure(e)})`);
     }
     this.log(`bridge ${s.server}: opened for ${o.target}${o.why ? `, with the conversation so far (${o.why})` : ''}`);
     yield* this._turn(adapter, driver, s, { ...o, release, info: { type: 'bridge', session: s.server, path: o.why ? 'cold' : 'new', turn: 1 } });

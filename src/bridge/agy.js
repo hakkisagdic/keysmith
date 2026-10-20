@@ -1,11 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { getParser, toLines } from '../parsers.js';
 import { expand } from '../config.js';
 import { joinArgs, keepTail } from '../util.js';
-import { which } from '../cli-adapter.js';
+import { refuseNul, spawnCli, which } from '../cli-adapter.js';
 import { redactSecrets } from '../redact.js';
 
 /**
@@ -120,10 +119,11 @@ export const agyDriver = {
    * Start agy for `session`: the agent file written, the process group spawned. Returns
    * `{ pid, events, stop(why), done }` — the parser's events (per-step usage), a stop switch
    * (SIGTERM to the group, SIGKILL after `killGraceMs`), and the outcome `{ code, stderr, killed }`.
+   * Throws an LlmError naming no part of the argv (cli-adapter.js spawnCli): a 400 for one a command
+   * line cannot carry, before the file is written; a 502 for a spawn that fails at once, with the
+   * file removed again.
    */
   spawn(adapter, { session, model, prompt, killGraceMs = KILL_GRACE_MS }) {
-    adapter._ensureCwd();
-    writePrivate(this.agentFile(adapter, session), this.agentText(session));
     const argv = joinArgs(adapter.bridge.args, {
       model: model || '',
       prompt: adapter.promptVia === 'stdin' ? '' : prompt,
@@ -134,8 +134,20 @@ export const agyDriver = {
       noSession: '',
       maxTokens: '',
     });
+    // An argv agy could never be given is refused before the session's file is written.
+    refuseNul(adapter.id, argv);
+    adapter._ensureCwd();
+    const file = this.agentFile(adapter, session);
+    writePrivate(file, this.agentText(session));
     const stdin = adapter.promptVia === 'stdin';
-    const child = spawn(which(adapter.bin) || adapter.bin, argv, { cwd: adapter.cwd, env: adapter._childEnv(), detached: true, stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+    let child;
+    try {
+      child = spawnCli(adapter.id, which(adapter.bin) || adapter.bin, argv, { cwd: adapter.cwd, env: adapter._childEnv(), detached: true, stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      // No process will read it: the file, and the token in it, go now.
+      rm(file);
+      throw e;
+    }
     if (stdin) {
       child.stdin.on('error', () => {});
       child.stdin.end(prompt);
