@@ -195,9 +195,10 @@ test('the MCP bridge through /v1/responses (opencode, streamed): a step\'s two c
   const c = conversation('oc/m', `Two cities ${t} SCENARIO=two-calls`, { stream: true });
   const a1 = await c.ask();
   assert.equal(a1.r.status, 200, a1.r.text);
+  assert.equal(a1.text, 'Checking both cities. ');
   assert.deepEqual(a1.calls.map((x) => JSON.parse(x.arguments).city).sort(), ['Ankara', 'Izmir']);
   c.results(a1.output);
   const a2 = await c.ask();
-  assert.equal(a2.text, 'Ankara RESULT for Ankara; Izmir RESULT for Izmir');
+  assert.equal(a2.text, 'Ankara RESULT for Ankara; Izmir RESULT for Izmir', 'the whole answer after the results, not cut by the text before the calls');
   assert.equal(lines(path.join(dir, 'oc.jsonl')).filter((e) => e.event === 'start' && e.argv.at(-1).includes(t)).length, 1);
 });

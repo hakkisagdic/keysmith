@@ -60,6 +60,36 @@ function json(line) {
 }
 
 /**
+ * Text a CLI prints whole, block by block, into deltas — opencode's text parts, the text blocks of
+ * a Claude-Code-shaped message. The function it returns takes `(key, text)` and gives back
+ * `{ text, fresh }`, what to forward: under one key (a part's
+ * id, a message's), a block that extends the one forwarded last is that block grown or printed
+ * again, and only its new tail goes out; an earlier print of it, or a block forwarded before it,
+ * goes out never again; any other text is a new block, whole (`fresh`). No block is ever cut by
+ * the length of another: a parser that counted one length across blocks dropped a shorter next
+ * block and cut a longer one — and on the MCP bridge one parser reads every HTTP turn of a session.
+ */
+function wholeBlocks() {
+  const seen = new Map(); // key -> { last: the block forwarded last, before: the blocks forwarded before it }
+  return (key, text) => {
+    let s = seen.get(key);
+    if (!s) seen.set(key, (s = { last: null, before: new Set() }));
+    if (s.last !== null) {
+      if (text.startsWith(s.last)) {
+        const tail = text.slice(s.last.length);
+        s.last = text;
+        return { text: tail, fresh: false };
+      }
+      if (s.last.startsWith(text)) return { text: '', fresh: false };
+    }
+    if (s.before.has(text)) return { text: '', fresh: false };
+    if (s.last !== null) s.before.add(s.last);
+    s.last = text;
+    return { text, fresh: true };
+  };
+}
+
+/**
  * Command Code (`cmd -p --output-format json`) — verified against cmd 1.66.0. A tool call is
  * reported once, at `tool_queued` — which Command Code 1.81.0 emits before its permission
  * check and `tool_running` (read from its bundle, not seen live) — so `stopAtToolCall` can
@@ -101,15 +131,23 @@ export async function* cmdNdjson(lines) {
  * is a `tool_use` line (`part.tool`, `part.callID`), reported once per call. An error line
  * carries its reason under `error.data.message`, with the upstream's `statusCode` (opencode's
  * free tier refuses the tool-less run with a 403 that says why).
+ *
+ * Text is a `text` line per text part, the part whole — opencode 1.19.3 prints it once, when the
+ * part ends (`part.time.end`) — so it is forwarded per part (`part.id`; its message's id when it
+ * has none): a new part whole, a part printed again only for what it grew. Two parts with no call
+ * between them are two paragraphs; the part after a call is a new answer (on the MCP bridge, the
+ * next HTTP turn's, read by this same parser), not a second paragraph of this one.
  */
 export async function* opencodeNdjson(lines) {
-  let emitted = 0;
+  const blocks = wholeBlocks();
+  let afterText = false; // the last thing forwarded was text: a new part is a new paragraph
   const tools = new Set();
   for await (const line of lines) {
     const d = json(line);
     if (!d) continue;
     const part = d.part || {};
     if (d.type === 'tool_use') {
+      afterText = false;
       const key = part.callID || part.id || `${part.tool}#${tools.size}`;
       if (!tools.has(key)) {
         tools.add(key);
@@ -118,13 +156,11 @@ export async function* opencodeNdjson(lines) {
       continue;
     }
     if (d.type === 'text' && typeof part.text === 'string') {
-      // opencode flushes the whole text block, not deltas; only send the new tail.
-      if (part.text.length > emitted) {
-        yield EV.delta(part.text.slice(emitted));
-        emitted = part.text.length;
-      } else if (part.text.length < emitted) {
-        yield EV.delta(part.text);
-        emitted = part.text.length;
+      const key = (typeof part.id === 'string' && part.id) || (typeof part.messageID === 'string' && part.messageID) || 'current';
+      const b = blocks(key, part.text);
+      if (b.text) {
+        yield EV.delta(b.fresh && afterText ? `\n\n${b.text}` : b.text);
+        afterText = true;
       }
     } else if (d.type === 'step_finish') {
       const u = normaliseUsage(part.tokens) || normaliseUsage(part.completion_tokens);
@@ -142,13 +178,16 @@ export async function* opencodeNdjson(lines) {
 /**
  * Claude-Code-shaped stream (`claude -p --output-format stream-json`), which
  * Qoder CLI and other Claude-derived harnesses imitate. Message objects arrive whole,
- * so deltas are computed against what has already been forwarded. A `tool_use` content block is
+ * so deltas are computed against what has already been forwarded — per text block of a message
+ * (Claude Code prints each content block of a message on a line of its own, under the message's
+ * id): a second text block of one message is forwarded whole, never cut by the first one's length,
+ * and joined to it with nothing between, as the text of two messages always was. A `tool_use` content block is
  * a `tool` event, once per block id — printed with the assistant message that made the call,
  * before the harness runs it (qodercli 1.1.59: `mcp__<server>__<tool>` for an MCP server's tool;
  * with its lazy MCP, `mcp_call` with the tool's name in `input.toolName`, read as that tool).
  */
 export async function* claudeStreamJson(lines) {
-  const sent = new Map(); // message id -> chars forwarded
+  const blocks = wholeBlocks(); // per message id
   const tools = new Set();
   for await (const line of lines) {
     const d = json(line);
@@ -157,10 +196,8 @@ export async function* claudeStreamJson(lines) {
       for (const block of d.message.content) {
         if (!block || typeof block !== 'object') continue;
         if (block.type === 'text' && typeof block.text === 'string') {
-          const key = d.message.id || 'current';
-          const prev = sent.get(key) || 0;
-          if (block.text.length > prev) yield EV.delta(block.text.slice(prev));
-          sent.set(key, Math.max(prev, block.text.length));
+          const b = blocks(d.message.id || 'current', block.text);
+          if (b.text) yield EV.delta(b.text);
         } else if (block.type === 'thinking' && block.thinking) {
           yield { type: 'reasoning', text: block.thinking };
         } else if (block.type === 'tool_use' || block.type === 'server_tool_use') {

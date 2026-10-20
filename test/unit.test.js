@@ -138,6 +138,40 @@ test('opencode flushes whole text blocks; only the tail is forwarded', async () 
   assert.deepEqual(events.find((e) => e.type === 'usage').usage, { input: 10, output: 5, cacheRead: 2, cacheWrite: 0 });
 });
 
+test('opencode prints each text part whole, once: a part is never cut by the length of an earlier one', async () => {
+  // opencode 1.19.3 prints a `text` line per part when it ends (`part.time.end`), the part as it is.
+  const text = (id, t, messageID = 'msg_1') => JSON.stringify({ type: 'text', sessionID: 'ses_1', part: { id, sessionID: 'ses_1', messageID, type: 'text', text: t, time: { start: 1, end: 2 } } });
+  const call = (callID) => JSON.stringify({ type: 'tool_use', sessionID: 'ses_1', part: { id: `prt_${callID}`, type: 'tool', tool: 'ks0_get_weather', callID, state: { status: 'completed' } } });
+  const deltas = async (list) => (await collect(opencodeNdjson(asLines(list)))).filter((e) => e.type === 'delta').map((e) => e.text);
+  // A preamble, a call, a longer answer: on the bridge, two HTTP turns of one process and one parser.
+  assert.deepEqual(await deltas([text('prt_1', 'Let me check the weather.'), call('c1'), text('prt_3', 'Ankara is sunny today, 24 degrees.', 'msg_2')]), ['Let me check the weather.', 'Ankara is sunny today, 24 degrees.']);
+  // As long as the one before it, or shorter.
+  assert.deepEqual(await deltas([text('prt_1', 'Checking.'), call('c1'), text('prt_3', 'Sunny 24.', 'msg_2')]), ['Checking.', 'Sunny 24.']);
+  assert.deepEqual(await deltas([text('prt_1', 'Checking the weather.'), call('c1'), text('prt_3', 'Sunny.', 'msg_2')]), ['Checking the weather.', 'Sunny.']);
+  // A new part that starts with the text of the one before it is still a part of its own.
+  assert.deepEqual(await deltas([text('prt_1', 'Weather'), call('c1'), text('prt_3', 'Weather: sunny', 'msg_2')]), ['Weather', 'Weather: sunny']);
+  // Two parts with no call between them are two paragraphs of one answer.
+  assert.deepEqual((await deltas([text('prt_1', 'First.'), text('prt_2', 'Second, a longer part.')])).join(''), 'First.\n\nSecond, a longer part.');
+  // A part printed again, grown or as it was: only what is new.
+  assert.deepEqual((await deltas([text('prt_1', 'Count'), text('prt_1', 'Count 1, 2, 3'), text('prt_1', 'Count 1, 2, 3')])).join(''), 'Count 1, 2, 3');
+  // No part id: the message's; two parts of one message are still two.
+  const noId = (t) => JSON.stringify({ type: 'text', part: { messageID: 'msg_9', type: 'text', text: t } });
+  assert.deepEqual((await deltas([noId('A long first part.'), noId('Short.')])).join(''), 'A long first part.\n\nShort.');
+});
+
+test('claude-stream-json: two text blocks of one message, each on its own line as Claude Code prints them, are both forwarded whole', async () => {
+  const msg = (id, content) => JSON.stringify({ type: 'assistant', message: { id, content } });
+  const deltas = async (list) => (await collect(claudeStreamJson(asLines(list)))).filter((e) => e.type === 'delta').map((e) => e.text).join('');
+  // A shorter second block was dropped, a longer one cut by the first one's length.
+  assert.equal(await deltas([msg('m1', [{ type: 'text', text: 'Here is what I found, at length.' }]), msg('m1', [{ type: 'text', text: 'Short.' }])]), 'Here is what I found, at length.Short.');
+  assert.equal(await deltas([msg('m1', [{ type: 'text', text: 'Found it.' }]), msg('m1', [{ type: 'text', text: 'And a longer second block.' }])]), 'Found it.And a longer second block.');
+  // Both blocks in one line, and that line sent again: each once.
+  const both = msg('m2', [{ type: 'text', text: 'A' }, { type: 'text', text: 'B' }]);
+  assert.equal(await deltas([both, both]), 'AB');
+  // A message sent again as it grows: the tail.
+  assert.equal(await deltas([msg('m3', [{ type: 'text', text: 'Hel' }]), msg('m3', [{ type: 'text', text: 'Hello' }])]), 'Hello');
+});
+
 test('claude-stream-json does not repeat a message it re-sends', async () => {
   const events = await collect(
     claudeStreamJson(

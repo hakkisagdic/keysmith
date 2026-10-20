@@ -140,6 +140,72 @@ function conversation(model, user, extra = {}) {
   };
 }
 
+const sse = (text) => text.split('\n\n').map((b) => b.split('\n').find((l) => l.startsWith('data: '))).filter(Boolean).filter((l) => l !== 'data: [DONE]').map((l) => JSON.parse(l.slice(6)));
+
+/**
+ * One answer on any face, streamed or not, as its SDK reads it: the text and the calls. `face` is
+ * chat, messages or responses.
+ */
+function answerOf(face, stream, r) {
+  if (face === 'chat') {
+    if (!stream) return chat(r);
+    const calls = [];
+    let text = '';
+    for (const e of sse(r.text)) {
+      const d = e.choices?.[0]?.delta || {};
+      if (d.content) text += d.content;
+      for (const tc of d.tool_calls || []) {
+        if (tc.id) calls[tc.index] = { id: tc.id, name: tc.function.name, arguments: '' };
+        calls[tc.index].arguments += tc.function?.arguments || '';
+      }
+    }
+    return { text, calls: calls.map((c) => ({ id: c.id, name: c.name, args: JSON.parse(c.arguments) })) };
+  }
+  if (face === 'messages') {
+    let blocks;
+    if (!stream) blocks = JSON.parse(r.text).content;
+    else {
+      blocks = [];
+      for (const e of sse(r.text)) {
+        if (e.type === 'content_block_start') blocks[e.index] = { ...e.content_block, json: '' };
+        else if (e.type === 'content_block_delta' && e.delta.type === 'text_delta') blocks[e.index].text += e.delta.text;
+        else if (e.type === 'content_block_delta' && e.delta.type === 'input_json_delta') blocks[e.index].json += e.delta.partial_json;
+      }
+      for (const b of blocks) if (b.type === 'tool_use') b.input = JSON.parse(b.json);
+    }
+    return { text: blocks.filter((b) => b.type === 'text').map((b) => b.text).join(''), calls: blocks.filter((b) => b.type === 'tool_use').map((b) => ({ id: b.id, name: b.name, args: b.input })) };
+  }
+  const output = stream ? sse(r.text).find((e) => e.type === 'response.completed').response.output : JSON.parse(r.text).output;
+  return { output, text: output.filter((o) => o.type === 'message').map((o) => o.content.map((c) => c.text).join('')).join(''), calls: output.filter((o) => o.type === 'function_call').map((o) => ({ id: o.call_id, name: o.name, args: JSON.parse(o.arguments) })) };
+}
+
+/** A two-turn round trip on any face: the first answer, and the one after its calls' results. */
+async function roundTrip(face, stream, model, user, textFor = (c) => `RESULT for ${c.args.city}`) {
+  const route = { chat: '/v1/chat/completions', messages: '/v1/messages', responses: '/v1/responses' }[face];
+  const first = [{ role: 'user', content: user }];
+  const body = (history) =>
+    face === 'chat' ? { model, stream, tools: TOOLS, messages: history }
+    : face === 'messages' ? { model, stream, max_tokens: 256, tools: A_TOOLS, messages: history }
+    : { model, stream, store: false, tools: [{ type: 'function', ...TOOLS[0].function }], input: history };
+  const r1 = await post(route, body(first));
+  assert.equal(r1.status, 200, r1.text);
+  const a1 = answerOf(face, stream, r1);
+  const history = [...first];
+  if (face === 'chat') {
+    history.push({ role: 'assistant', content: a1.text || null, tool_calls: a1.calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.args) } })) });
+    for (const c of a1.calls) history.push({ role: 'tool', tool_call_id: c.id, content: textFor(c) });
+  } else if (face === 'messages') {
+    history.push({ role: 'assistant', content: [...(a1.text ? [{ type: 'text', text: a1.text }] : []), ...a1.calls.map((c) => ({ type: 'tool_use', id: c.id, name: c.name, input: c.args }))] });
+    history.push({ role: 'user', content: a1.calls.map((c) => ({ type: 'tool_result', tool_use_id: c.id, content: textFor(c) })) });
+  } else {
+    history.push(...a1.output);
+    for (const c of a1.calls) history.push({ type: 'function_call_output', call_id: c.id, output: textFor(c) });
+  }
+  const r2 = await post(route, body(history));
+  assert.equal(r2.status, 200, r2.text);
+  return [a1, answerOf(face, stream, r2)];
+}
+
 /* ------------------------------------------------------------------- golden plans */
 
 /** A session as the hub makes one, with fixed values. */
@@ -231,6 +297,7 @@ test('opencode: two calls of one step go out in one answer, their results back i
   assert.equal(a1.r.status, 200, a1.r.text);
   assert.equal(a1.r.headers.get('x-keysmith-mode'), 'mcp');
   assert.equal(a1.finish, 'tool_calls');
+  assert.equal(a1.text, 'Checking both cities. ', 'the text before the calls stays in their answer');
   assert.deepEqual(a1.calls.map((x) => x.args.city).sort(), ['Ankara', 'Izmir'], 'both calls in one answer');
   assert.equal(new Set(a1.calls.map((x) => x.id)).size, 2);
   const [start] = startsOf(t);
@@ -243,6 +310,29 @@ test('opencode: two calls of one step go out in one answer, their results back i
   assert.ok(await until(() => !alive(start.pid) && !sessionFiles('opencode').length), 'the run ended and its file is gone');
   const rows = rowsOf('oc/m').slice(-2);
   assert.deepEqual(rows.map((r) => [r.toolMode, r.toolCalls ?? 0, r.bridge?.path, r.bridge?.turn]), [['mcp', 2, 'new', 1], ['mcp', 0, 'attached', 2]]);
+});
+
+test('opencode: the text before a call is that answer\'s, and the whole text after the result is the next one\'s — on every face, streamed or not', async () => {
+  // One opencode process (and one parser) carries both turns; opencode prints each text part whole,
+  // once, and the answer after the result is longer than the text before the call.
+  for (const face of ['chat', 'messages', 'responses']) {
+    for (const stream of [false, true]) {
+      const t = tag();
+      const [a1, a2] = await roundTrip(face, stream, 'oc/m', `Weather ${t} SCENARIO=one-call`);
+      const at = `${face}${stream ? ', streamed' : ''}`;
+      assert.equal(a1.text, 'Let me check. ', at);
+      assert.deepEqual(a1.calls.map((c) => c.args), [{ city: 'Ankara' }], at);
+      assert.equal(a2.text, 'Weather: RESULT for Ankara', at);
+      assert.deepEqual(a2.calls, [], at);
+      assert.equal(startsOf(t).length, 1, `${at}: one process for both turns`);
+      assert.equal(rowsOf('oc/m').at(-1).bridge.path, 'attached', at);
+    }
+  }
+  // An answer after the result exactly as long as the text before the call.
+  const t = tag();
+  const [, same] = await roundTrip('chat', false, 'oc/m', `Weather ${t} SCENARIO=one-call`, () => 'abcde');
+  assert.equal('Weather: abcde'.length, 'Let me check. '.length);
+  assert.equal(same.text, 'Weather: abcde');
 });
 
 test('opencode: a request that answers one of the two calls out is no continuation — the cold path, and the waiting session is not written to', async () => {

@@ -19,7 +19,8 @@
  *             run), user (tool_result), result with usage.
  *
  * Without an MCP server it answers in plain text, as the CLI would with nothing to call. What it
- * does is picked by `SCENARIO=<name>` in its prompt (the last argv entry); a prompt that carries a
+ * does is picked by `SCENARIO=<name>` in its prompt (the last argv entry; one-call and two-calls
+ * write a text before their calls, shorter than the answer after the results); a prompt that carries a
  * tool result (the cold path) is answered from it. Every event worth checking goes to
  * $CLI_BRIDGE_LOG as one JSON line with this process's pid: its argv, the env names it saw that
  * start with QODER_, the server it was given, each MCP result. Nothing here is a model.
@@ -88,11 +89,16 @@ note({ event: 'server', server: server && { ...server, env: Object.keys(server.e
 
 const out = {
   opencode: {
+    // opencode 1.19.3 prints a text part once, whole, when it ends (`part.time.end`): the part as
+    // it is, with its own id and its message's.
+    parts: 0,
+    message: 1,
     begin() {
       line({ type: 'step_start', sessionID: 'ses_stub', part: { type: 'step-start' } });
     },
     text(t) {
-      line({ type: 'text', sessionID: 'ses_stub', part: { type: 'text', text: t } });
+      const now = Date.now();
+      line({ type: 'text', sessionID: 'ses_stub', part: { id: `prt_stub${String(++this.parts).padStart(4, '0')}`, sessionID: 'ses_stub', messageID: `msg_stub${this.message}`, type: 'text', text: t, time: { start: now, end: now } } });
     },
     announce() {},
     finished(name, args, output, id) {
@@ -100,6 +106,7 @@ const out = {
     },
     step(reason, tokens) {
       line({ type: 'step_finish', sessionID: 'ses_stub', part: { type: 'step-finish', reason, tokens: { input: tokens[0], output: tokens[1], reasoning: 0, cache: { read: 0, write: 0 } } } });
+      this.message++;
     },
     end() {},
   },
@@ -220,12 +227,15 @@ if (prompt.includes('<<<TOOL_RESULT')) {
 } else {
   switch (scenario) {
     case 'one-call': {
-      if (cli !== 'opencode') out.text('Let me check. ');
+      // The text before the call is shorter than the answer after its result: a parser that counts
+      // one length across text parts cuts the answer by it.
+      out.text('Let me check. ');
       const r = await call('get_weather', { city: 'Ankara' });
       finish(r.refused ? 'I could not reach the weather tool: it needs an approval nobody can give.' : `Weather: ${r.text}`);
       break;
     }
     case 'two-calls': {
+      out.text('Checking both cities. ');
       // opencode runs the calls of one step at once; codex and qoder one after the other.
       const [a, b] = cli === 'opencode'
         ? await Promise.all([call('get_weather', { city: 'Ankara' }), call('get_weather', { city: 'Izmir' })])
