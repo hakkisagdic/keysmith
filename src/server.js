@@ -17,7 +17,7 @@ import { addUsage } from './tools/emulate.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { upstreamError } from './http-adapter.js';
-import { scopeError } from './gateway.js';
+import { failureOf, scopeError } from './gateway.js';
 import { authEnabled, describeScope, parseKeys, scopeWarnings, targetDecision } from './keys.js';
 
 const MAX_BODY = 32 * 1024 * 1024;
@@ -611,9 +611,13 @@ function failedMarks(failed, usage) {
 /** What an error that ends a request says it spent (emulate.js, gateway._toolRoute), for its row. */
 function errorMarks(e) {
   if (!e || typeof e !== 'object') return {};
+  const failure = failureOf(e);
   return {
     ...(e.usage ? { usage: e.usage } : {}),
     ...marks({ retries: e.retries || 0, toolMode: e.toolMode || null, fallback: e.fallback || null }),
+    // Why the engine failed, as a code (the bridge's: `foreign_tool` for the tripwire): the
+    // security event is in the row, not in the gateway log only.
+    ...(failure ? { failure } : {}),
     ...(e.failedLegs?.length ? { failedLegs: e.failedLegs } : {}),
   };
 }

@@ -9,6 +9,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,7 +26,8 @@ const STUB = fileURLToPath(new URL('./stubs/agy-bridge.mjs', import.meta.url));
 const KEY = 'ks_' + crypto.randomBytes(24).toString('base64url');
 const OTHER = 'ks_' + crypto.randomBytes(24).toString('base64url');
 
-let dir, ws, cache, server, base, gateway, usageLog;
+let dir, ws, cache, server, base, gateway, usageLog, upstream;
+let upstreamHits = 0;
 const log = [];
 
 /** The agy profile around the stub, toolMode `mode`, the bridge's limits `limits`. */
@@ -54,6 +56,16 @@ before(async () => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ksba-'));
   ws = path.join(dir, 'ws');
   cache = path.join(dir, 'mcp-cache');
+  // An HTTP upstream on the openai wire, for a route that goes on to one: it counts what it is asked.
+  upstream = http.createServer((req, res) => {
+    upstreamHits++;
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'u-1', object: 'chat.completion', model: 'm', choices: [{ index: 0, message: { role: 'assistant', content: 'upstream answer' }, finish_reason: 'stop' }] }));
+    });
+  });
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
   const cfg = {
     auth: { enabled: true, keys: [KEY, OTHER] },
     limits: { streamHoldMs: 300, streamKeepaliveMs: 60, bridge: { socket: path.join(dir, 'b.sock'), maxSessions: 4, maxSessionsPerKey: 1 } },
@@ -66,8 +78,10 @@ before(async () => {
       agys: agy('auto', {}, { maxConcurrent: 1 }),
       // An env value spawn() refuses at once (a NUL): a CLI that cannot be started.
       agyz: agy('mcp', {}, { env: { AGY_BRIDGE_LOG: path.join(dir, 'bridge.jsonl'), STUB_MCP_CACHE: cache, BROKEN: 'x\u0000y' } }),
+      agye: agy('emulate'),
+      up: { kind: 'http', wire: 'openai', baseUrl: `http://127.0.0.1:${upstream.address().port}/v1`, apiKey: false },
     },
-    aliases: { pair: ['agy/m', 'agy1/m'] },
+    aliases: { pair: ['agy/m', 'agy1/m'], tripemu: ['agy/m', 'agye/m'], triphttp: ['agy/m', 'up/m'] },
   };
   gateway = new Gateway(cfg, { log: (m) => log.push(m) });
   usageLog = new UsageLog(path.join(dir, 'usage.jsonl'));
@@ -79,6 +93,7 @@ before(async () => {
 after(async () => {
   await gateway.close();
   await new Promise((r) => server.close(r));
+  await new Promise((r) => upstream.close(r));
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -531,10 +546,77 @@ test('agy reaching for a tool of its own: stopped, a 502, logged — and never r
   assert.equal(r.status, 502, r.text);
   assert.match(json(r).error.message, /reached for a tool of its own \("run_command"\)/);
   assert.equal(emuRuns().length, before, 'a security event, not a slow engine');
-  assert.deepEqual([lastRow().status, lastRow().toolMode, lastRow().fallback], ['error', 'mcp', undefined]);
+  assert.deepEqual([lastRow().status, lastRow().toolMode, lastRow().fallback, lastRow().failure], ['error', 'mcp', undefined, 'foreign_tool']);
   assert.ok(log.some((l) => /SECURITY: agy reached for a tool of its own \("run_command"\).*foreign tool/.test(l)));
   const [run] = runsOf(t);
   assert.ok(await until(() => clean([run.pid, shimOf(run.pid)])));
+});
+
+test('the tripwire ends the route: no later leg answers the request — not EMULATE on another adapter, not an HTTP upstream', async () => {
+  const before = emuRuns().length;
+  const hits = upstreamHits;
+  for (const model of ['tripemu', 'triphttp']) {
+    const t = tag();
+    const r = await post('/v1/chat/completions', { model, tools: TOOLS, messages: [{ role: 'user', content: `Weather? SCENARIO=foreign ${t}` }] });
+    assert.equal(r.status, 502, `${model}: ${r.text}`);
+    assert.match(json(r).error.message, /reached for a tool of its own \("run_command"\)/);
+    const row = lastRow();
+    assert.deepEqual([row.status, row.toolMode, row.failure, row.failedLegs], ['error', 'mcp', 'foreign_tool', undefined], model);
+    const [run] = runsOf(t);
+    assert.ok(await until(() => clean([run.pid, shimOf(run.pid)])));
+  }
+  assert.equal(emuRuns().length, before, 'agye (EMULATE) was not asked');
+  assert.equal(upstreamHits, hits, 'the upstream was not asked');
+});
+
+test('a foreign tool while a call waits for the client: agy is stopped then and there, and the request that brings the result is the tripwire\'s 502 — the result never reaches agy', async () => {
+  const t = tag();
+  const c = conversation('openai', { user: `Weather? SCENARIO=foreign-while-waiting ${t}` });
+  const one = await c.ask();
+  assert.equal(one.r.status, 200, one.r.text);
+  assert.equal(one.calls[0].name, 'get_weather');
+  const [run] = runsOf(t);
+  const group = groupOf(run.pid);
+  assert.ok(await until(() => stub().some((e) => e.event === 'foreign-shown' && e.pid === run.pid)));
+  assert.ok(await until(() => clean(group), 3000), 'agy, its helper and its shim stopped, its files gone — with no request reading the session');
+  assert.ok(log.some((l) => /SECURITY: agy reached for a tool of its own \("run_command"\) while its call was with the client/.test(l)));
+  c.result((x) => `CLIENT-RESULT for ${x.args.city}`);
+  const two = await c.ask();
+  assert.equal(two.r.status, 502, two.r.text);
+  assert.match(json(two.r).error.message, /stopped when agy reached for a tool of its own/);
+  assert.equal(lastRow().failure, 'foreign_tool');
+  assert.ok(!stub().some((e) => e.event === 'result' && e.pid === run.pid && /CLIENT-RESULT/.test(e.text)), 'the client\'s result did not reach the flagged run');
+  assert.equal(runsOf(t).length, 1, 'and no other run was opened for it');
+  // Another key presenting the same history learns nothing of that: a new request, on the cold path.
+  const other = await post('/v1/chat/completions', { model: 'agy/m', tools: TOOLS, messages: c.history }, OTHER);
+  assert.equal(other.status, 200, other.text);
+  assert.equal(json(other).choices[0].message.content, 'From the history: CLIENT-RESULT for Ankara');
+  assert.ok(await until(() => clean([runsOf(t)[1]?.pid])));
+});
+
+test('a foreign tool while the result waits for a process slot: the session is closed then, and the result is never written to it', async () => {
+  // agys has one process slot. Another key's turn holds it, generating, while this conversation's
+  // result waits for it; agy shows a tool of its own in that wait.
+  const t = tag();
+  const c = conversation('openai', { model: 'agys/m', user: `Weather? SCENARIO=foreign-while-waiting FOREIGN_AFTER=1500 ${t}` });
+  const one = await c.ask();
+  assert.equal(one.calls.length, 1, one.r.text);
+  const [run] = runsOf(t);
+  const holder = new AbortController();
+  const t2 = tag();
+  const holding = post('/v1/chat/completions', { model: 'agys/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather? SCENARIO=step-then-hang ${t2}` }] }, OTHER, holder.signal).catch(() => null);
+  assert.ok(await until(() => stub().some((e) => e.event === 'hang' && e.pid === runsOf(t2)[0]?.pid)), 'the slot is taken');
+  c.result((x) => `CLIENT-RESULT for ${x.args.city}`);
+  const asking = c.ask();
+  assert.ok(await until(() => stub().some((e) => e.event === 'foreign-shown' && e.pid === run.pid)));
+  assert.ok(await until(() => log.some((l) => /SECURITY: agys reached for a tool of its own/.test(l) && l.includes(`ks${run.agent.slice(5, 11)}`))));
+  holder.abort();
+  await holding;
+  const two = await asking;
+  assert.equal(two.r.status, 502, two.r.text);
+  assert.match(json(two.r).error.message, /reached for a tool of its own \("run_command"\)/);
+  assert.ok(!stub().some((e) => e.event === 'result' && e.pid === run.pid && /CLIENT-RESULT/.test(e.text)), 'the client\'s result did not reach the flagged run');
+  assert.ok(await until(() => clean([...groupOf(run.pid), runsOf(t2)[0].pid])));
 });
 
 test('an answer followed by manage_task ends there (stopAtToolCall): the text stands, the row says cutAt', async () => {

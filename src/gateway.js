@@ -556,8 +556,10 @@ export class Gateway {
         return;
       } catch (e) {
         const err = this._legFailed(leg, e, st, args.signal, more);
-        // A 409 from the bridge (another request is answering this very tool result): no other
-        // leg makes a second answer to it.
+        // A failure that ends the route: a 409 from the bridge (another request is answering this
+        // very tool result: no other leg makes a second answer to it), and the bridge's tripwire
+        // (a CLI that reached for a tool of its own is a security event: the request is not moved
+        // to another engine, an HTTP upstream included).
         if (err.routeEnd) throw err;
         if (err.toolMode) failed.push(failedLeg(leg, err));
         lastError = routeError(lastError, err);
@@ -644,11 +646,20 @@ function mergeUsage(a, b) {
   };
 }
 
-/** The marks a tool engine puts on its failure (router.js, emulate.js), as own fields of `e`. */
+/**
+ * The marks a tool engine puts on its failure (router.js, emulate.js, the bridge), as own fields
+ * of `e`: which engine, why (`fallbackReason`), what it spent, and whether it ends the route.
+ */
 function engineMarks(e) {
   const out = {};
-  for (const k of ['toolMode', 'fallback', 'usage', 'retries']) if (e && typeof e === 'object' && e[k] != null) out[k] = e[k];
+  for (const k of ['toolMode', 'fallback', 'usage', 'retries', 'fallbackReason', 'noFallback', 'routeEnd']) if (e && typeof e === 'object' && e[k] != null) out[k] = e[k];
   return out;
+}
+
+/** Why a tool engine failed, as a usage row says it: the bridge's reason code (`foreign_tool`, `ready_timeout`, …), or null. */
+export function failureOf(e) {
+  const r = e && typeof e === 'object' ? e.fallbackReason : null;
+  return typeof r === 'string' && r ? r.slice(0, 40) : null;
 }
 
 /**
@@ -657,10 +668,12 @@ function engineMarks(e) {
  * quote the model's reply. The error itself rides along unenumerated (never written).
  */
 function failedLeg(leg, err) {
+  const failure = failureOf(err);
   const entry = {
     target: leg.target,
     toolMode: err.toolMode,
     status: err.status,
+    ...(failure ? { failure } : {}),
     ...(err.fallback ? { fallback: err.fallback } : {}),
     ...(err.retries ? { retries: err.retries } : {}),
     ...(err.usage ? { usage: err.usage } : {}),

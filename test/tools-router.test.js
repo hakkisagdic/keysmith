@@ -118,6 +118,7 @@ before(async () => {
       offonly: ['plain/m'],
       thinks: ['thinker/m', 'google/gemini-4-argon'],
       emuthenoff: ['emu/m', 'plain/m'],
+      brgoogle: ['bridged/m', 'google/gemini-4-argon'],
     },
   };
   gateway = new Gateway(cfg, { log: (m) => log.push(m) });
@@ -568,8 +569,28 @@ test('a bridge failure that must not be retried another way (the foreign-tool tr
     assert.equal(r.status, 502, r.text);
     assert.match(json(r).error.message, /bridge: foreign_tool/);
     assert.equal(runs().length, before);
-    // The error's row says which engine failed, and what its run spent.
-    assert.deepEqual([lastRow().status, lastRow().toolMode, lastRow().usage], ['error', 'mcp', { input: 7, output: 1 }]);
+    // The error's row says which engine failed, why, and what its run spent.
+    assert.deepEqual([lastRow().status, lastRow().toolMode, lastRow().failure, lastRow().usage], ['error', 'mcp', 'foreign_tool', { input: 7, output: 1 }]);
+  } finally {
+    gateway.toolEngines.mcp = null;
+  }
+});
+
+test('a bridge failure that ends the route (the tripwire): the next leg is not asked, even when it is an HTTP upstream; another failure is a failed leg, named with its reason', async () => {
+  try {
+    gateway.toolEngines.mcp = stubBridge({ fail: 'foreign_tool', noFallback: true, routeEnd: true });
+    let before = hits.length;
+    let r = await chat('argon', 'SCENARIO=one-call');
+    assert.equal(r.status, 502, r.text);
+    assert.equal(hits.length, before, 'Google was not asked');
+    assert.deepEqual([lastRow().status, lastRow().failure, lastRow().failedLegs], ['error', 'foreign_tool', undefined]);
+    // A bridge that fails for another reason (toolMode mcp: no EMULATE) leaves the request to the next leg.
+    gateway.toolEngines.mcp = stubBridge({ fail: 'ready_timeout' });
+    before = hits.length;
+    r = await chat('brgoogle', 'SCENARIO=one-call');
+    assert.equal(r.status, 200, r.text);
+    assert.equal(hits.length, before + 1);
+    assert.deepEqual(lastRow().failedLegs, [{ target: 'bridged/m', toolMode: 'mcp', status: 502, failure: 'ready_timeout' }]);
   } finally {
     gateway.toolEngines.mcp = null;
   }

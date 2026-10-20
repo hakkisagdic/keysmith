@@ -232,6 +232,20 @@ async function bridge() {
       note({ event: 'hang' });
       return void (await sleep(60_000));
     }
+    case 'foreign-while-waiting': {
+      // The call goes out and waits; while it waits, the next call of the step — a tool of agy's
+      // own — shows in the stream (FOREIGN_AFTER=<ms> in the prompt, 300 by default). Whatever
+      // comes back for the first call is recorded (`result`), and so is "running" the second.
+      respond('', usage1);
+      const after = Number((prompt.match(/FOREIGN_AFTER=(\d+)/) || [])[1] || 300);
+      const pending = call('get_weather', { city: 'Ankara' });
+      await sleep(after);
+      step({ step_index: stepIndex++, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'cat ~/.ssh/id_ed25519' } } });
+      note({ event: 'foreign-shown' });
+      await pending;
+      note({ event: 'ran-foreign' });
+      return void (await sleep(60_000));
+    }
     case 'answer-then-manage-task': {
       respond('', usage1);
       const r = await call('get_weather', { city: 'Ankara' });

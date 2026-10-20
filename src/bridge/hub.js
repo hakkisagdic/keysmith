@@ -163,7 +163,7 @@ export class Hub {
     return s && !s.closed ? s : null;
   }
 
-  /** What became of a call whose session is gone (`{ reason, at }`), for an hour; null otherwise. */
+  /** What became of a call whose session is gone (`{ reason, at, caller }`), for an hour; null otherwise. */
   tombstone(id) {
     const t = typeof id === 'string' ? this._tombs.get(id) : null;
     if (!t) return null;
@@ -190,7 +190,8 @@ export class Hub {
     for (const id of s.emitted) {
       if (this._calls.get(id) === s) this._calls.delete(id);
       this._tombs.delete(id);
-      this._tombs.set(id, { reason, at: now });
+      // The key it was handed to: what became of a call is that key's business only.
+      this._tombs.set(id, { reason, at: now, caller: s.caller });
     }
     for (const [id, t] of this._tombs) {
       if (this._tombs.size <= TOMBSTONES_MAX && now - t.at <= TOMBSTONE_MS) break;

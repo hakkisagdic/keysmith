@@ -244,7 +244,12 @@ keysmith set agy toolMode emulate  # EMULATE only: no MCP, no session held betwe
   the arguments unless the client's schema has one.
 - agy's stream is read per step (`agy-stream-json` with per-step usage): a turn's usage row
   counts the steps it ran. A call in it to anything but the bridge's tools and `manage_task` is
-  the tripwire: agy is stopped and the request is a 502, never retried as EMULATE.
+  the tripwire, wherever the session is — answering a request, or waiting while the client runs
+  a call: agy is stopped then and there, the gateway log says `SECURITY … foreign tool`, and the
+  usage row `failure: "foreign_tool"`. The request it was answering is a 502 that no other
+  engine or leg of the route answers in its place — not EMULATE, not an HTTP upstream; a call
+  that was with the client goes nowhere: the request that brings its result is the same 502
+  (for that key, for the hour the call's tombstone lives).
   `manage_task` after an answer ends the run, as on the text path (`stopAtToolCall`, `cutAt`).
   `toolDenialRetry` does not run on the bridge.
 

@@ -314,7 +314,7 @@ test('a client that never comes back: at toolResultTimeoutMs the session closes 
   assert.ok(await until(() => s.closed, 2000), 'closed by its clock');
   assert.equal(s.closedReason, 'expired');
   assert.equal(hub.sessionForCall('call_late'), null);
-  assert.deepEqual(hub.tombstone('call_late'), { reason: 'expired', at: 0 });
+  assert.deepEqual(hub.tombstone('call_late'), { reason: 'expired', at: 0, caller: 'k1' });
   assert.ok(!knownSecrets().includes(s.token), 'a dead token is no secret worth keeping');
   assert.equal(await within(c.exited, 2000), 0);
   clock.tick(3_600_001);

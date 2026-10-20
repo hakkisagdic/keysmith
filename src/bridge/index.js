@@ -38,7 +38,9 @@ import { startFailure } from '../cli-adapter.js';
  * session that fails before that — an agent agy cannot find, a CLI that never connects, an exit —
  * fails before anything went out, and `auto` answers the same request with EMULATE. A CLI that
  * reaches for a tool of its own (anything but the bridge's, and the harness tool stopAtToolCall
- * knows) is stopped, and the request is a 502 that is never retried another way: the tripwire.
+ * knows) is stopped the moment its stream shows it, whatever its session is doing, and the
+ * request it was answering — or the one that brings the result of the call it had handed out —
+ * is a 502 that no other engine or leg of the route answers in its place: the tripwire.
  *
  * A turn (`timeoutMs`) is the CLI generating: from the start or from the result going back, to a
  * call handed out or the end. The adapter's process slot (`maxConcurrent`) is held for it and let
@@ -128,6 +130,8 @@ export class McpBridge {
     if (m.session) return { ok: true };
     // A session at maxTurns gives up its place for the new one this request opens.
     if (m.spent) return { ok: true };
+    // The result of a call whose run the tripwire stopped: the bridge's to refuse (run()).
+    if (m.kind === 'tripped') return { ok: true };
     if (!namesFit(spec, driver.prefix('ks000000').length)) return { ok: false, reason: 'name_too_long' };
     try {
       this.listing(spec);
@@ -142,8 +146,9 @@ export class McpBridge {
   /**
    * Which session a request belongs to: `{ kind: 'attach', session, result }` (it continues a
    * waiting session), `{ kind: 'busy', session }` (another request is answering that very
-   * continuation), or `{ kind: 'new', why, late }` — `why` says why it continues none (null for a
-   * conversation with no call in it), `late` that its session existed and is gone.
+   * continuation), `{ kind: 'tripped' }` (it brings the result of a call this key was handed by a
+   * run the tripwire stopped), or `{ kind: 'new', why, late }` — `why` says why it continues none
+   * (null for a conversation with no call in it), `late` that its session existed and is gone.
    */
   match(adapter, spec, messages, { caller = '', target = '' } = {}) {
     const tail = continuation(messages);
@@ -152,6 +157,8 @@ export class McpBridge {
     const s = this.hub.sessionForCall(last);
     if (!s) {
       const t = this.hub.tombstone(last);
+      // Another key's tombstone says nothing to this one: its request is a new one like any other.
+      if (t?.reason === 'foreign_tool' && t.caller === caller) return { kind: 'tripped' };
       return { kind: 'new', why: t ? `its session is gone: ${t.reason}` : 'no live session', late: !!t };
     }
     // Another key's session: this request is a new one, and learns nothing about that one.
@@ -188,7 +195,13 @@ export class McpBridge {
     if (m.kind === 'busy') {
       // The CLI is answering this continuation for another request: two answers to one call are
       // one too many, and no other leg should make a second either.
-      throw Object.assign(bridgeError(adapter, 'busy', 409, `bridge ${m.session.server}: this conversation's last tool result is being answered by another request right now`, { noFallback: true }), { type: 'invalid_request_error', routeEnd: true });
+      throw Object.assign(bridgeError(adapter, 'busy', 409, `bridge ${m.session.server}: this conversation's last tool result is being answered by another request right now`, { noFallback: true, routeEnd: true }), { type: 'invalid_request_error' });
+    }
+    if (m.kind === 'tripped') {
+      // The run that made this call reached for a tool of its own while the client ran it (the
+      // tripwire stopped it then): the result goes nowhere, and no other engine or leg carries the
+      // conversation on in its place — for as long as the call's tombstone lives.
+      throw bridgeError(adapter, 'foreign_tool', 502, `bridge: the session this tool result belongs to was stopped when ${adapter.id} reached for a tool of its own (the tripwire); the conversation is not carried on`, { noFallback: true, routeEnd: true });
     }
     const o = { model, spec, messages, signal, caller, target, face };
     if (m.kind === 'attach') {
@@ -245,7 +258,7 @@ export class McpBridge {
       });
       const proc = driver.spawn(adapter, { session: s, model: o.model, prompt, killGraceMs: this.killGraceMs });
       s.proc = proc;
-      this._pump(s, proc);
+      this._pump(adapter, driver, s, proc);
     } catch (e) {
       release();
       s?.close('spawn_failed');
@@ -274,19 +287,48 @@ export class McpBridge {
       s.close('abandoned');
       throw e;
     }
-    s.answer({ text, isError: result.isError === true });
-    this.log(`bridge ${s.server}: the result of ${s.turns === 1 ? 'its call' : `call ${s.turns}`} went back to ${adapter.id}`);
+    // A session closed while this request waited for its slot (the tripwire, its clock) is told
+    // nothing: the turn below reads why it closed.
+    if (!s.closed) {
+      s.answer({ text, isError: result.isError === true });
+      this.log(`bridge ${s.server}: the result of ${s.turns === 1 ? 'its call' : `call ${s.turns}`} went back to ${adapter.id}`);
+    }
     yield* this._turn(adapter, driver, s, { ...o, release, info: { type: 'bridge', session: s.server, path: 'attached', turn: s.turns + 1 } });
   }
 
-  /** The CLI's events into its session, then how it ended. */
-  async _pump(s, proc) {
+  /**
+   * The CLI's events into its session, then how it ended. The tripwire is here, where the events
+   * arrive, so it acts whatever the session is doing — a turn reading it, a call with the client,
+   * a result waiting for a process slot: a tool that is neither the bridge's nor one the harness
+   * keeps (manage_task) closes the session at once.
+   */
+  async _pump(adapter, driver, s, proc) {
     try {
-      for await (const evt of proc.events) s.push(evt);
+      for await (const evt of proc.events) {
+        if (evt.type === 'tool' && isForeign(driver, s, evt.name)) {
+          this._tripwire(adapter, s, evt.name);
+          continue;
+        }
+        s.push(evt);
+      }
     } catch (e) {
       s.push({ type: 'error', message: `the CLI's output could not be read: ${e.message}` });
     }
     s.push({ type: 'exit', ...(await proc.done) });
+  }
+
+  /**
+   * agy reached for a tool of its own: a security event (design §3). The session is closed now —
+   * the CLI stopped, its files removed, its calls tombstoned `foreign_tool` — and logged. The
+   * request reading it, if one is, fails with the tripwire's 502; a call that was with the client
+   * leaves its result nowhere to go (match(): `tripped`). Neither is answered another way.
+   */
+  _tripwire(adapter, s, name) {
+    if (s.closed) return;
+    s.foreign = truncate(String(name || ''), 60);
+    const when = s.state === 'waiting' ? ' while its call was with the client' : '';
+    this.log(`bridge ${s.server}: SECURITY: ${adapter.id} reached for a tool of its own ("${s.foreign}")${when}, which is not one of the bridge's; the run was stopped (foreign tool)`);
+    s.close('foreign_tool');
   }
 
   async *_turn(adapter, driver, s, { signal, release, face, info }) {
@@ -326,6 +368,9 @@ export class McpBridge {
       yield info;
       for (;;) {
         const evt = await s.next();
+        // The tripwire fired (_tripwire): nothing queued before it goes out — no text, no call — and
+        // the request is the 502 of a security event, never answered by EMULATE or another leg.
+        if (s.foreign) throw fail('foreign_tool', 502, `${adapter.id} reached for a tool of its own ("${s.foreign}"), not one of the request's; the run was stopped`, { noFallback: true, routeEnd: true });
         const type = evt.type;
         if (evt.turn !== undefined && evt.turn !== turn) continue;
         if (type === 'delta' || type === 'reasoning') {
@@ -358,8 +403,9 @@ export class McpBridge {
               yield { type: 'cut', reason: 'tool_call', tool: name };
             }
           } else {
-            this.log(`bridge ${s.server}: SECURITY: ${adapter.id} reached for a tool of its own ("${truncate(name, 60)}"), which is not one of the bridge's; the run was stopped (foreign tool)`);
-            throw fail('foreign_tool', 502, `${adapter.id} reached for a tool of its own ("${truncate(name, 60)}"), not one of the request's; the run was stopped`, { noFallback: true });
+            // _pump stops a foreign tool before it reaches the inbox; one that got here all the same
+            // is the same event: the session closes, and the next event read is the 502.
+            this._tripwire(adapter, s, name);
           }
         } else if (type === 'call') {
           if (cut) continue;
@@ -460,6 +506,12 @@ export function toolsHash(tools) {
   return createHash('sha256').update(JSON.stringify((tools || []).map((t) => [t.name, t.description ?? '', t.parameters ?? null]))).digest('hex');
 }
 
+/** A tool in the CLI's stream that is neither the bridge's (`mcp_<server>_…`) nor one its harness keeps: the tripwire's. */
+function isForeign(driver, s, name) {
+  const n = String(name || '');
+  return !n.startsWith(driver.prefix(s.server)) && !driver.harnessTools.includes(n);
+}
+
 function sameList(a, b) {
   return a.length === b.length && a.every((x, i) => x === b[i]);
 }
@@ -468,10 +520,16 @@ function count(v, fallback) {
   return Number.isInteger(v) && v > 0 ? v : fallback;
 }
 
-function bridgeError(adapter, reason, status, message, { noFallback = false, usage = null, retriable = false } = {}) {
+/**
+ * A bridge failure: `fallbackReason` (the usage row's `failure`, and its `fallback` when auto runs
+ * EMULATE instead), `noFallback` (EMULATE does not answer in its place), `routeEnd` (no other leg
+ * of the route does either: gateway._toolWalk), and what the turn spent (`usage`).
+ */
+function bridgeError(adapter, reason, status, message, { noFallback = false, routeEnd = false, usage = null, retriable = false } = {}) {
   const e = new LlmError(message, { status, provider: adapter.id, retriable });
   e.fallbackReason = reason;
   if (noFallback) e.noFallback = true;
+  if (routeEnd) e.routeEnd = true;
   if (usage) e.usage = usage;
   return e;
 }

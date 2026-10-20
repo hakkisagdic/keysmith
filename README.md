@@ -254,8 +254,12 @@ second request carrying a result that another request is already answering is a 
   no inherited MCP servers or customizations, no harness sections, no hooks — with the request's
   tools as its only ones, each `eager` (agy's lazy `call_mcp_tool` is refused headless). A call
   in agy's stream to anything but the bridge's tools (`mcp_ks<rid6>_…`) and `manage_task` stops
-  the run: the request is a 502 that is never retried as EMULATE, and the log says
-  `SECURITY … foreign tool`. keysmith still runs no tool.
+  the run at once, whether a request is reading it or a call of its is with the client: the
+  request is a 502 that is never answered another way — not by EMULATE, not by the route's next
+  leg, an HTTP upstream included — the log says `SECURITY … foreign tool` and the usage row
+  `failure: "foreign_tool"`. A call that was with the client goes nowhere: the request that
+  brings its result gets the same 502 (another key's request with that history is a new one).
+  keysmith still runs no tool.
 - **Files.** `.agents/agents/ks-b-<rid>.md` in agy's workspace (0600; it holds the session's
   token) and agy's schema cache for the server, `~/.gemini/antigravity-cli/mcp/ks<rid6>/` —
   both removed when the session closes, and every session is closed when the gateway stops. A
@@ -294,11 +298,12 @@ running when the headers went out, and none when the route fell back to a plain 
 The usage row says which engine answered (`toolMode`), how many calls it handed over
 (`toolCalls`), `retries`, and why the engine is not the one `auto` picks first (`fallback`);
 never an argument or a result. What a tool engine spent is in the row even when it failed: a
-502's row has its `usage`, `toolMode` and `retries`; a bridge turn that spent a model step and
-then failed before any call (`auto` answering the same request with EMULATE) is counted in that
-answer's `usage`, the client's included; when a tool leg failed and a later leg
+502's row has its `usage`, `toolMode` and `retries`, and for the bridge why it failed
+(`failure`: `foreign_tool`, `ready_timeout`, `invalid_calls`, …); a bridge turn that spent a
+model step and then failed before any call (`auto` answering the same request with EMULATE) is
+counted in that answer's `usage`, the client's included; when a tool leg failed and a later leg
 answered (or failed too), `usage` and `retries` count every leg, and `failedLegs` names each
-tool leg that failed before — target, engine, status, its own `retries` and `usage`.
+tool leg that failed before — target, engine, status, `failure`, its own `retries` and `usage`.
 `GET /v1/keysmith/routes` lists each adapter's `tool_mode`, and the status page marks it.
 
 `keysmith set <adapter> toolMode auto` (or `emulate`) on an adapter attached before toolMode
@@ -541,7 +546,7 @@ An agent gets a key of its own instead, written to a file only it reads:
 |---|---|---|
 | `launchd-gateway.log` | launchd: `serve`'s stdout + stderr | start banner (address, adapters, the key redacted, tunnel URL); with `KEYSMITH_VERBOSE=1`, adapter failures, retries and skipped alias legs |
 | `keysmith.log` | `keysmith start`: the same stream | the same, for a gateway started without launchd |
-| `usage.jsonl` | the gateway, one line per request | time, model, status, duration, token counts, stream flag, user agent, error message, `retries`/`cutAt`; for a tool request `toolMode`, `toolCalls`, `fallback` and `failedLegs` (see [Tool calls](#tool-calls-thinking)); the key's fingerprint (`key: "fp:…"`) and its scope's decision (`scope`, `skipped`) |
+| `usage.jsonl` | the gateway, one line per request | time, model, status, duration, token counts, stream flag, user agent, error message, `retries`/`cutAt`; for a tool request `toolMode`, `toolCalls`, `fallback`, `failure` and `failedLegs` (see [Tool calls](#tool-calls-thinking)); the key's fingerprint (`key: "fp:…"`) and its scope's decision (`scope`, `skipped`) |
 | `launchd-tunnel.log` | launchd: cloudflared | cloudflared's own output |
 
 keysmith does not log prompts, answers, request headers or request URLs, and a request
