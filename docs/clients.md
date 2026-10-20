@@ -161,8 +161,11 @@ the client's next request carries it and its `function_call_output` in `input`. 
 with a tool no CLI leg can honour — a freeform one (`"type": "custom"`, such as Codex's own
 `apply_patch`) or a hosted one (`web_search`, …) — is a 400 that names it: a CLI route takes
 function tools only. Codex as a client sends tools of its own, `apply_patch` among them in the
-versions the design probed, so it is not a client of this path as it stands. With the openai
-SDK:
+versions the design probed, so it is not a client of this path as it stands. keysmith stores
+no response, so the loop keeps its own history, as below: a request that names
+`previous_response_id` (the SDK's other tool loop), a `conversation` or an `item_reference`, or
+that sends a `function_call_output` without its `function_call`, is a 400 that says so — with
+tools or without. With the openai SDK:
 
 ```python
 from openai import OpenAI

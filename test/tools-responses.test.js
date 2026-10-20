@@ -152,6 +152,77 @@ test('/v1/responses: a request whose only tool no CLI can honour (Codex\'s freef
   assert.match(JSON.parse(more.text).error.message, /at most 128/);
 });
 
+/* -------------------------------------------------------- what keysmith never stored */
+
+test('/v1/responses: previous_response_id is a 400 that says keysmith stores no responses — with tools or without — and no CLI runs for it', async () => {
+  const t = tag();
+  const c = conversation('emu/m', `Weather in Ankara? ${t}`);
+  const a1 = await c.ask();
+  assert.equal(a1.r.status, 200, a1.r.text);
+  const id = JSON.parse(a1.r.text).id;
+  const runs = () => lines(path.join(dir, 'emu.jsonl')).length;
+  const before = runs();
+  // The openai SDK's other tool loop: the first response's id, and only the output.
+  const follow = await post({ model: 'emu/m', store: true, tools: TOOLS, previous_response_id: id, input: [{ type: 'function_call_output', call_id: a1.calls[0].call_id, output: 'sunny, 24C' }] });
+  assert.equal(follow.status, 400, follow.text);
+  const err = JSON.parse(follow.text).error;
+  assert.equal(err.type, 'invalid_request_error');
+  assert.match(err.message, /previous_response_id/);
+  assert.match(err.message, /stores no responses/);
+  assert.match(err.message, /whole conversation in input/);
+  for (const stream of [false, true]) {
+    const plain = await post({ model: 'emu/m', stream, previous_response_id: id, input: 'And tomorrow?' });
+    assert.equal(plain.status, 400, plain.text);
+    assert.match(JSON.parse(plain.text).error.message, /previous_response_id/);
+  }
+  // The Conversations API's id is the same thing: state keysmith never had.
+  const conv = await post({ model: 'emu/m', tools: TOOLS, conversation: 'conv_123', input: 'And tomorrow?' });
+  assert.equal(conv.status, 400, conv.text);
+  assert.match(JSON.parse(conv.text).error.message, /conversation/);
+  // So is an item_reference: an item of a stored response, standing in for the item itself.
+  const ref = await post({ model: 'emu/m', tools: TOOLS, input: [{ role: 'user', content: 'Weather?' }, { type: 'item_reference', id: 'fc_old' }, { type: 'function_call_output', call_id: 'call_old', output: 'sunny' }] });
+  assert.equal(ref.status, 400, ref.text);
+  assert.match(JSON.parse(ref.text).error.message, /item_reference/);
+  assert.equal(runs(), before, 'no CLI ran for a refused request');
+});
+
+test('/v1/responses: a function_call_output with no function_call before it is a 400 (OpenAI\'s too), not an answer built from an orphan result', async () => {
+  const runs = () => lines(path.join(dir, 'emu.jsonl')).length;
+  const before = runs();
+  const orphan = [{ role: 'user', content: 'Weather in Ankara?' }, { type: 'function_call_output', call_id: 'call_nowhere', output: 'sunny, 24C' }];
+  for (const body of [{ tools: TOOLS, input: orphan }, { input: orphan }, { tools: TOOLS, input: [...orphan.slice(0, 1), { type: 'function_call', call_id: 'call_late', name: 'get_weather', arguments: '{"city":"Ankara"}' }, ...orphan.slice(1)] }]) {
+    const r = await post({ model: 'emu/m', ...body });
+    assert.equal(r.status, 400, r.text);
+    assert.equal(JSON.parse(r.text).error.type, 'invalid_request_error');
+    assert.match(JSON.parse(r.text).error.message, /No tool call found for function call output with call_id call_nowhere/);
+  }
+  // The output after its call, in the same input: fine.
+  const ok = await post({ model: 'emu/m', tools: TOOLS, input: [...orphan.slice(0, 1), { type: 'function_call', call_id: 'call_nowhere', name: 'get_weather', arguments: '{"city":"Ankara"}' }, ...orphan.slice(1)] });
+  assert.equal(ok.status, 200, ok.text);
+  assert.equal(runs(), before + 1);
+});
+
+test('the MCP bridge: a follow-up that names previous_response_id is refused before it reaches a session — the waiting one is neither answered nor evicted', async () => {
+  const t = tag();
+  const c = conversation('oc/m', `Weather ${t} SCENARIO=one-call`);
+  const a1 = await c.ask();
+  assert.equal(a1.r.status, 200, a1.r.text);
+  const callId = a1.calls[0].call_id;
+  const hub = gateway.toolEngines.mcp.hub;
+  const waiting = hub.sessionForCall(callId);
+  assert.equal(waiting?.state, 'waiting');
+  const follow = await post({ model: 'oc/m', tools: TOOLS, previous_response_id: JSON.parse(a1.r.text).id, input: [{ type: 'function_call_output', call_id: callId, output: 'sunny' }] });
+  assert.equal(follow.status, 400, follow.text);
+  assert.equal(hub.sessionForCall(callId), waiting, 'the session still waits for the call');
+  assert.equal(waiting.state, 'waiting');
+  assert.equal(lines(path.join(dir, 'oc.jsonl')).filter((e) => e.event === 'start' && e.argv.at(-1).includes(t)).length, 1, 'no second process');
+  // The whole conversation, as a Responses client without stored state sends it, continues it.
+  c.results(a1.output, () => 'sunny');
+  const a2 = await c.ask();
+  assert.equal(a2.text, 'Weather: sunny');
+  assert.equal(lastRow().bridge.path, 'attached');
+});
+
 /* ------------------------------------------------------------------- round trips */
 
 for (const stream of [false, true]) {

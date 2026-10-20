@@ -177,9 +177,10 @@ export function responsesToolSpec(body) {
  * are the calls of an assistant turn — the one right before them, or a new one — by `call_id`;
  * `function_call_output` (and `custom_tool_call_output`) items are tool results for that
  * `call_id`. A message's text is read as protocols.js reads it (input_text, output_text).
- * Reasoning items, item references and hosted tools' calls are nothing a CLI leg can read, and
- * are left out. Stateless: `previous_response_id` is not followed (the request must carry its
- * history, as Codex's `store: false` requests do).
+ * Reasoning items and hosted tools' calls are nothing a CLI leg can read, and are left out.
+ * Stateless: the request must carry its history, as Codex's `store: false` requests do — a body
+ * that names stored state (`previous_response_id`, `conversation`, an item reference) or holds an
+ * output with no call before it never gets here (responsesStateRefusal: a 400).
  */
 export function responsesToolMessages(body) {
   const out = [];
@@ -221,6 +222,35 @@ export function responsesToolMessages(body) {
     }
   }
   return out;
+}
+
+/**
+ * What a Responses body asks keysmith to know that it never kept — or null. keysmith stores no
+ * response and no conversation, so a body that names one (`previous_response_id`, `conversation`,
+ * an `item_reference` input item) would be answered from what it carries alone: a follow-up with
+ * nothing but a function_call_output, answered with a confident 200 built without the user's
+ * question. OpenAI answers an id it does not have with a 400; so does keysmith, on every Responses
+ * request, with tools or without — and, as OpenAI does, refuses a function_call_output (or
+ * custom_tool_call_output) whose call_id has no call earlier in the input. The reason names what
+ * to send instead; the server makes it a 400 invalid_request_error.
+ */
+export function responsesStateRefusal(body) {
+  const STATELESS = 'keysmith stores no responses: send the whole conversation in input (store: false)';
+  if (body?.previous_response_id != null) return `previous_response_id cannot be followed — ${STATELESS}`;
+  if (body?.conversation != null) return `conversation cannot be followed — ${STATELESS}`;
+  const calls = new Set();
+  for (const item of Array.isArray(body?.input) ? body.input : []) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'item_reference') return `input holds an item_reference${typeof item.id === 'string' ? ` (${item.id.slice(0, 64)})` : ''}, which cannot be followed — keysmith stores no responses: send the item itself`;
+    if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      if (typeof item.call_id === 'string' && item.call_id) calls.add(item.call_id);
+    } else if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
+      if (typeof item.call_id !== 'string' || !calls.has(item.call_id)) {
+        return `No tool call found for function call output with call_id ${typeof item.call_id === 'string' ? item.call_id.slice(0, 64) : '(none)'}: send its ${item.type === 'function_call_output' ? 'function_call' : 'custom_tool_call'} item before it — ${STATELESS}`;
+      }
+    }
+  }
+  return null;
 }
 
 /** Anthropic Messages: `tools` (custom tools; server tools are unsupported), `tool_choice`, `disable_parallel_tool_use`. Null when no tool is offered. */

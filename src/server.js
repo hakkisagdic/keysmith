@@ -12,7 +12,7 @@ import {
   errorBody,
 } from './protocols.js';
 import { AnthropicStream, KEEPALIVE_MS, OpenaiChatStream, ResponsesStream, anthropicMessage, faceCall, openaiCompletion, responsesBody } from './tools/faces.js';
-import { MAX_TOOLS, anthropicToolMessages, anthropicToolSpec, openaiLegacy, openaiToolCount, openaiToolMessages, openaiToolSpec, responsesToolCount, responsesToolMessages, responsesToolSpec } from './tools/model.js';
+import { MAX_TOOLS, anthropicToolMessages, anthropicToolSpec, openaiLegacy, openaiToolCount, openaiToolMessages, openaiToolSpec, responsesStateRefusal, responsesToolCount, responsesToolMessages, responsesToolSpec } from './tools/model.js';
 import { addUsage } from './tools/emulate.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
@@ -455,6 +455,10 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
 
 async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null }) {
   const body = await readJson(req);
+  // keysmith stores no response: a body that names one (or a conversation, or an item of one), or
+  // holds a result with no call before it, would be answered from the part it carries — with a 200.
+  const stateless = responsesStateRefusal(body);
+  if (stateless) throw new LlmError(stateless, { status: 400, type: 'invalid_request_error' });
   const messages = responsesMessages(body);
   if (!messages.length) throw new LlmError('input is empty', { status: 400 });
   const t0 = Date.now();

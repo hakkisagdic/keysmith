@@ -176,9 +176,12 @@ On `/v1/responses` the tools are `{"type": "function", "name", "parameters"}`; a
 (a freeform one, such as Codex's `apply_patch`) and the hosted ones (`web_search`,
 `file_search`, `computer_use_preview`, `code_interpreter`, `mcp`, …) are what no CLI can honour.
 The history is read from `input`: `function_call` items are their assistant turn's calls,
-`function_call_output` items their results by `call_id`; reasoning items and item references
-are left out, and `previous_response_id` is not followed — send the whole input, as Codex's
-`store: false` requests do. A call goes out as a `function_call` item (an `fc_` item id,
+`function_call_output` items their results by `call_id`; reasoning items are left out.
+keysmith stores no response, so send the whole input, as Codex's `store: false` requests do: a
+request that names `previous_response_id`, a `conversation` or an `item_reference`, or holds a
+`function_call_output` with no `function_call` before it, is a 400 (with tools or without), as
+OpenAI answers an id it does not have — never an answer built from what the request carries
+alone. A call goes out as a `function_call` item (an `fc_` item id,
 keysmith's `call_` call id) after the message item that holds the text before it; streamed,
 as `response.output_item.added`, `response.function_call_arguments.delta` and `.done`,
 `response.output_item.done`, and `response.completed` carries the whole output — the openai
