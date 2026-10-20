@@ -78,6 +78,15 @@ export function registerSecrets(keys) {
   }
 }
 
+/**
+ * Forget secrets that are dead: an MCP bridge session's token (src/bridge/hub.js) once its
+ * session is closed. A gateway that runs for weeks opens thousands of sessions, and every write
+ * looks for every registered secret; a dead token can no longer open anything.
+ */
+export function forgetSecrets(keys) {
+  for (const k of Array.isArray(keys) ? keys : []) if (typeof k === 'string') known.delete(k);
+}
+
 export function knownSecrets() {
   return [...known];
 }
