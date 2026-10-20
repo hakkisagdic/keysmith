@@ -173,7 +173,10 @@ export class HttpAdapter {
     Object.assign(payload, isAnthropic
       ? {
           model: this.upstreamModel(model),
-          max_tokens: maxTokens || 4096,
+          // The Messages API requires max_tokens: the client's, else the model's own in `modelParams`, else 4096.
+          // Built after `modelParams`, a bare 4096 here overwrote the model's value every time, and a thinking
+          // model ran out of answer on any long reply.
+          max_tokens: maxTokens || payload.max_tokens || 4096,
           stream: true,
           messages: messages.filter((m) => m.role !== 'system'),
           ...(system?.content ? { system: system.content } : {}),

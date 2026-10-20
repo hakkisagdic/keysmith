@@ -631,6 +631,17 @@ test('modelParams: sent with that model only, under the fields keysmith builds; 
   assert.throws(() => new HttpAdapter('g', { baseUrl, modelParams: ['x'] }), /modelParams must map/);
 });
 
+test('the Anthropic wire takes max_tokens from the client, else from the model\'s modelParams, else 4096', async () => {
+  const { seen, baseUrl } = await stubUpstream();
+  const a = new HttpAdapter('anth', { baseUrl, apiKey: false, wire: 'anthropic', modelParams: { 'claude-big': { max_tokens: 32000 } } });
+  // Only the request body is under test: the stub answers in OpenAI's shape, which this wire need not parse.
+  const ask = (model, maxTokens) => events(a.complete({ model, maxTokens, messages: [{ role: 'user', content: 'x' }] })).catch(() => {});
+  await ask('claude-big');
+  await ask('claude-big', 100);
+  await ask('claude-small');
+  assert.deepEqual(seen.map((b) => b.max_tokens), [32000, 100, 4096]);
+});
+
 test('the argon route: agy answers a plain request; tools go to the Google leg at high effort, unless the client chose one', async () => {
   const dir = tmp('argon');
   const { seen, baseUrl } = await stubUpstream();
