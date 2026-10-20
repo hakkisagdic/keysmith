@@ -145,6 +145,36 @@ const OPENCODE_WORKSPACE_CONFIG = `${JSON.stringify(
   2,
 )}\n`;
 
+/**
+ * `codex exec` without a shell and without anything that writes, as far as 0.163's own switches
+ * go (the codex profile says what each one removes, and what no switch does). One list, so every
+ * run of codex keysmith makes — text, EMULATE — takes the tools away the same way.
+ */
+const CODEX_TOOL_LESS = [
+  '--skip-git-repo-check',
+  '--ephemeral',
+  '--ignore-user-config',
+  '--ignore-rules',
+  '--sandbox', 'read-only',
+  '-c', 'approval_policy="never"',
+  '-c', 'skills.include_instructions=false',
+  '-c', 'web_search="disabled"',
+  '-c', 'agents.max_threads=1',
+  '--disable', 'shell_tool',
+  '--disable', 'unified_exec',
+  '--disable', 'multi_agent',
+  '--disable', 'goals',
+  '--disable', 'apps',
+  '--disable', 'plugins',
+  '--disable', 'browser_use',
+  '--disable', 'computer_use',
+  '--disable', 'image_generation',
+  '--disable', 'view_image',
+  '--disable', 'hooks',
+  '--color', 'never',
+];
+const codexArgs = () => ['exec', ...CODEX_TOOL_LESS, ['--model', '{model}'], '--', '{prompt}'];
+
 /** Where Warp installs its agent CLI on macOS. `/usr/local/bin/warp-cli` is Cloudflare WARP, a VPN client, not this. */
 const WARP_OZ_BIN = '/Applications/Warp.app/Contents/Resources/bin/oz';
 
@@ -192,10 +222,16 @@ export const CLI_PROFILES = {
       [`.opencode/agent/${OPENCODE_TEXT_AGENT_NAME}.md`]: OPENCODE_TEXT_AGENT,
     },
     stopAtToolCall: true,
+    // A request that offers tools: EMULATE (src/tools/emulate.js) through the same tool-less agent
+    // and argv as text — the request's prompt carries the tools and the JSON answer format. The
+    // tool-bridge probe (opencode 1.18.27, evren/deepseek-v4-flash) answered that protocol strictly:
+    // two parallel calls in one reply, then a final answer from the fenced results.
+    toolMode: 'emulate',
+    emulateArgs: ['run', '--format', 'json', '--pure', '--agent', OPENCODE_TEXT_AGENT_NAME, ['--model', '{model}'], '--', '{prompt}'],
     timeoutMs: 300_000,
     maxConcurrent: 2,
-    provenance: 'opencode 1.18.27 — `opencode run --format json` emits step_start / text / step_finish (live). The tool-less run was checked against a stub OpenAI endpoint: `--agent keysmith-text` with the workspace config sent `tools: []` (the default agent sent bash, edit, write, read, glob, grep, task, webfetch, todowrite, skill), a bash call the stub returned anyway failed as an unavailable tool and created nothing, and an unknown agent fell back to the default agent with no tools either. Not run against a live model: opencode\'s free tier (`opencode/*`) refuses this run with a 403.',
-    note: 'Runs without tools: the `keysmith-text` agent (`permission: {"*": deny}`, `tools: {"*": false}`) plus an opencode.json that denies every tool, in an empty keysmith-owned workspace, with no `--auto`. Model ids are provider/model as opencode resolves them, so a provider you wired into opencode with your own key is reachable through keysmith. opencode\'s free models (`opencode/*`) are not: its free tier answered this run, and its default agent under the deny-all config, with 403 "can only be used from within OpenCode" — it answered only the default agent with its tools, which keysmith does not run.',
+    provenance: 'opencode 1.18.27 — `opencode run --format json` emits step_start / text / step_finish (live). The tool-less run was checked against a stub OpenAI endpoint: `--agent keysmith-text` with the workspace config sent `tools: []` (the default agent sent bash, edit, write, read, glob, grep, task, webfetch, todowrite, skill), a bash call the stub returned anyway failed as an unavailable tool and created nothing, and an unknown agent fell back to the default agent with no tools either. opencode\'s free tier (`opencode/*`) refuses this run with a 403. opencode 1.19.3 (2026-10-20): EMULATE through this argv answered a two-turn tool round trip live on evren/deepseek-v4-flash.',
+    note: 'Runs without tools: the `keysmith-text` agent (`permission: {"*": deny}`, `tools: {"*": false}`) plus an opencode.json that denies every tool, in an empty keysmith-owned workspace, with no `--auto`. Model ids are provider/model as opencode resolves them, so a provider you wired into opencode with your own key is reachable through keysmith. opencode\'s free models (`opencode/*`) are not: its free tier answered this run, and its default agent under the deny-all config, with 403 "can only be used from within OpenCode" — it answered only the default agent with its tools, which keysmith does not run. A request that offers tools is answered with EMULATE (`toolMode: "emulate"`): the same tool-less agent writes its calls as one JSON object, keysmith checks them against the client\'s schemas and hands them over as tool_calls, and opencode runs none of them.',
   },
   qoder: {
     kind: 'cli',
@@ -210,10 +246,14 @@ export const CLI_PROFILES = {
     parser: 'raw',
     modelsFrom: { args: ['--list-models'] },
     cwd: '~/.local/share/keysmith/workspaces/qoder',
+    // A request that offers tools: EMULATE through the same tool-less argv as text (the tool-bridge
+    // probe, qodercli 1.1.59: two parallel calls in one strictly parseable reply).
+    toolMode: 'emulate',
+    emulateArgs: ['-p', '{noSession}', '--tools', '', '--strict-mcp-config', ['--model', '{model}'], '{prompt}'],
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Qoder CLI 1.1.59 — `qodercli -p` prints the answer and that is the only output mode verified from here. `--no-session-persistence`, `--tools ""` and `--strict-mcp-config` are what `qodercli --help` lists, and 1.1.59 parses them; it refuses `--no-session` (unknown option). The tool-less run itself was not checked live.',
-    note: 'Runs without tools: `--tools ""` (no built-in tool) and `--strict-mcp-config` (no MCP server), in an empty keysmith-owned workspace. Set QODER_* entrypoint vars aside (`keysmith serve` clears them) or the CLI exits 42 before it answers. `-o json` / `-o stream-json` also exit 42 with no output inside a nested agent session — those vars are how it finds its credentials — so `raw` is the default. If you run keysmith from a plain login shell, try `-o stream-json` with parser `claude-stream-json` for token counts and resume. Not on the LaunchAgent PATH by default: `keysmith add qoder --bin ~/.local/bin/qodercli`.',
+    provenance: 'Qoder CLI 1.1.59 — `qodercli -p` prints the answer and that is the only output mode verified from here. `--no-session-persistence`, `--tools ""` and `--strict-mcp-config` are what `qodercli --help` lists, and 1.1.59 parses them; it refuses `--no-session` (unknown option). 2026-10-20: EMULATE through this argv answered a two-turn tool round trip live on the default model.',
+    note: 'Runs without tools: `--tools ""` (no built-in tool) and `--strict-mcp-config` (no MCP server), in an empty keysmith-owned workspace. Set QODER_* entrypoint vars aside (`keysmith serve` clears them) or the CLI exits 42 before it answers. `-o json` / `-o stream-json` also exit 42 with no output inside a nested agent session — those vars are how it finds its credentials — so `raw` is the default. If you run keysmith from a plain login shell, try `-o stream-json` with parser `claude-stream-json` for token counts and resume. Not on the LaunchAgent PATH by default: `keysmith add qoder --bin ~/.local/bin/qodercli`. A request that offers tools is answered with EMULATE (`toolMode: "emulate"`): the same tool-less run writes its calls as one JSON object, which keysmith checks and hands to the client as tool_calls.',
   },
   claude: {
     kind: 'cli',
@@ -304,41 +344,19 @@ export const CLI_PROFILES = {
     // The user config (its MCP servers and profiles) and execpolicy rules are not loaded, the
     // plugin/app/browser/computer-use features are off, and no session is written. Codex
     // rejects an unknown feature name, so a renamed one fails loudly, not silently.
-    args: [
-      'exec',
-      '--skip-git-repo-check',
-      '--ephemeral',
-      '--ignore-user-config',
-      '--ignore-rules',
-      '--sandbox', 'read-only',
-      '-c', 'approval_policy="never"',
-      '-c', 'skills.include_instructions=false',
-      '-c', 'web_search="disabled"',
-      '-c', 'agents.max_threads=1',
-      '--disable', 'shell_tool',
-      '--disable', 'unified_exec',
-      '--disable', 'multi_agent',
-      '--disable', 'goals',
-      '--disable', 'apps',
-      '--disable', 'plugins',
-      '--disable', 'browser_use',
-      '--disable', 'computer_use',
-      '--disable', 'image_generation',
-      '--disable', 'view_image',
-      '--disable', 'hooks',
-      '--color', 'never',
-      ['--model', '{model}'],
-      '--',
-      '{prompt}',
-    ],
+    args: codexArgs(),
+    // A request that offers tools: EMULATE through the same argv (the tool-bridge probe, codex
+    // 0.163.0 on gpt-5.6-luna: two parallel calls in one strictly parseable reply).
+    toolMode: 'emulate',
+    emulateArgs: codexArgs(),
     parser: 'raw',
     // `codex debug models` prints the model catalogue as JSON (slug, display_name, visibility).
     modelsFrom: { args: ['debug', 'models'] },
     cwd: '~/.local/share/keysmith/workspaces/codex',
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Codex CLI 0.163.0 — every flag here is in `codex exec --help`; the feature names were accepted by 0.163 (`codex debug prompt-input` refuses an unknown one) and `codex debug models` lists the catalogue as JSON. This argv was run against a stub Responses endpoint (scratch CODEX_HOME): gpt-5.5 was offered request_user_input and apply_patch only; gpt-6-astra code-mode exec/wait, request_user_input, clock.sleep and the collaboration (sub-agent) namespace, with 2 concurrency slots. No request reached OpenAI, so the stdout shape (`raw`: the final message) is from the stub and its documented interface.',
-    note: 'Runs with no shell tool, a read-only sandbox and no approvals, no web search, without your ~/.codex/config.toml (its MCP servers included) and with no session on disk, in an empty keysmith-owned workspace. On gpt-6-* models codex keeps its sub-agent tools whatever the switches: one request can run a second agent (same tools, same quota), capped at one by `agents.max_threads=1`. A Homebrew codex and an npm one can both be installed, and PATH decides which one runs: pin it, e.g. `keysmith add codex --bin /opt/homebrew/bin/codex`.',
+    provenance: 'Codex CLI 0.163.0 — every flag here is in `codex exec --help`; the feature names were accepted by 0.163 (`codex debug prompt-input` refuses an unknown one) and `codex debug models` lists the catalogue as JSON. This argv was run against a stub Responses endpoint (scratch CODEX_HOME): gpt-5.5 was offered request_user_input and apply_patch only; gpt-6-astra code-mode exec/wait, request_user_input, clock.sleep and the collaboration (sub-agent) namespace, with 2 concurrency slots. The stdout shape (`raw`: the final message) is from the stub and its documented interface; 2026-10-20, EMULATE through this argv answered a two-turn tool round trip live on gpt-5.6-luna, the final message alone on stdout.',
+    note: 'Runs with no shell tool, a read-only sandbox and no approvals, no web search, without your ~/.codex/config.toml (its MCP servers included) and with no session on disk, in an empty keysmith-owned workspace. On gpt-6-* models codex keeps its sub-agent tools whatever the switches: one request can run a second agent (same tools, same quota), capped at one by `agents.max_threads=1`. A Homebrew codex and an npm one can both be installed, and PATH decides which one runs: pin it, e.g. `keysmith add codex --bin /opt/homebrew/bin/codex`. A request that offers tools is answered with EMULATE (`toolMode: "emulate"`): the same run writes its calls as one JSON object, which keysmith checks and hands to the client as tool_calls. Every codex request carries codex\'s own ~20k-token harness.',
   },
   kiro: {
     kind: 'cli',
@@ -354,13 +372,16 @@ export const CLI_PROFILES = {
     cwd: '~/.local/share/keysmith/workspaces/kiro',
     workspaceFiles: { [`.kiro/agents/${KIRO_TEXT_AGENT_NAME}.json`]: KIRO_TEXT_AGENT },
     stopAtToolCall: true,
-    // Kiro's text events were never seen live (the run hit the overage limit), so no tool engine
-    // is put on it yet: a request that offers tools passes it by.
+    // Kiro's text events were never seen live (the run hit the overage limit, again on 2026-10-20),
+    // so no tool engine is put on it yet: a request that offers tools passes it by. EMULATE through
+    // the same tool-less argv is checked against a stub of kiro's stream only (test/tools-emulate-clis
+    // .test.js), not a live model: `keysmith set kiro toolMode emulate` once a live run answers.
     toolMode: 'off',
+    emulateArgs: ['chat', '--no-interactive', '--trust-tools=', '--agent', KIRO_TEXT_AGENT_NAME, '--output-format', 'stream-json', ['--model', '{model}'], '--', '{prompt}'],
     timeoutMs: 300_000,
     maxConcurrent: 2,
     provenance: 'Kiro CLI 2.27.1 — `kiro-cli chat --no-interactive --output-format stream-json` prints `{type,data}` JSON lines; runStarted, metadata (sessionId) and runError were read off a live run, which the account\'s overage limit refused before any text. sessionUpdate (ACP agent_message_chunk) and runFinished (finalText) come from the binary and the ACP schema. `--list-models --format json` lists model_id / description / context_window_tokens; `agent validate` accepts the agent file.',
-    note: 'Uses your Kiro login and its credits. Runs the tool-less `keysmith-text` agent (`tools: []`, no MCP, no steering resources) with `--trust-tools=` trusting nothing, in an empty keysmith-owned workspace. The text events were not seen live yet (the run hit the overage limit): check the first real answer with `keysmith chat kiro/<model> "say hi"`. Not on the LaunchAgent PATH by default: `keysmith add kiro --bin ~/.local/bin/kiro-cli`.',
+    note: 'Uses your Kiro login and its credits. Runs the tool-less `keysmith-text` agent (`tools: []`, no MCP, no steering resources) with `--trust-tools=` trusting nothing, in an empty keysmith-owned workspace. The text events were not seen live yet (the run hit the overage limit): check the first real answer with `keysmith chat kiro/<model> "say hi"`. Not on the LaunchAgent PATH by default: `keysmith add kiro --bin ~/.local/bin/kiro-cli`. Tool requests pass it by (`toolMode: "off"`): EMULATE through its tool-less argv (`emulateArgs`) is checked against a stub of its stream only, never a live model — `keysmith set kiro toolMode emulate` once a live run answers.',
   },
   warp: {
     kind: 'cli',

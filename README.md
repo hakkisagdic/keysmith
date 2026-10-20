@@ -171,8 +171,16 @@ takes the tools the way it can:
   as `tool_calls` (`tool_use` blocks on `/v1/messages`), streamed or not, with keysmith's own
   ids. keysmith never runs a tool: the client does, behind its own approvals, and sends the
   result back on its next request.
-- **A CLI without one** (`toolMode` absent or `off`: every built-in profile but `agy`) is
-  passed by.
+- **A CLI without one** (`toolMode` absent or `off`: `claude`, `kiro` and the profiles marked
+  `unsafeTools`) is passed by.
+
+Which built-in profile answers how: `agy` with `auto` (the MCP bridge, EMULATE where the bridge
+cannot); `opencode`, `codex` and `qoder` with `emulate`, through the same tool-less agent and argv
+as their text runs (each answered the JSON protocol strictly in a live round trip: opencode on
+`evren/deepseek-v4-flash`, codex on `gpt-5.6-luna`, qoder on its default model); `claude` never
+(every request spends your subscription); `kiro` not yet — its EMULATE argv (`emulateArgs`) is in
+the profile and checked against a stub of its stream, but no live run got past its overage limit,
+so `keysmith set kiro toolMode emulate` is yours to make once one does.
 
 That is a change of order for a route that mixes the two: a CLI leg with a `toolMode` now takes
 tools where it stands in the chain. In `argon` (`agy/gemini-4-argon-high`, then
@@ -749,12 +757,12 @@ again to rewrite it.
 | Profile | Kind | Status |
 |---|---|---|
 | `cmd` | cli | verified live against Command Code 1.66.0 — **`unsafeTools`**: a `-p` run approves its own tool calls, so it ships disabled, see [above](#agents-that-could-act-on-this-machine) |
-| `opencode` | cli | verified live against opencode 1.18.27; tool-less agent checked against a stub endpoint (no `--auto`); its free `opencode/*` models refuse the tool-less run (403) |
-| `qoder` | cli | verified with `-p`; its `-o json/stream-json` modes fail inside a nested agent session; tool-less flags parsed by 1.1.59 |
+| `opencode` | cli | verified live against opencode 1.18.27; tool-less agent checked against a stub endpoint (no `--auto`); its free `opencode/*` models refuse the tool-less run (403); answers tool requests with EMULATE (`toolMode: "emulate"`, a live round trip on opencode 1.19.3) |
+| `qoder` | cli | verified with `-p`; its `-o json/stream-json` modes fail inside a nested agent session; tool-less flags parsed by 1.1.59; answers tool requests with EMULATE (`toolMode: "emulate"`, a live round trip on 1.1.59) |
 | `claude` | cli | tool-less flags and stream-json shape checked against Claude Code 2.1.261; no live request; explicit-only as shipped |
 | `agy` | cli | verified live against Antigravity CLI 1.3.3 — your Google login, no key; runs as a tool-less text agent (~600-token prompt instead of ~20k), see [docs/adapters.md](docs/adapters.md#agy-as-a-plain-text-model); answers tool requests too (`toolMode: "auto"`: the MCP bridge, EMULATE where the bridge cannot — see [docs/adapters.md](docs/adapters.md#agy-and-tool-requests-the-mcp-bridge)) |
-| `kiro` | cli | Kiro CLI 2.27.1 — tool-less agent, `stream-json`, model list as JSON; the first live run was refused for quota before any text, see [docs/adapters.md](docs/adapters.md#kiro-as-a-plain-text-model) |
-| `codex` | cli | argv run against a stub Responses endpoint with codex 0.163.0 (read-only, no shell, no web search); gpt-6-* keep sub-agent tools; no request reached OpenAI |
+| `kiro` | cli | Kiro CLI 2.27.1 — tool-less agent, `stream-json`, model list as JSON; the first live run was refused for quota before any text, see [docs/adapters.md](docs/adapters.md#kiro-as-a-plain-text-model); tool requests pass it by (`toolMode: "off"`): its EMULATE argv is checked against a stub only |
+| `codex` | cli | argv run against a stub Responses endpoint with codex 0.163.0 (read-only, no shell, no web search); gpt-6-* keep sub-agent tools; answers tool requests with EMULATE (`toolMode: "emulate"`, a live round trip on `gpt-5.6-luna`) |
 | `warp` | cli | Warp's `oz` agent CLI, ndjson verified live — **`unsafeTools`**: ships disabled, never an alias leg, see [above](#agents-that-could-act-on-this-machine) |
 | `gemini` | cli | documented argv shape, not run against a live install — **`unsafeTools`** until a tool-less argv is checked: ships disabled |
 | `openai`, `anthropic`, `openrouter`, `groq`, `deepseek`, `together` | http | standard endpoints |

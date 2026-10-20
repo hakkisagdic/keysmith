@@ -68,7 +68,7 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `workspaceFiles` | — | `{ "relative/path": "content" }` — files keysmith keeps inside a configured `cwd` (0600), put back before a spawn whenever they drift. Needs `cwd`; a path that leaves it is refused at load. See [agy as a plain text model](#agy-as-a-plain-text-model) |
 | `toolDenialRetry` | — | an instruction; when a run ends in a refused tool call and no text, the request runs once more with this text in front of the prompt, inside the same `timeoutMs` |
 | `stopAtToolCall` | `false` | for a CLI run as a text model: once the answer has text, the first tool call ends the run — the process is stopped and anything it says after that call is not part of the reply. A tool call before any text is left alone. `"always"` stops a call before any text too, and fails that request: for a CLI that kept its tools, a call is never the way to an answer |
-| `toolMode` | `off` | how this CLI answers a request that offers tools: `off` (it is passed by, as before toolMode existed), `emulate` (EMULATE: the model writes its calls as JSON, keysmith hands them to the client — see [agy and tool requests: EMULATE](#agy-and-tool-requests-emulate)), `mcp` (the MCP bridge: the CLI calls the request's tools over MCP and waits while the client runs each one — see [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge); only agy has a bridge driver) or `auto` (the bridge where it can, EMULATE otherwise and when the bridge fails before any call). The `agy` profile ships `auto`; `claude` and `kiro` say `off`. A load error on an `unsafeTools` entry, on an entry without a `cwd` (a tool engine runs the CLI only in an empty workspace keysmith owns, never the gateway's own directory; every built-in profile has one) and on an HTTP adapter. `keysmith set <id> toolMode <mode>` fills in the templates below from the entry's built-in profile when it lacks them |
+| `toolMode` | `off` | how this CLI answers a request that offers tools: `off` (it is passed by, as before toolMode existed), `emulate` (EMULATE: the model writes its calls as JSON, keysmith hands them to the client — see [agy and tool requests: EMULATE](#agy-and-tool-requests-emulate)), `mcp` (the MCP bridge: the CLI calls the request's tools over MCP and waits while the client runs each one — see [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge); only agy has a bridge driver) or `auto` (the bridge where it can, EMULATE otherwise and when the bridge fails before any call). The `agy` profile ships `auto`; `opencode`, `codex` and `qoder` ship `emulate` (see [opencode, codex, qoder and kiro](#opencode-codex-qoder-and-kiro-tool-requests-through-emulate)); `claude` and `kiro` say `off`. A load error on an `unsafeTools` entry, on an entry without a `cwd` (a tool engine runs the CLI only in an empty workspace keysmith owns, never the gateway's own directory; every built-in profile has one) and on an HTTP adapter. `keysmith set <id> toolMode <mode>` fills in the templates below from the entry's built-in profile when it lacks them |
 | `emulateArgs` | `args` | the argv template of an EMULATE run, same placeholders as `args`; no session is resumed on that path, so `{session}` is always empty. agy's names the `keysmith-tools` agent |
 | `bridge` | — | the MCP bridge's settings: `args`, its argv template, with `{agent}` (the session's agent) and `{printTimeout}` (its `sessionMaxMs`, as `1800s`) filled in per session — read by the auto-approve check below; `maxSessions` (2), `toolResultTimeoutMs` (300000), `readyTimeoutMs` (30000), `sessionMaxMs` (1800000), `maxTurns` (32); `mcpCacheDir` (`~/.gemini/antigravity-cli/mcp`, where agy keeps a server's schemas). See [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge) |
 | `unsafeTools` | `false` | keysmith could not take this CLI's tools away: it can run commands and edit files. Implies `explicitOnly`; `keysmith set` refuses to serve it (`disabled false`), to take the mark off, or to change anything that shapes what it runs or how it is stopped (`stopAtToolCall`, `args`, `resumeArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`, …) without `--allow-unsafe-tools`; the gateway logs it at load when it is enabled. An argv template — `args`, `resumeArgs`, `emulateArgs`, `bridge.args` — with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`, `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`, agy's `--mode auto` / `--mode accept-edits`, …) is a load error unless the entry has this mark; with it, `toolMode` must be `off` (`keysmith set <id> unsafeTools true`, and a re-add that keeps the mark, turn it off). See [Warp](#warps-oz-an-agent-that-keeps-its-tools) and [Command Code](#command-code-an-agent-that-approves-its-own-tools) |
@@ -296,6 +296,26 @@ The agent file is what keeps agy tool-less, and agy answers an agent name it can
 its full default agent, without a word — so the profile carries it under `workspaceFiles`,
 rewritten before every run, and `keysmith set … toolMode` refuses an entry with no `cwd` to
 write it into. Do not hand-write `emulateArgs` naming `keysmith-tools` without the file.
+
+### opencode, codex, qoder and kiro: tool requests through EMULATE
+
+The `opencode`, `codex` and `qoder` profiles answer a request that offers tools with EMULATE
+(`toolMode: "emulate"`). Their `emulateArgs` is their text argv, as tool-less as it is for text —
+opencode's `keysmith-text` agent and deny-all `opencode.json`, codex's read-only, shell-less
+`exec`, qoder's `--tools "" --strict-mcp-config` — and the request's own prompt carries the tools
+and the JSON answer format. Each reply is read by the profile's own parser (`opencode-ndjson`,
+`raw`); qoder's other shape, `-o stream-json` with `claude-stream-json`, is read the same way. A
+call the CLI's own harness reports before the reply (opencode's `tool_use`, kiro's ACP
+`tool_call`: refused, since the agent has no tools) is passed by; one after the reply ends the
+run there (`stopAtToolCall`), and the reply stands. Each of the three answered a two-turn round
+trip live — a call that fit the schema, then an answer that quoted the fenced result:
+opencode 1.19.3 on `evren/deepseek-v4-flash` (4.7 s + 3.0 s), codex 0.163.0 on `gpt-5.6-luna`
+(5.2 s + 3.2 s), qodercli 1.1.59 on its default model (11.8 s + 12.1 s). codex adds its own
+~20k-token harness to every request, and `raw` reports no token counts for codex or qoder.
+
+`kiro` carries the same `emulateArgs` (its text argv) and keeps `toolMode: "off"`: its stream
+was only ever checked against a stub, because every live run so far was refused by the account's
+overage limit before any text. `keysmith set kiro toolMode emulate` turns it on.
 
 - `emulateArgs` runs `--agent keysmith-tools`: like `keysmith-text`, an agent file with
   `tools: []`, `inheritMcp: false`, `inheritCustomizations: false` and
