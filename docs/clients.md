@@ -182,8 +182,8 @@ for chunk in c.chat.completions.create(model="cmd/gpt-5", stream=True,
 the upstreams instead of using the 10-minute cache.
 
 Tools work the way they do against OpenAI: the model asks, your code runs the tool and sends
-the result back. Through a CLI leg with a `toolMode` (agy, EMULATE) the calls come back in the
-same shape as from an HTTP upstream — keysmith runs none of them:
+the result back. Through a CLI leg with a `toolMode` (agy: the MCP bridge, or EMULATE) the calls
+come back in the same shape as from an HTTP upstream — keysmith runs none of them:
 
 ```python
 import json
@@ -204,6 +204,17 @@ print(r.choices[0].message.content)
 
 LangChain's `ChatOpenAI(base_url="http://127.0.0.1:8787/v1", api_key="ks_…",
 model="agy/gemini-4-argon-high").bind_tools([...])` reads them the same way, streamed or not.
+
+On agy's MCP bridge (its default for a tool request) the agy process that made the call waits
+for its result, so the loop above is all a client does — with three things to know. A turn
+holds one call, even with `parallel_tool_calls`: agy runs the calls of one step one after
+another, so a step of three is three round trips. The result goes straight back into the waiting
+process when it comes within `toolResultTimeoutMs` (5 minutes), with the same key and the history
+as keysmith answered it; a later result, an edited history or another key still gets an answer,
+on a new agy run that reads the conversation so far (slower, and it spends the whole transcript
+again). And one result goes in once: two requests carrying it at the same time get one answer
+and one 409. The response's `x-keysmith-mode` says `mcp` or `emulate`; both answer in the same
+shape.
 An EMULATE turn on Argon takes tens of seconds; a streamed one sends keepalive comments until
 the calls are ready, so leave the client's read timeout at its default (600 s for the
 `openai` SDK) or above. A reply the model got wrong twice is an error whose type is

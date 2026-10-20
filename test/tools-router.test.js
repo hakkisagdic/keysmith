@@ -192,7 +192,7 @@ test('a CLI without a toolMode never takes a tool request: the plain completion 
 
 /* ----------------------------------------------------- declared order: agy, then Google */
 
-test('argon: a tool request goes to agy first (EMULATE, no bridge yet), and Google is not asked', async () => {
+test('argon: a tool request goes to agy first (EMULATE: this entry has no bridge settings), and Google is not asked', async () => {
   for (const stream of [false, true]) {
     const before = hits.length;
     const r = await chat('argon', `Weather in Ankara? SCENARIO=one-call`, { stream });

@@ -68,9 +68,9 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `workspaceFiles` | — | `{ "relative/path": "content" }` — files keysmith keeps inside a configured `cwd` (0600), put back before a spawn whenever they drift. Needs `cwd`; a path that leaves it is refused at load. See [agy as a plain text model](#agy-as-a-plain-text-model) |
 | `toolDenialRetry` | — | an instruction; when a run ends in a refused tool call and no text, the request runs once more with this text in front of the prompt, inside the same `timeoutMs` |
 | `stopAtToolCall` | `false` | for a CLI run as a text model: once the answer has text, the first tool call ends the run — the process is stopped and anything it says after that call is not part of the reply. A tool call before any text is left alone. `"always"` stops a call before any text too, and fails that request: for a CLI that kept its tools, a call is never the way to an answer |
-| `toolMode` | `off` | how this CLI answers a request that offers tools: `off` (it is passed by, as before toolMode existed), `emulate` (EMULATE: the model writes its calls as JSON, keysmith hands them to the client — see [agy and tool requests](#agy-and-tool-requests-emulate)), `mcp` (the MCP bridge: not part of keysmith yet, a 503 until it is) or `auto` (the bridge where it can, EMULATE otherwise and when the bridge fails before any call). The `agy` profile ships `auto`; `claude` and `kiro` say `off`. A load error on an `unsafeTools` entry and on an HTTP adapter. `keysmith set <id> toolMode <mode>` fills in the templates below from the entry's built-in profile when it lacks them |
+| `toolMode` | `off` | how this CLI answers a request that offers tools: `off` (it is passed by, as before toolMode existed), `emulate` (EMULATE: the model writes its calls as JSON, keysmith hands them to the client — see [agy and tool requests: EMULATE](#agy-and-tool-requests-emulate)), `mcp` (the MCP bridge: the CLI calls the request's tools over MCP and waits while the client runs each one — see [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge); only agy has a bridge driver) or `auto` (the bridge where it can, EMULATE otherwise and when the bridge fails before any call). The `agy` profile ships `auto`; `claude` and `kiro` say `off`. A load error on an `unsafeTools` entry and on an HTTP adapter. `keysmith set <id> toolMode <mode>` fills in the templates below from the entry's built-in profile when it lacks them |
 | `emulateArgs` | `args` | the argv template of an EMULATE run, same placeholders as `args`; no session is resumed on that path, so `{session}` is always empty. agy's names the `keysmith-tools` agent |
-| `bridge` | — | the MCP bridge's settings (design U6/U7); `bridge.args` is its argv template, with `{printTimeout}` and `{agent}` filled in per session. Read by the auto-approve check below, used once the bridge exists |
+| `bridge` | — | the MCP bridge's settings: `args`, its argv template, with `{agent}` (the session's agent) and `{printTimeout}` (its `sessionMaxMs`, as `1800s`) filled in per session — read by the auto-approve check below; `maxSessions` (2), `toolResultTimeoutMs` (300000), `readyTimeoutMs` (30000), `sessionMaxMs` (1800000), `maxTurns` (32); `mcpCacheDir` (`~/.gemini/antigravity-cli/mcp`, where agy keeps a server's schemas). See [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge) |
 | `unsafeTools` | `false` | keysmith could not take this CLI's tools away: it can run commands and edit files. Implies `explicitOnly`; `keysmith set` refuses to serve it (`disabled false`), to take the mark off, or to change anything that shapes what it runs or how it is stopped (`stopAtToolCall`, `args`, `resumeArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`, …) without `--allow-unsafe-tools`; the gateway logs it at load when it is enabled. An argv template — `args`, `resumeArgs`, `emulateArgs`, `bridge.args` — with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`, `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`, agy's `--mode auto` / `--mode accept-edits`, …) is a load error unless the entry has this mark; with it, `toolMode` must be `off` (`keysmith set <id> unsafeTools true`, and a re-add that keeps the mark, turn it off). See [Warp](#warps-oz-an-agent-that-keeps-its-tools) and [Command Code](#command-code-an-agent-that-approves-its-own-tools) |
 | `env` | `{}` | merged over the scrubbed parent env |
 | `maxConcurrent` | `1` | semaphore; each call is a real process |
@@ -211,17 +211,79 @@ Gemini 4 Argon through agy: the effort is part of the model id
 `--effort max`/`xhigh` for it. The API route and its `reasoning_effort` are in the README,
 under "Gemini 4 Argon at its highest effort".
 
-### agy and tool requests: EMULATE
+### agy and tool requests: the MCP bridge
 
-A client that offers tools wants calls back, not text. agy can return neither in a form an
-API carries — its agents are tool-less here on purpose — so the `agy` profile answers tool
-requests with EMULATE (`toolMode: "auto"`; the MCP bridge that `auto` prefers is not part of
-keysmith yet, so every such request is EMULATE today, and the usage row says
-`fallback: "no_bridge"`):
+A client that offers tools wants calls back, not text. With `toolMode: "auto"` (the profile's)
+or `"mcp"`, agy gets them over MCP: each request is a session agent whose one MCP server is
+keysmith, offering the request's tools and nothing else. The model calls one; keysmith checks
+the call against the client's schema and hands it to the client as a tool call, and agy waits on
+it, in the same process, until the client's next request brings the result. The README's
+"Tool calls" has the rules a client sees (which request continues which session, the cold path,
+the 409, the clock, the room); this is what keysmith gives agy.
 
 ```bash
-keysmith add agy                   # toolMode auto, emulateArgs and both agent files
+keysmith add agy                   # toolMode auto, emulateArgs, bridge, both agent files
 keysmith set agy toolMode auto     # an entry attached before toolMode: adds what it lacks
+keysmith set agy toolMode emulate  # EMULATE only: no MCP, no session held between requests
+```
+
+- The agent, `.agents/agents/ks-b-<rid>.md` in the adapter's `cwd`, written 0600 for the session
+  and removed with it: `tools: []`, `inheritMcp: false`, `inheritCustomizations: false`,
+  `excludeDefaultComponents: true`, no hooks, and `mcpServers` — a list (agy 1.4.2 does not read
+  a map) of one server named `ks<rid6>`, new per session (agy caches a server's schemas under
+  `mcpCacheDir/<server>/` whatever agent named it), whose command is the gateway's own node
+  running `src/bridge/shim.js` (absolute paths: launchd's PATH does not matter), with the socket
+  and the session's token in its `env`, and each of the request's tools marked `eager: true`.
+- The argv is `bridge.args`: `--agent {agent}`, `--print-timeout {printTimeout}`, no
+  `--conversation` (a lost session is never resumed, it is answered on the cold path) and no
+  `--mode auto|accept-edits`, which would run agy's own tools unasked. agy runs in a process
+  group of its own, so stopping a session stops the shim with it.
+- The model sees a tool as `mcp_ks<rid6>_<name>`; Gemini takes 64 characters, so a tool name
+  longer than 51 is EMULATE's (`fallback: "name_too_long"`). The call reaches keysmith with the
+  tool's own name; the `toolSummary` agy shows its model next to a tool's parameters is taken off
+  the arguments unless the client's schema has one.
+- agy's stream is read per step (`agy-stream-json` with per-step usage): a turn's usage row
+  counts the steps it ran. A call in it to anything but the bridge's tools and `manage_task` is
+  the tripwire: agy is stopped and the request is a 502, never retried as EMULATE.
+  `manage_task` after an answer ends the run, as on the text path (`stopAtToolCall`, `cutAt`).
+  `toolDenialRetry` does not run on the bridge.
+
+```json
+{
+  "agy": {
+    "kind": "cli",
+    "bin": "agy",
+    "parser": "agy-stream-json",
+    "cwd": "~/.local/share/keysmith/workspaces/agy",
+    "toolMode": "auto",
+    "bridge": {
+      "args": ["--output-format", "stream-json", "--disable-slash-commands", "--print-timeout", "{printTimeout}", "--agent", "{agent}", ["--model", "{model}"], "-p", "{prompt}"],
+      "maxSessions": 2,
+      "readyTimeoutMs": 30000,
+      "toolResultTimeoutMs": 300000,
+      "sessionMaxMs": 1800000,
+      "maxTurns": 32
+    }
+  }
+}
+```
+
+The gateway-wide limits are `limits.bridge`: `maxSessions` (2 sessions in all: a waiting agy
+session is about 1 GB, see the README's "Tool calls"), `maxSessionsPerKey` (1) and `socket`
+(`~/.local/share/keysmith/run/bridge.sock`; its directory must be one only you can enter, and
+the path at most 103 bytes). `keysmith serve` opens the socket at start and says where, and
+removes what the sessions of a gateway that was killed left behind (agent files and schema
+directories of keysmith's naming, older than an hour).
+
+### agy and tool requests: EMULATE
+
+EMULATE is what `auto` runs where the bridge cannot — a `tool_choice` that forces a call
+(`required`, a named tool: MCP cannot make a model call one), a tool name too long, no room, a
+bridge that failed before its first call — and what `toolMode: "emulate"` runs always. agy's
+`keysmith-tools` agent writes the calls as one JSON object, and keysmith hands them to the
+client; the usage row says `toolMode: "emulate"` and, under `auto`, why (`fallback`).
+
+```bash
 keysmith set agy toolMode off      # tool requests pass agy by again
 ```
 
