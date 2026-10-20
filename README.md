@@ -160,17 +160,31 @@ caching. Sessions live in memory: restart the gateway and clients start fresh.
 ## Tool calls, thinking
 
 A request that offers tools — `tools` (or the older `functions`) on `/v1/chat/completions`,
-`tools` on `/v1/messages` — walks its route in the order the route was declared, and each leg
-takes the tools the way it can:
+`tools` on `/v1/messages` and on `/v1/responses` — walks its route in the order the route was
+declared, and each leg takes the tools the way it can:
 
 - **An HTTP upstream** on the openai wire gets the client's body verbatim (`passthrough`), on
-  `/v1/chat/completions`; its answer comes back byte for byte. `/v1/messages` has no verbatim
-  relay, so there its HTTP legs are passed by.
+  `/v1/chat/completions`; its answer comes back byte for byte. `/v1/messages` and
+  `/v1/responses` have no verbatim relay, so there its HTTP legs are passed by.
 - **A CLI with a `toolMode`** answers through a tool engine. The CLI runs without tools of its
   own, as it does for text; the model writes its calls, and keysmith hands them to the client
-  as `tool_calls` (`tool_use` blocks on `/v1/messages`), streamed or not, with keysmith's own
-  ids. keysmith never runs a tool: the client does, behind its own approvals, and sends the
-  result back on its next request.
+  as `tool_calls` (`tool_use` blocks on `/v1/messages`, `function_call` items on
+  `/v1/responses`), streamed or not, with keysmith's own ids. keysmith never runs a tool: the
+  client does, behind its own approvals, and sends the result back on its next request.
+
+On `/v1/responses` the tools are `{"type": "function", "name", "parameters"}`; a `custom` tool
+(a freeform one, such as Codex's `apply_patch`) and the hosted ones (`web_search`,
+`file_search`, `computer_use_preview`, `code_interpreter`, `mcp`, …) are what no CLI can honour.
+The history is read from `input`: `function_call` items are their assistant turn's calls,
+`function_call_output` items their results by `call_id`; reasoning items and item references
+are left out, and `previous_response_id` is not followed — send the whole input, as Codex's
+`store: false` requests do. A call goes out as a `function_call` item (an `fc_` item id,
+keysmith's `call_` call id) after the message item that holds the text before it; streamed,
+as `response.output_item.added`, `response.function_call_arguments.delta` and `.done`,
+`response.output_item.done`, and `response.completed` carries the whole output — the openai
+SDK's `responses.create` and `responses.stream(...).get_final_response()` read both (checked
+with openai 2.54.0). A failure after the stream started is an `error` event and
+`response.failed`. A request without tools is answered as it always was.
 - **A CLI without one** (`toolMode` absent or `off`: `claude`, `kiro` and the profiles marked
   `unsafeTools`) is passed by.
 

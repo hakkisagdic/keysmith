@@ -155,6 +155,30 @@ wire_api = "responses"
 client needs SSE `event:` names, they are there (`response.output_text.delta`,
 `response.completed`).
 
+Function tools work on this face too, on a route with a CLI leg that has a `toolMode` (agy,
+opencode, codex, qoder as shipped): a call comes back as a `function_call` output item, and
+the client's next request carries it and its `function_call_output` in `input`. A request
+with a tool no CLI leg can honour — a freeform one (`"type": "custom"`, such as Codex's own
+`apply_patch`) or a hosted one (`web_search`, …) — is a 400 that names it: a CLI route takes
+function tools only. Codex as a client sends tools of its own, `apply_patch` among them in the
+versions the design probed, so it is not a client of this path as it stands. With the openai
+SDK:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key=KEYSMITH_KEY)
+tools = [{"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+history = [{"role": "user", "content": "Weather in Ankara?"}]
+r = client.responses.create(model="agy/gemini-4-argon-high", input=history, tools=tools, store=False)
+for item in r.output:
+    history.append(item)
+    if item.type == "function_call":
+        history.append({"type": "function_call_output", "call_id": item.call_id, "output": "sunny, 21 C"})
+r = client.responses.create(model="agy/gemini-4-argon-high", input=history, tools=tools, store=False)
+print(r.output_text)
+```
+
 ## Qoder
 
 `~/.qoder/settings.json` → `providers`, with `$KEYSMITH_KEY`-style env references

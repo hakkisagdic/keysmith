@@ -1,6 +1,6 @@
 import { openaiChunk, openaiResult, anthropicResult } from '../protocols.js';
 import { LlmError } from '../util.js';
-import { FINISH_TOOL_CALLS, isPlainObject, newToolCallId } from './model.js';
+import { FINISH_TOOL_CALLS, isPlainObject, newToolCallId, newToolItemId } from './model.js';
 
 /**
  * Face writers: canonical events out to a client, in the shape its SDK reads — text, and the
@@ -13,6 +13,11 @@ import { FINISH_TOOL_CALLS, isPlainObject, newToolCallId } from './model.js';
  *   /v1/messages          tool_use content blocks, stop_reason "tool_use"; streamed, blocks open
  *                         when they have something in them, a call is content_block_start +
  *                         one input_json_delta + content_block_stop
+ *   /v1/responses         a `function_call` output item per call (`fc_` item id, `call_` call
+ *                         id), after the message item that holds the preamble; streamed,
+ *                         output_item.added + one function_call_arguments.delta + .done +
+ *                         output_item.done per call, and response.completed with the whole
+ *                         output (what an SDK's final response is read from)
  *
  * Text that comes before a call (a preamble) stays in the same answer. While nothing is written
  * — an engine buffering a whole answer to check it — a stream gets a keepalive every
@@ -297,6 +302,161 @@ export class AnthropicStream {
   /** A stream that failed after it started: an `error` event, the one an Anthropic SDK raises on. */
   fail(message, type = 'api_error') {
     this._event('error', { type: 'error', error: { type, message: `keysmith: ${message}` } });
+    this.ka?.stop();
+    this.res.end();
+  }
+}
+
+/* -------------------------------------------------------------- OpenAI Responses */
+
+/** A Responses usage object, with every field the openai SDK's model asks for. */
+function responsesUsage(u) {
+  const input = u?.input || 0;
+  const output = u?.output || 0;
+  return {
+    input_tokens: input,
+    input_tokens_details: { cached_tokens: u?.cacheRead || 0, cache_write_tokens: u?.cacheWrite || 0 },
+    output_tokens: output,
+    output_tokens_details: { reasoning_tokens: 0 },
+    total_tokens: u?.total || input + output,
+  };
+}
+
+function messageItem(id, text, status) {
+  return { id, type: 'message', status, role: 'assistant', content: status === 'in_progress' ? [] : [{ type: 'output_text', text, annotations: [] }] };
+}
+
+function callItem(call, itemId, status) {
+  return { id: itemId, type: 'function_call', status, call_id: call.id, name: call.name, arguments: status === 'in_progress' ? '' : call.arguments };
+}
+
+/**
+ * The response object of a Responses answer that offered tools: `output` its items, `status` how
+ * it ended, and what the request asked for (`tools`, `tool_choice`, `parallel_tool_calls`), which
+ * the API echoes and the openai SDK's model requires. `request` is the client's body.
+ */
+function responseObject({ id, model, created, status, output, usage = null, error = null, request = {} }) {
+  return {
+    id: `resp_${id}`,
+    object: 'response',
+    created_at: created,
+    status,
+    error,
+    incomplete_details: null,
+    instructions: null,
+    metadata: {},
+    model,
+    output,
+    parallel_tool_calls: request.parallel_tool_calls !== false,
+    temperature: null,
+    tool_choice: request.tool_choice ?? 'auto',
+    tools: Array.isArray(request.tools) ? request.tools : [],
+    top_p: null,
+    usage: usage ? responsesUsage(usage) : null,
+  };
+}
+
+/**
+ * A non-streamed Responses answer to a request that offered tools: the text as a message item
+ * (the preamble, when calls follow it), then a `function_call` item per call — its `call_id`
+ * keysmith's call id (what the client's function_call_output names), its `id` an item id of its
+ * own (`fc_<24>`). `output_text` mirrors the text, as on the text path.
+ */
+export function responsesBody({ id, model, created, text = '', usage = null, toolCalls = [], request = {} }) {
+  const output = [];
+  if (text || !toolCalls.length) output.push(messageItem(`msg_${id}`, text, 'completed'));
+  for (const c of toolCalls) output.push(callItem(c, newToolItemId(), 'completed'));
+  return { ...responseObject({ id, model, created, status: 'completed', output, usage, request }), output_text: text };
+}
+
+/**
+ * A streamed Responses answer to a request that offered tools. Items open when they have content:
+ * the message item at the first text (output_item.added, content_part.added, then
+ * output_text.delta), closed before a call's item; a call is output_item.added (empty arguments),
+ * one function_call_arguments.delta, function_call_arguments.done, output_item.done. Every event
+ * carries its `sequence_number`; response.completed carries the whole output and the usage, which
+ * is what an SDK's final response is read from. While nothing is written (an engine buffering a
+ * whole answer), an SSE comment goes out every KEEPALIVE_MS. A failure after it started is an
+ * `error` event and response.failed.
+ */
+export class ResponsesStream {
+  constructor(res, { id, model, created, request = {}, keepaliveMs = KEEPALIVE_MS, timers } = {}) {
+    Object.assign(this, { res, id, model, created, request, keepaliveMs, timers });
+    this.seq = 0;
+    this.output = []; // the items so far, as response.completed lists them
+    this.msg = null; // the open message item: { index, id, text }
+    this.calls = 0;
+    this.ka = null;
+    this.ended = false;
+  }
+
+  _event(name, data) {
+    this.ka?.touch();
+    this.res.write(`event: ${name}\ndata: ${JSON.stringify({ type: name, sequence_number: this.seq++, ...data })}\n\n`);
+  }
+
+  _response(status, extra = {}) {
+    return responseObject({ id: this.id, model: this.model, created: this.created, status, output: [], request: this.request, ...extra });
+  }
+
+  open() {
+    this._event('response.created', { response: this._response('in_progress') });
+    this._event('response.in_progress', { response: this._response('in_progress') });
+    this.ka = keepalive(this.res, ': keepalive\n\n', { intervalMs: this.keepaliveMs, timers: this.timers });
+  }
+
+  text(text) {
+    if (!this.msg) {
+      this.msg = { index: this.output.length, id: `msg_${this.id}`, text: '' };
+      this.output.push(messageItem(this.msg.id, '', 'in_progress'));
+      this._event('response.output_item.added', { output_index: this.msg.index, item: messageItem(this.msg.id, '', 'in_progress') });
+      this._event('response.content_part.added', { item_id: this.msg.id, output_index: this.msg.index, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+    }
+    this.msg.text += text;
+    this._event('response.output_text.delta', { item_id: this.msg.id, output_index: this.msg.index, content_index: 0, delta: text, logprobs: [] });
+  }
+
+  _closeText() {
+    const m = this.msg;
+    if (!m) return;
+    this.msg = null;
+    this._event('response.output_text.done', { item_id: m.id, output_index: m.index, content_index: 0, text: m.text, logprobs: [] });
+    this._event('response.content_part.done', { item_id: m.id, output_index: m.index, content_index: 0, part: { type: 'output_text', text: m.text, annotations: [] } });
+    this.output[m.index] = messageItem(m.id, m.text, 'completed');
+    this._event('response.output_item.done', { output_index: m.index, item: this.output[m.index] });
+  }
+
+  toolCall(call) {
+    this._closeText();
+    const index = this.output.length;
+    const itemId = newToolItemId();
+    this.output.push(callItem(call, itemId, 'completed'));
+    this.calls++;
+    this._event('response.output_item.added', { output_index: index, item: callItem(call, itemId, 'in_progress') });
+    this._event('response.function_call_arguments.delta', { item_id: itemId, output_index: index, delta: call.arguments });
+    this._event('response.function_call_arguments.done', { item_id: itemId, output_index: index, name: call.name, arguments: call.arguments });
+    this._event('response.output_item.done', { output_index: index, item: this.output[index] });
+  }
+
+  /** Close what is open; response.completed with the output and usage — or, with `error`, the failure. */
+  finish({ usage = null, error = null } = {}) {
+    if (error) return this.fail(error);
+    this._closeText();
+    this._event('response.completed', { response: this._response('completed', { output: this.output, usage }) });
+    this._end();
+  }
+
+  /** A stream that failed after it started: an `error` event, then response.failed. */
+  fail(message, type = 'upstream_error') {
+    if (this.ended) return;
+    const text = `keysmith: ${message}`;
+    this._event('error', { code: type, message: text, param: null });
+    this._event('response.failed', { response: this._response('failed', { output: this.output, error: { code: 'server_error', message: text } }) });
+    this._end();
+  }
+
+  _end() {
+    this.ended = true;
     this.ka?.stop();
     this.res.end();
   }

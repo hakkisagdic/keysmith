@@ -143,6 +143,86 @@ export function openaiToolSpec(body) {
   return spec;
 }
 
+/** How many tools a Responses body offers, without reading one. */
+export function responsesToolCount(body) {
+  return listLength(body?.tools);
+}
+
+/**
+ * OpenAI Responses (design U12): `tools` as `{type: "function", name, description, parameters}`
+ * (`strict` is the provider's to enforce; keysmith checks every call against the schema anyway),
+ * `tool_choice` (`auto`, `none`, `required`, `{type: "function", name}`), `parallel_tool_calls`.
+ * Every other tool type is unsupported — `custom` (a freeform tool: Codex's `apply_patch`),
+ * `web_search`, `file_search`, `computer_use_preview`, `code_interpreter`, `image_generation`,
+ * `mcp`, `local_shell` — and so is a tool_choice of another kind (`allowed_tools`, a hosted
+ * tool). Null when no tool is offered.
+ */
+export function responsesToolSpec(body) {
+  const listed = Array.isArray(body?.tools) ? body.tools : [];
+  if (!listed.length) return null;
+  const spec = emptySpec();
+  const names = new Set();
+  for (const t of listed) {
+    if (t && typeof t === 'object' && t.type === 'function') addTool(spec, names, t.name, t.description, t.parameters, 'function');
+    else spec.unsupported.push({ type: typeName(t), ...nameOf(t?.name) });
+  }
+  spec.choice = openaiChoice(body.tool_choice, spec, names);
+  spec.parallel = body.parallel_tool_calls !== false;
+  return spec;
+}
+
+/**
+ * Responses input, tool-aware: `instructions` and `system`/`developer` messages are system turns;
+ * `function_call` items (and `custom_tool_call` ones, from a history that used a freeform tool)
+ * are the calls of an assistant turn — the one right before them, or a new one — by `call_id`;
+ * `function_call_output` (and `custom_tool_call_output`) items are tool results for that
+ * `call_id`. A message's text is read as protocols.js reads it (input_text, output_text).
+ * Reasoning items, item references and hosted tools' calls are nothing a CLI leg can read, and
+ * are left out. Stateless: `previous_response_id` is not followed (the request must carry its
+ * history, as Codex's `store: false` requests do).
+ */
+export function responsesToolMessages(body) {
+  const out = [];
+  if (body?.instructions) out.push({ role: 'system', text: String(body.instructions) });
+  const input = body?.input;
+  if (typeof input === 'string') {
+    out.push({ role: 'user', text: input });
+    return out;
+  }
+  let turn = null; // the assistant turn a function_call joins, until a result or another turn comes
+  for (const item of Array.isArray(input) ? input : []) {
+    if (typeof item === 'string') {
+      out.push({ role: 'user', text: item });
+      turn = null;
+      continue;
+    }
+    if (!item || typeof item !== 'object') continue;
+    const type = item.type ?? (typeof item.role === 'string' ? 'message' : null);
+    if (type === 'message') {
+      const role = item.role === 'assistant' ? 'assistant' : item.role === 'system' || item.role === 'developer' ? 'system' : 'user';
+      const text = typeof item.content === 'string' ? item.content : contentToText(item.content);
+      if (role === 'assistant') {
+        turn = { role, text };
+        out.push(turn);
+      } else {
+        if (text) out.push({ role, text });
+        turn = null;
+      }
+    } else if (type === 'function_call' || type === 'custom_tool_call') {
+      const call = callFrom(item.call_id, item.name, type === 'function_call' ? item.arguments : item.input);
+      if (!turn) {
+        turn = { role: 'assistant', text: '' };
+        out.push(turn);
+      }
+      (turn.toolCalls ??= []).push(call);
+    } else if (type === 'function_call_output' || type === 'custom_tool_call_output') {
+      out.push({ role: 'tool', text: typeof item.output === 'string' ? item.output : contentToText(item.output), toolCallId: typeof item.call_id === 'string' ? item.call_id : null });
+      turn = null;
+    }
+  }
+  return out;
+}
+
 /** Anthropic Messages: `tools` (custom tools; server tools are unsupported), `tool_choice`, `disable_parallel_tool_use`. Null when no tool is offered. */
 export function anthropicToolSpec(body) {
   const listed = Array.isArray(body?.tools) ? body.tools : [];

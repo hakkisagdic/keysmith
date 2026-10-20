@@ -11,8 +11,8 @@ import {
   responsesResult,
   errorBody,
 } from './protocols.js';
-import { AnthropicStream, KEEPALIVE_MS, OpenaiChatStream, anthropicMessage, faceCall, openaiCompletion } from './tools/faces.js';
-import { MAX_TOOLS, anthropicToolMessages, anthropicToolSpec, openaiLegacy, openaiToolCount, openaiToolMessages, openaiToolSpec } from './tools/model.js';
+import { AnthropicStream, KEEPALIVE_MS, OpenaiChatStream, ResponsesStream, anthropicMessage, faceCall, openaiCompletion, responsesBody } from './tools/faces.js';
+import { MAX_TOOLS, anthropicToolMessages, anthropicToolSpec, openaiLegacy, openaiToolCount, openaiToolMessages, openaiToolSpec, responsesToolCount, responsesToolMessages, responsesToolSpec } from './tools/model.js';
 import { addUsage } from './tools/emulate.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
@@ -135,7 +135,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
       }
       if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope });
       if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope });
-      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, holdMs, scope });
+      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope });
       if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope });
       return json(res, 404, errorBody(`no route ${req.method} ${route}`, 'invalid_request_error', 404));
     } catch (e) {
@@ -453,7 +453,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   void log;
 }
 
-async function handleResponses(req, res, gateway, { usage, log, holdMs = STREAM_HOLD_MS, scope = null }) {
+async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null }) {
   const body = await readJson(req);
   const messages = responsesMessages(body);
   if (!messages.length) throw new LlmError('input is empty', { status: 400 });
@@ -464,6 +464,13 @@ async function handleResponses(req, res, gateway, { usage, log, holdMs = STREAM_
   const session = sessionFrom(req, body);
   const meta = track(res, body.model, stream, t0, '/v1/responses');
   if (scope) meta.skipped = gateway.resolve(body.model, { scope }).skipped;
+  // The same bound as the other faces': what an engine is handed (a prompt, a tools/list) has one.
+  const offered = responsesToolCount(body);
+  if (offered > MAX_TOOLS) throw new LlmError(`this request offers ${offered} tools; at most ${MAX_TOOLS} are taken`, { status: 400, type: 'invalid_request_error' });
+  // Tools on this face reach a CLI leg with a toolMode (design U12), as on /v1/messages: no HTTP leg
+  // is handed them (there is no verbatim relay for the Responses wire), so a route of those
+  // answers in text — or, when tool_choice asks for a call, with an error.
+  if (offered) return await responsesWithTools(req, res, gateway, body, { usage, caller, holdMs, keepaliveMs, scope, id, created, stream, session, meta, t0 });
   if (!stream) {
     const { text, usage: u, session: sid, retries, cutAt, toolCalls } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), scope });
     if (toolCalls.length) throw noResponsesToolCalls();
@@ -500,12 +507,59 @@ async function handleResponses(req, res, gateway, { usage, log, holdMs = STREAM_
 }
 
 /**
- * The Responses face has no writer for a tool call yet (function_call output items come with the
- * Responses tools, design U12). Until then an answer that is a call fails out loud: dropping it
- * would hand the client an empty answer that looks finished.
+ * A Responses request that offers tools (design U12): its route walked for a leg that takes them
+ * (gateway._toolRoute), the answer written by the Responses tool face — function_call items, or
+ * text — streamed or not, with the usage row of the other faces (toolMode, toolCalls, fallback,
+ * the bridge's session).
+ */
+async function responsesWithTools(req, res, gateway, body, { usage, caller, holdMs, keepaliveMs, scope, id, created, stream, session, meta, t0 }) {
+  const out = { mode: null };
+  const tools = { spec: responsesToolSpec(body), messages: responsesToolMessages(body), face: 'responses', state: out, caller, relay: null };
+  const messages = responsesMessages(body);
+  const request = { tools: body.tools, tool_choice: body.tool_choice, parallel_tool_calls: body.parallel_tool_calls };
+  if (!stream) {
+    const { text, usage: u, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), scope, tools });
+    const calls = toolCalls.map((c) => faceCall(c, 'responses'));
+    const payload = responsesBody({ id, model: body.model, created, text, usage: u, toolCalls: calls, request });
+    meta.done = true;
+    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, ...failedMarks(out.failed, u), stream: false, via: '/v1/responses', ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }) });
+    if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
+    return json(res, 200, payload, sid);
+  }
+  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), scope, tools }), holdMs);
+  startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
+  const face = new ResponsesStream(res, { id, model: body.model, created, request, keepaliveMs });
+  meta.face = face;
+  face.open();
+  let u = null;
+  let errMessage = null;
+  let retries = 0;
+  let cutAt = null;
+  let toolMode = null;
+  let fallback = null;
+  let bridge = null;
+  for await (const evt of events) {
+    if (evt.type === 'retry') retries++;
+    else if (evt.type === 'cut') cutAt = evt.tool;
+    else if (evt.type === 'delta') face.text(evt.text);
+    else if (evt.type === 'tool_call') face.toolCall(faceCall(evt, 'responses'));
+    else if (evt.type === 'tool_mode') [toolMode, fallback, bridge] = [evt.mode || null, evt.fallback || null, evt.bridge || null];
+    else if (evt.type === 'usage') u = mergeUsage(u, evt.usage);
+    else if (evt.type === 'error') errMessage = redactSecrets(evt.message); // written to the client below
+    else if (evt.type === 'done') break;
+  }
+  face.finish({ usage: u, error: errMessage });
+  meta.done = true;
+  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...failedMarks(out.failed, u), stream: true, error: errMessage, via: '/v1/responses', ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }) });
+}
+
+/**
+ * A Responses request that offers no tools never gets a call: no engine answers it with one. Should
+ * one come all the same, it fails out loud — dropping it would hand the client an empty answer that
+ * looks finished.
  */
 function noResponsesToolCalls() {
-  return new LlmError('this answer is a tool call, and /v1/responses does not carry tool calls yet — use /v1/chat/completions or /v1/messages', { status: 501, type: 'invalid_request_error' });
+  return new LlmError('this answer is a tool call, and the request offered no tools', { status: 502 });
 }
 
 async function handleEmbeddings(req, res, gateway, { usage, scope = null } = {}) {

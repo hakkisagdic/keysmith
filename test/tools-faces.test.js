@@ -187,7 +187,51 @@ const REF = {
   openaiStream: sse(fixture('openai-chat-tool-calls.sse')),
   anthropic: JSON.parse(fixture('anthropic-messages-tool-use.json')).body,
   anthropicStream: sse(fixture('anthropic-messages-tool-use.sse')),
+  responses: JSON.parse(fixture('openai-responses-function-call.json')).body,
+  responsesStream: sse(fixture('openai-responses-function-call.sse')),
 };
+
+const R_TOOLS = [{ type: 'function', name: 'get_weather', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } }];
+const responses = (model, extra = {}) => post('/v1/responses', { model, input: 'Weather in Ankara?', tools: R_TOOLS, ...extra });
+
+/**
+ * What the openai SDK's Responses stream accumulator does with events (ResponseStreamState): the
+ * snapshot starts as response.created's response; items are appended at output_item.added and
+ * found again by output_index; text and arguments are appended; the final response is
+ * response.completed's.
+ */
+function responsesAccumulate(events) {
+  let snapshot = null;
+  let final = null;
+  for (const { data } of events) {
+    if (data.type === 'error') throw new Error(`stream error: ${data.message}`);
+    if (!snapshot) {
+      if (data.type !== 'response.created') throw new Error(`expected response.created before ${data.type}`);
+      snapshot = structuredClone(data.response);
+      continue;
+    }
+    if (data.type === 'response.output_item.added') snapshot.output.push(structuredClone(data.item));
+    else if (data.type === 'response.content_part.added') snapshot.output[data.output_index].content.push(structuredClone(data.part));
+    else if (data.type === 'response.output_text.delta') snapshot.output[data.output_index].content[data.content_index].text += data.delta;
+    else if (data.type === 'response.function_call_arguments.delta') snapshot.output[data.output_index].arguments += data.delta;
+    else if (data.type === 'response.completed') final = data.response;
+  }
+  if (!final) throw new Error("no response.completed: the stream did not finish");
+  return { snapshot, final };
+}
+const responsesKind = ({ data }) => (data.item ? `${data.type}:${data.item.type}` : data.type);
+/**
+ * The reference with what keysmith cannot know and does not invent: no sampling values
+ * (temperature, top_p: null, as the API allows), and the request's own tools, echoed.
+ */
+function asKeysmithWouldSay(ref) {
+  const r = structuredClone(ref);
+  const fix = (resp) => Object.assign(resp, { temperature: null, top_p: null, tools: R_TOOLS });
+  if (r.object === 'response') return fix(r);
+  return r.map((e) => (e.data.response ? { ...e, data: { ...e.data, response: fix(e.data.response) } } : e));
+}
+/** Fields the API sends that no SDK needs and keysmith has no value for. */
+const RESPONSES_OPTIONAL = ['background', 'max_output_tokens', 'max_tool_calls', 'previous_response_id', 'prompt_cache_key', 'reasoning', 'safety_identifier', 'service_tier', 'store', 'text', 'top_logprobs', 'truncation', 'user', 'tools[].strict', 'tools[].description'];
 
 /**
  * What an OpenAI SDK's stream accumulator does with chunks: concatenate strings, keep index and
@@ -569,12 +613,88 @@ test('an error event after a call or text: streamed, both faces end in their err
   assert.equal(JSON.parse(plain.text).choices[0].message.tool_calls.length, 1);
 });
 
-test('/v1/responses has no tool-call writer yet: an answer that is a call fails out loud instead of arriving empty', async () => {
+/* --------------------------------------------------------------------- Responses */
+
+/** RESPONSES_OPTIONAL, wherever a response object sits in an event (`response.…`), and the logprobs of a text part. */
+const R_OPT = [...RESPONSES_OPTIONAL, ...RESPONSES_OPTIONAL.map((p) => `response.${p}`), 'part.logprobs', 'item.content[].logprobs', 'response.output[].content[].logprobs'];
+
+test('the Responses reference answers read as the SDK reads them (the accumulator here is the one the face is held to)', () => {
+  const { snapshot, final } = responsesAccumulate(REF.responsesStream);
+  assert.deepEqual(snapshot.output.map((o) => o.type), ['message', 'function_call']);
+  assert.equal(snapshot.output[0].content[0].text, 'Let me check.');
+  assert.equal(snapshot.output[1].arguments, '{"city":"Ankara"}');
+  assert.deepEqual(final.output.map((o) => o.type), ['message', 'function_call']);
+  assert.equal(REF.responses.output[0].type, 'function_call');
+  assert.deepEqual(REF.responsesStream.map((e) => e.data.sequence_number), REF.responsesStream.map((_, i) => i));
+});
+
+test('Responses, not streamed: a function_call item (fc_ item id, keysmith\'s call_ id), status completed — the reference shape', async () => {
+  const r = await responses('fake/one-call');
+  assert.equal(r.status, 200, r.text);
+  const body = JSON.parse(r.text);
+  assert.deepEqual(shapeDiff(asKeysmithWouldSay(REF.responses), body, { optional: RESPONSES_OPTIONAL, extra: ['output_text'] }), []);
+  const [item] = body.output;
+  assert.equal(item.type, 'function_call');
+  assert.match(item.id, /^fc_[0-9a-f]{24}$/);
+  assert.match(item.call_id, /^call_[0-9a-f]{24}$/);
+  assert.deepEqual([item.name, JSON.parse(item.arguments), item.status], ['get_weather', { city: 'Ankara' }, 'completed']);
+  assert.equal(body.status, 'completed');
+  assert.deepEqual(body.tools, R_TOOLS, 'the request\'s tools, echoed as the API does');
+  assert.deepEqual(body.usage, { input_tokens: 120, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, output_tokens: 30, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 150 });
+  const pre = JSON.parse((await responses('fake/preamble')).text);
+  assert.deepEqual(pre.output.map((o) => o.type), ['message', 'function_call'], 'a preamble is a message item before the call');
+  assert.equal(pre.output_text, 'Let me check.');
+  const two = JSON.parse((await responses('fake/two-calls')).text);
+  assert.deepEqual(two.output.map((o) => JSON.parse(o.arguments).city), ['Ankara', 'Izmir']);
+  assert.equal(new Set(two.output.map((o) => o.id)).size, 2);
+});
+
+test('Responses, streamed: the reference sequence, each event in its reference shape, and what the SDK accumulates is response.completed\'s output', async () => {
+  const r = await responses('fake/preamble', { stream: true });
+  assert.equal(r.status, 200, r.text);
+  const events = sse(r.text);
+  assert.deepEqual(runs(events, responsesKind), runs(REF.responsesStream, responsesKind));
+  assert.deepEqual(framesMatch(asKeysmithWouldSay(REF.responsesStream), events, responsesKind, { optional: R_OPT, extra: [] }), []);
+  assert.deepEqual(events.map((e) => e.data.sequence_number), events.map((_, i) => i));
+  const { snapshot, final } = responsesAccumulate(events);
+  assert.deepEqual(snapshot.output.map((o) => [o.type, o.type === 'message' ? o.content[0].text : JSON.parse(o.arguments)]), [['message', 'Let me check.'], ['function_call', { city: 'Ankara' }]]);
+  assert.deepEqual(final.output.map((o) => o.id), snapshot.output.map((o) => o.id), 'the same items, by id');
+  assert.equal(final.usage.input_tokens, 120);
+  const two = sse((await responses('fake/two-calls', { stream: true })).text);
+  assert.deepEqual(two.filter((e) => e.data.type === 'response.output_item.added').map((e) => e.data.output_index), [0, 1]);
+  assert.deepEqual(responsesAccumulate(two).snapshot.output.map((o) => JSON.parse(o.arguments).city), ['Ankara', 'Izmir']);
+  const text = responsesAccumulate(sse((await responses('fake/text', { stream: true })).text));
+  assert.deepEqual(text.final.output.map((o) => [o.type, o.content[0].text]), [['message', 'just text']]);
+});
+
+test('Responses, streamed: quiet while an engine buffers gets keepalive comments; a failure after a call is an error event and response.failed, never response.completed', async () => {
+  const slow = await responses('fake/slow-call', { stream: true });
+  assert.match(slow.text, /\n: keepalive\n/);
+  assert.equal(responsesAccumulate(sse(slow.text)).snapshot.output.length, 1);
+  const broken = sse((await responses('fake/throw-after-call', { stream: true })).text);
+  const kinds = broken.map((e) => e.data.type);
+  assert.deepEqual(kinds.slice(-2), ['error', 'response.failed']);
+  assert.ok(!kinds.includes('response.completed'));
+  assert.match(broken.at(-2).data.message, /^keysmith: the engine broke after the call/);
+  assert.equal(broken.at(-1).data.response.status, 'failed');
+  assert.throws(() => responsesAccumulate(broken), /stream error/);
+});
+
+test('Responses: the usage row says how many calls went out, never an argument', async () => {
+  await responses('fake/mode');
+  const row = usageLog.tail(1)[0];
+  assert.equal(row.via, '/v1/responses');
+  assert.equal(row.toolCalls, 1);
+  assert.equal(row.toolMode, 'emulate');
+  assert.ok(!JSON.stringify(row).includes(ARG_SENTINEL));
+});
+
+test('/v1/responses without tools: an answer that is a call (no engine makes one; a misbehaving adapter could) fails out loud instead of arriving empty', async () => {
   const plain = await post('/v1/responses', { model: 'fake/one-call', input: 'Weather in Ankara?' });
-  assert.equal(plain.status, 501, plain.text);
-  assert.match(JSON.parse(plain.text).error.message, /does not carry tool calls yet/);
+  assert.equal(plain.status, 502, plain.text);
+  assert.match(JSON.parse(plain.text).error.message, /the request offered no tools/);
   const streamed = await post('/v1/responses', { model: 'fake/one-call', input: 'Weather in Ankara?', stream: true });
-  assert.match(streamed.text, /does not carry tool calls yet/);
+  assert.match(streamed.text, /the request offered no tools/);
   assert.doesNotMatch(streamed.text, /response\.completed/);
 });
 

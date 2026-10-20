@@ -1,0 +1,57 @@
+{
+  "_provenance": "The shape of an OpenAI Responses answer that calls a function (no preamble), written out by hand from the Responses API reference (function calling), ids and values replaced. Not a recording: keysmith's tests never reach a provider. Checked against the openai Python SDK 2.54.0 (Response.model_validate) on 2026-10-20.",
+  "body": {
+    "id": "resp_0b6a4c2e9d8f71a3c5e0d2b4a6f8c1e3",
+    "object": "response",
+    "created_at": 1760870400,
+    "status": "completed",
+    "background": false,
+    "error": null,
+    "incomplete_details": null,
+    "instructions": null,
+    "max_output_tokens": null,
+    "max_tool_calls": null,
+    "model": "gpt-4.1-2025-04-14",
+    "output": [
+      {
+        "id": "fc_0b6a4c2e9d8f71a3c5e0d2b4a6f8c1e4",
+        "type": "function_call",
+        "status": "completed",
+        "arguments": "{\"city\":\"Ankara\"}",
+        "call_id": "call_Q8vB3nT1sLx0Ka7dWm2Yp5Rz",
+        "name": "get_weather"
+      }
+    ],
+    "parallel_tool_calls": true,
+    "previous_response_id": null,
+    "prompt_cache_key": null,
+    "reasoning": { "effort": null, "summary": null },
+    "safety_identifier": null,
+    "service_tier": "default",
+    "store": true,
+    "temperature": 1.0,
+    "text": { "format": { "type": "text" }, "verbosity": "medium" },
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Current weather for a city",
+        "parameters": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"], "additionalProperties": false },
+        "strict": true
+      }
+    ],
+    "top_logprobs": 0,
+    "top_p": 1.0,
+    "truncation": "disabled",
+    "usage": {
+      "input_tokens": 71,
+      "input_tokens_details": { "cached_tokens": 0, "cache_write_tokens": 0 },
+      "output_tokens": 17,
+      "output_tokens_details": { "reasoning_tokens": 0 },
+      "total_tokens": 88
+    },
+    "user": null,
+    "metadata": {}
+  }
+}
