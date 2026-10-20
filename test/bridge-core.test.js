@@ -213,7 +213,7 @@ test('a wrong or missing token is refused, so is a second connection; a dropped 
   // No token at all: the shim refuses to start.
   const none = client({ KEYSMITH_BRIDGE_SOCK: s.env.KEYSMITH_BRIDGE_SOCK });
   assert.equal(await none.exited, 2);
-  assert.match(none.stderr, /KEYSMITH_BRIDGE_TOKEN must be set/);
+  assert.match(none.stderr, /KEYSMITH_BRIDGE_TOKEN \(or KEYSMITH_BRIDGE_TOKEN_FILE\) must be set/);
   assert.ok(log.some((l) => /a connection was refused: a wrong or missing token/.test(l)), log.join('\n'));
   // One connection per session.
   const first = client(s.env);
@@ -230,6 +230,24 @@ test('a wrong or missing token is refused, so is a second connection; a dropped 
   const third = client(s.env);
   assert.deepEqual((await third.rpc('ping')).result, {});
   third.close();
+  await s.close('done');
+});
+
+test('the token from a file (KEYSMITH_BRIDGE_TOKEN_FILE, for a CLI that takes its MCP servers on the command line): it connects; a file it cannot read is an exit 2 that names no path or token', async () => {
+  const { dir, open } = await setup();
+  const s = open();
+  const file = path.join(dir, 'ks-b-token');
+  fs.writeFileSync(file, `${s.token}\n`, { mode: 0o600 });
+  const c = client({ KEYSMITH_BRIDGE_SOCK: s.env.KEYSMITH_BRIDGE_SOCK, KEYSMITH_BRIDGE_TOKEN_FILE: file });
+  const hs = await within(handshake(c), 3000);
+  assert.notEqual(hs, 'timeout', `the shim did not connect with the token from the file: ${c.stderr}`);
+  assert.deepEqual(hs.list.result.tools.map((t) => t.name), ['get_weather', 'note']);
+  c.close();
+  await c.exited;
+  const missing = client({ KEYSMITH_BRIDGE_SOCK: s.env.KEYSMITH_BRIDGE_SOCK, KEYSMITH_BRIDGE_TOKEN_FILE: path.join(dir, 'gone') });
+  assert.equal(await missing.exited, 2);
+  assert.match(missing.stderr, /cannot read the session's token file \(ENOENT\)/);
+  assert.doesNotMatch(missing.stderr, /gone|ks-b-/);
   await s.close('done');
 });
 

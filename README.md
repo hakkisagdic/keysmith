@@ -174,11 +174,12 @@ takes the tools the way it can:
 - **A CLI without one** (`toolMode` absent or `off`: `claude`, `kiro` and the profiles marked
   `unsafeTools`) is passed by.
 
-Which built-in profile answers how: `agy` with `auto` (the MCP bridge, EMULATE where the bridge
-cannot); `opencode`, `codex` and `qoder` with `emulate`, through the same tool-less agent and argv
-as their text runs (each answered the JSON protocol strictly in a live round trip: opencode on
-`evren/deepseek-v4-flash`, codex on `gpt-5.6-luna`, qoder on its default model); `claude` never
-(every request spends your subscription); `kiro` not yet — its EMULATE argv (`emulateArgs`) is in
+Which built-in profile answers how: `agy`, `opencode`, `codex` and `qoder` with `auto` — the MCP
+bridge, and EMULATE where the bridge cannot, through the same tool-less agent and argv as their
+text runs. Each answered a two-turn round trip live both ways (2026-10-20: opencode on
+`evren/deepseek-v4-flash`, codex on `gpt-5.6-luna`, qoder on its default model; agy is the live
+acceptance's). `claude` never (every request spends your subscription; its bridge driver is
+written from its `--help` and never run); `kiro` not yet — its EMULATE argv (`emulateArgs`) is in
 the profile and checked against a stub of its stream, but no live run got past its overage limit,
 so `keysmith set kiro toolMode emulate` is yours to make once one does.
 
@@ -193,7 +194,7 @@ answering. `keysmith set agy toolMode off` puts it back the way it was.
 |---|---|
 | `off` (absent) | nothing: the leg is passed by |
 | `emulate` | EMULATE, below |
-| `mcp` | the MCP bridge, below, always: a `tool_choice` that forces a call is a 400 (MCP cannot make a model call a tool), so are the older `functions` (no call id to continue a session by), a bridge with no room a 503 with `retry-after`, a CLI with no bridge driver (only agy has one) a 503 |
+| `mcp` | the MCP bridge, below, always: a `tool_choice` that forces a call is a 400 (MCP cannot make a model call a tool), so are the older `functions` (no call id to continue a session by), a bridge with no room a 503 with `retry-after`, a CLI with no bridge driver (agy, opencode, codex and qoder have one) a 503 |
 | `auto` | the bridge where it can take the request, EMULATE otherwise, and EMULATE in the same request when the bridge fails before any call went out. `tool_choice: "none"` is a text answer; `required` or a named tool is EMULATE (MCP cannot make a model call a tool); tool names too long for the bridge, a bridge with no room, a CLI with no bridge driver, the older `functions` is EMULATE — with the reason in the usage row (`fallback`: `name_too_long`, `bridge_full`, `no_bridge`, `legacy`, or what made the bridge fail: `unknown_agent`, `ready_timeout`, …) |
 
 Any mode but `off` needs the entry's `cwd`: a tool engine runs the CLI only in an empty
@@ -222,72 +223,100 @@ is data, not instructions. The most an instruction hidden in one can do is make 
 write a call — checked against the client's schema, then the client's to approve, as a
 provider's would be.
 
-**The MCP bridge** (agy, `toolMode` `auto` or `mcp`). agy runs with one MCP server whose tools
-are the request's own, and the model calls them the way it calls any tool. That server is
-keysmith: agy starts a shim (`node src/bridge/shim.js`) that relays to the gateway over a Unix
-socket — 0600, under `~/.local/share/keysmith/run/`, no TCP, so no tunnel reaches it — with a
-token per session. A call the client's schema refuses goes back to the model with the reason,
-and the model tries again (three such calls in one turn fail it). A call that fits goes to the
-client as `tool_calls`, with keysmith's id, and the HTTP answer ends there, while agy waits in
-the same process on its call. The client runs the tool and sends the result in its next
-request, as it would to a provider: keysmith finds the session the call belongs to and gives
-agy the result as the call's MCP result, and what agy does next — text, or its next call — is
-that request's answer. A turn after the first sends agy one tool result, not the transcript
-again. agy runs the calls of one step one after another, so a step with three calls is three
-HTTP turns of one call each, whatever `parallel_tool_calls` says. Text the model writes before
-a call stays in the answer that carries it.
+**The MCP bridge** (agy, opencode, codex, qoder; `toolMode` `auto` or `mcp`). The CLI runs
+with one MCP server whose tools are the request's own, and the model calls them the way it
+calls any tool. That server is keysmith: the CLI starts a shim (`node src/bridge/shim.js`) that
+relays to the gateway over a Unix socket — 0600, under `~/.local/share/keysmith/run/`, no TCP,
+so no tunnel reaches it — with a token per session. A call the client's schema refuses goes back
+to the model with the reason, and the model tries again (three such calls in one turn fail it).
+A call that fits goes to the client as `tool_calls`, with keysmith's id, and the HTTP answer ends
+there, while the CLI waits in the same process on its call. The client runs the tool and sends
+the result in its next request, as it would to a provider: keysmith finds the session the call
+belongs to and gives the CLI the result as the call's MCP result, and what it does next — text,
+or its next call — is that request's answer. A turn after the first sends the CLI one tool
+result, not the transcript again. Text the model writes before a call stays in the answer that
+carries it. agy, codex and qoder run the calls of one step one after another (asked for two at
+once, codex and qoder sent the second only after the first one's result), so a step with three
+calls is three HTTP turns of one call each, whatever `parallel_tool_calls` says. opencode sends
+them at once: the calls that arrive within 600 ms of each other go out in one answer, and the
+next request brings all their results (with `parallel_tool_calls: false`, one call per answer,
+the others waiting in the session).
+
+How each CLI is given the server, and kept to it (src/bridge/agy.js, src/bridge/clis.js):
+
+| CLI | The session's server | What else it may call |
+|---|---|---|
+| agy | a session agent `.agents/agents/ks-b-<rid>.md` with `mcpServers` as a list, every tool `eager` | nothing: `tools: []`, no inherited MCP servers or customizations, no harness sections |
+| opencode | `OPENCODE_CONFIG` names the session's config: `mcp.<server>` (`local`, its `timeout` past `toolResultTimeoutMs`) and an inline agent (`--agent ks-b-<rid>`), merged under the workspace's deny-all `opencode.json` | permission and tools `"*"` denied, `<server>_*` alone allowed; `--pure`: no plugin |
+| codex | `-c mcp_servers.<server>.…` on its command line, the token in a 0600 file the shim reads (`KEYSMITH_BRIDGE_TOKEN_FILE`), never in the argv; `default_tools_approval_mode="approve"` for that server alone (with `approval_policy="never"` an unapproved MCP call is refused), `tool_timeout_sec` past `toolResultTimeoutMs` | the text argv's: no shell, read-only sandbox, no web search, no user config; `--ephemeral`, so no session on disk |
+| qoder | `--mcp-config <file> --strict-mcp-config`, `--allowed-tools mcp__<server>` | `--tools ""`; `--setting-sources project` and `--settings '{"disableAllHooks":true}'` (with project settings alone, your plugin hooks still ran headless); `--no-session-persistence`; every inherited `QODER_*` variable left out |
+
+A request's tool names must fit under the model's 64-character limit behind the name the CLI
+gives a bridge tool: `mcp_ks<rid6>_` on agy, `ks<rid6>_` on opencode, `mcp__ks<rid6>__` on codex
+and qoder. A longer one is EMULATE's (`fallback: "name_too_long"`).
 
 A request continues a session only when it is the same conversation: its last assistant turn
-holds the call the session waits for and the result follows it, with nothing after the result,
-it comes with the same gateway key, for the same target, with the same tools and the same
-system and user turns. Anything else — another key presenting a valid id, an edited history, a
+holds exactly the calls the session waits for and one result for each follows it, with nothing
+after the results, it comes with the same gateway key, for the same target, with the same tools
+and the same system and user turns. Anything else — another key presenting a valid id, an edited history, a
 session that is gone, a conversation that goes on after its calls were answered — runs on a new
 session whose prompt carries the conversation so far, earlier calls and fenced results written
 the EMULATE way (the cold path, `"path": "cold"` in the row; a result for a session that
 expired is logged as late). A result with text of the user's after it — a `/v1/messages` user
 turn that holds the `tool_result` and then a `text` block, as Claude Code-style clients send
-reminders; a user message after the `tool` message — is the cold path too: agy can be given a
-call's result while it waits, not a user turn, and text folded into the result would reach the
+reminders; a user message after the `tool` message — is the cold path too: a waiting CLI can be
+given a call's result, not a user turn, and text folded into the result would reach the
 model as a tool's output, which it is told is data. The session that waited for that result is
 closed then. A second request carrying a result that another request is already answering is a
 409. The older `functions`/`function_call` carry no call id a later request could continue, so
 `auto` answers them with EMULATE (`fallback: "legacy"`) and `mcp` refuses them with a 400.
 
-- **Clock.** `bridge.readyTimeoutMs` (30 s): agy lists the bridge's tools within it, and until
-  it has, nothing of the answer goes out — so a session that fails before that (an agent agy
-  cannot find, a shim that never connects, an exit) leaves the same request to EMULATE under
-  `auto`. `timeoutMs` counts agy generating only, up to its next call or its end.
-  `bridge.toolResultTimeoutMs` (300 s) is how long a session waits for the client's result;
-  then agy is stopped and its files removed, and the result, when it comes, is answered on the
-  cold path — a tool behind a slow human approval still works, at the price of a cold turn.
-  `bridge.sessionMaxMs` (30 min) and `bridge.maxTurns` (32 calls) cap a session; past them the
-  conversation goes on on a new one. A client that leaves in the middle of a turn stops agy.
-- **Room.** Each waiting session is a live agy process — about 1 GB measured on agy 1.4.2, most
-  of it the MCP servers of your own agy config, which agy starts for every run although the
-  session's agent inherits none of them (they are not offered to the model: a one-tool turn cost
-  ~1,300 input tokens). So `bridge.maxSessions` is 2 per adapter, `limits.bridge.maxSessions` 2
-  in all, and `limits.bridge.maxSessionsPerKey` 1 — a key that opens a session over its share
-  gives up its oldest waiting one. With no room, `auto` is EMULATE and `mcp` a 503. A waiting
-  session holds no process slot (`maxConcurrent`), so agy's text requests are not held up by
-  clients running tools.
-- **What agy may call.** The session's agent is as tool-less as `keysmith-tools` — `tools: []`,
-  no inherited MCP servers or customizations, no harness sections, no hooks — with the request's
-  tools as its only ones, each `eager` (agy's lazy `call_mcp_tool` is refused headless). A call
-  in agy's stream to anything but the bridge's tools (`mcp_ks<rid6>_…`) and `manage_task` stops
-  the run at once, whether a request is reading it or a call of its is with the client: the
-  request is a 502 that is never answered another way — not by EMULATE, not by the route's next
-  leg, an HTTP upstream included — the log says `SECURITY … foreign tool` and the usage row
+- **Clock.** `bridge.readyTimeoutMs` (30 s): the CLI lists the bridge's tools within it, and
+  until it has, nothing of the answer goes out — so a session that fails before that (an agent
+  agy cannot find, a config opencode does not read, a shim that never connects, an exit) leaves
+  the same request to EMULATE under `auto`. `timeoutMs` counts the CLI generating only, up to its
+  next call or its end. `bridge.toolResultTimeoutMs` (300 s) is how long a session waits for the
+  client's result; then the CLI is stopped and its files removed, and the result, when it comes,
+  is answered on the cold path — a tool behind a slow human approval still works, at the price
+  of a cold turn. opencode and codex are told to wait 30 s longer than that on a call (their own
+  default is 60 s), so keysmith's clock ends a session first. `bridge.sessionMaxMs` (30 min) and
+  `bridge.maxTurns` (32 calls) cap a session; past them the conversation goes on on a new one. A
+  client that leaves in the middle of a turn stops the CLI.
+- **Room.** Each waiting session is a live CLI process. Measured while a call waited: agy 1.4.2
+  about 1 GB, most of it the MCP servers of your own agy config, which agy starts for every run
+  although the session's agent inherits none of them (they are not offered to the model: a
+  one-tool turn cost ~1,300 input tokens); opencode 1.19.3 about 690 MB, qodercli 1.1.59 about
+  370 MB, codex 0.163 about 110 MB (each with the ~50 MB shim). So `bridge.maxSessions` is 2 per
+  adapter, `limits.bridge.maxSessions` 2 in all, and `limits.bridge.maxSessionsPerKey` 1 — a key
+  that opens a session over its share gives up its oldest waiting one. With no room, `auto` is
+  EMULATE and `mcp` a 503. A waiting session holds no process slot (`maxConcurrent`), so the
+  CLI's text requests are not held up by clients running tools.
+- **What the CLI may call.** Its session has the request's tools as its only ones (the table
+  above). A call in its stream to anything but the bridge's tools and the one harness tool each
+  CLI keeps that runs nothing — agy's `manage_task`, opencode's `invalid` (its answer to a call
+  of a tool it does not have), qoder's `mcp_get` (reads a tool's schema) — stops the run at once,
+  whether a request is reading it or a call of its is with the client: the request is a 502
+  that is never answered another way — not by EMULATE, not by the route's next leg, an HTTP
+  upstream included — the log says `SECURITY … foreign tool` and the usage row
   `failure: "foreign_tool"`. A call that was with the client goes nowhere: the request that
   brings its result gets the same 502 (another key's request with that history is a new one).
-  keysmith still runs no tool.
-- **Files.** `.agents/agents/ks-b-<rid>.md` in agy's workspace (0600; it holds the session's
-  token) and agy's schema cache for the server, `~/.gemini/antigravity-cli/mcp/ks<rid6>/` —
-  both removed when the session closes, and every session is closed when the gateway stops. A
-  gateway that was killed leaves them; the next `keysmith serve` removes the ones older than an
-  hour.
-- **What it rests on.** agy 1.4.2 behaviour no document promises: `mcpServers` as a list, the
-  `eager` key, the `mcp_<server>_<tool>` names, the `server/discover` it asks first, the schema
-  cache. An agy that changes one fails the readiness gate, and `auto` answers with EMULATE.
+  On codex any item that is not text, reasoning, its plan or a warning is such a call (a shell
+  command, a file change, a web search, a sub-agent, an item type keysmith has never seen);
+  opencode reports a call only once it has finished, so there the tripwire comes after the fact
+  of a call its config already denied. keysmith still runs no tool.
+- **Files.** agy: `.agents/agents/ks-b-<rid>.md` in its workspace (0600; it holds the session's
+  token) and agy's schema cache for the server, `~/.gemini/antigravity-cli/mcp/ks<rid6>/`.
+  opencode, codex, qoder: `.keysmith-bridge/ks-b-<rid>.*` in the workspace (a 0700 directory;
+  each file 0600). All removed when the session closes, and every session is closed when the
+  gateway stops. A gateway that was killed leaves them; the next `keysmith serve` removes the
+  ones older than an hour. opencode keeps each run's session in its own storage, as it does for
+  a text run; codex (`--ephemeral`) and qoder (`--no-session-persistence`) keep none.
+- **What it rests on.** Behaviour no document promises: agy 1.4.2's `mcpServers` as a list, its
+  `eager` key, its `mcp_<server>_<tool>` names, the `server/discover` it asks first, its schema
+  cache; opencode's `OPENCODE_CONFIG` merge and inline agents, codex's per-server
+  `default_tools_approval_mode`, qoder's `disableAllHooks`. A CLI that changes one fails the
+  readiness gate, and `auto` answers with EMULATE — except an approval codex stops honouring:
+  its call is refused before it reaches keysmith, and the model answers in text without it.
 
 The usage row of a bridge turn says which session answered and how it was reached:
 `"bridge": {"session": "ks3f9a0c", "path": "new" | "attached" | "cold", "turn": 2}`.
@@ -444,6 +473,7 @@ hand-written adapter one too.
 |---|---|---|
 | `agy` | `--agent keysmith-text`: an agent file with `tools: []`, no MCP, no customizations; `stopAtToolCall` for the one tool agy keeps. A tool request (EMULATE) runs `--agent keysmith-tools`, the same `tools: []` agent with the JSON protocol as its prompt: the calls go to the client, agy runs none | live, agy 1.3.3; the tool protocol probed on agy 1.4.2 |
 | `agy`, MCP bridge | a tool request on the bridge runs `--agent ks-b-<rid>`, a session agent as tool-less as `keysmith-tools` whose one MCP server is keysmith (a Unix socket, a token per session) offering the request's tools and nothing else; each call goes to the client, never run by agy or keysmith; a call to any other tool stops the run (502, the tripwire) | stub agy in the tests; the MCP shape (list, `eager`, `mcp_<server>_<tool>`, `server/discover`, a held tools/call) probed on agy 1.4.2; live, agy 1.4.2 on gemini-3.8-flash-low: two turns of one call through both faces on one agy process, nothing left after |
+| `opencode`, `codex`, `qoder`, MCP bridge | the text argv's tool-less switches, and one MCP server — keysmith, over the same socket and per-session token — offering the request's tools and nothing else: opencode an inline session agent that allows `<server>_*` alone (`OPENCODE_CONFIG`, over the workspace's deny-all `opencode.json`); codex that server approved alone (`approval_policy="never"` refuses any other call), the token in a 0600 file, never the argv; qoder `--strict-mcp-config`, no built-in tool, no hooks, no inherited `QODER_*`; each call goes to the client, never run by the CLI or keysmith; a call to any other tool stops the run (502, the tripwire) | stub CLIs in the tests; live 2026-10-20 on opencode 1.19.3, codex 0.163.0, qodercli 1.1.59: two turns of one call on one process each, opencode's two calls of one step in one answer, and nothing — process, shim, session file — left after a session closed |
 | `kiro` | `--agent keysmith-text`: `tools: []`, `mcpServers: {}`, `includeMcpJson: false`, `resources: []`; `--trust-tools=` trusts nothing; `stopAtToolCall` | argv and agent file accepted by kiro-cli 2.27.1; its first live run was refused for quota before any text |
 | `claude` | `--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--disable-slash-commands`, `--safe-mode`, `--max-turns 1` | parsed by Claude Code 2.1.261; no live request sent |
 | `qoder` | `--tools ""`, `--strict-mcp-config` | parsed by qodercli 1.1.59 |
@@ -757,12 +787,12 @@ again to rewrite it.
 | Profile | Kind | Status |
 |---|---|---|
 | `cmd` | cli | verified live against Command Code 1.66.0 — **`unsafeTools`**: a `-p` run approves its own tool calls, so it ships disabled, see [above](#agents-that-could-act-on-this-machine) |
-| `opencode` | cli | verified live against opencode 1.18.27; tool-less agent checked against a stub endpoint (no `--auto`); its free `opencode/*` models refuse the tool-less run (403); answers tool requests with EMULATE (`toolMode: "emulate"`, a live round trip on opencode 1.19.3) |
-| `qoder` | cli | verified with `-p`; its `-o json/stream-json` modes fail inside a nested agent session; tool-less flags parsed by 1.1.59; answers tool requests with EMULATE (`toolMode: "emulate"`, a live round trip on 1.1.59) |
+| `opencode` | cli | verified live against opencode 1.18.27; tool-less agent checked against a stub endpoint (no `--auto`); its free `opencode/*` models refuse the tool-less run (403); answers tool requests (`toolMode: "auto"`: the MCP bridge, EMULATE where it cannot — both live round trips on opencode 1.19.3) |
+| `qoder` | cli | verified with `-p`; its `-o json/stream-json` modes fail inside a nested agent session; tool-less flags parsed by 1.1.59; answers tool requests (`toolMode: "auto"`: the MCP bridge with `-o stream-json`, EMULATE where it cannot — both live round trips on 1.1.59) |
 | `claude` | cli | tool-less flags and stream-json shape checked against Claude Code 2.1.261; no live request; explicit-only as shipped |
 | `agy` | cli | verified live against Antigravity CLI 1.3.3 — your Google login, no key; runs as a tool-less text agent (~600-token prompt instead of ~20k), see [docs/adapters.md](docs/adapters.md#agy-as-a-plain-text-model); answers tool requests too (`toolMode: "auto"`: the MCP bridge, EMULATE where the bridge cannot — see [docs/adapters.md](docs/adapters.md#agy-and-tool-requests-the-mcp-bridge)) |
 | `kiro` | cli | Kiro CLI 2.27.1 — tool-less agent, `stream-json`, model list as JSON; the first live run was refused for quota before any text, see [docs/adapters.md](docs/adapters.md#kiro-as-a-plain-text-model); tool requests pass it by (`toolMode: "off"`): its EMULATE argv is checked against a stub only |
-| `codex` | cli | argv run against a stub Responses endpoint with codex 0.163.0 (read-only, no shell, no web search); gpt-6-* keep sub-agent tools; answers tool requests with EMULATE (`toolMode: "emulate"`, a live round trip on `gpt-5.6-luna`) |
+| `codex` | cli | argv run against a stub Responses endpoint with codex 0.163.0 (read-only, no shell, no web search); gpt-6-* keep sub-agent tools; answers tool requests (`toolMode: "auto"`: the MCP bridge with `exec --json`, EMULATE where it cannot — both live round trips on `gpt-5.6-luna`) |
 | `warp` | cli | Warp's `oz` agent CLI, ndjson verified live — **`unsafeTools`**: ships disabled, never an alias leg, see [above](#agents-that-could-act-on-this-machine) |
 | `gemini` | cli | documented argv shape, not run against a live install — **`unsafeTools`** until a tool-less argv is checked: ships disabled |
 | `openai`, `anthropic`, `openrouter`, `groq`, `deepseek`, `together` | http | standard endpoints |

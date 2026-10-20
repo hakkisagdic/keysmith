@@ -148,7 +148,7 @@ const OPENCODE_WORKSPACE_CONFIG = `${JSON.stringify(
 /**
  * `codex exec` without a shell and without anything that writes, as far as 0.163's own switches
  * go (the codex profile says what each one removes, and what no switch does). One list, so every
- * run of codex keysmith makes — text, EMULATE — takes the tools away the same way.
+ * run of codex keysmith makes — text, EMULATE, the MCP bridge — takes the tools away the same way.
  */
 const CODEX_TOOL_LESS = [
   '--skip-git-repo-check',
@@ -174,6 +174,24 @@ const CODEX_TOOL_LESS = [
   '--color', 'never',
 ];
 const codexArgs = () => ['exec', ...CODEX_TOOL_LESS, ['--model', '{model}'], '--', '{prompt}'];
+/**
+ * The bridge's codex run: the same switches, `--json`, and the session's one MCP server
+ * (`{server}`, its command, args and env filled in per session by src/bridge/clis.js).
+ */
+const codexBridgeArgs = () => [
+  'exec',
+  '--json',
+  ...CODEX_TOOL_LESS,
+  '-c', 'mcp_servers.{server}.command={mcpCommand}',
+  '-c', 'mcp_servers.{server}.args={mcpArgs}',
+  '-c', 'mcp_servers.{server}.env={mcpEnv}',
+  '-c', 'mcp_servers.{server}.default_tools_approval_mode="approve"',
+  '-c', 'mcp_servers.{server}.startup_timeout_sec={readyTimeoutSec}',
+  '-c', 'mcp_servers.{server}.tool_timeout_sec={toolTimeoutSec}',
+  ['--model', '{model}'],
+  '--',
+  '{prompt}',
+];
 
 /** Where Warp installs its agent CLI on macOS. `/usr/local/bin/warp-cli` is Cloudflare WARP, a VPN client, not this. */
 const WARP_OZ_BIN = '/Applications/Warp.app/Contents/Resources/bin/oz';
@@ -222,16 +240,19 @@ export const CLI_PROFILES = {
       [`.opencode/agent/${OPENCODE_TEXT_AGENT_NAME}.md`]: OPENCODE_TEXT_AGENT,
     },
     stopAtToolCall: true,
-    // A request that offers tools: EMULATE (src/tools/emulate.js) through the same tool-less agent
-    // and argv as text — the request's prompt carries the tools and the JSON answer format. The
-    // tool-bridge probe (opencode 1.18.27, evren/deepseek-v4-flash) answered that protocol strictly:
-    // two parallel calls in one reply, then a final answer from the fenced results.
-    toolMode: 'emulate',
+    // A request that offers tools (design §4, U10/U11): the MCP bridge where it can, EMULATE
+    // otherwise. EMULATE (src/tools/emulate.js) runs the same tool-less agent and argv as text —
+    // the request's prompt carries the tools and the JSON answer format; the tool-bridge probe
+    // (opencode 1.18.27, evren/deepseek-v4-flash) answered it strictly. The bridge
+    // (src/bridge/clis.js) runs `{agent}`, the session's inline agent in the config
+    // OPENCODE_CONFIG names, whose only tools are the session's server's.
+    toolMode: 'auto',
     emulateArgs: ['run', '--format', 'json', '--pure', '--agent', OPENCODE_TEXT_AGENT_NAME, ['--model', '{model}'], '--', '{prompt}'],
+    bridge: { driver: 'opencode', args: ['run', '--format', 'json', '--pure', '--agent', '{agent}', ['--model', '{model}'], '--', '{prompt}'] },
     timeoutMs: 300_000,
     maxConcurrent: 2,
-    provenance: 'opencode 1.18.27 — `opencode run --format json` emits step_start / text / step_finish (live). The tool-less run was checked against a stub OpenAI endpoint: `--agent keysmith-text` with the workspace config sent `tools: []` (the default agent sent bash, edit, write, read, glob, grep, task, webfetch, todowrite, skill), a bash call the stub returned anyway failed as an unavailable tool and created nothing, and an unknown agent fell back to the default agent with no tools either. opencode\'s free tier (`opencode/*`) refuses this run with a 403. opencode 1.19.3 (2026-10-20): EMULATE through this argv answered a two-turn tool round trip live on evren/deepseek-v4-flash.',
-    note: 'Runs without tools: the `keysmith-text` agent (`permission: {"*": deny}`, `tools: {"*": false}`) plus an opencode.json that denies every tool, in an empty keysmith-owned workspace, with no `--auto`. Model ids are provider/model as opencode resolves them, so a provider you wired into opencode with your own key is reachable through keysmith. opencode\'s free models (`opencode/*`) are not: its free tier answered this run, and its default agent under the deny-all config, with 403 "can only be used from within OpenCode" — it answered only the default agent with its tools, which keysmith does not run. A request that offers tools is answered with EMULATE (`toolMode: "emulate"`): the same tool-less agent writes its calls as one JSON object, keysmith checks them against the client\'s schemas and hands them over as tool_calls, and opencode runs none of them.',
+    provenance: 'opencode 1.18.27 — `opencode run --format json` emits step_start / text / step_finish (live). The tool-less run was checked against a stub OpenAI endpoint: `--agent keysmith-text` with the workspace config sent `tools: []` (the default agent sent bash, edit, write, read, glob, grep, task, webfetch, todowrite, skill), a bash call the stub returned anyway failed as an unavailable tool and created nothing, and an unknown agent fell back to the default agent with no tools either. opencode\'s free tier (`opencode/*`) refuses this run with a 403. opencode 1.19.3 (2026-10-20): EMULATE through this argv answered a two-turn tool round trip live on evren/deepseek-v4-flash, and so did the MCP bridge — two calls of one step in one answer, both results back into the same process. `opencode debug config` showed OPENCODE_CONFIG merged under the workspace config, the inline agent allowed `<server>_*` alone and every built-in tool off.',
+    note: 'Runs without tools: the `keysmith-text` agent (`permission: {"*": deny}`, `tools: {"*": false}`) plus an opencode.json that denies every tool, in an empty keysmith-owned workspace, with no `--auto`. Model ids are provider/model as opencode resolves them, so a provider you wired into opencode with your own key is reachable through keysmith. opencode\'s free models (`opencode/*`) are not: its free tier answered this run, and its default agent under the deny-all config, with 403 "can only be used from within OpenCode" — it answered only the default agent with its tools, which keysmith does not run. A request that offers tools is answered too (`toolMode: "auto"`): through the MCP bridge — opencode calls the request\'s tools over MCP, keysmith hands each call to the client while opencode waits on it, and the calls of one step go out in one answer — or, where the bridge cannot, EMULATE, the same tool-less agent writing its calls as one JSON object. Either way opencode runs none of them. Each run leaves a session in opencode\'s own storage, as a text run does.',
   },
   qoder: {
     kind: 'cli',
@@ -246,14 +267,24 @@ export const CLI_PROFILES = {
     parser: 'raw',
     modelsFrom: { args: ['--list-models'] },
     cwd: '~/.local/share/keysmith/workspaces/qoder',
-    // A request that offers tools: EMULATE through the same tool-less argv as text (the tool-bridge
-    // probe, qodercli 1.1.59: two parallel calls in one strictly parseable reply).
-    toolMode: 'emulate',
+    // A request that offers tools: the MCP bridge where it can, EMULATE otherwise — through the
+    // same tool-less argv as text (the tool-bridge probe, qodercli 1.1.59: two parallel calls in
+    // one strictly parseable reply).
+    toolMode: 'auto',
     emulateArgs: ['-p', '{noSession}', '--tools', '', '--strict-mcp-config', ['--model', '{model}'], '{prompt}'],
+    // The MCP bridge's run (src/bridge/clis.js): stream-json (each call's tool_use block shows
+    // before it runs), the session's server alone (`{mcpConfig}`, --strict-mcp-config) and its
+    // tools allowed, no built-in tool, no user settings, no hooks — the user's plugin hooks
+    // (Qoder Security, qoder-context-hook) ran in a headless run until `disableAllHooks` — and no
+    // session on disk.
+    bridge: {
+      driver: 'qoder',
+      args: ['-p', '--output-format', 'stream-json', '--no-session-persistence', '--tools', '', '--strict-mcp-config', '--mcp-config', '{mcpConfig}', '--allowed-tools', 'mcp__{server}', '--setting-sources', 'project', '--settings', '{"disableAllHooks":true}', ['--model', '{model}'], '--', '{prompt}'],
+    },
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Qoder CLI 1.1.59 — `qodercli -p` prints the answer and that is the only output mode verified from here. `--no-session-persistence`, `--tools ""` and `--strict-mcp-config` are what `qodercli --help` lists, and 1.1.59 parses them; it refuses `--no-session` (unknown option). 2026-10-20: EMULATE through this argv answered a two-turn tool round trip live on the default model.',
-    note: 'Runs without tools: `--tools ""` (no built-in tool) and `--strict-mcp-config` (no MCP server), in an empty keysmith-owned workspace. Set QODER_* entrypoint vars aside (`keysmith serve` clears them) or the CLI exits 42 before it answers. `-o json` / `-o stream-json` also exit 42 with no output inside a nested agent session — those vars are how it finds its credentials — so `raw` is the default. If you run keysmith from a plain login shell, try `-o stream-json` with parser `claude-stream-json` for token counts and resume. Not on the LaunchAgent PATH by default: `keysmith add qoder --bin ~/.local/bin/qodercli`. A request that offers tools is answered with EMULATE (`toolMode: "emulate"`): the same tool-less run writes its calls as one JSON object, which keysmith checks and hands to the client as tool_calls.',
+    provenance: 'Qoder CLI 1.1.59 — `qodercli -p` prints the answer and that is the only output mode verified from here. `--no-session-persistence`, `--tools ""` and `--strict-mcp-config` are what `qodercli --help` lists, and 1.1.59 parses them; it refuses `--no-session` (unknown option). 2026-10-20: EMULATE through this argv answered a two-turn tool round trip live on the default model, and so did the MCP bridge (the bridge argv) — two calls of one step came one after the other, the second after the first one\'s result. With project settings alone the user\'s plugin hooks still ran headless; `disableAllHooks` stopped them.',
+    note: 'Runs without tools: `--tools ""` (no built-in tool) and `--strict-mcp-config` (no MCP server), in an empty keysmith-owned workspace. Set QODER_* entrypoint vars aside (`keysmith serve` clears them) or the CLI exits 42 before it answers. `-o json` / `-o stream-json` also exit 42 with no output inside a nested agent session — those vars are how it finds its credentials — so `raw` is the default. If you run keysmith from a plain login shell, try `-o stream-json` with parser `claude-stream-json` for token counts and resume. Not on the LaunchAgent PATH by default: `keysmith add qoder --bin ~/.local/bin/qodercli`. A request that offers tools is answered too (`toolMode: "auto"`): through the MCP bridge — `-o stream-json` with the session\'s one MCP server, no built-in tool, no hooks, every inherited QODER_* variable left out, each call handed to the client while qoder waits on it — or, where the bridge cannot, EMULATE, the tool-less run writing its calls as one JSON object. Either way qoder runs none of them.',
   },
   claude: {
     kind: 'cli',
@@ -320,7 +351,7 @@ export const CLI_PROFILES = {
     // `--mode auto|accept-edits`: that would run agy's tools unasked. Its limits are the defaults
     // (src/bridge/hub.js SESSION_DEFAULTS); `bridge.maxSessions`, `toolResultTimeoutMs`,
     // `sessionMaxMs`, `maxTurns`, `readyTimeoutMs` and `mcpCacheDir` set them per adapter.
-    bridge: { args: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '{printTimeout}', '--agent', '{agent}', ['--model', '{model}'], '-p', '{prompt}'] },
+    bridge: { driver: 'agy', args: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '{printTimeout}', '--agent', '{agent}', ['--model', '{model}'], '-p', '{prompt}'] },
     timeoutMs: 300_000,
     maxConcurrent: 2,
     provenance: 'Antigravity CLI (agy) 1.3.3 — `agy --output-format stream-json -p` emits init / step_update (agent_response text_delta, per-step usage) / result; `agy models` prints id<TAB>name; `--conversation <id>` resumes; `--agent <name>` loads a markdown agent from `.agents/agents/` (unknown names fall back to the default agent without an error). agy 1.4.2 (the tool-bridge probes, design §2–3): a `tools: []` agent answered the JSON tool protocol (`tool_calls` / `final`) on gemini-4-argon-high, 7 of 7 strictly parseable, in 9–44 s a turn; `--mode auto|accept-edits` approves tool calls. An agent with `mcpServers` as a list (a stdio server, each tool `eager: true`) asks the server `server/discover` (and takes -32601), then initialize / tools/list; the model sees `mcp_<server>_<tool>`, the server gets the tool\'s own name and arguments, the calls of one step come one after the other, a tools/call held 15 s was waited for, and the schemas land in ~/.gemini/antigravity-cli/mcp/<server>/.',
@@ -345,18 +376,23 @@ export const CLI_PROFILES = {
     // plugin/app/browser/computer-use features are off, and no session is written. Codex
     // rejects an unknown feature name, so a renamed one fails loudly, not silently.
     args: codexArgs(),
-    // A request that offers tools: EMULATE through the same argv (the tool-bridge probe, codex
-    // 0.163.0 on gpt-5.6-luna: two parallel calls in one strictly parseable reply).
-    toolMode: 'emulate',
+    // A request that offers tools: the MCP bridge where it can, EMULATE otherwise — through the
+    // same argv (the tool-bridge probe, codex 0.163.0 on gpt-5.6-luna: two parallel calls in one
+    // strictly parseable reply).
+    toolMode: 'auto',
     emulateArgs: codexArgs(),
+    // The MCP bridge's run (src/bridge/clis.js): the same tool-less switches, --json for the
+    // stream, and the session's server on the command line — approved alone (approval_policy
+    // "never" refuses an MCP call otherwise), with a call timeout past toolResultTimeoutMs.
+    bridge: { driver: 'codex', args: codexBridgeArgs() },
     parser: 'raw',
     // `codex debug models` prints the model catalogue as JSON (slug, display_name, visibility).
     modelsFrom: { args: ['debug', 'models'] },
     cwd: '~/.local/share/keysmith/workspaces/codex',
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Codex CLI 0.163.0 — every flag here is in `codex exec --help`; the feature names were accepted by 0.163 (`codex debug prompt-input` refuses an unknown one) and `codex debug models` lists the catalogue as JSON. This argv was run against a stub Responses endpoint (scratch CODEX_HOME): gpt-5.5 was offered request_user_input and apply_patch only; gpt-6-astra code-mode exec/wait, request_user_input, clock.sleep and the collaboration (sub-agent) namespace, with 2 concurrency slots. The stdout shape (`raw`: the final message) is from the stub and its documented interface; 2026-10-20, EMULATE through this argv answered a two-turn tool round trip live on gpt-5.6-luna, the final message alone on stdout.',
-    note: 'Runs with no shell tool, a read-only sandbox and no approvals, no web search, without your ~/.codex/config.toml (its MCP servers included) and with no session on disk, in an empty keysmith-owned workspace. On gpt-6-* models codex keeps its sub-agent tools whatever the switches: one request can run a second agent (same tools, same quota), capped at one by `agents.max_threads=1`. A Homebrew codex and an npm one can both be installed, and PATH decides which one runs: pin it, e.g. `keysmith add codex --bin /opt/homebrew/bin/codex`. A request that offers tools is answered with EMULATE (`toolMode: "emulate"`): the same run writes its calls as one JSON object, which keysmith checks and hands to the client as tool_calls. Every codex request carries codex\'s own ~20k-token harness.',
+    provenance: 'Codex CLI 0.163.0 — every flag here is in `codex exec --help`; the feature names were accepted by 0.163 (`codex debug prompt-input` refuses an unknown one) and `codex debug models` lists the catalogue as JSON. This argv was run against a stub Responses endpoint (scratch CODEX_HOME): gpt-5.5 was offered request_user_input and apply_patch only; gpt-6-astra code-mode exec/wait, request_user_input, clock.sleep and the collaboration (sub-agent) namespace, with 2 concurrency slots. The stdout shape (`raw`: the final message) is from the stub and its documented interface; 2026-10-20, EMULATE through this argv answered a two-turn tool round trip live on gpt-5.6-luna, the final message alone on stdout; so did the MCP bridge (`exec --json`, the session\'s server approved alone, `--ephemeral`: no session file) — two calls of one step came one after the other, the second after the first one\'s result.',
+    note: 'Runs with no shell tool, a read-only sandbox and no approvals, no web search, without your ~/.codex/config.toml (its MCP servers included) and with no session on disk, in an empty keysmith-owned workspace. On gpt-6-* models codex keeps its sub-agent tools whatever the switches: one request can run a second agent (same tools, same quota), capped at one by `agents.max_threads=1`. A Homebrew codex and an npm one can both be installed, and PATH decides which one runs: pin it, e.g. `keysmith add codex --bin /opt/homebrew/bin/codex`. A request that offers tools is answered too (`toolMode: "auto"`): through the MCP bridge — the same switches with `--json` and the session\'s one MCP server, approved alone (with approval_policy "never" an unapproved MCP call is refused), each call handed to the client while codex waits on it — or, where the bridge cannot, EMULATE, the same run writing its calls as one JSON object. Either way codex runs none of them, and every codex request carries its own ~20k-token harness.',
   },
   kiro: {
     kind: 'cli',

@@ -61,16 +61,16 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `resumeArgs` | — | template used when a session id exists |
 | `persistSessions` | `false` | the CLI keeps its own threads, so `{noSession}` renders empty and `resumeArgs` becomes reachable |
 | `noSessionFlag` | `--no-session` | what `{noSession}` renders as when the run is not resumed. Claude Code and Qoder refuse `--no-session` and take `--no-session-persistence`; their profiles say so |
-| `parser` | `raw` | one of `cmd-ndjson`, `opencode-ndjson`, `claude-stream-json`, `agy-stream-json`, `kiro-stream-json`, `warp-ndjson`, `raw` |
+| `parser` | `raw` | one of `cmd-ndjson`, `opencode-ndjson`, `claude-stream-json`, `agy-stream-json`, `kiro-stream-json`, `warp-ndjson`, `codex-json`, `raw` |
 | `modelsFrom` | — | `{ "args": ["--list-models"], "drop": ["preview"] }` — run the binary, read stdout: one model per line, or JSON (an array, or one under `models`/`data`; the id is `model_id`, `id`, `slug`, `model` or `name`; `visibility: "hide"` entries are left out) |
 | `promptVia` | `arg` | `"stdin"` pipes the prompt instead, for CLIs that choke on long argv. A command line cannot carry a NUL character (U+0000): a request with one in its argv (the prompt, a system prompt) is a 400 that quotes none of it, before anything is started — the route goes on to its next leg, which an HTTP upstream can take |
 | `cwd` | process cwd | the agent's workspace: an empty directory keysmith owns (`~/.local/share/keysmith/workspaces/<name>`), created 0700 on first spawn. Every built-in CLI profile sets one, and so does `keysmith add custom`; without it the agent runs in the gateway's own working directory (under launchd, keysmith's source tree). The child's `PWD` is set to it as well: spawn() would leave the gateway's, and opencode takes `PWD` as its project directory |
 | `workspaceFiles` | — | `{ "relative/path": "content" }` — files keysmith keeps inside a configured `cwd` (0600), put back before a spawn whenever they drift. Needs `cwd`; a path that leaves it is refused at load. See [agy as a plain text model](#agy-as-a-plain-text-model) |
 | `toolDenialRetry` | — | an instruction; when a run ends in a refused tool call and no text, the request runs once more with this text in front of the prompt, inside the same `timeoutMs` |
 | `stopAtToolCall` | `false` | for a CLI run as a text model: once the answer has text, the first tool call ends the run — the process is stopped and anything it says after that call is not part of the reply. A tool call before any text is left alone. `"always"` stops a call before any text too, and fails that request: for a CLI that kept its tools, a call is never the way to an answer |
-| `toolMode` | `off` | how this CLI answers a request that offers tools: `off` (it is passed by, as before toolMode existed), `emulate` (EMULATE: the model writes its calls as JSON, keysmith hands them to the client — see [agy and tool requests: EMULATE](#agy-and-tool-requests-emulate)), `mcp` (the MCP bridge: the CLI calls the request's tools over MCP and waits while the client runs each one — see [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge); only agy has a bridge driver) or `auto` (the bridge where it can, EMULATE otherwise and when the bridge fails before any call). The `agy` profile ships `auto`; `opencode`, `codex` and `qoder` ship `emulate` (see [opencode, codex, qoder and kiro](#opencode-codex-qoder-and-kiro-tool-requests-through-emulate)); `claude` and `kiro` say `off`. A load error on an `unsafeTools` entry, on an entry without a `cwd` (a tool engine runs the CLI only in an empty workspace keysmith owns, never the gateway's own directory; every built-in profile has one) and on an HTTP adapter. `keysmith set <id> toolMode <mode>` fills in the templates below from the entry's built-in profile when it lacks them |
+| `toolMode` | `off` | how this CLI answers a request that offers tools: `off` (it is passed by, as before toolMode existed), `emulate` (EMULATE: the model writes its calls as JSON, keysmith hands them to the client — see [agy and tool requests: EMULATE](#agy-and-tool-requests-emulate)), `mcp` (the MCP bridge: the CLI calls the request's tools over MCP and waits while the client runs each one — see [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge); agy, opencode, codex and qoder have a bridge driver) or `auto` (the bridge where it can, EMULATE otherwise and when the bridge fails before any call). The `agy`, `opencode`, `codex` and `qoder` profiles ship `auto` (see [opencode, codex, qoder and kiro](#opencode-codex-qoder-and-kiro-tool-requests)); `claude` and `kiro` say `off`. A load error on an `unsafeTools` entry, on an entry without a `cwd` (a tool engine runs the CLI only in an empty workspace keysmith owns, never the gateway's own directory; every built-in profile has one) and on an HTTP adapter. `keysmith set <id> toolMode <mode>` fills in the templates below from the entry's built-in profile when it lacks them |
 | `emulateArgs` | `args` | the argv template of an EMULATE run, same placeholders as `args`; no session is resumed on that path, so `{session}` is always empty. agy's names the `keysmith-tools` agent |
-| `bridge` | — | the MCP bridge's settings: `args`, its argv template, with `{agent}` (the session's agent) and `{printTimeout}` (its `sessionMaxMs`, as `1800s`) filled in per session — read by the auto-approve check below; `maxSessions` (2), `toolResultTimeoutMs` (300000), `readyTimeoutMs` (30000), `sessionMaxMs` (1800000), `maxTurns` (32); `mcpCacheDir` (`~/.gemini/antigravity-cli/mcp`, where agy keeps a server's schemas). See [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge) |
+| `bridge` | — | the MCP bridge's settings: `driver` (`agy`, `opencode`, `codex`, `qoder` or `claude`; absent, agy's for an `agy-stream-json` entry), `args`, its argv template, with `{agent}` (the session's agent), `{server}`, `{printTimeout}` (its `sessionMaxMs`, as `1800s`) and the driver's own placeholders (see [opencode, codex, qoder and kiro](#opencode-codex-qoder-and-kiro-tool-requests)) filled in per session — read by the auto-approve check below, and an approval in it may approve the session's own server only; `maxSessions` (2), `toolResultTimeoutMs` (300000), `readyTimeoutMs` (30000), `sessionMaxMs` (1800000), `maxTurns` (32); `mcpCacheDir` (`~/.gemini/antigravity-cli/mcp`, where agy keeps a server's schemas). See [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge) |
 | `unsafeTools` | `false` | keysmith could not take this CLI's tools away: it can run commands and edit files. Implies `explicitOnly`; `keysmith set` refuses to serve it (`disabled false`), to take the mark off, or to change anything that shapes what it runs or how it is stopped (`stopAtToolCall`, `args`, `resumeArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`, …) without `--allow-unsafe-tools`; the gateway logs it at load when it is enabled. An argv template — `args`, `resumeArgs`, `emulateArgs`, `bridge.args` — with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`, `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`, agy's `--mode auto` / `--mode accept-edits`, …) is a load error unless the entry has this mark; with it, `toolMode` must be `off` (`keysmith set <id> unsafeTools true`, and a re-add that keeps the mark, turn it off). See [Warp](#warps-oz-an-agent-that-keeps-its-tools) and [Command Code](#command-code-an-agent-that-approves-its-own-tools) |
 | `env` | `{}` | merged over the scrubbed parent env |
 | `maxConcurrent` | `1` | semaphore; each call is a real process |
@@ -142,7 +142,8 @@ yield `done` (a stream with no terminator is a client that hangs forever).
 |---|---|---|
 | `cmd-ndjson` | `{"type":"event","event":{"type":"text_delta",…}}` then one `{"type":"result",…}`; `tool_queued`/`tool_running` are one `tool` event per call | Command Code 1.66.0 (live); the tool events from the 1.81.0 bundle |
 | `opencode-ndjson` | `text` parts re-send the **whole** block; the parser forwards only the new tail; `tool_use` is one `tool` event per `callID`; an `error` line's reason is `error.data.message` (with its `statusCode`) | opencode 1.18.27 |
-| `claude-stream-json` | `assistant` message objects, then `result` with usage/session/`is_error` | Claude Code 2.1.261 |
+| `claude-stream-json` | `assistant` message objects, then `result` with usage/session/`is_error`; a `tool_use` block is one `tool` event per id (qoder's lazy `mcp_call` as the tool it names) | Claude Code 2.1.261; qodercli 1.1.59 (`-o stream-json`, live) |
+| `codex-json` | `codex exec --json`: `agent_message` items are text (two with no call between them are two paragraphs), `reasoning` items reasoning, an `mcp_tool_call` a `tool` event named `mcp__<server>__<tool>` as it starts, any other item that acts (`command_execution`, `file_change`, `web_search`, a type never seen) a `tool` event named by its type; `turn.completed` the usage, `turn.failed` the error. The MCP bridge's codex parser | codex 0.163.0 (live) |
 | `agy-stream-json` | `step_update` text deltas on `agent_response` steps, then `result`; usage summed per step (the `result` total re-counts a resumed thread), an auto-denied tool call with no answer is an error with code `tool_denied`, each `tool` step is reported once as a `tool` event, and a run stopped before its `result` line still reports what its steps spent | Antigravity CLI 1.3.3 |
 | `kiro-stream-json` | `{type,data}` lines: `metadata` carries the sessionId, `sessionUpdate` wraps the ACP update (`agent_message_chunk` text, `agent_thought_chunk` reasoning, `tool_call` reported once), `runFinished.finalText` answers when no chunk did, `runError.message` is an error | Kiro CLI 2.27.1 — runStarted/metadata/runError live; the text events from the binary and the ACP schema |
 | `warp-ndjson` | `agent` lines are the text, `agent_reasoning` reasoning, `tool_call` a `tool` event, `system`/`conversation_started` the session; no usage, no closing line | Oz CLI v0.2026.10.07 (a live run) |
@@ -297,26 +298,6 @@ its full default agent, without a word — so the profile carries it under `work
 rewritten before every run, and `keysmith set … toolMode` refuses an entry with no `cwd` to
 write it into. Do not hand-write `emulateArgs` naming `keysmith-tools` without the file.
 
-### opencode, codex, qoder and kiro: tool requests through EMULATE
-
-The `opencode`, `codex` and `qoder` profiles answer a request that offers tools with EMULATE
-(`toolMode: "emulate"`). Their `emulateArgs` is their text argv, as tool-less as it is for text —
-opencode's `keysmith-text` agent and deny-all `opencode.json`, codex's read-only, shell-less
-`exec`, qoder's `--tools "" --strict-mcp-config` — and the request's own prompt carries the tools
-and the JSON answer format. Each reply is read by the profile's own parser (`opencode-ndjson`,
-`raw`); qoder's other shape, `-o stream-json` with `claude-stream-json`, is read the same way. A
-call the CLI's own harness reports before the reply (opencode's `tool_use`, kiro's ACP
-`tool_call`: refused, since the agent has no tools) is passed by; one after the reply ends the
-run there (`stopAtToolCall`), and the reply stands. Each of the three answered a two-turn round
-trip live — a call that fit the schema, then an answer that quoted the fenced result:
-opencode 1.19.3 on `evren/deepseek-v4-flash` (4.7 s + 3.0 s), codex 0.163.0 on `gpt-5.6-luna`
-(5.2 s + 3.2 s), qodercli 1.1.59 on its default model (11.8 s + 12.1 s). codex adds its own
-~20k-token harness to every request, and `raw` reports no token counts for codex or qoder.
-
-`kiro` carries the same `emulateArgs` (its text argv) and keeps `toolMode: "off"`: its stream
-was only ever checked against a stub, because every live run so far was refused by the account's
-overage limit before any text. `keysmith set kiro toolMode emulate` turns it on.
-
 - `emulateArgs` runs `--agent keysmith-tools`: like `keysmith-text`, an agent file with
   `tools: []`, `inheritMcp: false`, `inheritCustomizations: false` and
   `excludeDefaultComponents: true`, whose prompt says the tools in the request are run by
@@ -362,6 +343,85 @@ Any CLI whose argv is already tool-less can answer tool requests the same way; w
   }
 }
 ```
+
+### opencode, codex, qoder and kiro: tool requests
+
+The `opencode`, `codex` and `qoder` profiles answer a request that offers tools the way agy
+does (`toolMode: "auto"`): through the MCP bridge, and through EMULATE where the bridge cannot.
+Both ran a two-turn round trip live on each of them (2026-10-20) — a call that fit the schema,
+then an answer that quoted the injected result:
+
+| | EMULATE (turn 1 + turn 2) | the bridge (turn 1 + turn 2) | a waiting session |
+|---|---|---|---|
+| opencode 1.19.3, `evren/deepseek-v4-flash` | 4.7 s + 3.0 s | 4.9 s + 0.4 s | ~690 MB |
+| codex 0.163.0, `gpt-5.6-luna` | 5.2 s + 3.2 s | 5.5 s + 1.8 s | ~110 MB |
+| qodercli 1.1.59, its default model | 11.8 s + 12.1 s | 5.8 s + 4.2 s | ~370 MB |
+
+**EMULATE.** `emulateArgs` is each profile's text argv, as tool-less as it is for text —
+opencode's `keysmith-text` agent and deny-all `opencode.json`, codex's read-only, shell-less
+`exec`, qoder's `--tools "" --strict-mcp-config` — and the request's own prompt carries the tools
+and the JSON answer format. Each reply is read by the profile's own parser (`opencode-ndjson`,
+`raw`); qoder's other shape, `-o stream-json` with `claude-stream-json`, is read the same way. A
+call the CLI's own harness reports before the reply (opencode's `tool_use`, kiro's ACP
+`tool_call`: refused, since the agent has no tools) is passed by; one after the reply ends the
+run there (`stopAtToolCall`), and the reply stands. codex adds its own ~20k-token harness to
+every request, and `raw` reports no token counts for codex or qoder.
+
+**The bridge.** `bridge.driver` names how the session's one MCP server is given to the CLI, and
+`bridge.args` is the argv, with these placeholders filled in per session besides `{model}` and
+`{prompt}`: `{server}` (`ks<rid6>`), `{agent}` (`ks-b-<rid>`), and for codex `{mcpCommand}`,
+`{mcpArgs}`, `{mcpEnv}` (TOML values: the gateway's node, the shim, the socket and the token
+file), `{toolTimeoutSec}` and `{readyTimeoutSec}`; for qoder and claude `{mcpConfig}` (the
+session's MCP config file). The session's files are in `.keysmith-bridge/` in the workspace
+(0700, each file 0600) and go with the session.
+
+- **opencode** (`opencode-ndjson`): `OPENCODE_CONFIG` names `ks-b-<rid>.json` — `mcp.<server>`
+  (`type: local`, the shim, `timeout` 30 s past `toolResultTimeoutMs`: opencode's own 60 s gave
+  up on a 75 s wait in the probe) and the inline agent `--agent {agent}`, whose permission and
+  tools deny `"*"` and allow `<server>_*`. opencode merges the workspace's `opencode.json`
+  (deny-all) over it — `opencode debug config` showed both, and `debug agent` every built-in
+  tool off. `--pure` loads no plugin. The model sees `ks<rid6>_<tool>`. opencode runs a step's
+  calls at once and reports each only when it finished, so the calls that come within 600 ms of
+  each other go out in one answer; its `invalid` tool (its answer to a call of a tool it does not
+  have) runs nothing and is not the tripwire's.
+- **codex** (`codex-json`, `exec --json`): the profile's tool-less switches, and `-c
+  mcp_servers.{server}.…` — the shim as command, `env` with the socket and
+  `KEYSMITH_BRIDGE_TOKEN_FILE` (the token is in `ks-b-<rid>.token`, never in the argv),
+  `default_tools_approval_mode="approve"` (with `approval_policy="never"`, codex refuses an MCP
+  call that is not approved, before it reaches the server), `startup_timeout_sec` and
+  `tool_timeout_sec` (codex's default, 60 s, is too short for a client running a tool).
+  `--ephemeral` writes no session. The model sees `mcp__ks<rid6>__<tool>`. codex runs a step's
+  calls one after the other and shows each (`item.started`) before it sends it. Any item that is
+  not text, reasoning, its plan (`todo_list`) or a warning is a tool of codex's own, so the
+  tripwire's: a shell command, a file change, a web search, a sub-agent, a type keysmith has never
+  seen. A load check refuses an approval in `bridge.args` for anything but `mcp_servers.{server}`,
+  and an `approval_policy` other than `"never"`. codex starts its MCP server outside its own
+  process group; the shim ends when the session's connection closes all the same (checked live).
+- **qoder** (`claude-stream-json`, `-o stream-json`): `--mcp-config {mcpConfig}
+  --strict-mcp-config`, `--allowed-tools mcp__{server}`, `--tools ""`,
+  `--setting-sources project`, `--settings '{"disableAllHooks":true}'` (with project settings
+  alone, the user's plugin hooks — Qoder Security, qoder-context-hook — still ran headless),
+  `--no-session-persistence`, and every inherited `QODER_*` variable left out of its environment:
+  a nested-agent marker makes `-o stream-json` exit 42, and `QODER_MCP_LAZY` puts the server's
+  tools behind qoder's own `mcp_get`/`mcp_call` (read as the tool `mcp_call` names; `mcp_get`
+  only reads a schema and is no foreign tool). The model sees `mcp__ks<rid6>__<tool>`; a step's
+  calls come one after the other, each `tool_use` block printed before it runs.
+- **claude**: `src/bridge/clis.js` has a driver and an argv for it (`CLAUDE_BRIDGE_ARGS`: as
+  qoder's, with Claude Code's `--permission-prompts none` and `--disable-slash-commands`, and
+  without the text argv's `--safe-mode`, which turns MCP servers off), written from `claude
+  --help` and checked against a golden plan only — never run, since every request would spend
+  your Claude subscription. The `claude` profile ships without bridge settings and with
+  `toolMode: "off"`.
+
+`keysmith set <id> toolMode auto` on an opencode, codex or qoder entry attached before this
+fills in `bridge` (and `emulateArgs`) from the profile, as for agy. With
+`toolMode: "emulate"` there is no bridge and no process held between requests.
+
+`kiro` carries `emulateArgs` (its text argv) and keeps `toolMode: "off"`: its stream was only
+ever checked against a stub, because every live run so far was refused by the account's overage
+limit before any text. `keysmith set kiro toolMode emulate` turns it on. kiro has no bridge
+driver (its ACP mode is a separate, experimental path, and so is codex's app-server
+`dynamicTools`; neither is used).
 
 ### Kiro as a plain text model
 

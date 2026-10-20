@@ -7,14 +7,16 @@ import { isPlainObject, newToolCallId } from '../tools/model.js';
 import { namesFit } from '../tools/router.js';
 import { HUB_DEFAULTS, Hub, SESSION_DEFAULTS } from './hub.js';
 import { MAX_INVALID_CALLS, toolListing } from './mcp.js';
-import { DRIVERS, KILL_GRACE_MS } from './agy.js';
+import { DRIVERS } from './drivers.js';
+import { KILL_GRACE_MS } from './proc.js';
 import { startFailure } from '../cli-adapter.js';
 
 /**
  * The MCP bridge (design §3, U6/U7): the tool engine the gateway hands a tool request to on a CLI
  * leg whose toolMode is `mcp` or `auto` (src/tools/router.js), as `{ check, run }`.
  *
- * A CLI with a bridge driver (agy, agy.js) runs with one MCP server — the hub, through the shim —
+ * A CLI with a bridge driver (agy: agy.js; opencode, codex, qoder and — written, never run —
+ * claude: clis.js) runs with one MCP server — the hub, through the shim —
  * whose tools are the request's own. The model calls one; the hub checks the call against the
  * client's schema; keysmith hands it to the client as a tool call (its own id, finish_reason
  * `tool_calls`) and the HTTP answer ends there, while the CLI process stays where it is, waiting
@@ -33,8 +35,14 @@ import { startFailure } from '../cli-adapter.js';
  *                  way (earlier calls, fenced results): the cold path. A request whose session
  *                  is gone — expired, evicted, broken — comes this way, logged as late
  *
- * One call per HTTP turn: agy runs the calls of one step one after another, so a step's second
- * call reaches the hub after the first one's result, and is the next request's answer.
+ * How the calls of one model step reach the client is the driver's (`batch`). agy, codex and qoder
+ * run them one after another, so a step's second call reaches the hub after the first one's result
+ * and is the next request's answer — one call per HTTP turn (`serial`; each call goes out once the
+ * CLI's stream shows it, so text written before it goes first). opencode runs them at once
+ * (`gather`): the calls that arrive within the driver's `settleMs` of each other go out in one
+ * answer, and the next request brings all their results (a request with parallel_tool_calls false
+ * is handed one, the rest in the requests after it). A continuation holds exactly the calls its
+ * session waits for, each with its result.
  *
  * Nothing reaches the client before the CLI listed the bridge's tools (the readiness gate), so a
  * session that fails before that — an agent agy cannot find, a CLI that never connects, an exit —
@@ -150,8 +158,9 @@ export class McpBridge {
   }
 
   /**
-   * Which session a request belongs to: `{ kind: 'attach', session, result }` (it continues a
-   * waiting session), `{ kind: 'busy', session }` (another request is answering that very
+   * Which session a request belongs to: `{ kind: 'attach', session, results }` (it continues a
+   * waiting session: `results` one `{ id, text, isError }` for each call out, in their order),
+   * `{ kind: 'busy', session }` (another request is answering that very
    * continuation), `{ kind: 'tripped' }` (it brings the result of a call this key was handed by a
    * run the tripwire stopped), or `{ kind: 'new', why, late, retire? }` — `why` says why it
    * continues none (null for a conversation with no call in it: the only `new` that is not the
@@ -179,9 +188,15 @@ export class McpBridge {
       : null;
     if (differs) return { kind: 'new', why: differs, late: false };
     if (s.state === 'generating') return { kind: 'busy', session: s };
-    if (s.state !== 'waiting' || s.out?.id !== last || tail.ids.length !== 1) return { kind: 'new', why: 'not the call its session waits for', late: false };
-    const result = tail.results.find((r) => r.toolCallId === last);
-    if (!result) return { kind: 'new', why: 'no result for the call its session waits for', late: false };
+    if (s.state !== 'waiting' || !s.outs.length || !sameList(tail.ids, s.outs.map((o) => o.id))) return { kind: 'new', why: 'not the calls its session waits for', late: false };
+    // One result for each call out, and none for a call it does not wait for.
+    const results = [];
+    for (const id of tail.ids) {
+      const mine = tail.results.filter((r) => r.toolCallId === id);
+      if (mine.length !== 1) return { kind: 'new', why: mine.length ? 'two results for one call' : 'no result for a call its session waits for', late: false };
+      results.push({ id, text: String(mine[0].text ?? ''), isError: mine[0].isError === true });
+    }
+    if (tail.results.some((r) => !tail.ids.includes(r.toolCallId))) return { kind: 'new', why: 'a result for a call its session does not wait for', late: false };
     // The client's own words after the result: agy can be given the call's result, but not a user
     // turn while it waits on the call — and text put into the result would reach the model as a
     // tool's output, which it is told is data, not instructions. The conversation goes on, on a
@@ -190,7 +205,7 @@ export class McpBridge {
     // A session that handed out maxTurns calls has had its share: the conversation goes on, on a
     // new one (run() closes this one).
     if (s.turns >= s.limits.maxTurns) return { kind: 'new', why: `its session reached maxTurns (${s.limits.maxTurns})`, late: false, retire: { session: s, reason: 'max_turns' } };
-    return { kind: 'attach', session: s, result };
+    return { kind: 'attach', session: s, results };
   }
 
   /**
@@ -218,7 +233,7 @@ export class McpBridge {
     }
     const o = { model, spec, messages, signal, caller, target, face };
     if (m.kind === 'attach') {
-      yield* this._attach(adapter, driver, m.session, m.result, o);
+      yield* this._attach(adapter, driver, m.session, m.results, o);
       return;
     }
     if (m.retire) {
@@ -291,10 +306,10 @@ export class McpBridge {
     yield* this._turn(adapter, driver, s, { ...o, release, info: { type: 'bridge', session: s.server, path: o.why ? 'cold' : 'new', turn: 1 } });
   }
 
-  async *_attach(adapter, driver, s, result, o) {
-    const text = String(result.text ?? '');
-    if (text.length > adapter.maxPromptChars) {
-      throw bridgeError(adapter, 'result_too_long', 400, `adapter "${adapter.id}": the tool result is ${text.length} chars, over maxPromptChars=${adapter.maxPromptChars}`, { noFallback: true });
+  async *_attach(adapter, driver, s, results, o) {
+    const size = results.reduce((n, r) => n + r.text.length, 0);
+    if (size > adapter.maxPromptChars) {
+      throw bridgeError(adapter, 'result_too_long', 400, `adapter "${adapter.id}": the tool result${results.length > 1 ? 's are' : ' is'} ${size} chars, over maxPromptChars=${adapter.maxPromptChars}`, { noFallback: true });
     }
     // Claimed now, before the wait for a process slot: a second request for the same result is a 409.
     s.attach();
@@ -308,10 +323,11 @@ export class McpBridge {
     // A session closed while this request waited for its slot (the tripwire, its clock) is told
     // nothing: the turn below reads why it closed.
     if (!s.closed) {
-      s.answer({ text, isError: result.isError === true });
-      this.log(`bridge ${s.server}: the result of ${s.turns === 1 ? 'its call' : `call ${s.turns}`} went back to ${adapter.id}`);
+      const n = results.length;
+      s.answer(results);
+      this.log(`bridge ${s.server}: ${n > 1 ? `the results of ${n} calls` : `the result of ${s.turns === 1 ? 'its call' : `call ${s.turns}`}`} went back to ${adapter.id}`);
     }
-    yield* this._turn(adapter, driver, s, { ...o, release, info: { type: 'bridge', session: s.server, path: 'attached', turn: s.turns + 1 } });
+    yield* this._turn(adapter, driver, s, { ...o, release, info: { type: 'bridge', session: s.server, path: 'attached', turn: s.rounds + 1 } });
   }
 
   /**
@@ -336,7 +352,7 @@ export class McpBridge {
   }
 
   /**
-   * agy reached for a tool of its own: a security event (design §3). The session is closed now —
+   * The CLI reached for a tool of its own: a security event (design §3). The session is closed now —
    * the CLI stopped, its files removed, its calls tombstoned `foreign_tool` — and logged. The
    * request reading it, if one is, fails with the tripwire's 502; a call that was with the client
    * leaves its result nowhere to go (match(): `tripped`). Neither is answered another way.
@@ -349,14 +365,16 @@ export class McpBridge {
     s.close('foreign_tool');
   }
 
-  async *_turn(adapter, driver, s, { signal, release, face, info }) {
+  async *_turn(adapter, driver, s, { signal, release, face, info, spec = null }) {
     const t = this.timers;
     const self = this;
     let usage = null;
     let text = false;
     let cut = null;
-    let out = null;
+    let batch = []; // the calls of this turn not yet handed out (one at most on a serial driver)
     let grace = null;
+    let settle = null;
+    const gather = driver.batch === 'gather';
     let delivered = false;
     let ended = null;
     const held = []; // text before the CLI listed the tools
@@ -372,13 +390,20 @@ export class McpBridge {
     const fail = (reason, status, message, extra = {}) => bridgeError(adapter, reason, status, `bridge ${s.server}: ${message}`, { usage, ...extra });
     const handOut = function* () {
       if (grace) t.clearTimeout(grace);
-      grace = null;
-      const id = newToolCallId(face);
+      if (settle) t.clearTimeout(settle);
+      grace = settle = null;
+      // A request with parallel calls off is handed one call; the others wait in the inbox, in
+      // their order, for the requests after it.
+      const take = spec?.parallel === false ? batch.slice(0, 1) : batch;
+      for (const rest of batch.slice(take.length).reverse()) s.inbox.unshift(rest);
+      batch = [];
+      const outs = take.map((c) => ({ id: newToolCallId(face), mcpId: c.mcpId, name: c.name, args: c.args }));
       // Waiting from here: a consumer that stops reading at any event below leaves the session to its clock.
-      s.hold({ id, mcpId: out.mcpId, name: out.name });
-      self.log(`bridge ${s.server}: call ${s.turns} (${truncate(out.name, 64)}) handed to the client`);
+      s.hold(outs);
+      const names = outs.map((o) => truncate(o.name, 64)).join(', ');
+      self.log(`bridge ${s.server}: ${outs.length > 1 ? `calls ${s.turns - outs.length + 1}-${s.turns}` : `call ${s.turns}`} (${names}) handed to the client`);
       if (usage) yield { type: 'usage', usage };
-      yield { type: 'tool_call', id, name: out.name, arguments: JSON.stringify(out.args), args: out.args };
+      for (const o of outs) yield { type: 'tool_call', id: o.id, name: o.name, arguments: JSON.stringify(o.args), args: o.args };
       delivered = true;
       yield { type: 'done', finishReason: 'tool_calls' };
     };
@@ -410,11 +435,18 @@ export class McpBridge {
         } else if (type === 'tool') {
           const name = String(evt.name || '');
           if (name.startsWith(driver.prefix(s.server))) {
-            s.steps = (s.steps || 0) + 1;
-            if (out && s.steps >= s.taken) return yield* handOut();
+            // The stream shows a call to the bridge as it is made (agy's tool step, codex's
+            // item.started, qoder's tool_use block). opencode reports a call only once it has
+            // finished: nothing to count there.
+            if (!gather) {
+              s.steps = (s.steps || 0) + 1;
+              if (batch.length && s.steps >= s.taken) return yield* handOut();
+            }
           } else if (driver.harnessTools.includes(name)) {
-            // agy's manage_task, which no agent file removes: after text the answer is complete
-            // (stopAtToolCall); before, it is refused by headless mode and the model goes on.
+            // A tool the harness keeps that runs nothing (agy's manage_task, which no agent file
+            // removes; opencode's invalid; qoder's mcp_get): after text the answer is complete
+            // (stopAtToolCall); before, it does nothing (agy's headless mode refuses manage_task)
+            // and the model goes on.
             if (adapter.stopAtToolCall && text && !cut) {
               cut = name;
               s.proc?.stop(`answer complete, stopped at a call to ${name}`);
@@ -427,18 +459,39 @@ export class McpBridge {
           }
         } else if (type === 'call') {
           if (cut) continue;
-          if (out) {
-            // A second call before the first one's step: the first goes out, this one is the next turn's.
-            s.inbox.unshift(evt);
-            return yield* handOut();
+          if (!gather) {
+            if (batch.length) {
+              // A second call before the first one's step: the first goes out, this one is the next turn's.
+              s.inbox.unshift(evt);
+              return yield* handOut();
+            }
+            s.taken = (s.taken || 0) + 1;
+            batch.push(evt);
+            if ((s.steps || 0) >= s.taken) return yield* handOut();
+            grace = t.setTimeout(() => s.push({ type: 'grace', turn }), this.stepGraceMs);
+            grace?.unref?.();
+            continue;
           }
-          s.taken = (s.taken || 0) + 1;
-          out = evt;
-          if ((s.steps || 0) >= s.taken) return yield* handOut();
-          grace = t.setTimeout(() => s.push({ type: 'grace', turn }), this.stepGraceMs);
-          grace?.unref?.();
+          // Gathering: counted once (a call handed back to the inbox by parallel false is not new),
+          // then the step's calls settle: they go out `settleMs` after the last one came, or at
+          // the latest STEP_GRACE_MS after the first.
+          if (!evt.counted) {
+            evt.counted = true;
+            s.taken = (s.taken || 0) + 1;
+          }
+          batch.push(evt);
+          if (settle) t.clearTimeout(settle);
+          settle = t.setTimeout(() => s.push({ type: 'settle', turn }), driver.settleMs);
+          settle?.unref?.();
+          if (!grace) {
+            grace = t.setTimeout(() => s.push({ type: 'grace', turn }), this.stepGraceMs);
+            grace?.unref?.();
+          }
+        } else if (type === 'settle') {
+          settle = null;
+          if (batch.length) return yield* handOut();
         } else if (type === 'grace') {
-          if (out) return yield* handOut();
+          if (batch.length) return yield* handOut();
         } else if (type === 'invalid') {
           s.taken = (s.taken || 0) + 1;
           this.log(`bridge ${s.server}: a call ${evt.name ? `to ${truncate(evt.name, 64)}` : 'to a tool the request does not offer'} did not fit the client's schema (${evt.count} of ${MAX_INVALID_CALLS} this turn): ${truncate(evt.reason, 160)}`);
@@ -482,6 +535,7 @@ export class McpBridge {
     } finally {
       t.clearTimeout(gen);
       if (grace) t.clearTimeout(grace);
+      if (settle) t.clearTimeout(settle);
       signal?.removeEventListener('abort', onAbort);
       release();
       if (!(s.state === 'waiting' && delivered)) {

@@ -24,7 +24,11 @@ const KEY = 'ks_' + crypto.randomBytes(24).toString('base64url');
 let dir, server, base, gateway, usageLog;
 const log = [];
 
-/** A profile around the stub: its argv, parser and workspace files as shipped, the stub printing `format`. */
+/**
+ * A profile around the stub: its argv, parser and workspace files as shipped, the stub printing
+ * `format`, EMULATE always (toolMode emulate: what `auto` runs where the bridge cannot — the
+ * bridge itself is test/bridge-clis.test.js's).
+ */
 function around(name, format, extra = {}) {
   const p = CLI_PROFILES[name];
   return {
@@ -33,6 +37,7 @@ function around(name, format, extra = {}) {
     cwd: path.join(dir, `ws-${name}-${format}`),
     env: { STUB_FORMAT: format, CLI_EMU_LOG: path.join(dir, 'runs.jsonl') },
     timeoutMs: 20_000,
+    toolMode: 'emulate',
     ...extra,
   };
 }
@@ -224,14 +229,15 @@ for (const [id, name] of [['oc', 'opencode'], ['kr', 'kiro']]) {
   });
 }
 
-test('profiles: opencode, codex and qoder answer tool requests with EMULATE through their text argv; kiro carries the argv and keeps toolMode off', () => {
+test('profiles: opencode, codex and qoder answer tool requests (auto: the bridge, EMULATE through their text argv where it cannot); kiro carries the argv and keeps toolMode off', () => {
   for (const name of ['opencode', 'codex', 'qoder']) {
     const p = CLI_PROFILES[name];
-    assert.equal(p.toolMode, 'emulate', name);
+    assert.equal(p.toolMode, 'auto', name);
     assert.deepEqual(p.emulateArgs, p.args, `${name}: EMULATE runs the tool-less text argv`);
     assert.notEqual(p.emulateArgs, p.args, `${name}: a copy, not the same list`);
-    assert.equal(checkAdapter(name, p).toolMode, 'emulate');
+    assert.equal(checkAdapter(name, p).toolMode, 'auto');
     assert.match(p.note, /EMULATE/, `${name}: the note says how tool requests are answered`);
+    assert.match(p.note, /MCP bridge/);
   }
   const k = CLI_PROFILES.kiro;
   assert.equal(k.toolMode, 'off', 'never verified live: the overage limit refused every run');

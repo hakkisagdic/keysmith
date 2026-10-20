@@ -2,7 +2,10 @@
 /**
  * The MCP server a CLI starts for the bridge (design §3, U6): `node src/bridge/shim.js`, with
  * KEYSMITH_BRIDGE_SOCK (the gateway's Unix socket) and KEYSMITH_BRIDGE_TOKEN (its session's
- * token) in its environment, both written by keysmith into the session's agent file.
+ * token) in its environment, both written by keysmith into the session's agent file — or, for a
+ * CLI that takes its MCP servers on the command line (codex), KEYSMITH_BRIDGE_TOKEN_FILE: the
+ * path of the session's token file (0600, in a directory keysmith owns), so the token itself is
+ * never part of an argv another process could read.
  *
  * It knows nothing about MCP. It connects, sends one hello line with the token, and from then on
  * copies bytes both ways — stdin to the socket, the socket to stdout — so the gateway's hub
@@ -12,11 +15,20 @@
  * It prints nothing of what it carries, and never the token.
  */
 import net from 'node:net';
+import fs from 'node:fs';
 
 const sock = process.env.KEYSMITH_BRIDGE_SOCK;
-const token = process.env.KEYSMITH_BRIDGE_TOKEN;
+let token = process.env.KEYSMITH_BRIDGE_TOKEN;
+if (!token && process.env.KEYSMITH_BRIDGE_TOKEN_FILE) {
+  try {
+    token = fs.readFileSync(process.env.KEYSMITH_BRIDGE_TOKEN_FILE, 'utf8').trim();
+  } catch (e) {
+    process.stderr.write(`keysmith bridge shim: cannot read the session's token file (${e.code || 'error'})\n`);
+    process.exit(2);
+  }
+}
 if (!sock || !token) {
-  process.stderr.write('keysmith bridge shim: KEYSMITH_BRIDGE_SOCK and KEYSMITH_BRIDGE_TOKEN must be set (keysmith writes them into the agent file)\n');
+  process.stderr.write('keysmith bridge shim: KEYSMITH_BRIDGE_SOCK and KEYSMITH_BRIDGE_TOKEN (or KEYSMITH_BRIDGE_TOKEN_FILE) must be set (keysmith writes them into the session\'s configuration)\n');
   process.exit(2);
 }
 

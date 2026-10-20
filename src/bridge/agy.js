@@ -1,11 +1,11 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getParser, toLines } from '../parsers.js';
 import { expand } from '../config.js';
-import { joinArgs, keepTail } from '../util.js';
-import { refuseNul, spawnCli, which } from '../cli-adapter.js';
-import { redactSecrets } from '../redact.js';
+import { joinArgs } from '../util.js';
+import { refuseNul } from '../cli-adapter.js';
+import { KILL_GRACE_MS, bridgeEnv, list, older, rm, spawnGroup, writePrivate } from './proc.js';
+
+export { KILL_GRACE_MS };
 
 /**
  * The agy driver of the MCP bridge (design §3, U7): how one bridge session runs agy.
@@ -38,11 +38,9 @@ import { redactSecrets } from '../redact.js';
  * conversation files stay where agy keeps them, as they do for a text run.
  */
 
-const SHIM = fileURLToPath(new URL('./shim.js', import.meta.url));
+export const SHIM = fileURLToPath(new URL('./shim.js', import.meta.url));
 const AGENT_FILE = /^ks-b-[0-9a-f]{12}\.md$/;
 const SERVER_DIR = /^ks[0-9a-f]{6}$/;
-/** After SIGTERM to the process group, SIGKILL this much later if anything of it is left. */
-export const KILL_GRACE_MS = 5_000;
 
 export const MCP_CACHE_DIR = '~/.gemini/antigravity-cli/mcp';
 
@@ -58,14 +56,23 @@ export const agyDriver = {
   id: 'agy',
   /** The tools agy keeps on every agent; one of them is not a foreign tool (stopAtToolCall decides). */
   harnessTools: ['manage_task'],
+  /**
+   * How the calls of one model step reach the client: agy runs them one after the other (the next
+   * one comes after the previous one's result), so one call per HTTP turn — and each call's step
+   * shows in agy's stream before or as its tools/call arrives (src/bridge/index.js waits for it).
+   */
+  batch: 'serial',
 
   /**
    * An agy adapter with a bridge argv — in a workspace keysmith owns (a configured cwd): the session
    * file is written there and agy reads its project there, so never the gateway's own directory.
    * (The gateway refuses a toolMode without a cwd at load; this holds without that check too.)
+   * `bridge.driver` names the driver; an entry without one is agy's when its parser is agy's.
    */
   supports(adapter) {
-    return adapter?.kind === 'cli' && adapter.parser === 'agy-stream-json' && Array.isArray(adapter.bridge?.args) && adapter._ownsCwd === true;
+    if (adapter?.kind !== 'cli' || !Array.isArray(adapter.bridge?.args) || adapter._ownsCwd !== true) return false;
+    const named = adapter.bridge.driver;
+    return named ? named === 'agy' : adapter.parser === 'agy-stream-json';
   },
 
   /** What agy's model calls a tool of server `server`. */
@@ -144,72 +151,20 @@ export const agyDriver = {
     adapter._ensureCwd();
     const file = this.agentFile(adapter, session);
     writePrivate(file, this.agentText(session));
-    const stdin = adapter.promptVia === 'stdin';
-    let child;
     try {
-      child = spawnCli(adapter.id, which(adapter.bin) || adapter.bin, argv, { cwd: adapter.cwd, env: adapter._childEnv(), detached: true, stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+      return spawnGroup(adapter, {
+        argv,
+        env: bridgeEnv(adapter),
+        stdinText: adapter.promptVia === 'stdin' ? prompt : null,
+        parser: 'agy-stream-json',
+        parserOpts: { perStepUsage: true },
+        killGraceMs,
+      });
     } catch (e) {
       // No process will read it: the file, and the token in it, go now.
       rm(file);
       throw e;
     }
-    if (stdin) {
-      child.stdin.on('error', () => {});
-      child.stdin.end(prompt);
-    }
-    let stderr = '';
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (c) => {
-      stderr += c;
-      if (stderr.length > 64_000) stderr = keepTail(stderr, 32_000);
-    });
-    let stopped = null;
-    let exited = false;
-    const group = (sig) => {
-      if (!child.pid) return;
-      try {
-        process.kill(-child.pid, sig);
-      } catch {
-        try {
-          if (!exited) child.kill(sig);
-        } catch {}
-      }
-    };
-    const done = new Promise((resolve) => {
-      child.on('error', (e) => {
-        exited = true;
-        resolve({ code: -1, stderr: redactSecrets(e.message), killed: !!stopped });
-      });
-      child.on('close', (code, signal) => {
-        exited = true;
-        resolve({ code: code ?? -1, signal: signal || null, stderr: redactSecrets(stderr.trim()), killed: !!stopped });
-      });
-    });
-    const stop = (why = 'stopped') => {
-      if (!stopped) {
-        stopped = why;
-        group('SIGTERM');
-        const t = setTimeout(() => group('SIGKILL'), killGraceMs);
-        t.unref?.();
-        done.then(() => {
-          // The leader is gone; whatever of its group is left (a shim) gets the same end now.
-          clearTimeout(t);
-          group('SIGKILL');
-        });
-      }
-      return done;
-    };
-    const parse = getParser('agy-stream-json');
-    const events = (async function* () {
-      try {
-        yield* parse(toLines(child.stdout), { perStepUsage: true });
-      } finally {
-        // The parser stops at agy's result line; what comes after it is read and dropped, so
-        // agy never blocks on a full pipe.
-        child.stdout.resume();
-      }
-    })();
-    return { pid: child.pid, events, stop, done };
   },
 
   /** Why a run that never listed the bridge's tools failed, as a fallback reason. */
@@ -235,50 +190,14 @@ export const agyDriver = {
     const dir = path.join(adapter.cwd, '.agents', 'agents');
     for (const f of list(dir)) {
       if (!AGENT_FILE.test(f) || keep.has(`ks${f.slice(5, 11)}`)) continue;
-      if (old(path.join(dir, f), now, olderThanMs) && rm(path.join(dir, f))) removed++;
+      if (older(path.join(dir, f), now, olderThanMs) && rm(path.join(dir, f))) removed++;
     }
     const cache = this.cacheDir(adapter);
     for (const d of list(cache)) {
       if (!SERVER_DIR.test(d) || keep.has(d)) continue;
-      if (old(path.join(cache, d), now, olderThanMs) && rm(path.join(cache, d), true)) removed++;
+      if (older(path.join(cache, d), now, olderThanMs) && rm(path.join(cache, d), true)) removed++;
     }
     return removed;
   },
 };
-
-/** The drivers there are: a CLI with none has no bridge (toolMode auto is EMULATE for it). */
-export const DRIVERS = [agyDriver];
-
-function writePrivate(file, content) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, content, { mode: 0o600 });
-  fs.renameSync(tmp, file);
-  fs.chmodSync(file, 0o600);
-}
-
-function rm(p, dir = false) {
-  try {
-    fs.rmSync(p, { recursive: dir, force: true });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function list(dir) {
-  try {
-    return fs.readdirSync(dir);
-  } catch {
-    return [];
-  }
-}
-
-function old(p, now, olderThanMs) {
-  try {
-    return now - fs.statSync(p).mtimeMs > olderThanMs;
-  } catch {
-    return false;
-  }
-}
 

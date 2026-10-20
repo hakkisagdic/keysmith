@@ -142,15 +142,20 @@ export async function* opencodeNdjson(lines) {
 /**
  * Claude-Code-shaped stream (`claude -p --output-format stream-json`), which
  * Qoder CLI and other Claude-derived harnesses imitate. Message objects arrive whole,
- * so deltas are computed against what has already been forwarded.
+ * so deltas are computed against what has already been forwarded. A `tool_use` content block is
+ * a `tool` event, once per block id — printed with the assistant message that made the call,
+ * before the harness runs it (qodercli 1.1.59: `mcp__<server>__<tool>` for an MCP server's tool;
+ * with its lazy MCP, `mcp_call` with the tool's name in `input.toolName`, read as that tool).
  */
 export async function* claudeStreamJson(lines) {
   const sent = new Map(); // message id -> chars forwarded
+  const tools = new Set();
   for await (const line of lines) {
     const d = json(line);
     if (!d) continue;
-    if (d.type === 'assistant' && d.message?.content) {
+    if (d.type === 'assistant' && Array.isArray(d.message?.content)) {
       for (const block of d.message.content) {
+        if (!block || typeof block !== 'object') continue;
         if (block.type === 'text' && typeof block.text === 'string') {
           const key = d.message.id || 'current';
           const prev = sent.get(key) || 0;
@@ -158,6 +163,15 @@ export async function* claudeStreamJson(lines) {
           sent.set(key, Math.max(prev, block.text.length));
         } else if (block.type === 'thinking' && block.thinking) {
           yield { type: 'reasoning', text: block.thinking };
+        } else if (block.type === 'tool_use' || block.type === 'server_tool_use') {
+          const key = block.id || `${block.name}#${tools.size}`;
+          if (!tools.has(key)) {
+            tools.add(key);
+            // qoder's lazy MCP proxy (`mcp_call {toolName, arguments}`) calls the MCP tool it names:
+            // that tool is the call, as far as a reader of this stream is concerned.
+            const via = block.name === 'mcp_call' && typeof block.input?.toolName === 'string' && block.input.toolName ? block.input.toolName : null;
+            yield EV.tool(via || (typeof block.name === 'string' && block.name ? block.name : 'a tool'));
+          }
         }
       }
     } else if (d.type === 'result') {
@@ -384,6 +398,73 @@ export async function* warpNdjson(lines) {
   yield EV.done('stop');
 }
 
+/** The item types of `codex exec --json` that are not a tool: text, thinking, its own plan, a compaction, a warning. */
+const CODEX_QUIET_ITEMS = new Set(['agent_message', 'reasoning', 'todo_list', 'context_compaction', 'error']);
+
+/**
+ * Codex CLI (`codex exec --json`) — codex 0.163.0, read off the tool-bridge probe's live runs:
+ *
+ *   {"type":"thread.started","thread_id":"…"}
+ *   {"type":"turn.started"}
+ *   {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I'm checking …"}}
+ *   {"type":"item.started","item":{"id":"item_1","type":"mcp_tool_call","server":"ks3f9a0c","tool":"get_weather","arguments":{…},"status":"in_progress"}}
+ *   {"type":"item.completed","item":{"id":"item_1","type":"mcp_tool_call",…,"result":{…},"status":"completed"}}
+ *   {"type":"turn.completed","usage":{"input_tokens":20221,"cached_input_tokens":14976,"output_tokens":144,"reasoning_output_tokens":20}}
+ *
+ * An agent message is a delta when it completes (codex sends it whole); two with no call between
+ * them are two paragraphs. Every item that is not text, thinking, its plan (`todo_list`), a compaction or a
+ * warning (`error` items: an MCP server that failed to start, say) is a tool: an MCP call is a
+ * `tool` event named `mcp__<server>__<tool>` as it starts — before codex sends its tools/call —
+ * and anything else (`command_execution`, `file_change`, `web_search`, a sub-agent's call, a type
+ * this parser has never seen) a `tool` event named by its type, once per item. That is what the
+ * bridge's tripwire reads (src/bridge/clis.js). `turn.completed` carries the run's usage,
+ * `turn.failed` and a top-level `error` line its failure.
+ */
+export async function* codexJson(lines) {
+  const tools = new Set();
+  let afterText = false; // the last item that said anything was an agent message: a next one is a new paragraph
+  for await (const line of lines) {
+    const d = json(line);
+    if (!d || typeof d.type !== 'string') continue;
+    if (d.type === 'thread.started') {
+      if (typeof d.thread_id === 'string' && d.thread_id) yield EV.session(d.thread_id);
+    } else if (d.type === 'item.started' || d.type === 'item.updated' || d.type === 'item.completed') {
+      const it = d.item && typeof d.item === 'object' ? d.item : {};
+      const kind = typeof it.type === 'string' ? it.type : 'unknown';
+      if (kind === 'agent_message') {
+        if (d.type === 'item.completed' && typeof it.text === 'string' && it.text) {
+          yield EV.delta(afterText ? `\n\n${it.text}` : it.text);
+          afterText = true;
+        }
+      } else if (kind === 'reasoning') {
+        if (d.type === 'item.completed' && typeof it.text === 'string' && it.text) yield { type: 'reasoning', text: it.text };
+      } else if (!CODEX_QUIET_ITEMS.has(kind)) {
+        // A call ends the paragraph: what the model says after its result is a new answer (on the
+        // bridge, the next HTTP turn's), not a second paragraph of this one.
+        afterText = false;
+        const key = typeof it.id === 'string' && it.id ? it.id : `${kind}#${tools.size}`;
+        if (!tools.has(key)) {
+          tools.add(key);
+          yield EV.tool(kind === 'mcp_tool_call' ? `mcp__${String(it.server ?? '')}__${String(it.tool ?? '')}` : kind);
+        }
+      }
+    } else if (d.type === 'turn.completed') {
+      const u = d.usage && typeof d.usage === 'object' ? d.usage : null;
+      if (u) {
+        // OpenAI's counts: output_tokens holds the reasoning tokens, input_tokens the cached ones.
+        const usage = normaliseUsage({ input_tokens: u.input_tokens, output_tokens: u.output_tokens, cache_read_input_tokens: u.cached_input_tokens });
+        if (usage) yield EV.usage(usage);
+      }
+    } else if (d.type === 'turn.failed') {
+      const why = typeof d.error === 'string' ? d.error : d.error?.message || 'turn failed';
+      yield EV.error(truncate(`codex: ${why}`, 400));
+    } else if (d.type === 'error') {
+      yield EV.error(truncate(`codex: ${typeof d.message === 'string' ? d.message : 'error'}`, 400));
+    }
+  }
+  yield EV.done('stop');
+}
+
 /** Anything that just prints the answer. */
 export async function* rawText(lines) {
   const out = [];
@@ -400,6 +481,7 @@ export const PARSERS = {
   'agy-stream-json': agyStreamJson,
   'kiro-stream-json': kiroStreamJson,
   'warp-ndjson': warpNdjson,
+  'codex-json': codexJson,
   raw: rawText,
 };
 

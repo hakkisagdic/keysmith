@@ -288,8 +288,9 @@ export class Session {
     registerSecrets([this.token]);
     this.state = 'generating';
     this.turns = 0; // calls handed to the client
+    this.rounds = 0; // answers that handed calls out (HTTP turns that ended in tool_calls)
     this.emitted = [];
-    this.out = null; // the call with the client: { id, mcpId, name }
+    this.outs = []; // the calls with the client: [{ id, mcpId, name }] — one on a serial driver (agy)
     this.openedAt = hub.now();
     this.lastActive = this.openedAt;
     this.inbox = [];
@@ -341,13 +342,25 @@ export class Session {
     return this.inbox.shift();
   }
 
-  /** Call `out` went to the client: the session waits for its result, on the clock. */
-  hold({ id, mcpId, name }) {
-    this.out = { id, mcpId, name };
-    this.emitted.push(id);
-    this.idSeq.push(id);
-    this.hub._index(id, this);
-    this.turns++;
+  /** The first call with the client (the only one on a serial driver), or null. */
+  get out() {
+    return this.outs[0] ?? null;
+  }
+
+  /**
+   * The calls `calls` (one `{ id, mcpId, name }`, or a list of them: the calls of one step that
+   * went out in one answer) went to the client: the session waits for their results, on the clock.
+   */
+  hold(calls) {
+    const list = (Array.isArray(calls) ? calls : [calls]).map(({ id, mcpId, name }) => ({ id, mcpId, name }));
+    this.outs = list;
+    for (const { id } of list) {
+      this.emitted.push(id);
+      this.idSeq.push(id);
+      this.hub._index(id, this);
+    }
+    this.turns += list.length;
+    this.rounds++;
     this.state = 'waiting';
     this.lastActive = this.hub.now();
     const t = this.hub.timers;
@@ -373,10 +386,19 @@ export class Session {
     this.mcp.resetTurn();
   }
 
-  /** The client's result for the call it was handed, as that call's MCP result. False when the CLI can no longer be told. */
-  answer({ text = '', isError = false } = {}) {
-    const ok = !!this.out && this.mcp.answer(this.out.mcpId, { text, isError });
-    this.out = null;
+  /**
+   * The client's results for the calls it was handed, each as its call's MCP result: a list of
+   * `{ id, text, isError }`, or one `{ text, isError }` for the one call out. False when the CLI
+   * can no longer be told (of any of them).
+   */
+  answer(results = {}) {
+    const list = Array.isArray(results) ? results : this.outs.length === 1 ? [{ ...results, id: this.outs[0].id }] : [];
+    let ok = list.length > 0;
+    for (const r of list) {
+      const out = this.outs.find((o) => o.id === r.id);
+      ok = (!!out && this.mcp.answer(out.mcpId, { text: r.text ?? '', isError: r.isError === true })) && ok;
+    }
+    this.outs = [];
     return ok;
   }
 

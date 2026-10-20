@@ -9,7 +9,7 @@ import { adapterReach, aliasDecision, requestDecision } from './keys.js';
 import { describeUnsupported, toolEvents, toolPath } from './tools/router.js';
 import { addUsage } from './tools/emulate.js';
 import { McpBridge } from './bridge/index.js';
-import { DRIVERS } from './bridge/agy.js';
+import { DRIVERS } from './bridge/drivers.js';
 
 /**
  * The gateway: config in, one model catalogue + one streaming `complete()` out.
@@ -53,8 +53,9 @@ export class Gateway {
         this.log(`adapter "${id}" failed to load: ${e.message}`);
       }
     }
-    // The bridge exists when a CLI with toolMode mcp or auto has a driver for it (agy with a
-    // `bridge.args`). Nothing listens until the first request that takes it, or `serve`'s start().
+    // The bridge exists when a CLI with toolMode mcp or auto has a driver for it (a `bridge.args`,
+    // and the driver it names: agy, opencode, codex, qoder). Nothing listens until the first
+    // request that takes it, or `serve`'s start().
     const bridged = [...this.adapters.values()].some((a) => a.kind === 'cli' && (a.toolMode === 'mcp' || a.toolMode === 'auto') && DRIVERS.some((d) => d.supports(a)));
     if (bridged) this.toolEngines.mcp = new McpBridge({ limits: cfg.limits?.bridge, log: this.log, adapters: () => [...this.adapters.values()] });
   }

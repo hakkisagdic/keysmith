@@ -532,14 +532,33 @@ function checkTemplate(id, field, tpl) {
   return tpl;
 }
 
+/** The bridge drivers there are (src/bridge/drivers.js), by the name `bridge.driver` takes. */
+export const BRIDGE_DRIVERS = ['agy', 'opencode', 'codex', 'qoder', 'claude'];
+
 /**
- * The MCP bridge's settings on a CLI entry (src/bridge): an object; its `args` an argv template;
- * its limits positive numbers (`maxSessions` and `maxTurns` whole ones); `mcpCacheDir` a path.
+ * The MCP bridge's settings on a CLI entry (src/bridge): an object; its `driver` one of
+ * BRIDGE_DRIVERS (absent: agy's, for an agy-stream-json entry); its `args` an argv template; its
+ * limits positive numbers (`maxSessions` and `maxTurns` whole ones); `mcpCacheDir` a path.
+ *
+ * An approval setting in the bridge's argv may approve the session's own server and nothing else:
+ * codex's `default_tools_approval_mode` only as `mcp_servers.{server}.…`, its `approval_policy`
+ * only `"never"`. Whatever the bridge's server is offered goes to keysmith, which hands it to the
+ * client; an approval wider than that would let the CLI run something of its own unasked.
  */
 function checkBridge(id, bridge) {
   if (bridge == null) return null;
   if (typeof bridge !== 'object' || Array.isArray(bridge)) throw new Error(`adapter "${id}": bridge must be an object of the MCP bridge's settings`);
+  if (bridge.driver != null && !BRIDGE_DRIVERS.includes(bridge.driver)) throw new Error(`adapter "${id}": bridge.driver must be one of ${BRIDGE_DRIVERS.join(', ')} — got ${JSON.stringify(bridge.driver)?.slice(0, 40)}`);
   checkTemplate(id, 'bridge.args', bridge.args);
+  for (const t of (bridge.args || []).flat(Infinity)) {
+    if (typeof t !== 'string') continue;
+    if (/default_tools_approval_mode/.test(t) && !t.startsWith('mcp_servers.{server}.default_tools_approval_mode=')) {
+      throw new Error(`adapter "${id}": bridge.args may approve the session's own MCP server only (mcp_servers.{server}.default_tools_approval_mode=…) — got ${JSON.stringify(t.slice(0, 80))}`);
+    }
+    if (/^approval_policy\s*=/.test(t) && !/^approval_policy\s*=\s*"never"$/.test(t)) {
+      throw new Error(`adapter "${id}": bridge.args sets approval_policy to something other than "never" — the CLI could run its own tools unasked`);
+    }
+  }
   for (const k of ['maxSessions', 'maxTurns']) {
     if (bridge[k] != null && !(Number.isInteger(bridge[k]) && bridge[k] > 0)) throw new Error(`adapter "${id}": bridge.${k} must be a whole number above 0`);
   }
