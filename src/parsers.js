@@ -194,8 +194,13 @@ export async function* claudeStreamJson(lines) {
  *    answer again, as often as it likes. Each tool step is reported once as a `tool` event,
  *    so an adapter that wants one answer can end the run there. A run stopped that way has
  *    no `result` line, so the usage counted so far is reported when the stream ends.
+ *
+ * `perStepUsage` (the MCP bridge, src/bridge/index.js): each agent_response step's usage is its
+ * own `usage` event as the step ends, and nothing is summed — one run of the bridge answers
+ * several HTTP turns, and each turn reports the steps it ran. The `result` line's total is
+ * reported only when no step carried usage. Text runs read the stream as they always did.
  */
-export async function* agyStreamJson(lines) {
+export async function* agyStreamJson(lines, { perStepUsage = false } = {}) {
   let emitted = false;
   let sessionSent = false;
   let lastToolStep = null;
@@ -222,7 +227,8 @@ export async function* agyStreamJson(lines) {
       const u = s.step_type === 'agent_response' ? normaliseUsage(s.usage) : null;
       if (u) {
         stepUsage = true;
-        for (const k of Object.keys(spent)) spent[k] += u[k] || 0;
+        if (perStepUsage) yield EV.usage(u);
+        else for (const k of Object.keys(spent)) spent[k] += u[k] || 0;
       }
       if (s.step_type === 'tool') {
         // ACTIVE then DONE/ERROR arrive for the same step: one call, one event.
@@ -241,7 +247,7 @@ export async function* agyStreamJson(lines) {
         emitted = true;
         yield EV.delta(r.response);
       }
-      const usage = stepUsage ? spent : normaliseUsage(r.usage);
+      const usage = stepUsage ? (perStepUsage ? null : spent) : normaliseUsage(r.usage);
       if (usage && (usage.input || usage.output || usage.total)) yield EV.usage(usage);
       const denied = Array.isArray(r.denied_actions) ? r.denied_actions : [];
       if (r.status && r.status !== 'SUCCESS') {
@@ -259,8 +265,9 @@ export async function* agyStreamJson(lines) {
       yield EV.error(truncate(`agy: ${typeof d.error === 'string' ? d.error : d.error?.message || d.message || 'error'}`, 400));
     }
   }
-  // No `result` line: the process was stopped or killed. What it spent is still spent.
-  if (stepUsage && (spent.input || spent.output)) yield EV.usage(spent);
+  // No `result` line: the process was stopped or killed. What it spent is still spent (and,
+  // per step, was reported as each step ended).
+  if (stepUsage && !perStepUsage && (spent.input || spent.output)) yield EV.usage(spent);
   yield EV.done('stop');
 }
 

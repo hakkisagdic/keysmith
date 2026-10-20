@@ -495,11 +495,21 @@ function checkTemplate(id, field, tpl) {
   return tpl;
 }
 
-/** The MCP bridge's settings on a CLI entry: an object; its `args` an argv template. */
+/**
+ * The MCP bridge's settings on a CLI entry (src/bridge): an object; its `args` an argv template;
+ * its limits positive numbers (`maxSessions` and `maxTurns` whole ones); `mcpCacheDir` a path.
+ */
 function checkBridge(id, bridge) {
   if (bridge == null) return null;
   if (typeof bridge !== 'object' || Array.isArray(bridge)) throw new Error(`adapter "${id}": bridge must be an object of the MCP bridge's settings`);
   checkTemplate(id, 'bridge.args', bridge.args);
+  for (const k of ['maxSessions', 'maxTurns']) {
+    if (bridge[k] != null && !(Number.isInteger(bridge[k]) && bridge[k] > 0)) throw new Error(`adapter "${id}": bridge.${k} must be a whole number above 0`);
+  }
+  for (const k of ['toolResultTimeoutMs', 'sessionMaxMs', 'readyTimeoutMs']) {
+    if (bridge[k] != null && !(Number.isFinite(bridge[k]) && bridge[k] > 0)) throw new Error(`adapter "${id}": bridge.${k} must be a number of milliseconds above 0`);
+  }
+  if (bridge.mcpCacheDir != null && (typeof bridge.mcpCacheDir !== 'string' || !bridge.mcpCacheDir)) throw new Error(`adapter "${id}": bridge.mcpCacheDir must be a path`);
   return bridge;
 }
 

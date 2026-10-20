@@ -8,6 +8,8 @@ import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { adapterReach, aliasDecision, requestDecision } from './keys.js';
 import { describeUnsupported, toolEvents, toolPath } from './tools/router.js';
 import { addUsage } from './tools/emulate.js';
+import { McpBridge } from './bridge/index.js';
+import { DRIVERS } from './bridge/agy.js';
 
 /**
  * The gateway: config in, one model catalogue + one streaming `complete()` out.
@@ -31,8 +33,9 @@ export class Gateway {
     // failover leg to a second key on the same endpoint can put back what the first leg saw.
     this.signatureStores = new Map();
     // The tool engines a CLI leg can run besides EMULATE (src/tools/router.js): the MCP bridge,
-    // `{ check(adapter, spec), run(adapter, opts) }`, once there is one (design U6/U7). Without it
-    // toolMode auto is EMULATE, and toolMode mcp a 503.
+    // `{ check(adapter, spec, ctx), run(adapter, opts) }` (src/bridge/index.js), when an adapter
+    // can use it — set below, once the adapters are loaded. Without it toolMode auto is EMULATE,
+    // and toolMode mcp a 503.
     this.toolEngines = { mcp: null };
     for (const [id, raw] of Object.entries(cfg.adapters || {})) {
       try {
@@ -50,6 +53,15 @@ export class Gateway {
         this.log(`adapter "${id}" failed to load: ${e.message}`);
       }
     }
+    // The bridge exists when a CLI with toolMode mcp or auto has a driver for it (agy with a
+    // `bridge.args`). Nothing listens until the first request that takes it, or `serve`'s start().
+    const bridged = [...this.adapters.values()].some((a) => a.kind === 'cli' && (a.toolMode === 'mcp' || a.toolMode === 'auto') && DRIVERS.some((d) => d.supports(a)));
+    if (bridged) this.toolEngines.mcp = new McpBridge({ limits: cfg.limits?.bridge, log: this.log, adapters: () => [...this.adapters.values()] });
+  }
+
+  /** Stop what the gateway runs on its own: the MCP bridge's sessions (each CLI stopped) and its socket. */
+  async close() {
+    await this.toolEngines.mcp?.close?.();
   }
 
   /**
@@ -500,7 +512,7 @@ export class Gateway {
   }
 
   async *_toolWalk(requested, chain, args, run, tools, failed) {
-    const { spec, face, relay = null, state = null } = tools;
+    const { spec, face, relay = null, state = null, caller = '' } = tools;
     let lastError = null;
     const tried = new Set();
     const refused = [];
@@ -537,11 +549,16 @@ export class Gateway {
           state,
           mcp: this.toolEngines.mcp,
           log: this.log,
+          caller,
+          face,
         });
         yield* this._leg(leg, events, run, st, { sessions: false });
         return;
       } catch (e) {
         const err = this._legFailed(leg, e, st, args.signal, more);
+        // A 409 from the bridge (another request is answering this very tool result): no other
+        // leg makes a second answer to it.
+        if (err.routeEnd) throw err;
         if (err.toolMode) failed.push(failedLeg(leg, err));
         lastError = routeError(lastError, err);
         refused.push({ target: leg.target, status: err.status });
@@ -579,7 +596,8 @@ export class Gateway {
   /**
    * Non-streaming convenience used by the faces when stream=false: the text, and the tool calls
    * an engine handed back for the client to run (`toolCalls`, canonical `tool_call` events), with
-   * which engine answered (`toolMode`) and why not the one picked first (`fallback`). `relayed`:
+   * which engine answered (`toolMode`), why not the one picked first (`fallback`) and, for the MCP
+   * bridge, which session answered and how it was reached (`bridge`). `relayed`:
    * an HTTP leg's answer went to the client verbatim (the face's relay wrote it), so there is
    * nothing here to write.
    */
@@ -594,6 +612,7 @@ export class Gateway {
     const toolCalls = [];
     let toolMode = null;
     let fallback = null;
+    let bridge = null;
     let relayed = false;
     for await (const evt of this.complete(opts)) {
       if (evt.type === 'relayed') relayed = true;
@@ -601,14 +620,14 @@ export class Gateway {
       else if (evt.type === 'cut') cutAt = evt.tool;
       else if (evt.type === 'delta') text += evt.text;
       else if (evt.type === 'tool_call') toolCalls.push(evt);
-      else if (evt.type === 'tool_mode') [toolMode, fallback] = [evt.mode || null, evt.fallback || null];
+      else if (evt.type === 'tool_mode') [toolMode, fallback, bridge] = [evt.mode || null, evt.fallback || null, evt.bridge || null];
       else if (evt.type === 'reasoning') reasoning += evt.text;
       else if (evt.type === 'usage') usage = mergeUsage(usage, evt.usage);
       else if (evt.type === 'session') sessionId = sessionId || evt.id;
       else if (evt.type === 'error') err = evt.message;
     }
     if (err && !text && !toolCalls.length) throw new LlmError(err, { status: 502 });
-    return { text, reasoning, usage, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, relayed };
+    return { text, reasoning, usage, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed };
   }
 }
 

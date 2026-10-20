@@ -604,6 +604,16 @@ async function cmdServe(flags) {
   for (const issue of keyProblems(cfg)) warn(`! auth.keys: ${issue}`);
   if (secured.changed.length) out(`  logs    : tightened ${secured.changed.length} file(s)/dir(s) to 0600/0700`);
   for (const f of secured.failed) warn(`! could not tighten ${f}`);
+  // The MCP bridge (agy's toolMode auto/mcp): its socket, and what a gateway killed before it
+  // could clean up left behind. A bridge that cannot listen leaves tool requests to EMULATE.
+  if (gateway.toolEngines.mcp) {
+    try {
+      await gateway.toolEngines.mcp.start();
+      out(`  bridge  : ${rel(gateway.toolEngines.mcp.hub.socketPath)}`);
+    } catch (e) {
+      warn(`! MCP bridge: ${redactSecrets(e.message)} — tool requests run as EMULATE (toolMode auto) or fail (toolMode mcp)`);
+    }
+  }
   writePid(cfg.port, process.pid);
 
   let tn = null;
@@ -626,8 +636,10 @@ async function cmdServe(flags) {
   const shutdown = (sig) => {
     out(`\n${sig} — closing`);
     tn?.stop();
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 3000).unref();
+    // The bridge's waiting CLIs are stopped (their process groups), and their files removed once
+    // they are gone, before the process ends.
+    Promise.allSettled([gateway.close(), new Promise((r) => server.close(r))]).then(() => process.exit(0));
+    setTimeout(() => process.exit(0), 8000).unref();
     removePid();
   };
   process.on('SIGINT', () => shutdown('SIGINT'));

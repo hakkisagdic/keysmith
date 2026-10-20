@@ -74,10 +74,12 @@ export function toolPath(adapter, spec, face) {
 /**
  * Which engine runs a tool request on a CLI leg: `{ engine: 'plain' | 'emulate' | 'mcp',
  * fallback? }`, or a thrown LlmError when this leg cannot take it (the route moves on).
- * `mcp` is the bridge (null until there is one): `check(adapter, spec)` says whether it can take
- * this request now — `{ ok: true }` or `{ ok: false, reason, status?, retryAfter? }`.
+ * `mcp` is the bridge (src/bridge/index.js; null when no adapter has one): `check(adapter, spec,
+ * ctx)` says whether it can take this request now — `{ ok: true }` or `{ ok: false, reason,
+ * status?, retryAfter? }`. `ctx` (`messages`, `caller`, `target`) lets it see a request that
+ * continues one of its sessions, which is always the bridge's.
  */
-export function pickEngine(adapter, spec, mcp) {
+export function pickEngine(adapter, spec, mcp, ctx = {}) {
   const mode = adapter.toolMode || 'off';
   const choice = spec.choice?.mode || 'auto';
   if (choice === 'none') return { engine: 'plain' };
@@ -92,7 +94,7 @@ export function pickEngine(adapter, spec, mcp) {
       });
     }
     if (!mcp) throw new LlmError(`adapter "${adapter.id}": toolMode mcp, and this keysmith has no MCP bridge — set toolMode emulate or auto`, { status: 503, provider: adapter.id });
-    const c = mcp.check(adapter, spec);
+    const c = mcp.check(adapter, spec, ctx);
     if (!c.ok) {
       const e = new LlmError(`adapter "${adapter.id}": the MCP bridge cannot take this request (${c.reason})`, { status: c.status || 503, provider: adapter.id });
       if (c.retryAfter) e.retryAfter = String(c.retryAfter);
@@ -103,7 +105,7 @@ export function pickEngine(adapter, spec, mcp) {
   // auto
   if (forced) return { engine: 'emulate' };
   if (!mcp) return { engine: 'emulate', fallback: 'no_bridge' };
-  const c = mcp.check(adapter, spec);
+  const c = mcp.check(adapter, spec, ctx);
   if (!c.ok) return { engine: 'emulate', fallback: c.reason || 'bridge_refused' };
   return { engine: 'mcp' };
 }
@@ -114,13 +116,19 @@ export function pickEngine(adapter, spec, mcp) {
  * answer event. `state.mode` follows the engine as it starts, for a header written before the
  * answer is known. In auto, a bridge that fails before any call or text went out hands the same
  * request to EMULATE — unless the failure is one that must never be retried another way
- * (`noFallback`: the bridge's foreign-tool tripwire is a security event, not a slow engine).
+ * (`noFallback`: the bridge's foreign-tool tripwire is a security event, not a slow engine; a
+ * 409 for a result another request is answering).
+ *
+ * The bridge is told who asks (`caller`, the gateway key's hash), for which leg (`target`) and
+ * on which face (`face`: the ids it hands out are that face's); its `bridge` event (which
+ * session, reached how) rides on the `tool_mode` event, for the usage row.
  *
  * A failure says which engine failed (`toolMode`, and `fallback` when it was not auto's first
  * pick) next to what the engine spent (`usage`, `retries`: emulate.js), for the usage row.
  */
-export async function* toolEvents({ adapter, model }, { spec, messages, plain, signal, includeReasoning = false, maxTokens, state = null, mcp = null, log = () => {} }) {
-  const pick = pickEngine(adapter, spec, mcp);
+export async function* toolEvents({ adapter, model, target = null }, { spec, messages, plain, signal, includeReasoning = false, maxTokens, state = null, mcp = null, log = () => {}, caller = '', face = 'openai' }) {
+  const ctx = { messages, caller, target: target || `${adapter.id}/${model}` };
+  const pick = pickEngine(adapter, spec, mcp, ctx);
   if (pick.engine === 'plain') {
     // tool_choice none: the model may not call a tool, so the CLI answers in text — with the
     // history (earlier calls, fenced results) rendered the EMULATE way, and no session resumed.
@@ -136,8 +144,14 @@ export async function* toolEvents({ adapter, model }, { spec, messages, plain, s
     if (state) state.mode = 'mcp';
     const held = [];
     let started = false;
+    let bridge = null;
+    const said = () => ({ type: 'tool_mode', mode: 'mcp', ...(bridge ? { bridge } : {}) });
     try {
-      for await (const evt of mcp.run(adapter, { model, spec, messages, signal, includeReasoning })) {
+      for await (const evt of mcp.run(adapter, { model, spec, messages, signal, includeReasoning, ...ctx, face })) {
+        if (evt.type === 'bridge') {
+          bridge = { session: evt.session, path: evt.path, turn: evt.turn };
+          continue;
+        }
         // An error before any answer is the bridge failing, whether it threw or said so.
         if (!started && evt.type === 'error') throw Object.assign(new LlmError(evt.message, { status: 502, provider: adapter.id }), { fallbackReason: evt.code || null, noFallback: !!evt.noFallback });
         if (!started && evt.type !== 'delta' && evt.type !== 'tool_call') {
@@ -146,13 +160,13 @@ export async function* toolEvents({ adapter, model }, { spec, messages, plain, s
         }
         if (!started) {
           started = true;
-          yield { type: 'tool_mode', mode: 'mcp' };
+          yield said();
           yield* held.splice(0);
         }
         yield evt;
       }
       if (!started) {
-        yield { type: 'tool_mode', mode: 'mcp' };
+        yield said();
         yield* held.splice(0);
       }
       return;
