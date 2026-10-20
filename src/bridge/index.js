@@ -21,11 +21,13 @@ import { startFailure } from '../cli-adapter.js';
  * on its tools/call. The client runs the tool and comes back with the result in its next request:
  *
  *   continuation   the request's last assistant turn holds exactly the call that session waits
- *                  for, followed by its result, from the same gateway key, to the same target,
- *                  with the same tools and the same system/user turns before it, and every call
- *                  id of the conversation in the order the session knows: the result goes to the
- *                  CLI as the call's MCP result (isError from the client's is_error), and what
- *                  the CLI does next is that request's answer — text, or its next call
+ *                  for, followed by its result and nothing else (a user turn after the result is
+ *                  the cold path: agy takes a result while it waits, not a user turn), from the
+ *                  same gateway key, to the same target, with the same tools and the same
+ *                  system/user turns before it, and every call id of the conversation in the
+ *                  order the session knows: the result goes to the CLI as the call's MCP result
+ *                  (isError from the client's is_error), and what the CLI does next is that
+ *                  request's answer — text, or its next call
  *   the same one   a second request for the continuation another one is answering: 409
  *   anything else  a new session, the conversation so far written into its prompt the EMULATE
  *                  way (earlier calls, fenced results): the cold path. A request whose session
@@ -126,10 +128,14 @@ export class McpBridge {
   check(adapter, spec, { messages = [], caller = '', target = '' } = {}) {
     const driver = this.driverFor(adapter);
     if (!driver) return { ok: false, reason: 'no_bridge' };
+    // The older functions/function_call: the call goes out with no id and its result comes back
+    // with none, so no later request could continue the session — every turn would leave an agy
+    // waiting on a call nobody can answer, until its clock or the next eviction.
+    if (spec.legacy) return { ok: false, reason: 'legacy', status: 400, why: 'the older functions/function_call carry no call id, so no later request could continue a session: send tools instead, or use toolMode emulate or auto' };
     const m = this.match(adapter, spec, messages, { caller, target });
     if (m.session) return { ok: true };
-    // A session at maxTurns gives up its place for the new one this request opens.
-    if (m.spent) return { ok: true };
+    // A session that gives up its place for the new one this request opens (maxTurns, a result with user text).
+    if (m.retire) return { ok: true };
     // The result of a call whose run the tripwire stopped: the bridge's to refuse (run()).
     if (m.kind === 'tripped') return { ok: true };
     if (!namesFit(spec, driver.prefix('ks000000').length)) return { ok: false, reason: 'name_too_long' };
@@ -147,12 +153,14 @@ export class McpBridge {
    * Which session a request belongs to: `{ kind: 'attach', session, result }` (it continues a
    * waiting session), `{ kind: 'busy', session }` (another request is answering that very
    * continuation), `{ kind: 'tripped' }` (it brings the result of a call this key was handed by a
-   * run the tripwire stopped), or `{ kind: 'new', why, late }` — `why` says why it continues none
-   * (null for a conversation with no call in it), `late` that its session existed and is gone.
+   * run the tripwire stopped), or `{ kind: 'new', why, late, retire? }` — `why` says why it
+   * continues none (null for a conversation with no call in it: the only `new` that is not the
+   * cold path), `late` that its session existed and is gone, `retire` the session of this very
+   * conversation that gives way to the new one (`{ session, reason }`: run() closes it).
    */
   match(adapter, spec, messages, { caller = '', target = '' } = {}) {
     const tail = continuation(messages);
-    if (!tail) return { kind: 'new', why: null, late: false };
+    if (!tail) return { kind: 'new', why: callIds(messages).length ? 'the request does not end in tool results' : null, late: false };
     const last = tail.ids[tail.ids.length - 1];
     const s = this.hub.sessionForCall(last);
     if (!s) {
@@ -174,9 +182,14 @@ export class McpBridge {
     if (s.state !== 'waiting' || s.out?.id !== last || tail.ids.length !== 1) return { kind: 'new', why: 'not the call its session waits for', late: false };
     const result = tail.results.find((r) => r.toolCallId === last);
     if (!result) return { kind: 'new', why: 'no result for the call its session waits for', late: false };
+    // The client's own words after the result: agy can be given the call's result, but not a user
+    // turn while it waits on the call — and text put into the result would reach the model as a
+    // tool's output, which it is told is data, not instructions. The conversation goes on, on a
+    // new session that reads it all (run() closes this one).
+    if (tail.extra.length) return { kind: 'new', why: "the result came with text of the user's", late: false, retire: { session: s, reason: 'user_text' } };
     // A session that handed out maxTurns calls has had its share: the conversation goes on, on a
     // new one (run() closes this one).
-    if (s.turns >= s.limits.maxTurns) return { kind: 'new', why: `its session reached maxTurns (${s.limits.maxTurns})`, late: false, spent: s };
+    if (s.turns >= s.limits.maxTurns) return { kind: 'new', why: `its session reached maxTurns (${s.limits.maxTurns})`, late: false, retire: { session: s, reason: 'max_turns' } };
     return { kind: 'attach', session: s, result };
   }
 
@@ -208,9 +221,14 @@ export class McpBridge {
       yield* this._attach(adapter, driver, m.session, m.result, o);
       return;
     }
-    if (m.spent) {
-      this.log(`bridge ${m.spent.server}: closed at maxTurns (${m.spent.limits.maxTurns} calls); the conversation goes on on a new session`);
-      m.spent.close('max_turns');
+    if (m.retire) {
+      const { session: old, reason } = m.retire;
+      this.log(
+        reason === 'max_turns'
+          ? `bridge ${old.server}: closed at maxTurns (${old.limits.maxTurns} calls); the conversation goes on on a new session`
+          : `bridge ${old.server}: closed: the result came with text of the user's, which ${adapter.id} cannot be given while it waits on a call; the conversation goes on on a new session (the cold path)`,
+      );
+      old.close(reason);
     }
     if (m.late) this.log(`bridge: a late result for ${target} (${m.why}); it runs on a new session with the conversation so far (the cold path)`);
     yield* this._open(adapter, driver, { ...o, why: m.why });
@@ -478,16 +496,21 @@ export class McpBridge {
 
 /**
  * The tail of a request that may continue a session: the tool results after the last assistant
- * turn that made calls (`ids`, in that turn's order), and what came before that turn. Null when
- * the request does not end in tool results.
+ * turn that made calls (`ids`, in that turn's order), what came before that turn, and the user
+ * turns after the results (`extra`: a Messages API user turn that holds tool_result blocks and
+ * then text, which reads as the results and a user turn; a user message after the tool
+ * messages). Null when the request does not end in tool results, or in tool results and user
+ * turns.
  */
 export function continuation(messages) {
   const list = Array.isArray(messages) ? messages : [];
   let i = list.length - 1;
+  const extra = [];
+  while (i >= 0 && list[i]?.role === 'user') extra.unshift(list[i--]);
   const results = [];
   while (i >= 0 && list[i]?.role === 'tool') results.unshift(list[i--]);
   if (!results.length || i < 0 || list[i]?.role !== 'assistant' || !list[i].toolCalls?.length) return null;
-  return { ids: list[i].toolCalls.map((c) => c.id), results, before: list.slice(0, i) };
+  return { ids: list[i].toolCalls.map((c) => c.id), results, before: list.slice(0, i), extra };
 }
 
 /** Every call id of a conversation, in order. */

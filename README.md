@@ -185,8 +185,8 @@ answering. `keysmith set agy toolMode off` puts it back the way it was.
 |---|---|
 | `off` (absent) | nothing: the leg is passed by |
 | `emulate` | EMULATE, below |
-| `mcp` | the MCP bridge, below, always: a `tool_choice` that forces a call is a 400 (MCP cannot make a model call a tool), a bridge with no room a 503 with `retry-after`, a CLI with no bridge driver (only agy has one) a 503 |
-| `auto` | the bridge where it can take the request, EMULATE otherwise, and EMULATE in the same request when the bridge fails before any call went out. `tool_choice: "none"` is a text answer; `required` or a named tool is EMULATE (MCP cannot make a model call a tool); tool names too long for the bridge, a bridge with no room, a CLI with no bridge driver is EMULATE — with the reason in the usage row (`fallback`: `name_too_long`, `bridge_full`, `no_bridge`, or what made the bridge fail: `unknown_agent`, `ready_timeout`, …) |
+| `mcp` | the MCP bridge, below, always: a `tool_choice` that forces a call is a 400 (MCP cannot make a model call a tool), so are the older `functions` (no call id to continue a session by), a bridge with no room a 503 with `retry-after`, a CLI with no bridge driver (only agy has one) a 503 |
+| `auto` | the bridge where it can take the request, EMULATE otherwise, and EMULATE in the same request when the bridge fails before any call went out. `tool_choice: "none"` is a text answer; `required` or a named tool is EMULATE (MCP cannot make a model call a tool); tool names too long for the bridge, a bridge with no room, a CLI with no bridge driver, the older `functions` is EMULATE — with the reason in the usage row (`fallback`: `name_too_long`, `bridge_full`, `no_bridge`, `legacy`, or what made the bridge fail: `unknown_agent`, `ready_timeout`, …) |
 
 Any mode but `off` needs the entry's `cwd`: a tool engine runs the CLI only in an empty
 workspace keysmith owns, never in the gateway's own directory (an entry without one does not
@@ -230,12 +230,20 @@ HTTP turns of one call each, whatever `parallel_tool_calls` says. Text the model
 a call stays in the answer that carries it.
 
 A request continues a session only when it is the same conversation: its last assistant turn
-holds the call the session waits for and the result follows it, it comes with the same gateway
-key, for the same target, with the same tools and the same system and user turns. Anything else
-— another key presenting a valid id, an edited history, a session that is gone — runs on a new
+holds the call the session waits for and the result follows it, with nothing after the result,
+it comes with the same gateway key, for the same target, with the same tools and the same
+system and user turns. Anything else — another key presenting a valid id, an edited history, a
+session that is gone, a conversation that goes on after its calls were answered — runs on a new
 session whose prompt carries the conversation so far, earlier calls and fenced results written
-the EMULATE way (the cold path; a result for a session that expired is logged as late). A
-second request carrying a result that another request is already answering is a 409.
+the EMULATE way (the cold path, `"path": "cold"` in the row; a result for a session that
+expired is logged as late). A result with text of the user's after it — a `/v1/messages` user
+turn that holds the `tool_result` and then a `text` block, as Claude Code-style clients send
+reminders; a user message after the `tool` message — is the cold path too: agy can be given a
+call's result while it waits, not a user turn, and text folded into the result would reach the
+model as a tool's output, which it is told is data. The session that waited for that result is
+closed then. A second request carrying a result that another request is already answering is a
+409. The older `functions`/`function_call` carry no call id a later request could continue, so
+`auto` answers them with EMULATE (`fallback: "legacy"`) and `mcp` refuses them with a 400.
 
 - **Clock.** `bridge.readyTimeoutMs` (30 s): agy lists the bridge's tools within it, and until
   it has, nothing of the answer goes out — so a session that fails before that (an agent agy

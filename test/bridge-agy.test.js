@@ -480,6 +480,69 @@ test('a history whose user turns changed is not a continuation: the cold path, a
   assert.ok(log.some((l) => /closed to make room for a new session of the same key/.test(l)));
 });
 
+test('a result with text of the user\'s after it (a Messages API turn holding a tool_result and a text block; a user message after the tool message) cannot go to the waiting agy: the cold path, labelled cold, and that session closed for it', async () => {
+  for (const face of ['anthropic', 'openai']) {
+    const t = tag();
+    const c = conversation(face, { user: `Weather? SCENARIO=one-call ${t}` });
+    const one = await c.ask();
+    assert.equal(one.calls.length, 1, one.r.text);
+    const [first] = runsOf(t);
+    const server = `ks${first.agent.slice(5, 11)}`;
+    c.result();
+    if (face === 'anthropic') c.history.at(-1).content.push({ type: 'text', text: 'Thanks, go on.' });
+    else c.history.push({ role: 'user', content: 'Thanks, go on.' });
+    const two = await c.ask();
+    assert.equal(two.r.status, 200, two.r.text);
+    assert.equal(two.text, 'From the history: RESULT for Ankara', `${face}: a new run read the result and the text from the transcript`);
+    assert.equal(lastRow().bridge.path, 'cold', face);
+    const runs = runsOf(t);
+    assert.equal(runs.length, 2);
+    assert.match(runs[1].prompt, /<<<END [0-9a-f]{8}>>>\n\n<user>\nThanks, go on\.\n<\/user>/, 'the text is a user turn after the result, never part of it');
+    assert.ok(log.some((l) => l.startsWith(`bridge ${server}: closed: the result came with text of the user's`)), face);
+    assert.ok(!log.some((l) => l.startsWith(`bridge ${server}: closed to make room`)), 'closed for the conversation, not evicted');
+    assert.ok(await until(() => !alive(first.pid)));
+    assert.ok(await until(() => clean([runs[1].pid])));
+  }
+});
+
+test('a conversation that goes on after its calls were answered is the cold path, and its row says so', async () => {
+  const t = tag();
+  const c = conversation('openai', { user: `Weather? SCENARIO=one-call ${t}` });
+  await c.ask();
+  c.result();
+  const two = await c.ask();
+  assert.equal(two.text, 'Weather: RESULT for Ankara');
+  c.history.push({ role: 'assistant', content: two.text }, { role: 'user', content: 'And in Izmir?' });
+  const three = await c.ask();
+  assert.equal(three.r.status, 200, three.r.text);
+  assert.equal(three.text, 'From the history: RESULT for Ankara');
+  assert.equal(lastRow().bridge.path, 'cold', 'its prompt carries earlier calls and results: not a new conversation');
+  assert.ok(await until(() => clean([runsOf(t)[1]?.pid])));
+});
+
+test('the older functions/function_call carry no call id a later request could continue: auto answers them with EMULATE from the first turn, and toolMode mcp refuses them', async () => {
+  const FUNCS = [TOOLS[0].function];
+  const emuBefore = emuRuns().length;
+  const t = tag();
+  const msgs = [{ role: 'user', content: `Weather? SCENARIO=one-call ${t}` }];
+  const one = await post('/v1/chat/completions', { model: 'agy/m', functions: FUNCS, messages: msgs });
+  assert.equal(one.status, 200, one.text);
+  assert.equal(one.headers.get('x-keysmith-mode'), 'emulate');
+  const c1 = json(one).choices[0];
+  assert.equal(c1.finish_reason, 'function_call');
+  assert.deepEqual([lastRow().toolMode, lastRow().fallback], ['emulate', 'legacy']);
+  msgs.push({ role: 'assistant', content: null, function_call: c1.message.function_call }, { role: 'function', name: 'get_weather', content: 'RESULT for Ankara' });
+  const two = await post('/v1/chat/completions', { model: 'agy/m', functions: FUNCS, messages: msgs });
+  assert.equal(two.status, 200, two.text);
+  assert.deepEqual([two.headers.get('x-keysmith-mode'), lastRow().fallback], ['emulate', 'legacy']);
+  assert.equal(runsOf(t).length, 0, 'no agy was left waiting on a call nobody can continue');
+  assert.equal(emuRuns().length, emuBefore + 2);
+  const r = await post('/v1/chat/completions', { model: 'agym/m', functions: FUNCS, messages: [{ role: 'user', content: `Weather? ${tag()}` }] });
+  assert.equal(r.status, 400, r.text);
+  assert.match(json(r).error.message, /the MCP bridge cannot take this request \(legacy: the older functions\/function_call/);
+  assert.equal(json(r).error.type, 'invalid_request_error');
+});
+
 test('a second request for a result another request is answering: 409, and no other leg of the route is asked', async () => {
   const t = tag();
   const c = conversation('openai', { model: 'pair', user: `Weather? SCENARIO=slow-final ${t}` });

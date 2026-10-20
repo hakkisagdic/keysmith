@@ -102,7 +102,12 @@ export function pickEngine(adapter, spec, mcp, ctx = {}) {
     if (!mcp) throw new LlmError(`adapter "${adapter.id}": toolMode mcp, and this keysmith has no MCP bridge — set toolMode emulate or auto`, { status: 503, provider: adapter.id });
     const c = mcp.check(adapter, spec, ctx);
     if (!c.ok) {
-      const e = new LlmError(`adapter "${adapter.id}": the MCP bridge cannot take this request (${c.reason})`, { status: c.status || 503, provider: adapter.id });
+      const status = c.status || 503;
+      const e = new LlmError(`adapter "${adapter.id}": the MCP bridge cannot take this request (${c.reason}${c.why ? `: ${c.why}` : ''})`, {
+        status,
+        ...(status === 400 ? { type: 'invalid_request_error' } : {}),
+        provider: adapter.id,
+      });
       if (c.retryAfter) e.retryAfter = String(c.retryAfter);
       throw e;
     }

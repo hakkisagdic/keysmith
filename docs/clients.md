@@ -210,11 +210,14 @@ for its result, so the loop above is all a client does — with three things to 
 holds one call, even with `parallel_tool_calls`: agy runs the calls of one step one after
 another, so a step of three is three round trips. The result goes straight back into the waiting
 process when it comes within `toolResultTimeoutMs` (5 minutes), with the same key and the history
-as keysmith answered it; a later result, an edited history or another key still gets an answer,
-on a new agy run that reads the conversation so far (slower, and it spends the whole transcript
-again). And one result goes in once: two requests carrying it at the same time get one answer
-and one 409. The response's `x-keysmith-mode` says `mcp` or `emulate`; both answer in the same
-shape.
+as keysmith answered it, and nothing after it; a later result, an edited history, another key,
+or text of your own after the result (a `text` block next to the `tool_result` on
+`/v1/messages`, a user message after the `tool` message) still gets an answer, on a new agy run
+that reads the conversation so far (slower, and it spends the whole transcript again). And one
+result goes in once: two requests carrying it at the same time get one answer and one 409. The
+response's `x-keysmith-mode` says `mcp` or `emulate`; both answer in the same shape. A client
+that still sends the older `functions` and reads `function_call` gets its answers from EMULATE
+on every turn: those calls carry no id a later request could continue a session by.
 An EMULATE turn on Argon takes tens of seconds; a streamed one sends keepalive comments until
 the calls are ready, so leave the client's read timeout at its default (600 s for the
 `openai` SDK) or above. A reply the model got wrong twice is an error whose type is
