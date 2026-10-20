@@ -20,16 +20,18 @@ import { redactSecrets } from './redact.js';
  * is 0600 in a 0700 directory.
  */
 export class UsageLog {
-  constructor(file = null) {
+  /** `now`: the clock a row's `ts` is read from (ms), injectable for a test. */
+  constructor(file = null, { now = () => Date.now() } = {}) {
     this.file = file || path.join(dataDir(), 'usage.jsonl');
     this.enabled = true;
+    this.now = now;
   }
 
   record(entry) {
     if (!this.enabled) return;
     try {
       ensurePrivateDir(path.dirname(this.file));
-      const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }, (_, v) => (typeof v === 'string' ? redactSecrets(v) : v));
+      const line = JSON.stringify({ ts: new Date(this.now()).toISOString(), ...entry }, (_, v) => (typeof v === 'string' ? redactSecrets(v) : v));
       fs.appendFileSync(this.file, line + '\n', { mode: FILE_MODE });
     } catch {
       /* logging must never break a response */
@@ -51,6 +53,37 @@ export class UsageLog {
         }
       });
     return filter ? rows.filter(filter).slice(0, n) : rows;
+  }
+
+  /**
+   * Every row written at or after `since` (ms), oldest first — what the daily caps rebuild their
+   * counts from at start (quota.js). Rows are appended as requests end, so the file is in `ts`
+   * order: the read walks back from the end and stops at the first older row. A line that does
+   * not parse is skipped.
+   */
+  rowsSince(since) {
+    let text;
+    try {
+      text = fs.readFileSync(this.file, 'utf8');
+    } catch {
+      return [];
+    }
+    const lines = text.split('\n');
+    const rows = [];
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i]) continue;
+      let e;
+      try {
+        e = JSON.parse(lines[i]);
+      } catch {
+        continue;
+      }
+      const t = Date.parse(e?.ts || '');
+      if (!Number.isFinite(t)) continue;
+      if (t < since) break;
+      rows.push(e);
+    }
+    return rows.reverse();
   }
 
   /** Counts per model and per gateway key over `windowMs`; `filter` keeps only the entries it accepts. */

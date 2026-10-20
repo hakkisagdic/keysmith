@@ -19,11 +19,17 @@ import { redactSecrets, registerSecrets } from './redact.js';
 import { upstreamError } from './http-adapter.js';
 import { failureOf, scopeError } from './gateway.js';
 import { authEnabled, describeScope, parseKeys, scopeWarnings, targetDecision } from './keys.js';
+import { DailyQuota, overCapMessage } from './quota.js';
 
 const MAX_BODY = 32 * 1024 * 1024;
 const STREAM_HOLD_MS = 10_000;
+/**
+ * The routes that ask a model something: a request to one of them is what a key's daily cap
+ * counts (quota.js). Listing models, routes or usage, and the status page, are not.
+ */
+const METERED = new Set(['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/embeddings']);
 
-export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}) {
+export function createServer(gateway, cfg, { usage, log: write = () => {}, now = () => Date.now() } = {}) {
   // Every line this server logs can quote an upstream error; it leaves here redacted.
   const log = (m) => write(redactSecrets(m));
   // Each key, with what it may reach (keys.js): a bare key is unscoped, as it always was.
@@ -39,6 +45,10 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
   // The usage log redacts these from every line it writes; register them even when the
   // config did not come through loadConfig (an embedded server, a test).
   registerSecrets(cfg.auth?.keys);
+  // Today's requests per key, rebuilt from today's usage rows: a restart does not hand a capped
+  // key a fresh day (quota.js).
+  const quota = new DailyQuota({ now });
+  if (authOn) quota.seed(usage);
   const startedAt = Date.now();
   const pages = pageSessions();
   // How long a streamed answer's headers wait for its first event (see `held`).
@@ -97,8 +107,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
           startedAt,
           loadErrors: visibleEntries(gateway.loadErrors, (id) => gateway.adapterVisible(id, scope)),
           aliasIssues: gateway.aliasIssuesFor(scope),
-          viewer: viewer.entry ? { fp: viewer.entry.fp, label: viewer.entry.label, scope: describeScope(scope) } : null,
-          keys: authOn && !scope ? keys.map((k) => ({ fp: k.fp, label: k.label, scope: describeScope(k.scope), warnings: keyWarnings.filter((w) => w.fp === k.fp).map((w) => `${w.field} ${w.problem}`) })) : null,
+          viewer: viewer.entry ? { fp: viewer.entry.fp, label: viewer.entry.label, scope: describeScope(scope), perDay: viewer.entry.perDay ?? null, today: quota.today(viewer.entry.fp) } : null,
+          keys: authOn && !scope ? keys.map((k) => ({ fp: k.fp, label: k.label, scope: describeScope(k.scope), perDay: k.perDay ?? null, today: quota.today(k.fp), warnings: keyWarnings.filter((w) => w.fp === k.fp).map((w) => `${w.field} ${w.problem}`) })) : null,
           keyIssues: scope ? [] : keyIssues,
         }));
       }
@@ -113,6 +123,9 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
     const stamped = usage ? { record: (entry) => usage.record(stamp(entry, who, res)) } : null;
 
     try {
+      // A request that asks a model counts against its key's daily cap before anything is read:
+      // one per client request, whatever alias, failover or retry happens under it.
+      if (req.method === 'POST' && METERED.has(route)) meter(who, route, stamped);
       if (route === '/v1/models' || route === '/models') {
         const { models, errors } = await gateway.listModels({ refresh: url.searchParams.has('refresh'), scope });
         return json(res, 200, { object: 'list', data: models, ...(errors.length ? { keysmith: { errors } } : {}) });
@@ -167,6 +180,27 @@ export function createServer(gateway, cfg, { usage, log: write = () => {} } = {}
       if (e?.retryAfter) res.setHeader('retry-after', String(e.retryAfter));
       return json(res, status, errorBody(message, e instanceof LlmError ? e.type : 'internal_error', status, e?.provider || null));
     }
+  }
+
+  /**
+   * Count one request of the key `who` came with, or refuse it: over the key's `perDay`, a 429
+   * (`rate_limit_error`) with a `retry-after` up to local midnight, whose message names the cap
+   * and never the key. The day's first refusal of a key writes a usage row (`status: "limited"`)
+   * and a log line; the ones after it are counted (the status page shows them) but write
+   * nothing, so a client that keeps asking cannot fill the disk.
+   */
+  function meter(who, route, stamped) {
+    if (!who.fp) return; // auth off: there is no key to count against
+    const d = quota.admit(who.fp, who.perDay ?? null);
+    if (d.ok) return;
+    const message = overCapMessage(d);
+    if (d.first) {
+      log(`key fp:${who.fp}${who.label ? ` (${who.label})` : ''} reached its daily cap of ${d.perDay} requests: refused until local midnight`);
+      record(stamped, { model: null, status: 'limited', ms: 0, stream: false, via: route, error: message });
+    }
+    const e = new LlmError(message, { status: 429, type: 'rate_limit_error' });
+    e.retryAfter = d.retryAfter;
+    throw e;
   }
 
   async function pageLogin(req, res, route) {
@@ -241,7 +275,8 @@ function usageFilterFor(gateway, who) {
   const scope = who?.scope;
   if (!scope) return null;
   const mine = `fp:${who.fp}`;
-  return (e) => e?.key === mine && gateway.mayName(e.model, scope);
+  // A refusal over the daily cap names no model: it is the key's own row all the same.
+  return (e) => e?.key === mine && (e.status === 'limited' || gateway.mayName(e.model, scope));
 }
 
 /** `obj` with only the own entries whose key `keep` accepts. */
@@ -869,13 +904,13 @@ function headerEntry(req, entries) {
  * key fits; with auth off, `{ caller: '' }` and no scope. Otherwise `{ caller, fp, label,
  * scope }`: `caller` is a hash of the key (what one caller's requests leave behind, Gemini's
  * thought signatures, goes back up on that caller's requests only), `fp` its fingerprint for
- * the usage log, `scope` what it may reach (null: everything).
+ * the usage log, `scope` what it may reach (null: everything), `perDay` its daily cap (null: none).
  */
 function identify(req, entries, url, authOn) {
-  if (!authOn) return { caller: '', fp: null, label: null, scope: null };
+  if (!authOn) return { caller: '', fp: null, label: null, scope: null, perDay: null };
   const entry = headerEntry(req, entries) ?? matchKey(entries, url.searchParams.get('api_key') || '');
   if (!entry) return null;
-  return { caller: createHash('sha256').update(entry.key).digest('base64url').slice(0, 22), fp: entry.fp, label: entry.label, scope: entry.scope };
+  return { caller: createHash('sha256').update(entry.key).digest('base64url').slice(0, 22), fp: entry.fp, label: entry.label, scope: entry.scope, perDay: entry.perDay ?? null };
 }
 
 function safeEqual(a, b) {

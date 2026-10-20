@@ -13,7 +13,7 @@ import * as service from './service.js';
 import { rel, truncate } from './util.js';
 import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets, streamRedactor } from './redact.js';
 import { ensurePrivateDir, logFiles, openPrivateLog, rotatedLogFiles, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
-import { adapterReach, aliasDecision, authEnabled, describeScope, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
+import { adapterReach, aliasDecision, authEnabled, describePerDay, describeScope, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
 
 const PKG = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
@@ -44,8 +44,9 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith key add <label> [--allow p,…] [--deny p,…] [--out <file>]
                                      a labelled key with a scope; --out writes the key to a new 0600 file
                                      (--force replaces that file; --allow-unknown saves a pattern that names nothing yet)
-  keysmith key scope fp:<8 hex> [--allow p,…] [--deny p,…] [--clear]
-                                     what an existing key may reach (p: claude-api, 'agy/*', alias:argon)
+  keysmith key scope fp:<8 hex> [--allow p,…] [--deny p,…] [--clear] [--per-day N|--no-per-day]
+                                     what an existing key may reach (p: claude-api, 'agy/*', alias:argon),
+                                     and how many requests it may make per local day (over it: 429 until midnight)
   keysmith key who-can <adapter>     the keys, by fingerprint, that can reach an adapter (or adapter/model, alias:<name>)
   keysmith key revoke fp:<8 hex>     revoke by the fingerprint list/logs print (never the key itself: argv is public)
   keysmith scrub-logs [file…]        redact keys left in the logs, their rotated copies and any file named; counts only
@@ -1051,7 +1052,7 @@ function cmdUsage(flags) {
 const KEY_USAGE = [
   'usage: keysmith key list [--reveal]',
   '       keysmith key add [<label>] [--allow <patterns>] [--deny <patterns>] [--out <file> [--force]] [--allow-unknown] [--reveal]',
-  '       keysmith key scope fp:<8 hex> [--allow <patterns>] [--deny <patterns>] [--no-allow] [--no-deny] [--clear] [--label <name>] [--allow-unknown]',
+  '       keysmith key scope fp:<8 hex> [--allow <patterns>] [--deny <patterns>] [--no-allow] [--no-deny] [--clear] [--label <name>] [--allow-unknown] [--per-day <N> | --no-per-day]',
   '       keysmith key who-can <adapter> | <adapter/model> | alias:<name>',
   '       keysmith key revoke fp:<8 hex>',
   "  patterns: an adapter id (claude-api), an adapter/model glob ('agy/*', 'google/gemini-3.8-*'), alias:<name>;",
@@ -1092,10 +1093,15 @@ function keyList(cfg, flags) {
   if (!cfg.auth.keys.length) return out('(none)');
   const { entries, issues } = parseKeys(cfg.auth.keys);
   const w = Math.max(1, ...entries.map((e) => (e.label || '-').length));
-  if (entries.length) showKeys(entries, { reveal: flags.reveal, describe: (e) => `  ${(e.label || '-').padEnd(w)}  ${describeScope(e.scope)}` });
+  if (entries.length) showKeys(entries, { reveal: flags.reveal, describe: (e) => `  ${(e.label || '-').padEnd(w)}  ${describeKey(e)}` });
   for (const issue of issues) warn(`! ${issue}`);
   for (const w of scopeWarnings(cfg, entries)) warn(`! ${w.message}`);
   if (!cfg.auth.enabled) warn(AUTH_OFF);
+}
+
+/** A key entry's scope, and its daily cap when it has one: `deny: claude-api · 300 requests/day`. */
+function describeKey(e) {
+  return `${describeScope(e.scope)}${e.perDay != null ? ` · ${describePerDay(e.perDay)}` : ''}`;
 }
 
 /** Said wherever a key or a scope is written or listed while auth is off: none of it applies. */
@@ -1149,7 +1155,9 @@ function keyAdd(cfg, flags) {
 /**
  * `keysmith key scope fp:<hex> …`: what an existing key may reach. `--allow` / `--deny` replace
  * that list, `--no-allow` / `--no-deny` drop it, `--clear` drops both (the key is unscoped
- * again), `--label` / `--no-label` name it. With no change asked for, it shows the scope.
+ * again), `--label` / `--no-label` name it, `--per-day N` caps its requests per local day and
+ * `--no-per-day` lifts the cap (`--clear` leaves the cap as it is). With no change asked for, it
+ * shows the scope and the cap.
  */
 function keyScope(cfg, flags) {
   const m = String(flags._[1] ?? '').match(/^(?:fp:)?([0-9a-fA-F]{8})$/);
@@ -1163,11 +1171,13 @@ function keyScope(cfg, flags) {
   const allow = listFlag(flags, 'allow');
   const deny = listFlag(flags, 'deny');
   const label = flags.label;
-  const changing = allow || deny || flags.clear || flags.noAllow || flags.noDeny || flags.noLabel || label !== undefined;
+  const perDay = perDayFlag(flags);
+  const changing = allow || deny || flags.clear || flags.noAllow || flags.noDeny || flags.noLabel || label !== undefined || perDay !== undefined || flags.noPerDay;
   if (!changing) {
     const e = parseKeys([cur]).entries[0];
-    return out(`fp:${fp}  ${e?.label || '-'}  ${e ? describeScope(e.scope) : 'unreadable entry'}`);
+    return out(`fp:${fp}  ${e?.label || '-'}  ${e ? describeKey(e) : 'unreadable entry'}`);
   }
+  if (perDay !== undefined && flags.noPerDay) fail('--per-day sets the daily cap, --no-per-day lifts it: one of them');
   if (allow && (flags.noAllow || flags.clear)) fail('--allow sets the allow-list, --no-allow and --clear drop it: one of them');
   if (deny && (flags.noDeny || flags.clear)) fail('--deny sets the deny-list, --no-deny and --clear drop it: one of them');
   if (label === true) fail('--label takes a name');
@@ -1183,6 +1193,8 @@ function keyScope(cfg, flags) {
   if (flags.clear || flags.noDeny) delete next.deny;
   if (allow) next.allow = allow;
   if (deny) next.deny = deny;
+  if (flags.noPerDay) delete next.perDay;
+  if (perDay !== undefined) next.perDay = perDay;
   // Back to a bare string when nothing but the key is left: the form every reader knows.
   const entry = Object.keys(next).length === 1 && Object.hasOwn(next, 'key') ? next.key : next;
   const parsed = parseKeys([entry]);
@@ -1190,13 +1202,23 @@ function keyScope(cfg, flags) {
   cfg.auth.keys[i] = entry;
   saveConfig(cfg);
   const e = parsed.entries[0];
-  out(`fp:${fp}${e.label ? ` (${e.label})` : ''}: ${describeScope(e.scope)}`);
+  out(`fp:${fp}${e.label ? ` (${e.label})` : ''}: ${describeKey(e)}`);
   if (allow && !allow.length) out('! an empty --allow: this key reaches nothing');
+  if (perDay === 0) out('! --per-day 0: every request of this key is refused (429) until the cap is raised or lifted');
+  if (perDay !== undefined) out('  the cap counts every request this key makes in a local calendar day — each face, adapter and alias, failures included — and starts again at local midnight');
   if (i === 0 && typeof entry === 'object' && typeof cur === 'string') {
     out("  auth.keys[0] is an object now: a script that reads the key with jq takes .auth.keys[0] | .key? // .");
   }
   if (!cfg.auth.enabled) warn(AUTH_OFF);
   return noteRestart(`the scope of fp:${fp}`);
+}
+
+/** `--per-day N` as a whole number of requests; undefined when the flag is absent. */
+function perDayFlag(flags) {
+  if (flags.perDay === undefined) return undefined;
+  const raw = flags.perDay;
+  if (raw === true || !/^\d+$/.test(String(raw)) || !Number.isSafeInteger(Number(raw))) fail(`--per-day takes a whole number of requests, e.g. --per-day 300 (got ${raw === true ? 'nothing' : JSON.stringify(String(raw))})`);
+  return Number(raw);
 }
 
 /**
@@ -1240,7 +1262,7 @@ function keyWhoCan(cfg, flags) {
   const can = rows.filter((r) => r.reach !== 'none');
   const cannot = rows.filter((r) => r.reach === 'none');
   const w = Math.max(1, ...entries.map((e) => (e.label || '-').length));
-  const line = (r) => `  fp:${r.e.fp}  ${(r.e.label || '-').padEnd(w)}  ${r.reach === 'some' ? `part of it (${r.how || 'some models'}) — ` : ''}${describeScope(r.e.scope)}`;
+  const line = (r) => `  fp:${r.e.fp}  ${(r.e.label || '-').padEnd(w)}  ${r.reach === 'some' ? `part of it (${r.how || 'some models'}) — ` : ''}${describeKey(r.e)}`;
   out(`${target}: reachable by ${can.length} of ${entries.length} key(s)`);
   for (const r of can) out(line(r));
   if (cannot.length) {

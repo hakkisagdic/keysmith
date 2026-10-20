@@ -20,14 +20,20 @@ import { fingerprint } from './redact.js';
  * is refused (403) only when no leg is left. So an alias that later gains a `claude-api` leg
  * still cannot take a key that is denied `claude-api` there.
  *
+ * An entry may also carry a daily cap, `"perDay": 300`: how many requests the key may make in
+ * one local calendar day, whatever it asks for (quota.js counts them; over it, a 429 until
+ * local midnight). The cap is not part of the scope: a key with a cap and no lists is still
+ * unscoped, and `key scope --clear` leaves the cap where it is.
+ *
  * Fails closed: an entry with a field keysmith does not know (`"alow"` would otherwise read as
- * "no allow list"), a list that is not a list of patterns, or the same key twice with two
- * different scopes, leaves that key reaching nothing until the config is fixed — and says so
- * in `doctor`, on the status page and in `keysmith key list`. Nothing here ever puts a key in
- * a message: a key is named by its fingerprint.
+ * "no allow list"), a list that is not a list of patterns, a cap that is not a whole number of
+ * requests, or the same key twice with two different scopes or caps, leaves that key reaching
+ * nothing until the config is fixed — and says so in `doctor`, on the status page and in
+ * `keysmith key list`. Nothing here ever puts a key in a message: a key is named by its
+ * fingerprint.
  */
 
-const ENTRY_FIELDS = new Set(['key', 'label', 'allow', 'deny']);
+const ENTRY_FIELDS = new Set(['key', 'label', 'allow', 'deny', 'perDay']);
 
 /** A key string out of an `auth.keys` entry, or null. */
 export function keyOf(entry) {
@@ -93,9 +99,10 @@ function patternList(value, field) {
 export function compileScope(entry) {
   if (typeof entry === 'string') return null;
   for (const field of Object.keys(entry)) {
-    if (!ENTRY_FIELDS.has(field)) throw new Error(`unknown field "${field}" (a key entry has key, label, allow, deny)`);
+    if (!ENTRY_FIELDS.has(field)) throw new Error(`unknown field "${field}" (a key entry has key, label, allow, deny, perDay)`);
   }
   if (entry.label != null && typeof entry.label !== 'string') throw new Error('"label" must be a string');
+  perDayOf(entry);
   const allow = entry.allow === undefined ? null : patternList(entry.allow, 'allow');
   const deny = entry.deny === undefined ? [] : patternList(entry.deny, 'deny');
   if (!allow && !deny.length) return null;
@@ -105,9 +112,26 @@ export function compileScope(entry) {
 const NOTHING = (why) => ({ allow: [], deny: [], invalid: why });
 
 /**
- * `auth.keys` as the gateway uses it: `{ entries: [{ key, label, fp, scope }], issues }`.
- * An entry with no usable key is left out (and named in `issues`); one whose scope cannot be
- * read stays in — it authenticates, so its client hears a 403 that says why, not a 401 — with
+ * The daily cap an `auth.keys` entry carries: a whole number of requests (0 refuses every one),
+ * or null for none. Throws on anything else — `"300"`, `-1`, `1.5` — which parseKeys turns into
+ * a key that reaches nothing: a cap that cannot be read must not read as "no cap".
+ */
+export function perDayOf(entry) {
+  if (!entry || typeof entry !== 'object' || entry.perDay === undefined) return null;
+  const n = entry.perDay;
+  if (!Number.isSafeInteger(n) || n < 0) throw new Error(`"perDay" must be a whole number of requests, e.g. 300 (got ${JSON.stringify(n)})`);
+  return n;
+}
+
+/** One line for a cap: `300 requests/day`, or '' for none. */
+export function describePerDay(perDay) {
+  return perDay == null ? '' : `${perDay} request${perDay === 1 ? '' : 's'}/day`;
+}
+
+/**
+ * `auth.keys` as the gateway uses it: `{ entries: [{ key, label, fp, scope, perDay }], issues }`.
+ * An entry with no usable key is left out (and named in `issues`); one whose scope or cap cannot
+ * be read stays in — it authenticates, so its client hears a 403 that says why, not a 401 — with
  * a scope that reaches nothing.
  */
 export function parseKeys(list) {
@@ -126,24 +150,29 @@ export function parseKeys(list) {
     const fp = fingerprint(key);
     const label = item && typeof item === 'object' && typeof item.label === 'string' ? item.label : null;
     let scope;
+    let perDay = null;
     try {
       scope = compileScope(item);
+      perDay = perDayOf(item);
     } catch (e) {
       scope = NOTHING(e.message);
       issues.push(`key fp:${fp}${label ? ` (${label})` : ''}: ${e.message} — it reaches nothing until that is fixed`);
     }
-    entries.push({ key, label, fp, scope });
+    entries.push({ key, label, fp, scope, perDay });
   }
   // The same key twice: the gateway would match the first entry, and a hand edit that adds an
-  // unscoped copy above a scoped one would quietly widen it. Two different scopes is an error.
+  // unscoped (or uncapped) copy above a scoped (or capped) one would quietly widen it. Two
+  // different scopes, or two different caps, is an error.
   const byKey = new Map();
   for (const e of entries) byKey.set(e.key, [...(byKey.get(e.key) || []), e]);
   for (const [, same] of byKey) {
     if (same.length < 2) continue;
-    const shapes = new Set(same.map((e) => JSON.stringify(scopeText(e.scope))));
-    if (shapes.size < 2) continue;
-    for (const e of same) e.scope = NOTHING(`listed ${same.length} times with different scopes`);
-    issues.push(`key fp:${same[0].fp} is listed ${same.length} times with different scopes — it reaches nothing until one entry is left`);
+    const scopes = new Set(same.map((e) => JSON.stringify(scopeText(e.scope))));
+    const caps = new Set(same.map((e) => e.perDay));
+    if (scopes.size < 2 && caps.size < 2) continue;
+    const what = scopes.size > 1 ? 'different scopes' : 'different daily caps';
+    for (const e of same) e.scope = NOTHING(`listed ${same.length} times with ${what}`);
+    issues.push(`key fp:${same[0].fp} is listed ${same.length} times with ${what} — it reaches nothing until one entry is left`);
   }
   return { entries, issues };
 }

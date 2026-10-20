@@ -18,7 +18,7 @@ export function statusPage({ cfg, models, usage, usageFilter = null, startedAt, 
       const n = perKey.get(`fp:${k.fp}`) || { requests: 0, denied: 0 };
       // A pattern that names nothing configured (`deny: Claude-API`) is flagged where it is read.
       const warned = (k.warnings || []).map((w) => `<br><span class="bad">! ${esc(w)}</span>`).join('');
-      return `<tr><td>fp:${esc(k.fp)}</td><td>${esc(k.label || '—')}</td><td${/^INVALID/.test(k.scope) ? ' class="bad"' : ''}>${esc(k.scope)}${warned}</td><td class="n">${n.requests}</td><td class="n ${n.denied ? 'bad' : ''}">${n.denied}</td></tr>`;
+      return `<tr><td>fp:${esc(k.fp)}</td><td>${esc(k.label || '—')}</td><td${/^INVALID/.test(k.scope) ? ' class="bad"' : ''}>${esc(k.scope)}${warned}</td><td class="n">${todayCell(k)}</td><td class="n">${n.requests}</td><td class="n ${n.denied ? 'bad' : ''}">${n.denied}</td></tr>`;
     })
     .join('');
   const rows = (summary.models || [])
@@ -30,6 +30,7 @@ export function statusPage({ cfg, models, usage, usageFilter = null, startedAt, 
 <h1>key<span>smith</span></h1>
 <div class="sub">OpenAI-compatible front for the agents already on this machine · up ${humanUptime(Date.now() - startedAt)} · config <code>${esc(rel(configPath()))}</code></div>
 ${viewer && viewer.scope && !/^unscoped/.test(viewer.scope) ? `<div class="sub">viewing as key fp:${esc(viewer.fp)}${viewer.label ? ` (${esc(viewer.label)})` : ''} — its scope: ${esc(viewer.scope)}. This page shows what that key can reach.</div>` : ''}
+${viewer && viewer.perDay != null ? `<div class="sub">this key today: <b class="${(viewer.today?.requests || 0) >= viewer.perDay ? 'bad' : 'ok'}">${viewer.today?.requests || 0} of ${viewer.perDay}</b> requests${viewer.today?.refused ? `, ${viewer.today.refused} refused over the cap` : ''} — the count starts again at local midnight.</div>` : ''}
 <div class="grid">
   <div class="card"><small>requests 24h</small><b>${summary.requests}</b></div>
   <div class="card"><small>failures</small><b class="${summary.failures ? 'bad' : 'ok'}">${summary.failures}</b></div>
@@ -50,7 +51,7 @@ ${aliasList.length ? `<h2>Alias legs that can never work</h2><table><thead><tr><
 <table><thead><tr><th>id</th><th>adapter</th><th>upstream</th><th>context</th></tr></thead><tbody>
 ${models.map((m) => `<tr><td${m.keysmith?.kind === 'alias' && aliasIssues[m.id] ? ' class="bad"' : ''}>${esc(m.id)}</td><td class="muted">${esc(m.keysmith?.adapter || '')}</td><td class="muted">${esc(m.keysmith?.upstream || '')}</td><td class="n">${m.keysmith?.contextWindow || ''}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">no models listed — check <code>keysmith doctor</code></td></tr>'}
 </tbody></table>
-${keys ? `<h2>Keys</h2><table><thead><tr><th>key</th><th>label</th><th>scope</th><th class="n">req 24h</th><th class="n">denied</th></tr></thead><tbody>${keyRows}</tbody></table>${keyIssues.length ? `<p class="bad">${keyIssues.map(esc).join('<br>')}</p>` : ''}<p class="muted">A key is named by its fingerprint. <code>keysmith key scope fp:&lt;hex&gt; --deny &lt;adapter&gt;</code> narrows one; <code>keysmith key who-can &lt;adapter&gt;</code> lists the keys that reach an adapter.</p>` : ''}
+${keys ? `<h2>Keys</h2><table><thead><tr><th>key</th><th>label</th><th>scope</th><th class="n">today / cap</th><th class="n">req 24h</th><th class="n">denied</th></tr></thead><tbody>${keyRows}</tbody></table>${keyIssues.length ? `<p class="bad">${keyIssues.map(esc).join('<br>')}</p>` : ''}<p class="muted">A key is named by its fingerprint. <code>keysmith key scope fp:&lt;hex&gt; --deny &lt;adapter&gt;</code> narrows one, <code>--per-day N</code> caps its requests per local day; <code>keysmith key who-can &lt;adapter&gt;</code> lists the keys that reach an adapter.</p>` : ''}
 ${rows ? `<h2>Last 24h by model</h2><table><thead><tr><th>model</th><th class="n">req</th><th class="n">err</th><th class="n">in</th><th class="n">out</th><th class="n">avg</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
 <p class="muted">Keys never leave this machine's config. <code>Authorization: Bearer &lt;key&gt;</code> is required on /v1. This page takes the key once, through its form, and keeps a cookie that opens this page alone for an hour.</p>
 </body></html>`;
@@ -91,6 +92,14 @@ const HEAD = `<!doctype html>
  input,button{font:inherit;color:inherit;background:#151a26;border:1px solid #2e3a52;border-radius:6px;padding:6px 10px}
  input{width:min(28em,100%)} button{cursor:pointer}
 </style></head>`;
+
+/** A key's requests today, with its daily cap and the refusals over it when it has one. */
+function todayCell(k) {
+  const n = k.today?.requests || 0;
+  if (k.perDay == null) return String(n);
+  const over = n >= k.perDay;
+  return `<span class="${over ? 'bad' : ''}">${n} / ${k.perDay}</span>${k.today?.refused ? `<br><span class="bad">${k.today.refused} refused</span>` : ''}`;
+}
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);

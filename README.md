@@ -736,6 +736,43 @@ older than the config.
 `explicitOnly` and a scope answer different questions: `explicitOnly` keeps an adapter out of
 aliases for every key; a scope keeps one key away from an adapter however it asks for it.
 
+### A daily cap: how much a key may ask
+
+A scope says *what* a key may reach; `perDay` says *how often*. It caps the requests a key may
+make in one local calendar day:
+
+```json
+{ "key": "ks_…", "label": "ada", "deny": ["claude-api"], "perDay": 300 }
+```
+
+```bash
+keysmith key scope fp:3f9a0c12 --per-day 300   # cap it (the scope and the label stay as they are)
+keysmith key scope fp:3f9a0c12 --no-per-day    # lift it; --clear drops the lists and leaves the cap
+keysmith key list                              # … deny: claude-api · 300 requests/day
+```
+
+- A request is counted once, when it comes in — before its body is read and before any adapter
+  or alias leg is picked: one per request to `/v1/chat/completions`, `/v1/messages`,
+  `/v1/responses` or `/v1/embeddings`, streamed or not, whatever it asks for. An alias that fails
+  over to its second leg, a CLI asked again, a tool request that walks three legs: one request.
+  A request that fails — upstream, or refused by the key's scope — is one too. Listing models,
+  routes or usage, and the status page, are not counted.
+- Over the cap, every face answers **429** (`rate_limit_error`) with a `retry-after` in seconds
+  up to the next local midnight, when the count starts again at 0. The message names the cap and
+  when it resets, never the key. The day's first refusal writes one usage row
+  (`"status": "limited"`) and a gateway log line; the refusals after it are counted on the status
+  page and write nothing, so a client that keeps asking does not fill the disk.
+- The count survives a restart: at start it is rebuilt from today's rows in `usage.jsonl` (a
+  request writes one row, stamped with its key's fingerprint). A request refused before its body
+  was read — not JSON, no messages — costs nothing upstream and leaves no row, so it is not in
+  the count a restart rebuilds.
+- Every key is counted, capped or not: the status page (to an unscoped key) shows each key's
+  requests today next to its cap, and a capped key sees its own count at the top of its page.
+- It fails closed like a scope: a `perDay` that is not a whole number (`"300"`, `-1`) leaves the
+  key reaching nothing, and one key listed twice with two different caps reaches nothing —
+  otherwise an uncapped copy above a capped entry would quietly lift the cap. `perDay: 0` refuses
+  every request. Like every key change, a cap takes effect when the gateway restarts.
+
 ### Recipe: an agent key that cannot reach claude-api
 
 Say `claude-api` is an Anthropic HTTP adapter that spends a credit you use on purpose. An agent
@@ -839,7 +876,7 @@ Warp, Claude Code, opencode, Codex, Qoder, `openai` Python — copy-paste config
 ## Development
 
 ```bash
-npm test          # 313 tests: parsers, routing, key scopes, tool routing and EMULATE, HTTP suites against stub CLIs and stub upstreams, and no key reaching a log
+npm test          # 434 tests: parsers, routing, key scopes, tool routing and EMULATE, HTTP suites against stub CLIs and stub upstreams, and no key reaching a log
 node src/cli.js doctor --probe-models   # the truth about which models answer (spends quota)
 ```
 
