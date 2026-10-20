@@ -59,8 +59,13 @@ export const agyDriver = {
   /** The tools agy keeps on every agent; one of them is not a foreign tool (stopAtToolCall decides). */
   harnessTools: ['manage_task'],
 
+  /**
+   * An agy adapter with a bridge argv — in a workspace keysmith owns (a configured cwd): the session
+   * file is written there and agy reads its project there, so never the gateway's own directory.
+   * (The gateway refuses a toolMode without a cwd at load; this holds without that check too.)
+   */
   supports(adapter) {
-    return adapter?.kind === 'cli' && adapter.parser === 'agy-stream-json' && Array.isArray(adapter.bridge?.args);
+    return adapter?.kind === 'cli' && adapter.parser === 'agy-stream-json' && Array.isArray(adapter.bridge?.args) && adapter._ownsCwd === true;
   },
 
   /** What agy's model calls a tool of server `server`. */

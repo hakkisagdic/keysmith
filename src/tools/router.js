@@ -39,9 +39,12 @@ import { emulate, renderPrompt } from './emulate.js';
 export const TOOL_MODES = ['off', 'emulate', 'mcp', 'auto'];
 
 /**
- * A CLI entry's toolMode: 'off' when it has none. A value that is not a mode, and any mode but
- * off on an adapter marked `unsafeTools` — a CLI that kept its own tools never answers a tool
- * request — is a load error.
+ * A CLI entry's toolMode: 'off' when it has none. A value that is not a mode, any mode but off on
+ * an adapter marked `unsafeTools` — a CLI that kept its own tools never answers a tool request —
+ * and any mode but off on an entry without a `cwd` are load errors. A tool engine runs the CLI in
+ * an empty workspace keysmith owns (design §5): without a configured cwd it would run in the
+ * gateway's own directory, read whatever project config is there (an opencode.json, an
+ * AGENTS.md, an agent of agy's), and the bridge would write its session file into it.
  */
 export function checkToolMode(id, cfg) {
   const mode = cfg?.toolMode;
@@ -49,6 +52,9 @@ export function checkToolMode(id, cfg) {
   if (!TOOL_MODES.includes(mode)) throw new Error(`adapter "${id}": toolMode must be one of ${TOOL_MODES.join(', ')} — got ${JSON.stringify(mode)?.slice(0, 40)}`);
   if (mode !== 'off' && cfg.unsafeTools) {
     throw new Error(`adapter "${id}": toolMode ${mode} on an adapter marked unsafeTools — a CLI that kept its own tools could act on a tool request itself; set toolMode off`);
+  }
+  if (mode !== 'off' && !cfg.cwd) {
+    throw new Error(`adapter "${id}": toolMode ${mode} needs a configured cwd — a tool request runs the CLI only in an empty workspace keysmith owns, never in the gateway's own directory (keysmith add <profile> --as ${id} brings one)`);
   }
   return mode;
 }

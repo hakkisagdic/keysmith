@@ -108,7 +108,7 @@ before(async () => {
       emu: agy('emulate'),
       bridged: agy('mcp'),
       plain: agy(null),
-      thinker: { kind: 'cli', bin: thinker, args: ['{prompt}'], parser: 'claude-stream-json', toolMode: 'emulate', timeoutMs: 30_000 },
+      thinker: { kind: 'cli', bin: thinker, args: ['{prompt}'], parser: 'claude-stream-json', toolMode: 'emulate', cwd: path.join(dir, 'ws-thinker'), timeoutMs: 30_000 },
       google: { kind: 'http', wire: 'openai', baseUrl: `http://127.0.0.1:${upstream.address().port}/v1`, apiKey: false },
     },
     aliases: {
@@ -692,6 +692,9 @@ test('toolMode is checked at load: a mode that is not one, on an HTTP upstream, 
   assert.throws(() => checkAdapter('a', { ...base, toolMode: 'yes' }), /toolMode must be one of off, emulate, mcp, auto/);
   assert.throws(() => checkAdapter('a', { ...base, toolMode: 'auto', unsafeTools: true }), /toolMode auto on an adapter marked unsafeTools/);
   assert.equal(checkAdapter('a', { ...base, toolMode: 'off', unsafeTools: true }).toolMode, 'off');
+  // A tool engine runs the CLI only in a workspace keysmith owns (design §5): not in the gateway's own cwd.
+  for (const mode of ['emulate', 'mcp', 'auto']) assert.throws(() => checkAdapter('a', { ...base, toolMode: mode }), new RegExp(`toolMode ${mode} needs a configured cwd`));
+  assert.equal(checkAdapter('a', { ...base, toolMode: 'auto', cwd: path.join(dir, 'ws-owned') }).toolMode, 'auto');
   assert.throws(() => checkAdapter('g', { kind: 'http', baseUrl: 'http://x/v1', toolMode: 'emulate' }), /toolMode is a CLI adapter's field/);
   assert.throws(() => checkAdapter('a', { ...base, emulateArgs: '-p {prompt}' }), /emulateArgs must be an argv template/);
   assert.throws(() => checkAdapter('a', { ...base, bridge: ['--agent'] }), /bridge must be an object/);

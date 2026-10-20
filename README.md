@@ -188,6 +188,10 @@ answering. `keysmith set agy toolMode off` puts it back the way it was.
 | `mcp` | the MCP bridge, below, always: a `tool_choice` that forces a call is a 400 (MCP cannot make a model call a tool), a bridge with no room a 503 with `retry-after`, a CLI with no bridge driver (only agy has one) a 503 |
 | `auto` | the bridge where it can take the request, EMULATE otherwise, and EMULATE in the same request when the bridge fails before any call went out. `tool_choice: "none"` is a text answer; `required` or a named tool is EMULATE (MCP cannot make a model call a tool); tool names too long for the bridge, a bridge with no room, a CLI with no bridge driver is EMULATE — with the reason in the usage row (`fallback`: `name_too_long`, `bridge_full`, `no_bridge`, or what made the bridge fail: `unknown_agent`, `ready_timeout`, …) |
 
+Any mode but `off` needs the entry's `cwd`: a tool engine runs the CLI only in an empty
+workspace keysmith owns, never in the gateway's own directory (an entry without one does not
+load; every built-in profile has one).
+
 There is no mode that runs both engines at once and takes the faster: it would spend the
 CLI's quota twice per turn for what the fallback gives anyway.
 

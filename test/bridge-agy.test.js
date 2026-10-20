@@ -13,7 +13,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Gateway } from '../src/gateway.js';
+import { Gateway, checkAdapter } from '../src/gateway.js';
 import { createServer } from '../src/server.js';
 import { UsageLog } from '../src/usage.js';
 import { CLI_PROFILES } from '../src/profiles.js';
@@ -709,6 +709,17 @@ test('a CLI that cannot be started at all (spawn() throws at once): no agent fil
   assert.ok(!r.text.includes('BROKEN'), 'what spawn() quoted stays out of the message');
   assert.ok(await until(() => clean()), 'the session\'s agent file (with its token) was removed');
   assert.equal(gateway.toolEngines.mcp.hub.stats().sessions, 0);
+});
+
+test('the bridge runs agy only in a workspace keysmith owns: an entry with no cwd does not load with a toolMode, and the driver takes no adapter without one', () => {
+  const noCwd = { ...agy('mcp') };
+  delete noCwd.cwd;
+  delete noCwd.workspaceFiles;
+  for (const mode of ['mcp', 'auto', 'emulate']) assert.throws(() => checkAdapter('agyx', { ...noCwd, toolMode: mode }), /needs a configured cwd — a tool request runs the CLI only in an empty workspace keysmith owns/);
+  const off = new CliAdapter('agyx', { ...noCwd, toolMode: 'off' });
+  assert.equal(off.cwd, process.cwd());
+  assert.equal(agyDriver.supports(off), false, 'bridge.args alone is not enough: agy would run, and its session file be written, in the gateway\'s own directory');
+  assert.equal(agyDriver.supports(new CliAdapter('agyw', agy('mcp'))), true);
 });
 
 test('the start-up sweep: an earlier gateway\'s agent files and schema dirs older than an hour go, anything else stays', async () => {
