@@ -79,7 +79,7 @@ function serverOf() {
     const file = val('--mcp-config');
     if (!file) return null;
     const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
-    note({ event: 'config', mode: (fs.statSync(file).mode & 0o777).toString(8), strict: argv.includes('--strict-mcp-config'), allowed: val('--allowedTools'), tools: val('--tools'), prompts: val('--permission-prompts'), settings: val('--settings'), sources: val('--setting-sources'), effort: val('--effort'), safeMode: argv.includes('--safe-mode'), persist: !argv.includes('--no-session-persistence'), env: { MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT ?? null, MCP_TIMEOUT: process.env.MCP_TIMEOUT ?? null, ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? null, CLAUDECODE: process.env.CLAUDECODE ?? null } });
+    note({ event: 'config', mode: (fs.statSync(file).mode & 0o777).toString(8), strict: argv.includes('--strict-mcp-config'), allowed: val('--allowedTools'), tools: val('--tools'), prompts: val('--permission-prompts'), settings: val('--settings'), sources: val('--setting-sources'), effort: val('--effort'), safeMode: argv.includes('--safe-mode'), persist: !argv.includes('--no-session-persistence'), env: { MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT ?? null, MCP_TIMEOUT: process.env.MCP_TIMEOUT ?? null, ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? null, CLAUDE_CODE_DISABLE_AUTO_MEMORY: process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY ?? null, CLAUDECODE: process.env.CLAUDECODE ?? null } });
     const [name, s] = Object.entries(cfg.mcpServers || {})[0] || [];
     return name ? { name, command: s.command, args: s.args || [], env: s.env || {} } : null;
   }
@@ -231,7 +231,7 @@ const rpc = (method, params = {}) =>
 const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: `${cli}-stub`, version: '0' } });
 mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
 const list = await rpc('tools/list', {});
-note({ event: 'mcp', protocolVersion: init.result?.protocolVersion ?? null, tools: list.result?.tools?.map((t) => t.name) ?? null });
+note({ event: 'mcp', protocolVersion: init.result?.protocolVersion ?? null, tools: list.result?.tools?.map((t) => t.name) ?? null, meta: list.result?.tools?.map((t) => t._meta ?? null) ?? null });
 
 let seq = 0;
 /** One call: shown (where the CLI shows it first), sent, its result read, shown finished. */
@@ -305,6 +305,15 @@ if (prompt.includes('<<<TOOL_RESULT')) {
       else line({ type: 'assistant', message: { id: 'msg_x', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_x', name: 'Bash', input: { command: 'ls' } }] } });
       note({ event: 'hang' });
       await sleep(60_000);
+      break;
+    }
+    case 'builtin-names': {
+      // The request's own tools named like Claude Code's built-ins: reached the bridge's way, as
+      // mcp__<server>__Bash and mcp__<server>__Read.
+      out.text('Listing. ');
+      const a = await call('Bash', { command: 'ls' });
+      const b = await call('Read', { file_path: 'notes.txt' });
+      finish(`Bash said ${a.text}; Read said ${b.text}`);
       break;
     }
     case 'hang-after-call': {

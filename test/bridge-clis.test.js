@@ -63,6 +63,8 @@ before(async () => {
       // Claude Code's profile as shipped (explicit-only, toolMode auto made mcp here), with a catalogue of its own.
       cc: around('claude', 'claude', { models: [{ id: 'm', efforts: ['low', 'high'] }] }),
       oct: around('opencode', 'opencode', { bridge: { toolResultTimeoutMs: 1_200 }, cwd: path.join(dir, 'ws-opencode-t') }),
+      // Claude Code's profile with a short clock: a client that never comes back.
+      cct: around('claude', 'claude', { bridge: { toolResultTimeoutMs: 1_200 }, cwd: path.join(dir, 'ws-claude-t'), models: [{ id: 'm', efforts: ['low', 'high'] }] }),
     },
   };
   gateway = new Gateway(cfg, { log: (m) => log.push(m) });
@@ -616,6 +618,100 @@ test('claude: each answer reports its own share of the run — the step that mad
   d.results();
   assert.equal((await d.ask()).text, 'Ankara RESULT for Ankara; Izmir RESULT for Izmir');
   assert.equal(startsOf(t).length, 1);
+});
+
+test('claude: the request\'s own tools may be named like Claude Code\'s built-ins (Bash, Read) — each reaches the client by its own name, one per answer, and none of them is the tripwire', async () => {
+  const builtinNamed = [
+    { type: 'function', function: { name: 'Bash', description: 'Runs a command on the client', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } },
+    { type: 'function', function: { name: 'Read', description: 'Reads a file on the client', parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } } },
+  ];
+  const t = tag();
+  const history = [{ role: 'user', content: `List ${t} SCENARIO=builtin-names` }];
+  const ask = async () => {
+    const r = await post('/v1/chat/completions', { model: 'cc/m', tools: builtinNamed, messages: history });
+    assert.equal(r.status, 200, r.text);
+    return chat(r);
+  };
+  const answer = (a, text) => {
+    history.push({ role: 'assistant', content: a.text || null, tool_calls: a.calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.args) } })) });
+    for (const c of a.calls) history.push({ role: 'tool', tool_call_id: c.id, content: text });
+  };
+  const a1 = await ask();
+  assert.deepEqual(a1.calls.map((c) => [c.name, c.args]), [['Bash', { command: 'ls' }]]);
+  answer(a1, 'a.txt');
+  const a2 = await ask();
+  assert.deepEqual(a2.calls.map((c) => [c.name, c.args]), [['Read', { file_path: 'notes.txt' }]]);
+  answer(a2, 'notes');
+  const a3 = await ask();
+  assert.equal(a3.text, 'Bash said a.txt; Read said notes');
+  const [start] = startsOf(t);
+  assert.equal(startsOf(t).length, 1, 'one Claude Code process for the three turns');
+  assert.deepEqual(eventsOf(start.pid).find((e) => e.event === 'mcp').tools, ['Bash', 'Read'], 'the hub lists them under the request\'s names');
+  const server = eventsOf(start.pid).find((e) => e.event === 'server').server.name;
+  assert.ok(!log.some((l) => l.includes(server) && /SECURITY/.test(l)), 'no tripwire for the request\'s own tools');
+  assert.ok(await until(() => !sessionFiles('claude').length), 'nothing left after');
+});
+
+test('claude: a client that never comes back — at toolResultTimeoutMs Claude Code\'s process group is stopped and its MCP config, token and all, removed; the token is in no argv, log line or usage row; the late result runs on the cold path', async () => {
+  const t = tag();
+  const c = conversation('cct/m', `Weather ${t}`);
+  const a1 = await c.ask();
+  assert.equal(a1.r.status, 200, a1.r.text);
+  assert.equal(a1.calls.length, 1);
+  const [start] = startsOf(t);
+  const shim = eventsOf(start.pid).find((e) => e.event === 'shim').shimPid;
+  const server = eventsOf(start.pid).find((e) => e.event === 'server').server.name;
+  const file = sessionFiles('claude-t').find((f) => f.endsWith('.mcp.json'));
+  const token = JSON.parse(fs.readFileSync(path.join(dir, 'ws-claude-t', '.keysmith-bridge', file), 'utf8')).mcpServers[server].env.KEYSMITH_BRIDGE_TOKEN;
+  assert.ok(token.length > 30);
+  assert.ok(alive(start.pid));
+  assert.ok(await until(() => !alive(start.pid) && !alive(shim) && !sessionFiles('claude-t').length, 6000), 'stopped at its clock, its files gone');
+  assert.ok(!start.argv.some((a) => a.includes(token)), 'never in the argv');
+  assert.ok(!log.some((l) => l.includes(token)), 'never in the gateway\'s log');
+  assert.ok(!fs.readFileSync(path.join(dir, 'usage.jsonl'), 'utf8').includes(token), 'never in a usage row');
+  c.results(() => 'LATE-RESULT');
+  const a2 = await c.ask();
+  assert.equal(a2.r.status, 200, a2.r.text);
+  assert.equal(a2.text, 'From the history: LATE-RESULT', 'a new run read the conversation so far');
+  assert.equal(startsOf(t).length, 2);
+  assert.equal(rowsOf('cct/m').at(-1).bridge.path, 'cold');
+  assert.ok(await until(() => !sessionFiles('claude-t').length), 'nothing left after');
+});
+
+// Blocking findings of the independent test of 2026-11-03, against Claude Code 2.1.303 itself (a stub
+// Messages endpoint, then live on haiku). Marked todo until the bridge does what they say.
+
+test('claude: Claude Code\'s auto-memory is off on the bridge (autoMemoryEnabled false) — no MEMORY.md and no "write it with the Write tool" section in its prompt', {
+  todo: 'with --setting-sources "" Claude Code 2.1.303 still loads ~/.claude/projects/<workspace>/memory/MEMORY.md into the prompt as instructions and tells the model to keep memories with the Write tool; live on haiku a "remember that my favourite colour is teal" request reached for Read and the tripwire ended it (502). --settings \'{"disableAllHooks":true,"autoMemoryEnabled":false}\' (or CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 set after the CLAUDE_CODE_ drop) takes both out',
+}, async () => {
+  const t = tag();
+  const c = conversation('cc/m', `Weather ${t}`);
+  try {
+    const a1 = await c.ask();
+    assert.equal(a1.r.status, 200, a1.r.text);
+    const [start] = startsOf(t);
+    const cfg = eventsOf(start.pid).find((e) => e.event === 'config');
+    assert.ok(JSON.parse(cfg.settings).autoMemoryEnabled === false || cfg.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY === '1', `auto-memory left on: --settings ${cfg.settings}`);
+  } finally {
+    await closeAll();
+  }
+});
+
+test('claude: each tool the hub lists to Claude Code takes a result as long as the adapter takes one (_meta "anthropic/maxResultSizeChars" ≥ maxPromptChars)', {
+  todo: 'Claude Code 2.1.303 writes an MCP result over ~50,000 chars to ~/.claude/projects/<workspace>/<session>/tool-results/ (left there after the session is gone) and hands the model a 2 KB preview and the path: live on haiku a 60,000-char result made it reach for Read and the tripwire ended the turn (502). A tools/list entry with _meta {"anthropic/maxResultSizeChars": N} let a 300,000-char result through whole',
+}, async () => {
+  const t = tag();
+  const c = conversation('cc/m', `Weather ${t}`);
+  try {
+    const a1 = await c.ask();
+    assert.equal(a1.r.status, 200, a1.r.text);
+    const [start] = startsOf(t);
+    const meta = eventsOf(start.pid).find((e) => e.event === 'mcp').meta;
+    const max = gateway.adapters.get('cc').maxPromptChars;
+    assert.ok(meta.length > 0 && meta.every((m) => (m?.['anthropic/maxResultSizeChars'] ?? 0) >= max), `tools/list _meta: ${JSON.stringify(meta)}`);
+  } finally {
+    await closeAll();
+  }
 });
 
 /* ---------------------------------------------------------------- tripwire and clock */
