@@ -29,6 +29,12 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith add <profile>             attach an adapter (see: keysmith adapters); --explicit-only keeps it out of aliases
   keysmith remove <adapter>          detach one
   keysmith set <adapter> <field> <v> change one field of an attached adapter (JSON when it parses); --unset removes it
+  keysmith set <adapter>             its fields: yours, its built-in profile's, and what else can be set
+  keysmith upgrade [<adapter>…]      what its built-in profile has and it lacks (a dry run); --apply writes it,
+                                     --take <field,…> replaces a field you changed with the profile's
+  keysmith enable|disable <adapter>  serve it, or stop: set <adapter> disabled false|true
+  keysmith vision <adapter> on|off   let a CLI see images: set <adapter> vision true|false
+  keysmith tools <adapter> <mode>    how a CLI takes tool requests, off|emulate|mcp|auto: set <adapter> toolMode <mode>
   keysmith alias [<name> <leg>…]     list aliases, or set one; --prepend/--append/--drop <leg>, --delete
   keysmith adapters                  list profiles and what is attached
   keysmith models [--refresh]        what this gateway exposes, and from where
@@ -95,6 +101,16 @@ export async function main(argv) {
         return await cmdRemove(flags);
       case 'set':
         return await cmdSet(flags);
+      case 'upgrade':
+        return await cmdUpgrade(flags);
+      case 'enable':
+        return await cmdEnable(flags, false);
+      case 'disable':
+        return await cmdEnable(flags, true);
+      case 'vision':
+        return await cmdVision(flags);
+      case 'tools':
+        return await cmdTools(flags);
       case 'alias':
       case 'aliases':
         return await cmdAlias(flags);
@@ -322,6 +338,7 @@ function unsafeChange(entry, next, field) {
  */
 function cmdSet(flags) {
   const [id, field, raw] = flags._;
+  if (id && !field && !flags.unset) return showAdapter(id);
   if (!id || !field || (raw === undefined && !flags.unset)) {
     fail('usage: keysmith set <adapter> <field> <value>   (value: JSON when it parses, a string otherwise)\n       keysmith set <adapter> <field> --unset');
   }
@@ -433,6 +450,197 @@ function fillToolTemplates(id, next) {
     done.push(...files.map(([rel]) => `workspaceFiles[${rel}]`));
   }
   return done.length ? `filled from the built-in "${name}" profile: ${done.join(', ')}` : `the entry already has the "${name}" profile's tool templates`;
+}
+
+/**
+ * The built-in profile an attached entry was made from: a CLI by what it runs (profileFor), an
+ * HTTP adapter by where it goes — the same baseUrl and wire. `[name, profile]`, or null.
+ */
+function entryProfile(id, entry) {
+  if (kindOf(entry) === 'cli') return profileFor(id, entry);
+  for (const [name, p] of Object.entries(HTTP_PROFILES)) {
+    if (p.baseUrl === entry.baseUrl && (p.wire || 'openai') === (entry.wire || 'openai')) return [name, p];
+  }
+  return null;
+}
+
+/** Fields shown by name only: a key, or a map that may hold one (`env: {ANTHROPIC_API_KEY}`, `headers`). */
+const HIDDEN_FIELDS = new Set(['apiKey', 'key']);
+const NAMES_ONLY_FIELDS = new Set(['env', 'headers']);
+
+/** A field's value as `keysmith set <adapter>` and `upgrade` print it: short, and never a secret. */
+function showValue(field, v) {
+  if (v === undefined) return '—';
+  if (HIDDEN_FIELDS.has(field)) return v && !looksLikeRef(String(v)) ? '(literal, hidden)' : String(v);
+  if (NAMES_ONLY_FIELDS.has(field) && v && typeof v === 'object') return truncate(`{${Object.keys(v).join(', ')}}`, 60);
+  const s = JSON.stringify(v);
+  if (s.length <= 60 || typeof v !== 'object' || v === null) return truncate(s, 60);
+  return Array.isArray(v) ? `[${v.length} items]` : truncate(`{${Object.keys(v).join(', ')}}`, 60);
+}
+
+/** Fields worth knowing about that an entry may not have yet, by kind (docs/adapters.md has them all). */
+const SETTABLE = {
+  cli: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'models', 'defaultModel', 'toolMode', 'vision', 'maxImages', 'maxImageBytes', 'stopAtToolCall', 'stripSystemPrompt', 'systemFlag', 'promptVia', 'env'],
+  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures'],
+};
+
+/**
+ * `keysmith set <adapter>`: the entry's fields beside its built-in profile's — `=` the same, `≠`
+ * changed (the profile's value after it), `+` the profile has it and the entry does not
+ * (`keysmith upgrade` brings it), `·` the entry's own — and the common fields it does not set.
+ */
+function showAdapter(id) {
+  const cfg = loadOrFail();
+  if (!own(cfg.adapters, id)) fail(`no adapter named "${id}" — keysmith add <profile> first`);
+  const entry = cfg.adapters[id];
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) fail(`adapter "${id}" is not an object in ${rel(configPath())}`);
+  const found = entryProfile(id, entry);
+  const p = found?.[1] || {};
+  const kind = kindOf(entry);
+  const lines = [`${id}  ${kind}${found ? ` · built-in profile "${found[0]}"` : ' · no built-in profile'}`];
+  const row = (mark, field, value, after = '') => lines.push(`  ${mark} ${field.padEnd(16)} ${value}${after}`);
+  for (const [field, v] of Object.entries(entry)) {
+    if (!Object.hasOwn(p, field)) row('·', field, showValue(field, v));
+    else if (JSON.stringify(p[field]) === JSON.stringify(v)) row('=', field, showValue(field, v));
+    else row('≠', field, showValue(field, v), `   profile: ${showValue(field, p[field])}`);
+  }
+  const missing = Object.keys(p).filter((f) => !Object.hasOwn(entry, f));
+  for (const field of missing) row('+', field, '—', `   profile: ${showValue(field, p[field])}`);
+  const more = SETTABLE[kind].filter((f) => !Object.hasOwn(entry, f) && !Object.hasOwn(p, f));
+  if (more.length) lines.push(`  also settable: ${more.join(', ')} (docs/adapters.md)`);
+  lines.push(`  change one: keysmith set ${id} <field> <value>${missing.length ? ` · what the profile has and this lacks: keysmith upgrade ${id}` : ''}`);
+  out(lines.join('\n'));
+}
+
+/** Profile text `upgrade` refreshes without being asked: what the profile says it verified, and its advice. */
+const PROFILE_TEXT = new Set(['provenance', 'note']);
+
+/**
+ * What `keysmith upgrade` would do to one entry: `{ next, added, refreshed, taken, kept }`, the
+ * field names in each. A field the entry lacks is added; `provenance` and `note` are refreshed; a
+ * field the entry has with another value is kept, unless `take` names it. `workspaceFiles` is a
+ * map of files, so a file the entry lacks is added and one it has is kept. A guard is never
+ * loosened, and a CLI marked unsafeTools gets no tool engine.
+ */
+function upgradePlan(id, entry, profile, take = []) {
+  const next = structuredClone(entry);
+  const plan = { next, added: [], refreshed: [], taken: [], kept: [] };
+  for (const [field, v] of Object.entries(profile)) {
+    if (take.includes(field) && JSON.stringify(entry[field]) !== JSON.stringify(v)) {
+      next[field] = structuredClone(v);
+      plan.taken.push(field);
+    } else if (!Object.hasOwn(entry, field)) {
+      if (field === 'toolMode' && entry.unsafeTools && v !== 'off') continue;
+      next[field] = structuredClone(v);
+      plan.added.push(field);
+    } else if (JSON.stringify(entry[field]) === JSON.stringify(v)) {
+      continue;
+    } else if (PROFILE_TEXT.has(field)) {
+      next[field] = v;
+      plan.refreshed.push(field);
+    } else if (field === 'workspaceFiles' && entry[field] && typeof entry[field] === 'object') {
+      for (const [file, content] of Object.entries(v)) {
+        if (!Object.hasOwn(entry[field], file)) {
+          next[field] = { ...next[field], [file]: content };
+          plan.added.push(`workspaceFiles[${file}]`);
+        } else if (entry[field][file] !== content) plan.kept.push(`workspaceFiles[${file}]`);
+      }
+    } else {
+      plan.kept.push(field);
+    }
+  }
+  // As a re-add: a mark the entry had stays, whatever the profile says.
+  for (const k of ['explicitOnly', 'unsafeTools', 'disabled']) if (entry[k]) next[k] = true;
+  return plan;
+}
+
+/**
+ * `keysmith upgrade [<adapter>…] [--apply] [--take <field,…>]`: bring attached adapters up to their
+ * built-in profiles — what a profile gained since the entry was copied (vision, a tool engine's
+ * templates), without a re-add and without touching what was changed on the entry. A dry run
+ * unless --apply; with no adapter named, every entry that has a profile. Every entry is checked as
+ * `set` checks one before anything is written, and one that fails stops them all.
+ */
+function cmdUpgrade(flags) {
+  const cfg = loadOrFail();
+  const ids = flags._.length ? flags._ : Object.keys(cfg.adapters || {});
+  const take = typeof flags.take === 'string' ? flags.take.split(',').map((f) => f.trim()).filter(Boolean) : [];
+  if (flags.take !== undefined && !take.length) fail('--take names fields: --take workspaceFiles,bridge');
+  if (take.length && !flags._.length) fail('--take changes fields you changed yourself: name the adapter it is for — keysmith upgrade <adapter> --take ' + take.join(','));
+  const lines = [];
+  const plans = [];
+  const refused = [];
+  for (const id of ids) {
+    if (!own(cfg.adapters, id)) fail(`no adapter named "${id}" — keysmith add <profile> first`);
+    const entry = cfg.adapters[id];
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) fail(`adapter "${id}" is not an object in ${rel(configPath())}`);
+    const found = entryProfile(id, entry);
+    if (!found) {
+      if (flags._.length) lines.push(`${id}: no built-in profile runs it — nothing to upgrade from`);
+      continue;
+    }
+    const [name, profile] = found;
+    const unknown = take.filter((f) => !Object.hasOwn(profile, f));
+    if (unknown.length) fail(`--take ${unknown.join(',')}: the "${name}" profile has no such field`);
+    const plan = upgradePlan(id, entry, profile, take);
+    const changed = [...plan.added, ...plan.refreshed, ...plan.taken];
+    if (!changed.length) {
+      lines.push(`${id} ← "${name}": up to date${plan.kept.length ? ` (yours kept: ${plan.kept.join(', ')})` : ''}`);
+      continue;
+    }
+    lines.push(`${id} ← "${name}"`);
+    for (const f of plan.added) lines.push(`  + ${f.padEnd(16)} ${f.startsWith('workspaceFiles[') ? 'a file of the profile' : showValue(f, profile[f])}`);
+    for (const f of plan.taken) lines.push(`  ← ${f.padEnd(16)} ${showValue(f, profile[f])}   was: ${showValue(f, entry[f])}`);
+    for (const f of plan.refreshed) lines.push(`  ~ ${f.padEnd(16)} the profile's current text`);
+    for (const f of plan.kept) {
+      const value = f.startsWith('workspaceFiles[') ? 'yours differs from the profile' : `yours: ${showValue(f, entry[f])} · profile: ${showValue(f, profile[f])}`;
+      lines.push(`  = ${f.padEnd(16)} ${value}`);
+    }
+    // What `set` would refuse field by field, refused here too: an unsafeTools entry changes
+    // what it runs only with the flag, and nothing is saved that the gateway would not load.
+    const unsafe = changed.map((f) => f.replace(/\[.*$/, '')).map((f) => unsafeChange(entry, plan.next, f)).find(Boolean);
+    if (unsafe && !flags.allowUnsafeTools) refused.push(`${id}: it can run commands and edit files, and ${unsafe} needs --allow-unsafe-tools`);
+    try {
+      checkAdapter(id, plan.next);
+    } catch (e) {
+      refused.push(`${id}: ${e.message}`);
+    }
+    plans.push([id, plan]);
+  }
+  if (!lines.length) lines.push('no attached adapter has a built-in profile to upgrade from');
+  out(lines.join('\n'));
+  if (!plans.length) return;
+  if (refused.length) fail(`not upgraded: ${refused.join('\n  ')}`);
+  if (!flags.apply) {
+    out(`\ndry run, nothing written — to write it: keysmith upgrade ${flags._.join(' ')}${flags._.length ? ' ' : ''}--apply${take.length ? ` --take ${take.join(',')}` : ''}${flags.allowUnsafeTools ? ' --allow-unsafe-tools' : ''}${plans.some(([, p]) => p.kept.length) && !take.length ? '\n  (a field marked = is yours and stays; --take <field,…> replaces it with the profile\'s)' : ''}`);
+    return;
+  }
+  for (const [id, plan] of plans) cfg.adapters[id] = plan.next;
+  saveConfig(cfg);
+  out(`\nupgraded ${plans.map(([id]) => id).join(', ')} → ${rel(configPath())}`);
+  noteRestart(`upgrading ${plans.map(([id]) => id).join(', ')}`);
+}
+
+/** `keysmith enable|disable <adapter>`: `keysmith set <adapter> disabled false|true`, with its checks. */
+function cmdEnable(flags, disabled) {
+  const [id, ...extra] = flags._;
+  if (!id || extra.length) fail(`usage: keysmith ${disabled ? 'disable' : 'enable'} <adapter>`);
+  return cmdSet({ ...flags, _: [id, 'disabled', String(disabled)] });
+}
+
+/** `keysmith vision <adapter> on|off`: `keysmith set <adapter> vision true|false`, visionArgs filled in as set fills them. */
+function cmdVision(flags) {
+  const [id, state, ...extra] = flags._;
+  const value = { on: 'true', true: 'true', off: 'false', false: 'false' }[state];
+  if (!id || !value || extra.length) fail('usage: keysmith vision <adapter> on|off');
+  return cmdSet({ ...flags, _: [id, 'vision', value] });
+}
+
+/** `keysmith tools <adapter> off|emulate|mcp|auto`: `keysmith set <adapter> toolMode <mode>`, its templates filled in as set fills them. */
+function cmdTools(flags) {
+  const [id, mode, ...extra] = flags._;
+  if (!id || !['off', 'emulate', 'mcp', 'auto'].includes(mode) || extra.length) fail('usage: keysmith tools <adapter> off|emulate|mcp|auto');
+  return cmdSet({ ...flags, _: [id, 'toolMode', mode] });
 }
 
 /**

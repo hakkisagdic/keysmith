@@ -148,6 +148,7 @@ otherwise; `--unset` removes the field; nothing is echoed back, since the field 
 of fields, an `args` with an auto-approve flag, an http adapter without `baseUrl` — is refused
 before it replaces a working entry (`--force` saves it anyway, and says the adapter will not
 load); credentials are not resolved for that check, so a key only launchd can see is fine.
+What an entry has, and the rest of these commands: [Changing an attached adapter](#changing-an-attached-adapter).
 
 ## Sessions: multi-turn out of a stateless client
 
@@ -564,7 +565,8 @@ with the images in place, through the same tool-less switches. An image URL is a
 fetched (a gateway behind a tunnel would fetch whatever this machine can reach); so is an
 image over 5 MB or more than 20 in one request (`maxImageBytes`, `maxImages` per adapter).
 Every other adapter reads an image as `[image omitted by keysmith]`, as before. A `claude`
-entry attached before this gets it with `keysmith set claude vision true`. Details:
+entry attached before this gets it with `keysmith upgrade claude --apply` (or `keysmith vision
+claude on`). Details:
 [docs/adapters.md](docs/adapters.md#images-a-cli-that-sees-them).
 
 **Ollaya** ([ollaya.dev](https://ollaya.dev)) is out of scope: it is a local runtime for
@@ -847,6 +849,55 @@ every CLI the gateway spawns, at utility priority with throttled I/O; on a busy 
 that tripled the wait for an agent's first token (9–30 s against 4–5 s, same code). An
 agent installed by an older keysmith keeps its old plist — run `keysmith install-service`
 again to rewrite it.
+
+## Changing an attached adapter
+
+`keysmith add` copies a profile into your config; from then on the entry is yours, and these
+change it without opening the file that holds the gateway key:
+
+| Command | What it does |
+|---|---|
+| `keysmith set <adapter>` | its fields: `=` as its built-in profile has it, `≠` changed (the profile's value after it), `+` the profile has it and the entry does not, `·` the entry's own; then the common fields it does not set. A key is shown only as a reference (`{env:…}`), `env` and `headers` by name |
+| `keysmith set <adapter> <field> <value>` | one field; the value is JSON when it parses. `--unset` removes it |
+| `keysmith upgrade [<adapter>…]` | what its built-in profile gained since the entry was copied — a dry run. `--apply` writes it |
+| `keysmith enable \| disable <adapter>` | `set <adapter> disabled false\|true` |
+| `keysmith vision <adapter> on\|off` | `set <adapter> vision true\|false`, the profile's `visionArgs` filled in when the entry lacks them |
+| `keysmith tools <adapter> off\|emulate\|mcp\|auto` | `set <adapter> toolMode …`, the tool engine's templates filled in the same way |
+
+Each goes through `set`'s checks: a value the gateway would not load is refused before it
+replaces a working entry, and an `unsafeTools` adapter is served, or changed in what it runs,
+only with `--allow-unsafe-tools`. A running gateway picks a change up when it restarts.
+
+Fields people set often:
+
+```bash
+keysmith set claude models '["sonnet","opus"]'   # what /v1/models lists for it
+keysmith set claude timeoutMs 600000             # a run may take ten minutes
+keysmith set claude maxImages 5                  # images per request (20)
+keysmith set claude maxImageBytes 2097152        # the largest image, decoded (5 MB)
+keysmith set agy maxConcurrent 4                 # processes at once
+keysmith set codex explicitOnly true             # answers codex/… by name only: no alias, no probe
+keysmith set copilot priority 10                 # first in the flat listing
+keysmith set google modelParams '{"gemini-4-argon":{"reasoning_effort":"high"}}'
+```
+
+**`keysmith upgrade`.** A profile gains things — `vision` on `claude`, a tool engine's
+templates on `agy`, `opencode`, `codex` and `qoder` — and an entry copied before that does not
+have them. `upgrade` compares each entry with the profile it was made from (a CLI by its binary
+and parser, an HTTP adapter by its `baseUrl` and wire) and says, per field:
+
+- `+` the profile has it and the entry does not: added;
+- `~` `provenance` and `note`: the profile's current text;
+- `=` the entry has another value: yours, kept. `--take <field,…>` replaces it with the
+  profile's (`← field … was: …`). A file of `workspaceFiles` the entry lacks is added, one it
+  has is kept the same way.
+
+Nothing is written without `--apply`, and with no adapter named it looks at every entry that
+has a profile. Like a re-add it never loosens a guard (`explicitOnly`, `unsafeTools`,
+`disabled`), and a CLI marked `unsafeTools` gets no tool engine. Every entry is checked as `set`
+checks one before anything is written; one that fails stops them all. Read the dry run before
+`--apply`: an added `toolMode: "auto"` means that adapter starts answering requests that offer
+tools.
 
 ## Built-in profiles
 

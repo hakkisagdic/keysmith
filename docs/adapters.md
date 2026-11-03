@@ -77,7 +77,7 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `stripSystemPrompt` | `false` | drop system turns instead of inlining them |
 | `systemFlag` | — | e.g. `"--system-prompt"`: passed as `--system-prompt <text>` when a system turn exists |
 | `maxPromptChars` | `200000` | refuses a request rather than handing a 400 KB argv to a subprocess |
-| `vision` | `false` | the CLI sees images: a request that carries one runs `visionArgs`, its prompt on stdin as a stream-json user message with the images in it. Needs `visionArgs`; `keysmith set <id> vision true` fills them in from the entry's built-in profile when it lacks them. See [Images: a CLI that sees them](#images-a-cli-that-sees-them) |
+| `vision` | `false` | the CLI sees images: a request that carries one runs `visionArgs`, its prompt on stdin as a stream-json user message with the images in it. Needs `visionArgs`; `keysmith set <id> vision true` (or `keysmith vision <id> on`) fills them in from the entry's built-in profile when it lacks them, and `keysmith upgrade <id>` brings both. See [Images: a CLI that sees them](#images-a-cli-that-sees-them) |
 | `visionArgs` | — | the argv template of a run that carries images, read by the auto-approve check like every other template. No `{prompt}`: stdin is the prompt; `{session}` is always empty |
 | `maxImages` | `20` | images one request may carry to this adapter; more is a 400 |
 | `maxImageBytes` | `5242880` | the largest image, decoded, this adapter takes; larger is a 400 |
