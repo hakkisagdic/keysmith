@@ -625,6 +625,12 @@ Claude Code 2.1.303, live on `haiku` at effort low through a keysmith gateway:
 Claude Code's own prompt here is about 4.3k tokens, and it is cached after the first turn. A
 waiting session is about 230 MB of Claude Code and 50 MB of shim.
 
+A `claude` entry attached before this keeps what it had — `toolMode: "off"`, its argv without
+`{effort}`, no model listing — so its clients get what they always did. `keysmith upgrade claude`
+lists what the profile gained; `--take args,resumeArgs,visionArgs,modelsFrom,toolMode --apply`
+brings the effort, the listing and the tool engine (until every argv has `{effort}`, a request's
+effort is not applied, and the row says `effortIgnored`).
+
 **Images, PDFs, audio, video.** An adapter takes the media its `media` lists (`image`, `pdf`,
 `audio`, `video`; `vision: true` is `image`), and a request that carries some reaches it as the
 thing itself: `claude/<model>` gets images and PDFs on Claude Code's stdin as one stream-json

@@ -91,9 +91,15 @@ export class CliAdapter {
     }
     // Answers only a request that names it: never an alias leg, never probed.
     this.explicitOnly = !!cfg.explicitOnly || this.unsafeTools;
-    // A CLI that takes a reasoning effort: one of its argv templates says where (`{effort}`), and
-    // its catalogue which levels each model takes (src/effort.js).
-    this.takesEffort = [this.args, this.resumeArgs, this.emulateArgs, this.visionArgs, this.bridge?.args].some(takesEffort);
+    // A CLI that takes a reasoning effort: every argv template it has says where (`{effort}`), and
+    // its catalogue which levels each model takes (src/effort.js). An entry upgraded in part (the
+    // bridge's argv has it, `args` not yet) takes none, so no path of it runs a request's effort
+    // and another refuses it: `effortGap` names the templates that lack it.
+    const templates = { args: this.args, resumeArgs: this.resumeArgs, emulateArgs: this.emulateArgs, visionArgs: this.visionArgs, 'bridge.args': this.bridge?.args };
+    const present = Object.entries(templates).filter(([, t]) => Array.isArray(t));
+    const lacking = present.filter(([, t]) => !takesEffort(t)).map(([k]) => k);
+    this.takesEffort = present.length > 0 && !lacking.length;
+    this.effortGap = lacking.length && lacking.length < present.length ? `${id}'s ${lacking.join(', ')} take${lacking.length > 1 ? '' : 's'} no {effort} — keysmith upgrade ${id} --take ${lacking.join(',')} --apply brings the profile's` : null;
     this.env = cfg.env || {};
     this.timeoutMs = cfg.timeoutMs ?? 300_000;
     this.priority = cfg.priority ?? 200;

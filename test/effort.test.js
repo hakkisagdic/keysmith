@@ -230,6 +230,18 @@ test('a CLI whose argv takes no effort is handed none, as before; the row says t
   assert.equal(lastRow().effort, undefined);
 });
 
+test('an entry upgraded in part (`{effort}` in some templates, not all) takes no effort on any path, and its row says which templates lack it', async () => {
+  const { CliAdapter } = await import('../src/cli-adapter.js');
+  const p = structuredClone(CLI_PROFILES.claude);
+  const plain = (a) => a.filter((t) => !(Array.isArray(t) && t[0] === '--effort'));
+  const half = new CliAdapter('claude', { ...p, args: plain(p.args), resumeArgs: plain(p.resumeArgs), visionArgs: plain(p.visionArgs) });
+  assert.equal(half.takesEffort, false);
+  assert.match(half.effortGap, /claude's args, resumeArgs, visionArgs take no \{effort\} — keysmith upgrade claude --take args,resumeArgs,visionArgs --apply/);
+  const { resolveEffort } = await import('../src/effort.js');
+  assert.deepEqual(await resolveEffort(half, 'sonnet', 'high'), { model: 'sonnet', effort: null, ignored: half.effortGap });
+  assert.equal(new CliAdapter('claude', p).effortGap, null);
+});
+
 test('EMULATE takes the effort too: its argv is the profile\'s, with the level in it', async () => {
   const tools = [{ type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {} } } }];
   const r = await chat('cx/gpt-x-high', { tools });

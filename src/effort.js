@@ -18,7 +18,8 @@ import { LlmError } from './util.js';
  * a model whose catalogue entry lists none takes no effort. Never guessed.
  *
  * A CLI whose argv has no `{effort}` (agy, opencode, an entry attached before it had one) is
- * handed no effort, as before; the usage row says the client's was not applied (`effortIgnored`).
+ * handed no effort, as before, and so is one that has it in some of its templates and not all (an
+ * entry upgraded in part); the usage row says the client's was not applied (`effortIgnored`), and why.
  */
 
 /** The placeholder an argv template carries an effort in. */
@@ -90,7 +91,7 @@ export function suffixedIds(list, m) {
  */
 export async function resolveEffort(adapter, model, effort) {
   if (!adapter.takesEffort) {
-    return { model, effort: null, ...(effort ? { ignored: `${adapter.id}'s argv takes no effort` } : {}) };
+    return { model, effort: null, ...(effort ? { ignored: adapter.effortGap || `${adapter.id}'s argv takes no effort` } : {}) };
   }
   let list;
   try {
