@@ -66,6 +66,28 @@ test('codex-json-final: what plain `codex exec` prints — the last agent messag
   assert.equal(events.at(-1).type, 'done');
 });
 
+// A finding of the independent test of 2026-11-03. codex exec --json prints a stream error it
+// retries as a top-level `error` line (exec's JSONL processor turns every ServerNotification::Error
+// into ThreadEvent::Error; the app-server sends StreamError as one with will_retry: true, and exec
+// sets its failure flag only when !will_retry), then goes on to turn.completed and exits 0. Plain
+// `codex exec` (parser raw, before this branch) printed that notice on stderr and the answer on
+// stdout. Through a stub that prints this run, every face answered 502 "codex: Reconnecting… 1/5".
+test('codex-json-final: a stream error codex retries ("Reconnecting... 1/5") and a turn that then completes is the answer, not a failure', { todo: 'a retried stream error is read as the run\'s failure: 502 for an answer codex gave' }, async () => {
+  const events = await all(
+    codexJsonFinal(
+      lines([
+        { type: 'thread.started', thread_id: 'th' },
+        { type: 'turn.started' },
+        { type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses))' },
+        { type: 'item.completed', item: { id: 'i0', type: 'agent_message', text: 'PONG' } },
+        { type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 } },
+      ]),
+    ),
+  );
+  assert.deepEqual(events.filter((e) => e.type === 'delta'), [{ type: 'delta', text: 'PONG' }]);
+  assert.deepEqual(events.filter((e) => e.type === 'error'), [], 'codex retried and answered: no error reaches the client');
+});
+
 test('the Anthropic wire: input_tokens is the uncached input, so the cache\'s counts are added to `input`', async () => {
   const up = http.createServer((req, res) => {
     req.resume();

@@ -242,6 +242,18 @@ test('an entry upgraded in part (`{effort}` in some templates, not all) takes no
   assert.equal(new CliAdapter('claude', p).effortGap, null);
 });
 
+// A finding of the independent test of 2026-11-03: a codex entry attached before (parser raw, plain
+// `exec`) upgraded in part (`--take emulateArgs,bridge`) is told to `--take args`. That brings
+// `exec --json` and leaves parser raw, so every text answer is codex's JSONL event stream, 200 OK.
+test('a codex entry upgraded in part is told to take its parser along with args: `exec --json` is never read as raw', { todo: 'the advice names args alone, and args with --json under parser raw answers with the JSONL' }, async () => {
+  const { CliAdapter } = await import('../src/cli-adapter.js');
+  const p = structuredClone(CLI_PROFILES.codex);
+  const plain = (a) => a.filter((t) => t !== '--json' && !(Array.isArray(t) && t.includes('model_reasoning_effort="{effort}"')));
+  const half = new CliAdapter('codex', { ...p, args: plain(p.args), parser: 'raw' });
+  assert.equal(half.takesEffort, false);
+  assert.match(half.effortGap, /--take args,parser\b|--take parser,args\b/, half.effortGap);
+});
+
 test('an alias leg that names an effort id of a model the adapter declares is no unusable leg', () => {
   const g = new Gateway({ adapters: { cx: { ...structuredClone(CLI_PROFILES.codex), bin: '/usr/bin/true', cwd: path.join(os.tmpdir(), 'ks-effort-alias'), models: [{ id: 'gpt-x', efforts: ['low'] }] } }, aliases: { fast: ['cx/gpt-x-low'], typo: ['cx/gpt-x-lo'] } });
   assert.deepEqual(Object.keys(g.aliasIssues), ['typo']);
