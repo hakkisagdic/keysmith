@@ -22,8 +22,9 @@
  *             own, under the message's id, with the usage of the message's start (output 1); the
  *             result line the run's total. Calls one after the other. A result longer than the
  *             tool's `_meta["anthropic/maxResultSizeChars"]` (50,000 with none: 2.1.303 kept
- *             49,220 chars whole and spilled 73,820) reaches the model as 2.1.303 gave it: a
- *             2,000-char preview, the rest left in a file (noted `spilled`, not written).
+ *             49,220 chars whole and spilled 73,820; 500,000 at most, whatever the _meta says)
+ *             reaches the model as 2.1.303 gave it: a 2,000-char preview, the rest left in a
+ *             file (noted `spilled`, not written).
  *
  * Without an MCP server it answers in plain text, as the CLI would with nothing to call. What it
  * does is picked by `SCENARIO=<name>` in its prompt (the last argv entry; one-call and two-calls
@@ -235,10 +236,19 @@ const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabiliti
 mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
 const list = await rpc('tools/list', {});
 note({ event: 'mcp', protocolVersion: init.result?.protocolVersion ?? null, tools: list.result?.tools?.map((t) => t.name) ?? null, meta: list.result?.tools?.map((t) => t._meta ?? null) ?? null });
-/** Claude Code 2.1.303: how long a tool's result may be before the model gets a preview of it instead. */
+/**
+ * Claude Code 2.1.303: how long a tool's result may be before the model gets a preview of it
+ * instead — 50,000 with no _meta; with one, its `anthropic/maxResultSizeChars` up to a ceiling of
+ * 500,000 (`Math.min(meta, 500000)` in the binary; against a stub Messages endpoint a 450,009-char
+ * result went whole and a 550,032-char one was spilled under a meta of 700,000).
+ */
 const SPILL_AT = 50_000;
+const SPILL_CEILING = 500_000;
 const PREVIEW = 2_000;
-const spillAt = (name) => list.result?.tools?.find((t) => t.name === name)?._meta?.['anthropic/maxResultSizeChars'] ?? SPILL_AT;
+const spillAt = (name) => {
+  const m = list.result?.tools?.find((t) => t.name === name)?._meta?.['anthropic/maxResultSizeChars'];
+  return typeof m === 'number' && Number.isFinite(m) && m > 0 ? Math.min(m, SPILL_CEILING) : SPILL_AT;
+};
 
 let seq = 0;
 /** One call: shown (where the CLI shows it first), sent, its result read, shown finished. */
