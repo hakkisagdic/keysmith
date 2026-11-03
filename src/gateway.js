@@ -804,18 +804,18 @@ function modelOf(target) {
  * Returns null when neither exists — startup, before any listing has been asked for.
  */
 function knownModels(adapter) {
+  // An effort-suffixed id (`gpt-6-astra-xhigh`) is the catalogue's too, on a CLI that takes an effort.
+  const withEfforts = (list) => list.flatMap((m) => [typeof m === 'string' ? m : m?.id, ...(adapter.takesEffort && m && typeof m === 'object' ? suffixedIds(list, m).map((x) => x.id) : [])]).filter(Boolean);
   const declared = adapter._declared ?? adapter.declaredModels ?? null;
   if (Array.isArray(declared)) {
-    const ids = declared.map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean);
+    const ids = withEfforts(declared);
     if (ids.length) return { ids, from: 'declared models' };
   } else if (declared && typeof declared === 'object' && Object.keys(declared).length) {
     return { ids: Object.keys(declared), from: 'declared models' };
   }
   const cached = adapter._modelCache;
   if (Array.isArray(cached?.list) && cached.list.length && Date.now() - (cached.at || 0) < 600_000) {
-    // An effort-suffixed id (`gpt-6-astra-xhigh`) is the catalogue's too, on a CLI that takes an effort.
-    const ids = cached.list.flatMap((m) => [m?.id || m, ...(adapter.takesEffort ? suffixedIds(cached.list, m).map((x) => x.id) : [])]).filter(Boolean);
-    return { ids, from: 'last-read model list' };
+    return { ids: withEfforts(cached.list), from: 'last-read model list' };
   }
   return null;
 }

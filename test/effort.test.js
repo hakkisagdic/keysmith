@@ -242,6 +242,11 @@ test('an entry upgraded in part (`{effort}` in some templates, not all) takes no
   assert.equal(new CliAdapter('claude', p).effortGap, null);
 });
 
+test('an alias leg that names an effort id of a model the adapter declares is no unusable leg', () => {
+  const g = new Gateway({ adapters: { cx: { ...structuredClone(CLI_PROFILES.codex), bin: '/usr/bin/true', cwd: path.join(os.tmpdir(), 'ks-effort-alias'), models: [{ id: 'gpt-x', efforts: ['low'] }] } }, aliases: { fast: ['cx/gpt-x-low'], typo: ['cx/gpt-x-lo'] } });
+  assert.deepEqual(Object.keys(g.aliasIssues), ['typo']);
+});
+
 test('a request waits on the CLI\'s listing only when there has never been one: a stale catalogue answers and is read again behind it; an id with no `-` and no effort reads none', async () => {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-effort-swr-'));
   try {
