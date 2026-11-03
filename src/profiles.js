@@ -295,6 +295,11 @@ export const CLI_PROFILES = {
     // out CLAUDE.md, plugins, hooks and custom agents — auth and model selection stay.
     args: ['-p', '--output-format', 'stream-json', '--verbose', '{noSession}', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', ['--model', '{model}'], '{prompt}'],
     resumeArgs: ['-p', '--output-format', 'stream-json', '--verbose', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', '--resume', '{session}', '{prompt}'],
+    // A request that carries an image runs `visionArgs`: the same tool-less switches, and the
+    // prompt on stdin as one stream-json user message, its images as base64 blocks (src/images.js).
+    // Claude Code passes those blocks on to the model as they are. No `{prompt}`: stdin is the prompt.
+    vision: true,
+    visionArgs: ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '{noSession}', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', ['--model', '{model}']],
     persistSessions: false,
     // Claude Code 2.1.261 refuses `--no-session` ("unknown option"); this is its spelling.
     noSessionFlag: '--no-session-persistence',
@@ -308,8 +313,8 @@ export const CLI_PROFILES = {
     toolMode: 'off',
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Claude Code 2.1.261 — every flag here is listed by `claude --help` and parsed by 2.1.261 (checked with an empty prompt, which it refuses before any request); `--max-turns` is undocumented but parsed. The stream-json `result` line carries usage/session_id. No live request was sent through this argv.',
-    note: 'Runs without tools (`--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--safe-mode`) in an empty keysmith-owned workspace. Declare `models: ["sonnet", "opus"]` or pass the id through; Claude Code has no offline model listing. A failed run prints one `result` line with is_error and the reason in `errors[]` — the parser surfaces it rather than returning an empty completion. It spends your Claude subscription, so the profile is explicit-only: it answers `claude/<model>` and is in no alias and no `doctor --probe-models`. To put it in a route anyway: `keysmith set claude explicitOnly false`.',
+    provenance: 'Claude Code 2.1.261 — every flag here is listed by `claude --help` and parsed by 2.1.261 (checked with an empty prompt, which it refuses before any request); `--max-turns` is undocumented but parsed. The stream-json `result` line carries usage/session_id. No live request was sent through this argv. Claude Code 2.1.303 (2026-11-03): `visionArgs` with one stream-json user message on stdin (a text block and a base64 JPEG block) was run against a stub Messages endpoint (ANTHROPIC_BASE_URL): the image block reached it as sent, and stdout was the same assistant/result lines. Live the same day, through a keysmith gateway on sonnet: a scanned typewritten polytonic Greek page (943×1500 JPEG) sent as a data: URL on /v1/chat/completions and as a base64 source on /v1/messages came back transcribed, line for line.',
+    note: 'Runs without tools (`--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--safe-mode`) in an empty keysmith-owned workspace. Declare `models: ["sonnet", "opus"]` or pass the id through; Claude Code has no offline model listing. A failed run prints one `result` line with is_error and the reason in `errors[]` — the parser surfaces it rather than returning an empty completion. It sees images (`vision: true`): a request with an inline image — a base64 data: URL on /v1/chat/completions, a base64 source on /v1/messages — runs `visionArgs`, the prompt on stdin as stream-json with the images in it. An image URL is refused, not fetched. It spends your Claude subscription, so the profile is explicit-only: it answers `claude/<model>` and is in no alias and no `doctor --probe-models`. To put it in a route anyway: `keysmith set claude explicitOnly false`.',
   },
   agy: {
     kind: 'cli',

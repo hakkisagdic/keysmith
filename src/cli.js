@@ -348,6 +348,8 @@ function cmdSet(flags) {
   // A tool engine needs its templates: an entry attached before they existed gets the ones its
   // built-in profile has and it lacks (never one it has), when the profile is the same CLI.
   const filled = field === 'toolMode' && !flags.unset && typeof value === 'string' && value !== 'off' && kindOf(next) === 'cli' ? fillToolTemplates(id, next) : null;
+  // Likewise images: `vision true` brings the profile's visionArgs, when the entry has none.
+  const filledVision = field === 'vision' && !flags.unset && value === true && kindOf(next) === 'cli' ? fillVisionArgs(id, next) : null;
   // A tool-capable CLI is served only by someone who said so: turning it on, taking the mark
   // off, or changing what it runs and how it is stopped needs the flag that names what it means.
   const unsafe = unsafeChange(entry, next, field);
@@ -370,6 +372,7 @@ function cmdSet(flags) {
   saveConfig(cfg);
   out(`${flags.unset ? 'removed' : 'set'} ${id}.${field} → ${rel(configPath())}`);
   if (filled) out(`  ${filled}`);
+  if (filledVision) out(`  ${filledVision}`);
   if (engineOff) out(`  and ${id}.toolMode ${engineOff} → off: a CLI marked unsafeTools takes no tool request (after unsafeTools false: keysmith set ${id} toolMode ${engineOff})`);
   if (unsafe) out(`! "${id}": ${unsafe}, with --allow-unsafe-tools. It can run commands and edit files on this machine${next.disabled ? ' once it is enabled' : ''}; it is still never an alias leg.`);
   noteRestart(`${id}.${field}`);
@@ -386,6 +389,19 @@ function profileFor(id, entry) {
     if (path.basename(String(p.bin)) === bin && (p.parser || 'raw') === parser) return [name, p];
   }
   return null;
+}
+
+/**
+ * `keysmith set <id> vision true`: the built-in profile's visionArgs, when the entry has none and
+ * its profile has them. What was done, in one line, or null (the entry's own visionArgs stand, or
+ * there is no profile to take them from — and checkAdapter then says what is missing).
+ */
+function fillVisionArgs(id, next) {
+  if (next.visionArgs) return null;
+  const found = profileFor(id, next);
+  if (!found?.[1].visionArgs) return null;
+  next.visionArgs = structuredClone(found[1].visionArgs);
+  return `filled from the built-in "${found[0]}" profile: visionArgs`;
 }
 
 /**

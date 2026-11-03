@@ -48,11 +48,11 @@ export function joinArgs(templates, vars) {
  * string. The system turn is hoisted out when `systemVar` is set, so the adapter can
  * pass it through a dedicated flag instead of burying it in the user text.
  */
-export function flattenMessages(messages, { systemSeparator = '\n\n', roleSeparator = '\n\n', includeSystem = true } = {}) {
+export function flattenMessages(messages, { systemSeparator = '\n\n', roleSeparator = '\n\n', includeSystem = true, image } = {}) {
   const sys = [];
   const turns = [];
   for (const m of messages || []) {
-    const text = contentToText(m.content);
+    const text = contentToText(m.content, { image });
     if (!text) continue;
     if (m.role === 'system') {
       if (includeSystem) sys.push(text);
@@ -65,7 +65,19 @@ export function flattenMessages(messages, { systemSeparator = '\n\n', roleSepara
   return { system: sys.join(systemSeparator), prompt, history: prompt };
 }
 
-export function contentToText(content) {
+export const IMAGE_OMITTED = '[image omitted by keysmith]';
+
+/** An image part as a client sends one: OpenAI Chat `image_url`, Anthropic `image`, Responses `input_image`. */
+export function isImagePart(part) {
+  return !!part && typeof part === 'object' && (part.type === 'image_url' || part.type === 'image' || part.type === 'input_image');
+}
+
+/**
+ * Message content as text. An image becomes `image(part)`: the IMAGE_OMITTED label by default,
+ * because a vision request that arrives as text must say so; a CLI that takes images
+ * (src/images.js) marks the spot instead and puts the image back there.
+ */
+export function contentToText(content, { image = () => IMAGE_OMITTED } = {}) {
   if (content == null) return '';
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -74,13 +86,24 @@ export function contentToText(content) {
         if (typeof part === 'string') return part;
         if (!part || typeof part !== 'object') return '';
         if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') return part.text || '';
-        if (part.type === 'image_url' || part.type === 'image') return '[image omitted by keysmith]';
+        if (isImagePart(part)) return image(part);
         return part.text || '';
       })
       .filter(Boolean)
       .join('\n');
   }
   return String(content);
+}
+
+/**
+ * A message as the protocol faces build it (`{ role, content }`, the content as text), with its
+ * original parts kept as `msg.parts` when they hold an image: what a CLI that takes images reads
+ * (src/images.js). Every other reader goes on reading the text. Not enumerable, so the message
+ * still reads, compares and serializes as `{ role, content }`, and a copy of it is text alone.
+ */
+export function keepImageParts(msg, content) {
+  if (Array.isArray(content) && content.some(isImagePart)) Object.defineProperty(msg, 'parts', { value: content, enumerable: false });
+  return msg;
 }
 
 export class LlmError extends Error {

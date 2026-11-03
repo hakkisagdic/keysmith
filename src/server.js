@@ -315,6 +315,8 @@ function describeAdapters(gateway) {
     unsafe_tools: !!a.unsafeTools,
     // How it takes a request that offers tools: a CLI's toolMode, an HTTP upstream's relay.
     tool_mode: a.kind === 'cli' ? a.toolMode || 'off' : (a.wire || 'openai') === 'openai' ? 'passthrough' : 'off',
+    // Whether it sees an image a request carries; one that does not reads it as a text label.
+    vision: !!a.vision,
   }));
 }
 

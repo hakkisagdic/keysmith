@@ -71,12 +71,16 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `toolMode` | `off` | how this CLI answers a request that offers tools: `off` (it is passed by, as before toolMode existed), `emulate` (EMULATE: the model writes its calls as JSON, keysmith hands them to the client — see [agy and tool requests: EMULATE](#agy-and-tool-requests-emulate)), `mcp` (the MCP bridge: the CLI calls the request's tools over MCP and waits while the client runs each one — see [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge); agy, opencode, codex and qoder have a bridge driver) or `auto` (the bridge where it can, EMULATE otherwise and when the bridge fails before any call). The `agy`, `opencode`, `codex` and `qoder` profiles ship `auto` (see [opencode, codex, qoder and kiro](#opencode-codex-qoder-and-kiro-tool-requests)); `claude` and `kiro` say `off`. A load error on an `unsafeTools` entry, on an entry without a `cwd` (a tool engine runs the CLI only in an empty workspace keysmith owns, never the gateway's own directory; every built-in profile has one) and on an HTTP adapter. `keysmith set <id> toolMode <mode>` fills in the templates below from the entry's built-in profile when it lacks them |
 | `emulateArgs` | `args` | the argv template of an EMULATE run, same placeholders as `args`; no session is resumed on that path, so `{session}` is always empty. agy's names the `keysmith-tools` agent |
 | `bridge` | — | the MCP bridge's settings: `driver` (`agy`, `opencode`, `codex`, `qoder` or `claude`; absent, agy's for an `agy-stream-json` entry), `args`, its argv template, with `{agent}` (the session's agent), `{server}`, `{printTimeout}` (its `sessionMaxMs`, as `1800s`) and the driver's own placeholders (see [opencode, codex, qoder and kiro](#opencode-codex-qoder-and-kiro-tool-requests)) filled in per session — read by the auto-approve check below, and an approval in it may approve the session's own server only; `maxSessions` (2), `toolResultTimeoutMs` (300000), `readyTimeoutMs` (30000), `sessionMaxMs` (1800000), `maxTurns` (32); `mcpCacheDir` (`~/.gemini/antigravity-cli/mcp`, where agy keeps a server's schemas). See [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge) |
-| `unsafeTools` | `false` | keysmith could not take this CLI's tools away: it can run commands and edit files. Implies `explicitOnly`; `keysmith set` refuses to serve it (`disabled false`), to take the mark off, or to change anything that shapes what it runs or how it is stopped (`stopAtToolCall`, `args`, `resumeArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`, …) without `--allow-unsafe-tools`; the gateway logs it at load when it is enabled. An argv template — `args`, `resumeArgs`, `emulateArgs`, `bridge.args` — with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`, `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`, agy's `--mode auto` / `--mode accept-edits`, …) is a load error unless the entry has this mark; with it, `toolMode` must be `off` (`keysmith set <id> unsafeTools true`, and a re-add that keeps the mark, turn it off). See [Warp](#warps-oz-an-agent-that-keeps-its-tools) and [Command Code](#command-code-an-agent-that-approves-its-own-tools) |
+| `unsafeTools` | `false` | keysmith could not take this CLI's tools away: it can run commands and edit files. Implies `explicitOnly`; `keysmith set` refuses to serve it (`disabled false`), to take the mark off, or to change anything that shapes what it runs or how it is stopped (`stopAtToolCall`, `args`, `resumeArgs`, `visionArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`, …) without `--allow-unsafe-tools`; the gateway logs it at load when it is enabled. An argv template — `args`, `resumeArgs`, `emulateArgs`, `visionArgs`, `bridge.args` — with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`, `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`, agy's `--mode auto` / `--mode accept-edits`, …) is a load error unless the entry has this mark; with it, `toolMode` must be `off` (`keysmith set <id> unsafeTools true`, and a re-add that keeps the mark, turn it off). See [Warp](#warps-oz-an-agent-that-keeps-its-tools) and [Command Code](#command-code-an-agent-that-approves-its-own-tools) |
 | `env` | `{}` | merged over the scrubbed parent env |
 | `maxConcurrent` | `1` | semaphore; each call is a real process |
 | `stripSystemPrompt` | `false` | drop system turns instead of inlining them |
 | `systemFlag` | — | e.g. `"--system-prompt"`: passed as `--system-prompt <text>` when a system turn exists |
 | `maxPromptChars` | `200000` | refuses a request rather than handing a 400 KB argv to a subprocess |
+| `vision` | `false` | the CLI sees images: a request that carries one runs `visionArgs`, its prompt on stdin as a stream-json user message with the images in it. Needs `visionArgs`; `keysmith set <id> vision true` fills them in from the entry's built-in profile when it lacks them. See [Images: a CLI that sees them](#images-a-cli-that-sees-them) |
+| `visionArgs` | — | the argv template of a run that carries images, read by the auto-approve check like every other template. No `{prompt}`: stdin is the prompt; `{session}` is always empty |
+| `maxImages` | `20` | images one request may carry to this adapter; more is a 400 |
+| `maxImageBytes` | `5242880` | the largest image, decoded, this adapter takes; larger is a 400 |
 
 ### The argv template
 
@@ -107,8 +111,43 @@ Assistant: …
 User: …
 ```
 
-Images are not dropped silently — they become `[image omitted by keysmith]`, because a
-vision request that arrives as text must say so.
+Images are not dropped silently. A CLI that cannot see them reads each one as
+`[image omitted by keysmith]`, because a vision request that arrives as text must say so —
+an OpenAI Chat `image_url`, an Anthropic `image` block and a Responses `input_image` alike.
+
+### Images: a CLI that sees them
+
+A CLI with `vision: true` (the `claude` profile) gets the images themselves. A request that
+carries one runs `visionArgs` instead of `args`: the prompt is flattened exactly as above, and
+goes to the CLI's stdin as one Claude Code stream-json user message, the text cut where each
+image was and the images between as base64 blocks:
+
+```json
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"User: Transcribe:\n"},{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"/9j/4AAQ…"}},{"type":"text","text":"\nthe first page"}]}}
+```
+
+So `visionArgs` has no `{prompt}`, and takes stdin as stream-json (`--input-format
+stream-json` for Claude Code); the rest of it is the text run's tool-less argv. A request
+without an image runs `args` as before. No temporary file is written, and a vision run is
+never resumed.
+
+What is taken, on each face: a data: URL with `;base64` (`image_url` on
+`/v1/chat/completions`, `input_image` on `/v1/responses`) and a `base64` source on
+`/v1/messages`. The type is read off the bytes — JPEG, PNG, GIF or WebP; a declared
+`media_type` that disagrees is corrected, anything else is a 400. A URL is refused with a
+400 that names its host and no more, never fetched: the gateway can sit behind a tunnel, and
+a fetch on a key holder's behalf would reach whatever this machine can. An uploaded-file
+reference (`file_id`, a `file` source) is refused too. Each image is at most `maxImageBytes`
+(5 MB decoded) and a request carries at most `maxImages` (20); both are per adapter, and
+every image is read before any process starts, so a bad one costs nothing. An error never
+quotes image data. `GET /v1/keysmith/routes` says which adapters see images (`vision`).
+
+Only Claude Code is known to take images this way: Claude Code 2.1.303 sent such a message's
+image block on to the model as it was (checked against a stub Messages endpoint), and live, on
+sonnet, a scanned typewritten Greek page sent through `/v1/chat/completions` and `/v1/messages`
+came back transcribed. agy 1.4.12
+takes stream-json on stdin too, and refuses an image block in it (`only "text"`), so the `agy`
+profile has no `vision`. HTTP adapters are handed the text with the label, as before.
 
 ### Parsers, and the event contract
 
@@ -518,7 +557,9 @@ to that check (not run live from here).
   `--no-session-persistence`: 2.1.261 refuses `--no-session` as an unknown option. All of it
   parsed by 2.1.261 with an empty prompt, which it rejects before sending anything; no
   request went through it. It spends your Claude subscription, so the profile ships
-  `explicitOnly: true`: no alias, no probe, and a re-add keeps it.
+  `explicitOnly: true`: no alias, no probe, and a re-add keeps it. A request with an image
+  runs `visionArgs`: the same switches with `--input-format stream-json` and the prompt on
+  stdin (see [Images](#images-a-cli-that-sees-them)).
 - `qoder`: `--tools ""` and `--strict-mcp-config`; `{noSession}` is
   `--no-session-persistence` (1.1.59 refuses `--no-session` too).
 - `codex`: `--disable shell_tool` takes the shell away (`--disable unified_exec` is passed

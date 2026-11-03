@@ -494,7 +494,7 @@ hand-written adapter one too.
 | `agy`, MCP bridge | a tool request on the bridge runs `--agent ks-b-<rid>`, a session agent as tool-less as `keysmith-tools` whose one MCP server is keysmith (a Unix socket, a token per session) offering the request's tools and nothing else; each call goes to the client, never run by agy or keysmith; a call to any other tool stops the run (502, the tripwire) | stub agy in the tests; the MCP shape (list, `eager`, `mcp_<server>_<tool>`, `server/discover`, a held tools/call) probed on agy 1.4.2; live, agy 1.4.2 on gemini-3.8-flash-low: two turns of one call through both faces on one agy process, nothing left after |
 | `opencode`, `codex`, `qoder`, MCP bridge | the text argv's tool-less switches, and one MCP server — keysmith, over the same socket and per-session token — offering the request's tools and nothing else: opencode an inline session agent that allows `<server>_*` alone (`OPENCODE_CONFIG`, over the workspace's deny-all `opencode.json`); codex that server approved alone (`approval_policy="never"` refuses any other call), the token in a 0600 file, never the argv; qoder `--strict-mcp-config`, no built-in tool, no hooks, no inherited `QODER_*`; each call goes to the client, never run by the CLI or keysmith; a call to any other tool stops the run (502, the tripwire) | stub CLIs in the tests; live 2026-10-20 on opencode 1.19.3, codex 0.163.0, qodercli 1.1.59: two turns of one call on one process each, opencode's two calls of one step in one answer, and nothing — process, shim, session file — left after a session closed |
 | `kiro` | `--agent keysmith-text`: `tools: []`, `mcpServers: {}`, `includeMcpJson: false`, `resources: []`; `--trust-tools=` trusts nothing; `stopAtToolCall` | argv and agent file accepted by kiro-cli 2.27.1; its first live run was refused for quota before any text |
-| `claude` | `--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--disable-slash-commands`, `--safe-mode`, `--max-turns 1` | parsed by Claude Code 2.1.261; no live request sent |
+| `claude` | `--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--disable-slash-commands`, `--safe-mode`, `--max-turns 1` — a request with an image the same, with `--input-format stream-json` and the prompt on stdin | parsed by Claude Code 2.1.261; the image run live on 2.1.303 (sonnet), both faces |
 | `qoder` | `--tools ""`, `--strict-mcp-config` | parsed by qodercli 1.1.59 |
 | `codex` | `--disable shell_tool`, `--sandbox read-only`, `approval_policy="never"`, `web_search="disabled"`, `--disable goals`, `--ignore-user-config` (no MCP servers from your config), plugins/apps/browser/computer-use off, `agents.max_threads=1` | a stub Responses endpoint, codex 0.163.0: gpt-5.5 is offered request_user_input and apply_patch (the read-only sandbox refuses it); gpt-6-* keep code mode's exec (no shell) and sub-agent tools no switch removes — capped at one sub-agent |
 | `opencode` | `--agent keysmith-text` (`permission: {"*": deny}`, `tools: {"*": false}`) and a workspace `opencode.json` denying every tool to any agent; no `--auto`; `stopAtToolCall` | a stub OpenAI endpoint, opencode 1.18.27: no tools offered, a bash call the model made anyway ran nothing; its free tier (`opencode/*`) refuses this run with a 403 |
@@ -513,7 +513,7 @@ Two marks keep an adapter out of routes it was not asked for by name:
   `explicitOnly` does, and the profile ships `disabled: true`. Serving it is a decision with
   its own flag: `keysmith set <id> disabled false --allow-unsafe-tools`, and so is any later
   change to what it runs or how it is stopped — `stopAtToolCall`, `args`, `resumeArgs`,
-  `bin`, `env`, `cwd`, `parser`, `modelsFrom`; only `note`, `models`, `defaultModel`,
+  `visionArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`; only `note`, `models`, `defaultModel`,
   `priority`, `timeoutMs`, `maxConcurrent`, `maxPromptChars` and `explicitOnly` change
   without it, and turning it off never needs it. Its profile also sets
   `stopAtToolCall: "always"` where the parser can see tool calls: the run is stopped at the
@@ -556,6 +556,16 @@ switched off (`keysmith set cmd disabled true`).
 shipped, so `keysmith add claude` puts it in no alias and no probe, and a re-add (to pin its
 `bin`, say) keeps it that way. That is what a setup whose own work runs on the same Claude
 subscription needs: every request to `claude/…` spends that subscription.
+
+**Images.** `claude/<model>` sees the images a request carries: inline base64, as a data: URL
+on `/v1/chat/completions` (`image_url`) and `/v1/responses` (`input_image`), or a base64
+source on `/v1/messages`. The prompt goes to Claude Code's stdin as one stream-json message
+with the images in place, through the same tool-less switches. An image URL is a 400, never
+fetched (a gateway behind a tunnel would fetch whatever this machine can reach); so is an
+image over 5 MB or more than 20 in one request (`maxImageBytes`, `maxImages` per adapter).
+Every other adapter reads an image as `[image omitted by keysmith]`, as before. A `claude`
+entry attached before this gets it with `keysmith set claude vision true`. Details:
+[docs/adapters.md](docs/adapters.md#images-a-cli-that-sees-them).
 
 **Ollaya** ([ollaya.dev](https://ollaya.dev)) is out of scope: it is a local runtime for
 decision models — typed questions answered with calibrated probabilities over their
@@ -845,7 +855,7 @@ again to rewrite it.
 | `cmd` | cli | verified live against Command Code 1.66.0 — **`unsafeTools`**: a `-p` run approves its own tool calls, so it ships disabled, see [above](#agents-that-could-act-on-this-machine) |
 | `opencode` | cli | verified live against opencode 1.18.27; tool-less agent checked against a stub endpoint (no `--auto`); its free `opencode/*` models refuse the tool-less run (403); answers tool requests (`toolMode: "auto"`: the MCP bridge, EMULATE where it cannot — both live round trips on opencode 1.19.3) |
 | `qoder` | cli | verified with `-p`; its `-o json/stream-json` modes fail inside a nested agent session; tool-less flags parsed by 1.1.59; answers tool requests (`toolMode: "auto"`: the MCP bridge with `-o stream-json`, EMULATE where it cannot — both live round trips on 1.1.59) |
-| `claude` | cli | tool-less flags and stream-json shape checked against Claude Code 2.1.261; no live request; explicit-only as shipped |
+| `claude` | cli | tool-less flags and stream-json shape checked against Claude Code 2.1.261; sees images (`vision: true`: stream-json on stdin; a scanned page transcribed live on 2.1.303 through both faces); explicit-only as shipped |
 | `agy` | cli | verified live against Antigravity CLI 1.3.3 — your Google login, no key; runs as a tool-less text agent (~600-token prompt instead of ~20k), see [docs/adapters.md](docs/adapters.md#agy-as-a-plain-text-model); answers tool requests too (`toolMode: "auto"`: the MCP bridge, EMULATE where the bridge cannot — see [docs/adapters.md](docs/adapters.md#agy-and-tool-requests-the-mcp-bridge)) |
 | `kiro` | cli | Kiro CLI 2.27.1 — tool-less agent, `stream-json`, model list as JSON; the first live run was refused for quota before any text, see [docs/adapters.md](docs/adapters.md#kiro-as-a-plain-text-model); tool requests pass it by (`toolMode: "off"`): its EMULATE argv is checked against a stub only |
 | `codex` | cli | argv run against a stub Responses endpoint with codex 0.163.0 (read-only, no shell, no web search); gpt-6-* keep sub-agent tools; answers tool requests (`toolMode: "auto"`: the MCP bridge with `exec --json`, EMULATE where it cannot — both live round trips on `gpt-5.6-luna`) |

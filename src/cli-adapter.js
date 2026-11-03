@@ -5,6 +5,7 @@ import { getParser, toLines } from './parsers.js';
 import { expand } from './config.js';
 import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, agentCleanEnv } from './util.js';
 import { checkToolMode } from './tools/router.js';
+import { IMAGE_LIMITS, hasImages, visionPrompt } from './images.js';
 
 /**
  * Run a coding CLI once per request and turn its stdout into a chat completion.
@@ -63,11 +64,18 @@ export class CliAdapter {
     // agent. And the MCP bridge's own settings, its argv among them (design U7).
     this.emulateArgs = checkTemplate(id, 'emulateArgs', cfg.emulateArgs);
     this.bridge = checkBridge(id, cfg.bridge);
+    // A CLI that sees images (`vision: true`): a request that carries one runs `visionArgs`, its
+    // prompt on stdin as one stream-json user message with the images in it (src/images.js).
+    // Any other CLI reads an image as `[image omitted by keysmith]`.
+    this.vision = checkVision(id, cfg);
+    this.visionArgs = checkTemplate(id, 'visionArgs', cfg.visionArgs);
+    this.maxImages = cfg.maxImages ?? IMAGE_LIMITS.maxImages;
+    this.maxImageBytes = cfg.maxImageBytes ?? IMAGE_LIMITS.maxImageBytes;
     // An argv that auto-approves the agent's tool calls (`opencode --auto`, `--yolo`, …) is an
     // agent that acts on this machine for whoever holds a key. That is never a default: it
     // loads only when the entry says so with `unsafeTools`, which keeps it out of every alias
     // and every probe. A config copied from an older profile stops here, with the way out.
-    // Every template is read: `args`, `resumeArgs`, `emulateArgs` and the bridge's `args`.
+    // Every template is read: `args`, `resumeArgs`, `emulateArgs`, `visionArgs` and the bridge's `args`.
     const approving = autoApproveFlag(cfg);
     if (approving && !this.unsafeTools) {
       throw new Error(
@@ -182,7 +190,9 @@ export class CliAdapter {
   async *complete({ model, messages, session, signal, maxTokens, rendered = null }) {
     this.ready();
 
-    const { system, prompt } = rendered || flattenMessages(messages);
+    // A request with an image, on a CLI that sees them: the prompt goes on stdin, images and all.
+    const vision = this.vision && !rendered && hasImages(messages) ? visionPrompt(messages, { adapterId: this.id, maxImages: this.maxImages, maxImageBytes: this.maxImageBytes }) : null;
+    const { system, prompt } = vision || rendered || flattenMessages(messages);
     if (!prompt && !system) throw new LlmError('nothing to send: the message list is empty after flattening', { status: 400, provider: this.id });
     if (prompt.length > this.maxPromptChars) {
       throw new LlmError(
@@ -192,11 +202,12 @@ export class CliAdapter {
     }
     const keepSystem = !this.stripSystemPrompt;
     const body = keepSystem && system && !this.systemFlag ? `<system>\n${system}\n</system>\n\n${prompt}` : prompt;
-    const useResume = !!(session && this.resumable) && !rendered;
+    const useResume = !!(session && this.resumable) && !rendered && !vision;
+    const stdinFor = (text) => (vision ? vision.stdin(text) : this.promptVia === 'stdin' ? text : null);
     const argvFor = (text) => {
-      const argv = joinArgs(useResume ? this.resumeArgs : this.args, {
+      const argv = joinArgs(vision ? this.visionArgs : useResume ? this.resumeArgs : this.args, {
         model: model || '',
-        prompt: this.promptVia === 'stdin' ? '' : text,
+        prompt: this.promptVia === 'stdin' || vision ? '' : text,
         system: keepSystem ? system || '' : '',
         session: useResume ? session : '',
         noSession: this.persistSessions || useResume ? '' : this.noSessionFlag,
@@ -221,7 +232,7 @@ export class CliAdapter {
         const text = attempt === 0 ? body : `${this.toolDenialRetry}\n\n${body}`;
         const run = this._spawnStream({
           args: argvFor(text),
-          stdin: this.promptVia === 'stdin' ? text : null,
+          stdin: stdinFor(text),
           timeoutMs: Math.max(1_000, deadline - Date.now()),
           signal,
         });
@@ -469,12 +480,12 @@ const AUTO_APPROVE_MODES = {
 
 /**
  * The first auto-approving switch in any argv template of an adapter — `args`, `resumeArgs`,
- * `emulateArgs`, the bridge's `args` — (`--auto`, `--permission-mode yolo`,
+ * `emulateArgs`, `visionArgs`, the bridge's `args` — (`--auto`, `--permission-mode yolo`,
  * `--sandbox=danger-full-access`, `--mode auto`), or null.
  */
 export function autoApproveFlag(cfg) {
   const bridge = cfg?.bridge && typeof cfg.bridge === 'object' && !Array.isArray(cfg.bridge) ? cfg.bridge : null;
-  for (const tpl of [cfg?.args, cfg?.resumeArgs, cfg?.emulateArgs, bridge?.args]) {
+  for (const tpl of [cfg?.args, cfg?.resumeArgs, cfg?.emulateArgs, cfg?.visionArgs, bridge?.args]) {
     if (!Array.isArray(tpl)) continue;
     const tokens = tpl.flat(Infinity).filter((t) => typeof t === 'string');
     for (let i = 0; i < tokens.length; i++) {
@@ -530,6 +541,21 @@ function checkTemplate(id, field, tpl) {
     throw new Error(`adapter "${id}": ${field} must be an argv template — a list of strings and [flag, value] groups, like args`);
   }
   return tpl;
+}
+
+/**
+ * `vision`: true or false (absent). True needs `visionArgs`, the argv of a run whose prompt is on
+ * stdin; and the image caps, when set, are whole numbers above 0.
+ */
+function checkVision(id, cfg) {
+  if (cfg.vision != null && typeof cfg.vision !== 'boolean') throw new Error(`adapter "${id}": vision must be true or false`);
+  if (cfg.vision && !cfg.visionArgs) {
+    throw new Error(`adapter "${id}": vision needs visionArgs — the argv of a run whose prompt, images included, goes on stdin as stream-json (\`keysmith set ${id} vision true\` fills the built-in profile's)`);
+  }
+  for (const k of ['maxImages', 'maxImageBytes']) {
+    if (cfg[k] != null && !(Number.isInteger(cfg[k]) && cfg[k] > 0)) throw new Error(`adapter "${id}": ${k} must be a whole number above 0`);
+  }
+  return !!cfg.vision;
 }
 
 /** The bridge drivers there are (src/bridge/drivers.js), by the name `bridge.driver` takes. */

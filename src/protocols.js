@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { contentToText } from './util.js';
+import { contentToText, keepImageParts } from './util.js';
 
 /**
  * Wire-protocol translation. keysmith is one internal shape — a message list and a
@@ -19,10 +19,15 @@ export function chatId(prefix = 'chatcmpl') {
 
 export function openaiMessages(body) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  return messages.map((m) => ({
-    role: m.role === 'developer' ? 'system' : m.role || 'user',
-    content: typeof m.content === 'string' ? m.content : contentToText(m.content),
-  }));
+  return messages.map((m) =>
+    keepImageParts(
+      {
+        role: m.role === 'developer' ? 'system' : m.role || 'user',
+        content: typeof m.content === 'string' ? m.content : contentToText(m.content),
+      },
+      m.content,
+    ),
+  );
 }
 
 export function openaiChunk(id, model, created, delta, finish = null) {
@@ -77,7 +82,7 @@ export function anthropicMessages(body) {
   }
   for (const m of body.messages || []) {
     if (m.role === 'tool' || m.type === 'tool_result') continue;
-    out.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: contentToText(m.content) });
+    out.push(keepImageParts({ role: m.role === 'assistant' ? 'assistant' : 'user', content: contentToText(m.content) }, m.content));
   }
   return out.filter((m) => m.content);
 }
@@ -120,7 +125,7 @@ export function responsesMessages(body) {
     else if (item?.type === 'function_call_output') out.push({ role: 'tool', content: String(item.output ?? '') });
     else if (item?.role) {
       const text = typeof item.content === 'string' ? item.content : contentToText(item.content);
-      if (text) out.push({ role: item.role === 'assistant' ? 'assistant' : 'user', content: text });
+      if (text) out.push(keepImageParts({ role: item.role === 'assistant' ? 'assistant' : 'user', content: text }, item.content));
     }
   }
   return out;
