@@ -6,7 +6,7 @@ import { loadConfig, saveConfig, configPath, dataDir, newApiKey, newUniqueApiKey
 import { Gateway, checkAdapter, kindOf, own } from './gateway.js';
 import { createServer } from './server.js';
 import { UsageLog } from './usage.js';
-import { CLI_PROFILES, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
+import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
 import { autoApproveFlag, which } from './cli-adapter.js';
 import * as tunnel from './tunnel.js';
 import * as service from './service.js';
@@ -410,7 +410,8 @@ function profileFor(id, entry) {
   const bin = path.basename(String(entry.bin || id));
   const parser = entry.parser || 'raw';
   for (const [name, p] of Object.entries(CLI_PROFILES)) {
-    if (path.basename(String(p.bin)) === bin && (p.parser || 'raw') === parser) return [name, p];
+    // An entry attached before its profile changed parser (codex: raw, before `--json`) is still that profile's.
+    if (path.basename(String(p.bin)) === bin && ((p.parser || 'raw') === parser || FORMER_PARSERS[name]?.includes(parser))) return [name, p];
   }
   return null;
 }

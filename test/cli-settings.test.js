@@ -117,6 +117,26 @@ test('keysmith upgrade: a dry run lists what the profile gained; --apply adds it
   assert.equal(read().adapters.claude.timeoutMs, 300_000);
 });
 
+test('keysmith upgrade: a codex entry attached when its text runs were plain `exec` (parser raw) is still the codex profile\'s, and --take brings `--json` and its usage', (t) => {
+  const { run, read, edit } = sandbox(t);
+  assert.equal(run('add', 'codex', '--bin', '/opt/homebrew/bin/codex').status, 0);
+  const plain = (args) => args.filter((a) => a !== '--json');
+  edit('codex', (e) => {
+    e.parser = 'raw';
+    e.args = plain(e.args);
+    e.emulateArgs = plain(e.emulateArgs);
+  });
+  let r = run('upgrade', 'codex');
+  assert.equal(r.status, 0, r.all);
+  assert.match(r.stdout, /^codex ← "codex": up to date \(yours kept: bin, args, emulateArgs, parser\)$/m, 'found by its binary and the parser its profile had');
+  r = run('upgrade', 'codex', '--take', 'args,emulateArgs,parser', '--apply');
+  assert.equal(r.status, 0, r.all);
+  const now = read().adapters.codex;
+  assert.equal(now.parser, 'codex-json-final');
+  assert.deepEqual(now.args, CLI_PROFILES.codex.args);
+  assert.equal(now.args[1], '--json');
+});
+
 test('keysmith upgrade: a profile file the entry lacks is added, one it changed is kept — --take replaces it', (t) => {
   const { run, read, edit } = sandbox(t);
   assert.equal(run('add', 'agy', '--bin', '/usr/local/bin/agy').status, 0);

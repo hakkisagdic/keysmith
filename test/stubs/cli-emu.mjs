@@ -6,7 +6,9 @@
  *
  *   opencode   `opencode run --format json`: step_start, text (the whole block), step_finish with
  *              tokens; a tool call is a `tool_use` line (`part.tool`, `part.callID`)
- *   raw        `codex exec` and `qodercli -p`: the final message, and nothing else
+ *   raw        `qodercli -p` (and plain `codex exec`): the final message, and nothing else
+ *   codex      `codex exec --json` (codex-json-final): a preamble agent message, the reply as the
+ *              last one, and turn.completed with the run's usage (cached input among it)
  *   claude     `qodercli -p -o stream-json` (claude-stream-json): an assistant message, a result
  *              line with usage; a tool call is a `tool_use` content block
  *   kiro       `kiro-cli chat --output-format stream-json`: runStarted, metadata, ACP
@@ -61,7 +63,7 @@ function plan() {
 
 const { reply, before = null, after = null } = plan();
 const usage = second ? { input: 1100, output: 30 } : { input: 1000, output: 20 };
-const writers = { opencode, raw, claude, kiro };
+const writers = { opencode, raw, codex, claude, kiro };
 await (writers[format] || raw)();
 
 async function opencode() {
@@ -80,6 +82,15 @@ async function opencode() {
 
 async function raw() {
   process.stdout.write(reply + '\n');
+}
+
+async function codex() {
+  line({ type: 'thread.started', thread_id: 'th-stub' });
+  line({ type: 'turn.started' });
+  // A preamble message before the answer: plain stdout would not print it, and neither does codex-json-final.
+  line({ type: 'item.completed', item: { id: 'item_0', type: 'agent_message', text: 'Working on it.' } });
+  line({ type: 'item.completed', item: { id: 'item_1', type: 'agent_message', text: reply } });
+  line({ type: 'turn.completed', usage: { input_tokens: usage.input, cached_input_tokens: 600, output_tokens: usage.output, reasoning_output_tokens: 5 } });
 }
 
 async function claude() {

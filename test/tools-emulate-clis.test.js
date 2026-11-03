@@ -45,7 +45,7 @@ function around(name, format, extra = {}) {
 /** The adapters under test: id -> [profile, stdout format, what the profile's run must carry]. */
 const CASES = {
   oc: ['opencode', 'opencode'],
-  cx: ['codex', 'raw'],
+  cx: ['codex', 'codex'],
   qd: ['qoder', 'raw'],
   // qoder's other output shape (`-o stream-json`, parser claude-stream-json), which its note offers.
   qdj: ['qoder', 'claude', { parser: 'claude-stream-json' }],
@@ -192,7 +192,7 @@ test('opencode: parallel calls come back in one answer, two tool_calls', async (
   assert.equal(new Set(a.calls.map((c) => c.id)).size, 2);
 });
 
-test('codex (raw): prose around the JSON is asked for again once, and the second reply is the answer; a fenced object is read as is', async () => {
+test('codex (exec --json): prose around the JSON is asked for again once, and the second reply is the answer; a fenced object is read as is; both runs are counted', async () => {
   const t = tag();
   const r = await post('/v1/chat/completions', { model: 'cx/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather ${t} SCENARIO=prose-then-ok` }] });
   assert.equal(r.status, 200, r.text);
@@ -201,6 +201,7 @@ test('codex (raw): prose around the JSON is asked for again once, and the second
   assert.equal(one.second, false);
   assert.equal(two.second, true, 'the second run carries the correction line');
   assert.equal(rowsOf('cx/m').at(-1).retries, 1);
+  assert.deepEqual(rowsOf('cx/m').at(-1).usage, { input: 2100, output: 50, cacheRead: 1200, cacheWrite: 0, reasoning: 10 }, 'turn.completed of each run, the preamble message left out of the reply');
   const fenced = await post('/v1/chat/completions', { model: 'cx/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather ${tag()} SCENARIO=fenced` }] });
   assert.deepEqual(chatAnswer(false, fenced).calls.map((c) => c.args), [{ city: 'Ankara' }]);
 });

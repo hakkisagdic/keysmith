@@ -181,7 +181,11 @@ const CODEX_TOOL_LESS = [
   '--disable', 'hooks',
   '--color', 'never',
 ];
-const codexArgs = () => ['exec', ...CODEX_TOOL_LESS, ['--model', '{model}'], '--', '{prompt}'];
+/**
+ * A text (and EMULATE) run of codex: `exec --json`, read by codex-json-final as plain `codex exec`
+ * prints it — the last agent message — with what plain stdout leaves out: the run's usage.
+ */
+const codexArgs = () => ['exec', '--json', ...CODEX_TOOL_LESS, ['--model', '{model}'], '--', '{prompt}'];
 /**
  * The bridge's codex run: the same switches, `--json`, and the session's one MCP server
  * (`{server}`, its command, args and env filled in per session by src/bridge/clis.js).
@@ -401,14 +405,15 @@ export const CLI_PROFILES = {
     // stream, and the session's server on the command line — approved alone (approval_policy
     // "never" refuses an MCP call otherwise), with a call timeout past toolResultTimeoutMs.
     bridge: { driver: 'codex', args: codexBridgeArgs() },
-    parser: 'raw',
+    // `--json` for the run's usage (turn.completed): plain stdout is the answer and nothing else.
+    parser: 'codex-json-final',
     // `codex debug models` prints the model catalogue as JSON (slug, display_name, visibility).
     modelsFrom: { args: ['debug', 'models'] },
     cwd: '~/.local/share/keysmith/workspaces/codex',
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Codex CLI 0.163.0 — every flag here is in `codex exec --help`; the feature names were accepted by 0.163 (`codex debug prompt-input` refuses an unknown one) and `codex debug models` lists the catalogue as JSON. This argv was run against a stub Responses endpoint (scratch CODEX_HOME): gpt-5.5 was offered request_user_input and apply_patch only; gpt-6-astra code-mode exec/wait, request_user_input, clock.sleep and the collaboration (sub-agent) namespace, with 2 concurrency slots. The stdout shape (`raw`: the final message) is from the stub and its documented interface; 2026-10-20, EMULATE through this argv answered a two-turn tool round trip live on gpt-5.6-luna, the final message alone on stdout; so did the MCP bridge (`exec --json`, the session\'s server approved alone, `--ephemeral`: no session file) — two calls of one step came one after the other, the second after the first one\'s result.',
-    note: 'Runs with no shell tool, a read-only sandbox and no approvals, no web search, without your ~/.codex/config.toml (its MCP servers included) and with no session on disk, in an empty keysmith-owned workspace. On gpt-6-* models codex keeps its sub-agent tools whatever the switches: one request can run a second agent (same tools, same quota), capped at one by `agents.max_threads=1`. A Homebrew codex and an npm one can both be installed, and PATH decides which one runs: pin it, e.g. `keysmith add codex --bin /opt/homebrew/bin/codex`. A request that offers tools is answered too (`toolMode: "auto"`): through the MCP bridge — the same switches with `--json` and the session\'s one MCP server, approved alone (with approval_policy "never" an unapproved MCP call is refused), each call handed to the client while codex waits on it — or, where the bridge cannot, EMULATE, the same run writing its calls as one JSON object. Either way codex runs none of them, and every codex request carries its own ~20k-token harness.',
+    provenance: 'Codex CLI 0.163.0 — every flag here is in `codex exec --help`; the feature names were accepted by 0.163 (`codex debug prompt-input` refuses an unknown one) and `codex debug models` lists the catalogue as JSON. This argv was run against a stub Responses endpoint (scratch CODEX_HOME): gpt-5.5 was offered request_user_input and apply_patch only; gpt-6-astra code-mode exec/wait, request_user_input, clock.sleep and the collaboration (sub-agent) namespace, with 2 concurrency slots. The stdout shape (`raw`: the final message) is from the stub and its documented interface; 2026-10-20, EMULATE through this argv answered a two-turn tool round trip live on gpt-5.6-luna, the final message alone on stdout; so did the MCP bridge (`exec --json`, the session\'s server approved alone, `--ephemeral`: no session file) — two calls of one step came one after the other, the second after the first one\'s result. 2026-11-03: the text argv with `--json` (codex-json-final) answered live on gpt-6-astra with the last agent message and turn.completed\'s usage.',
+    note: 'Runs with no shell tool, a read-only sandbox and no approvals, no web search, without your ~/.codex/config.toml (its MCP servers included) and with no session on disk, in an empty keysmith-owned workspace. On gpt-6-* models codex keeps its sub-agent tools whatever the switches: one request can run a second agent (same tools, same quota), capped at one by `agents.max_threads=1`. A Homebrew codex and an npm one can both be installed, and PATH decides which one runs: pin it, e.g. `keysmith add codex --bin /opt/homebrew/bin/codex`. A request that offers tools is answered too (`toolMode: "auto"`): through the MCP bridge — the same switches with `--json` and the session\'s one MCP server, approved alone (with approval_policy "never" an unapproved MCP call is refused), each call handed to the client while codex waits on it — or, where the bridge cannot, EMULATE, the same run writing its calls as one JSON object. Either way codex runs none of them, and every codex request carries its own ~20k-token harness — which its token counts include: a text or EMULATE run is `exec --json`, read as plain `exec` prints it (the last agent message) with the usage of its turn.completed, cached input and reasoning among it. A codex adapter attached before that runs plain `exec` (parser raw), whose stdout carries no counts: `keysmith upgrade codex --take args,emulateArgs,parser --apply`.',
   },
   kiro: {
     kind: 'cli',
@@ -481,6 +486,13 @@ export const CLI_PROFILES = {
  * worse bridge: keep one direct route to a real API and failover can skip the CLI
  * when it is slow, cold or out of quota.
  */
+/**
+ * Parsers a built-in CLI profile shipped before its current one, so an entry attached then is still
+ * known as made from it (`keysmith set`, `upgrade`): codex ran plain `exec` (raw) until its text runs
+ * took `--json` for their usage.
+ */
+export const FORMER_PARSERS = { codex: ['raw'] };
+
 export const HTTP_PROFILES = {
   // `media`: what the API itself takes in a user turn (src/media.js). Audio reaches only OpenAI's
   // audio models; another model on the same API answers a request with audio with its own error.
