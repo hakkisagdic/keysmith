@@ -141,12 +141,30 @@ export class CliAdapter {
    * own listing (`modelsFrom`), when it has one — a level is never guessed.
    */
   async effortCatalogue() {
-    const list = await this.models();
+    const list = await this._staleOk('_modelCache', () => this.models());
     if (!this.declaredModels || list.some((m) => Array.isArray(m?.efforts)) || !this.modelsFrom) return list;
-    if (this._listedCache && Date.now() - this._listedCache.at < 600_000) return this._listedCache.list;
-    const listed = await this._listModels();
-    this._listedCache = { at: Date.now(), list: listed };
-    return listed;
+    return this._staleOk('_listedCache', async () => {
+      const listed = await this._listModels();
+      this._listedCache = { at: Date.now(), list: listed };
+      return listed;
+    });
+  }
+
+  /**
+   * A catalogue read for a request: the one in `field` when there is one — a stale one is read
+   * again in the background, so a request waits on a CLI's listing (Claude Code's `initialize`
+   * takes ~4 s) only when there has never been one — or `read()` now.
+   */
+  async _staleOk(field, read) {
+    const c = this[field];
+    if (!c) return read();
+    if (Date.now() - c.at >= 600_000 && !this[`${field}Refresh`]) {
+      this[`${field}Refresh`] = Promise.resolve()
+        .then(read)
+        .catch(() => {})
+        .finally(() => (this[`${field}Refresh`] = null));
+    }
+    return c.list;
   }
 
   /** The CLI's own model listing (`modelsFrom`), read now. */

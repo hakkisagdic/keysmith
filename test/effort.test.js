@@ -242,6 +242,30 @@ test('an entry upgraded in part (`{effort}` in some templates, not all) takes no
   assert.equal(new CliAdapter('claude', p).effortGap, null);
 });
 
+test('a request waits on the CLI\'s listing only when there has never been one: a stale catalogue answers and is read again behind it; an id with no `-` and no effort reads none', async () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-effort-swr-'));
+  try {
+    const count = path.join(d, 'count');
+    const bin = path.join(d, 'codex');
+    fs.writeFileSync(bin, `#!/usr/bin/env node\nrequire('node:fs').appendFileSync(${JSON.stringify(count)}, 'x');\nprocess.stdout.write(JSON.stringify({ models: [{ slug: 'gpt-x', supported_reasoning_levels: [{ effort: 'low' }] }] }));\n`, { mode: 0o755 });
+    const reads = () => (fs.existsSync(count) ? fs.readFileSync(count, 'utf8').length : 0);
+    const { CliAdapter } = await import('../src/cli-adapter.js');
+    const { resolveEffort } = await import('../src/effort.js');
+    const a = new CliAdapter('cx', { ...structuredClone(CLI_PROFILES.codex), bin, cwd: path.join(d, 'ws') });
+    assert.deepEqual(await resolveEffort(a, 'gptx', null), { model: 'gptx', effort: null });
+    assert.equal(reads(), 0, 'nothing to read the catalogue for');
+    assert.deepEqual(await resolveEffort(a, 'gpt-x-low', null), { model: 'gpt-x', effort: 'low' });
+    assert.equal(reads(), 1);
+    a._modelCache.at -= 3_600_000;
+    assert.deepEqual(await resolveEffort(a, 'gpt-x', 'low'), { model: 'gpt-x', effort: 'low' }, 'the stale list answers at once');
+    await a._modelCacheRefresh;
+    assert.equal(reads(), 2, 'and was read again behind it');
+    assert.ok(Date.now() - a._modelCache.at < 60_000);
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
 test('EMULATE takes the effort too: its argv is the profile\'s, with the level in it', async () => {
   const tools = [{ type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {} } } }];
   const r = await chat('cx/gpt-x-high', { tools });

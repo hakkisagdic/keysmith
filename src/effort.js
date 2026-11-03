@@ -93,6 +93,9 @@ export async function resolveEffort(adapter, model, effort) {
   if (!adapter.takesEffort) {
     return { model, effort: null, ...(effort ? { ignored: adapter.effortGap || `${adapter.id}'s argv takes no effort` } : {}) };
   }
+  // An id with no `-` in it is no `<model>-<level>`: with no effort named there is nothing to read
+  // the catalogue for (`claude/sonnet` waits on no listing).
+  if (!effort && !String(model || '').includes('-')) return { model, effort: null };
   let list;
   try {
     list = await adapter.effortCatalogue();
