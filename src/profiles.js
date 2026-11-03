@@ -213,6 +213,20 @@ const codexBridgeArgs = () => [
   '{prompt}',
 ];
 
+/**
+ * Claude Code's MCP bridge run (src/bridge/clis.js): the session's one server (`{mcpConfig}`,
+ * `--strict-mcp-config`) and its tools allowed, no built-in tool, nothing that would prompt, no
+ * settings file and no CLAUDE.md (`--setting-sources ""`: `project` read the workspace's parent
+ * directories' CLAUDE.md), no hooks, no skills, no session on disk. Not the text argv's
+ * `--safe-mode`: it turns MCP servers off, --mcp-config's included (2.1.303).
+ */
+const claudeBridgeArgs = () => [
+  '-p', '--output-format', 'stream-json', '--verbose', '--no-session-persistence',
+  '--tools', '', '--strict-mcp-config', '--mcp-config', '{mcpConfig}', '--allowedTools', 'mcp__{server}',
+  '--permission-prompts', 'none', '--disable-slash-commands', '--setting-sources', '', '--settings', '{"disableAllHooks":true}',
+  ['--effort', '{effort}'], ['--model', '{model}'], '{prompt}',
+];
+
 /** Where Warp installs its agent CLI on macOS. `/usr/local/bin/warp-cli` is Cloudflare WARP, a VPN client, not this. */
 const WARP_OZ_BIN = '/Applications/Warp.app/Contents/Resources/bin/oz';
 
@@ -334,12 +348,16 @@ export const CLI_PROFILES = {
     // Every request spends your Claude subscription, so it answers only a request that names
     // it: never an alias leg, never probed. `keysmith set claude explicitOnly false` opts out.
     explicitOnly: true,
-    // Nor does it take a request that offers tools: no tool engine spends the subscription.
-    toolMode: 'off',
+    // A request that offers tools — one that names claude, never an alias — answers through the
+    // MCP bridge where it can (Claude Code calls the request's tools over MCP; each call goes to
+    // the client while Claude Code waits on it) and EMULATE otherwise, through the text argv.
+    toolMode: 'auto',
+    emulateArgs: ['-p', '--output-format', 'stream-json', '--verbose', '{noSession}', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', ['--effort', '{effort}'], ['--model', '{model}'], '{prompt}'],
+    bridge: { driver: 'claude', args: claudeBridgeArgs() },
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Claude Code 2.1.261 — every flag here is listed by `claude --help` and parsed by 2.1.261 (checked with an empty prompt, which it refuses before any request); `--max-turns` is undocumented but parsed. The stream-json `result` line carries usage/session_id. No live request was sent through this argv. Claude Code 2.1.303 (2026-11-03): `visionArgs` with one stream-json user message on stdin (a text block and a base64 JPEG block) was run against a stub Messages endpoint (ANTHROPIC_BASE_URL): the image block reached it as sent, and stdout was the same assistant/result lines. Live the same day, through a keysmith gateway on sonnet: a scanned typewritten polytonic Greek page (943×1500 JPEG) sent as a data: URL on /v1/chat/completions and as a base64 source on /v1/messages came back transcribed, line for line. A `document` block (base64 PDF) in that stdin message reached a stub Messages endpoint as sent, too (2.1.303, 2026-11-03). `modelsFrom` (2.1.303): an `initialize` control request on stdin, stdin closed, is answered with one control_response line — the models, each with its `supportedEffortLevels` — and an exit 0 in ~4 s, no prompt sent; `--effort` takes low, medium, high, xhigh, max (`claude --help`).',
-    note: 'Runs without tools (`--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--safe-mode`) in an empty keysmith-owned workspace. Its models are what Claude Code answers an `initialize` control request with (no prompt, nothing spent), each with the effort levels it takes: a request\'s `reasoning_effort` / `output_config.effort` (or an id like `claude/sonnet-high`) runs `--effort <level>`, a level the model does not take is a 400. A failed run prints one `result` line with is_error and the reason in `errors[]` — the parser surfaces it rather than returning an empty completion. It takes images and PDFs (`media`): a request that carries one — inline, or a URL keysmith fetches from the public internet — runs `visionArgs`, the prompt on stdin as stream-json with the media in it. It spends your Claude subscription, so the profile is explicit-only: it answers `claude/<model>` and is in no alias and no `doctor --probe-models`. To put it in a route anyway: `keysmith set claude explicitOnly false`.',
+    provenance: 'Claude Code 2.1.261 — every flag here is listed by `claude --help` and parsed by 2.1.261 (checked with an empty prompt, which it refuses before any request); `--max-turns` is undocumented but parsed. The stream-json `result` line carries usage/session_id. No live request was sent through this argv. Claude Code 2.1.303 (2026-11-03): `visionArgs` with one stream-json user message on stdin (a text block and a base64 JPEG block) was run against a stub Messages endpoint (ANTHROPIC_BASE_URL): the image block reached it as sent, and stdout was the same assistant/result lines. Live the same day, through a keysmith gateway on sonnet: a scanned typewritten polytonic Greek page (943×1500 JPEG) sent as a data: URL on /v1/chat/completions and as a base64 source on /v1/messages came back transcribed, line for line. A `document` block (base64 PDF) in that stdin message reached a stub Messages endpoint as sent, too (2.1.303, 2026-11-03). `modelsFrom` (2.1.303): an `initialize` control request on stdin, stdin closed, is answered with one control_response line — the models, each with its `supportedEffortLevels` — and an exit 0 in ~4 s, no prompt sent; `--effort` takes low, medium, high, xhigh, max (`claude --help`). The MCP bridge (2.1.303, 2026-11-03): against a stub Messages endpoint the request offered the session\'s tools and nothing else, `--setting-sources ""` kept every CLAUDE.md out (`project` let a parent directory\'s in), `--safe-mode` turned the --mcp-config server off, MCP_TOOL_TIMEOUT was honoured, and two calls of one step were sent one after the other; live on haiku at effort low, a two-turn round trip on each face and two tools of one step, nothing left after.',
+    note: 'Runs without tools (`--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--safe-mode`) in an empty keysmith-owned workspace. Its models are what Claude Code answers an `initialize` control request with (no prompt, nothing spent), each with the effort levels it takes: a request\'s `reasoning_effort` / `output_config.effort` (or an id like `claude/sonnet-high`) runs `--effort <level>`, a level the model does not take is a 400. A request that offers tools is answered too (`toolMode: "auto"`): through the MCP bridge — Claude Code with keysmith\'s one MCP server, the request\'s tools its only ones (no built-in tool, no settings file or CLAUDE.md, no hooks, no tool search, no session on disk), each call handed to the client while Claude Code waits on it — or, where the bridge cannot, EMULATE through the text argv. Either way Claude Code runs none of them. A failed run prints one `result` line with is_error and the reason in `errors[]` — the parser surfaces it rather than returning an empty completion. It takes images and PDFs (`media`): a request that carries one — inline, or a URL keysmith fetches from the public internet — runs `visionArgs`, the prompt on stdin as stream-json with the media in it. It spends your Claude subscription, so the profile is explicit-only: it answers `claude/<model>` and is in no alias and no `doctor --probe-models`. To put it in a route anyway: `keysmith set claude explicitOnly false`.',
   },
   agy: {
     kind: 'cli',

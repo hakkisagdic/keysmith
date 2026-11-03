@@ -15,8 +15,8 @@ import { startFailure } from '../cli-adapter.js';
  * The MCP bridge (design §3, U6/U7): the tool engine the gateway hands a tool request to on a CLI
  * leg whose toolMode is `mcp` or `auto` (src/tools/router.js), as `{ check, run }`.
  *
- * A CLI with a bridge driver (agy: agy.js; opencode, codex, qoder and — written, never run —
- * claude: clis.js) runs with one MCP server — the hub, through the shim —
+ * A CLI with a bridge driver (agy: agy.js; opencode, codex, qoder and claude: clis.js) runs with
+ * one MCP server — the hub, through the shim —
  * whose tools are the request's own. The model calls one; the hub checks the call against the
  * client's schema; keysmith hands it to the client as a tool call (its own id, finish_reason
  * `tool_calls`) and the HTTP answer ends there, while the CLI process stays where it is, waiting

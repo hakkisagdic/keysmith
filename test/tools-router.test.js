@@ -834,7 +834,7 @@ test('unsafeTools wins over a profile\'s tool engine: a re-add keeps the mark an
 
 /* ------------------------------------------------------------- profiles and the docs */
 
-test('profiles: agy answers tool requests (auto) through its own tool-less agent; claude, kiro and the unsafe ones never do', () => {
+test('profiles: agy answers tool requests (auto) through its own tool-less agent; claude does too, explicit-only; kiro and the unsafe ones never do', () => {
   const agyP = CLI_PROFILES.agy;
   assert.equal(agyP.toolMode, 'auto');
   const argv = agyP.emulateArgs.flat();
@@ -849,7 +849,9 @@ test('profiles: agy answers tool requests (auto) through its own tool-less agent
   assert.match(agent, /do not call `manage_task`/);
   assert.ok(agyP.workspaceFiles['.agents/agents/keysmith-text.md'], 'the text agent is still there for text');
   assert.equal(checkAdapter('agy', agyP).toolMode, 'auto');
-  for (const name of ['claude', 'kiro']) assert.equal(CLI_PROFILES[name].toolMode, 'off', name);
+  assert.equal(CLI_PROFILES.kiro.toolMode, 'off');
+  assert.equal(CLI_PROFILES.claude.toolMode, 'auto');
+  assert.equal(checkAdapter('claude', CLI_PROFILES.claude).explicitOnly, true, 'a tool request reaches claude only by its name, never through an alias');
   for (const [name, p] of Object.entries(CLI_PROFILES)) {
     if (p.unsafeTools) assert.ok(p.toolMode === undefined || p.toolMode === 'off', name);
     assert.doesNotThrow(() => checkAdapter(name, p), name);

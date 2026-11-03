@@ -1,9 +1,9 @@
 /**
- * The MCP bridge's drivers for opencode, codex and qoder (design U11), and claude's, written but
- * never run: src/bridge/clis.js behind the gateway's faces. The CLI is test/stubs/cli-bridge.mjs,
- * which takes the session's MCP server the way each CLI was seen to take it (opencode's
- * OPENCODE_CONFIG, codex's `-c mcp_servers.…`, qoder's `--mcp-config`), starts it — the real
- * shim, so the hub is the real one — and prints that CLI's stream. Nothing here spends a token.
+ * The MCP bridge's drivers for opencode, codex, qoder (design U11) and claude: src/bridge/clis.js
+ * behind the gateway's faces. The CLI is test/stubs/cli-bridge.mjs, which takes the session's MCP
+ * server the way each CLI was seen to take it (opencode's OPENCODE_CONFIG, codex's
+ * `-c mcp_servers.…`, qoder's and Claude Code's `--mcp-config`), starts it — the real shim, so the
+ * hub is the real one — and prints that CLI's stream. Nothing here spends a token.
  */
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -60,6 +60,8 @@ before(async () => {
       // The codex profile with a catalogue of its own (declared models, with the levels each takes).
       cxe: around('codex', 'codex', { models: [{ id: 'm', efforts: ['low', 'high'] }], cwd: path.join(dir, 'ws-codex-e') }),
       qd: around('qoder', 'qoder'),
+      // Claude Code's profile as shipped (explicit-only, toolMode auto made mcp here), with a catalogue of its own.
+      cc: around('claude', 'claude', { models: [{ id: 'm', efforts: ['low', 'high'] }] }),
       oct: around('opencode', 'opencode', { bridge: { toolResultTimeoutMs: 1_200 }, cwd: path.join(dir, 'ws-opencode-t') }),
     },
   };
@@ -233,7 +235,7 @@ test('golden: what each driver starts for one session — the argv, the session\
     opencode: planOf(opencodeDriver, CLI_PROFILES.opencode),
     codex: planOf(codexDriver, CLI_PROFILES.codex),
     qoder: planOf(qoderDriver, CLI_PROFILES.qoder),
-    claude: planOf(claudeDriver, { ...CLI_PROFILES.claude, bridge: { driver: 'claude', args: CLAUDE_BRIDGE_ARGS } }),
+    claude: planOf(claudeDriver, CLI_PROFILES.claude),
   };
   for (const name of Object.keys(plans)) assert.deepEqual(plans[name], golden[name], `${name}: the plan changed — review it, then the fixture`);
   // What the plans must hold, whatever the fixture says.
@@ -252,11 +254,15 @@ test('golden: what each driver starts for one session — the argv, the session\
     const argv = plans[name].argv;
     assert.equal(argv[argv.indexOf('--tools') + 1], '', `${name}: no built-in tool`);
     assert.ok(argv.includes('--strict-mcp-config'));
-    assert.equal(argv[argv.indexOf('--allowed-tools') + 1], 'mcp__ks012345');
+    assert.equal(argv[argv.indexOf(name === 'claude' ? '--allowedTools' : '--allowed-tools') + 1], 'mcp__ks012345');
     assert.equal(argv[argv.indexOf('--settings') + 1], '{"disableAllHooks":true}');
     assert.ok(!argv.some((a) => a.includes('TOKEN-0123')), `${name}: the token is in the 0600 file, not the argv`);
   }
   assert.ok(!plans.claude.argv.includes('--safe-mode'), 'claude: --safe-mode would turn the MCP server off');
+  const cc = plans.claude.argv;
+  assert.equal(cc[cc.indexOf('--setting-sources') + 1], '', 'claude: no settings file and no CLAUDE.md (`project` read the parent directories\' CLAUDE.md)');
+  assert.equal(cc[cc.indexOf('--permission-prompts') + 1], 'none');
+  assert.ok(cc.includes('--no-session-persistence') && cc.includes('--disable-slash-commands'));
 });
 
 test('every session file is 0600 in a 0700 directory of the workspace; qoder\'s run gets no QODER_* variable, opencode\'s gets OPENCODE_CONFIG', async () => {
@@ -540,9 +546,81 @@ test('qoder: the call shown in its assistant message, the result back into the s
   assert.ok(await until(() => !sessionFiles('qoder').length));
 });
 
+/* ----------------------------------------------------------------------------- claude */
+
+test('claude: a two-turn round trip on every face, streamed or not — the call shown in its assistant message before it runs, the result back into the same process', async () => {
+  for (const face of ['chat', 'messages', 'responses']) {
+    for (const stream of [false, true]) {
+      const t = tag();
+      const [a1, a2] = await roundTrip(face, stream, 'cc/m', `Weather ${t}`);
+      const at = `${face}${stream ? ', streamed' : ''}`;
+      assert.equal(a1.text, 'Let me check. ', at);
+      assert.deepEqual(a1.calls.map((x) => [x.name, x.args]), [['get_weather', { city: 'Ankara' }]], at);
+      assert.equal(a2.text, 'Weather: RESULT for Ankara', at);
+      assert.deepEqual(a2.calls, [], at);
+      assert.equal(startsOf(t).length, 1, `${at}: one Claude Code process for both turns`);
+      assert.deepEqual(rowsOf('cc/m').slice(-2).map((r) => [r.toolMode, r.bridge?.path]), [['mcp', 'new'], ['mcp', 'attached']], at);
+    }
+  }
+  assert.ok(await until(() => !sessionFiles('claude').length), 'nothing left after');
+});
+
+test('claude: what its run is given — the session\'s server alone, allowed; no built-in tool, no settings file, no prompt, no session on disk; the token in a 0600 file; Claude Code\'s own clock past keysmith\'s', async () => {
+  const t = tag();
+  const c = conversation('cc/m', `Weather ${t}`, { reasoning_effort: 'high' });
+  const a1 = await c.ask();
+  assert.equal(a1.r.status, 200, a1.r.text);
+  const [start] = startsOf(t);
+  const cfg = eventsOf(start.pid).find((e) => e.event === 'config');
+  const server = eventsOf(start.pid).find((e) => e.event === 'server').server.name;
+  assert.deepEqual(
+    [cfg.mode, cfg.strict, cfg.allowed, cfg.tools, cfg.prompts, cfg.sources, cfg.settings, cfg.safeMode, cfg.persist, cfg.effort],
+    ['600', true, `mcp__${server}`, '', 'none', '', '{"disableAllHooks":true}', false, false, 'high'],
+  );
+  assert.equal(Number(cfg.env.MCP_TOOL_TIMEOUT), 60_000 + 30_000, 'Claude Code waits on a call 30 s past toolResultTimeoutMs');
+  assert.equal(cfg.env.ENABLE_TOOL_SEARCH, 'false');
+  assert.equal(cfg.env.CLAUDECODE, null, 'no marker of a Claude Code session the gateway was started in');
+  const file = sessionFiles('claude').find((f) => f.endsWith('.mcp.json'));
+  const token = JSON.parse(fs.readFileSync(path.join(dir, 'ws-claude', '.keysmith-bridge', file), 'utf8')).mcpServers[server].env.KEYSMITH_BRIDGE_TOKEN;
+  assert.ok(token.length > 30);
+  assert.ok(!start.argv.some((a) => a.includes(token)), 'the token is in the 0600 file, never the argv');
+  c.results();
+  const a2 = await c.ask();
+  assert.equal(a2.text, 'Weather: RESULT for Ankara');
+  assert.equal(rowsOf('cc/m').at(-1).effort, 'high');
+});
+
+test('claude: each answer reports its own share of the run — the step that made the call, then the run\'s total less it; a step\'s second call has no tokens of its own (null, with why)', async () => {
+  let t = tag();
+  const c = conversation('cc/m', `Usage ${t}`);
+  const a1 = await c.ask();
+  const u1 = JSON.parse(a1.r.text).usage;
+  // Message 1's start: 10 uncached + 100 written + 1000 read; its output count is Claude Code's first.
+  assert.deepEqual([u1.prompt_tokens, u1.prompt_tokens_details.cached_tokens, u1.completion_tokens], [1110, 1000, 1]);
+  c.results();
+  const a2 = await c.ask();
+  const u2 = JSON.parse(a2.r.text).usage;
+  // The result line: 30 + 300 + 2000 in, 30 out, for the whole run — less what the first answer said.
+  assert.deepEqual([u2.prompt_tokens, u2.prompt_tokens_details.cached_tokens, u2.completion_tokens], [1220, 1000, 29]);
+  assert.deepEqual(rowsOf('cc/m').slice(-2).map((r) => r.usage), [{ input: 1110, output: 1, cacheRead: 1000, cacheWrite: 100 }, { input: 1220, output: 29, cacheRead: 1000, cacheWrite: 200 }]);
+
+  t = tag();
+  const d = conversation('cc/m', `Two ${t} SCENARIO=two-calls`);
+  assert.deepEqual((await d.ask()).calls.map((x) => x.args.city), ['Ankara']);
+  d.results();
+  const second = await d.ask();
+  assert.deepEqual(second.calls.map((x) => x.args.city), ['Izmir'], 'Claude Code runs a step\'s calls one after the other: one per answer');
+  const su = JSON.parse(second.r.text).usage;
+  assert.equal(su.prompt_tokens, null);
+  assert.match(su.reason, /no model step of cc reported tokens in this turn/);
+  d.results();
+  assert.equal((await d.ask()).text, 'Ankara RESULT for Ankara; Izmir RESULT for Izmir');
+  assert.equal(startsOf(t).length, 1);
+});
+
 /* ---------------------------------------------------------------- tripwire and clock */
 
-for (const [id, ws] of [['oc', 'opencode'], ['cx', 'codex'], ['qd', 'qoder']]) {
+for (const [id, ws] of [['oc', 'opencode'], ['cx', 'codex'], ['qd', 'qoder'], ['cc', 'claude']]) {
   test(`${ws}: a tool of its own in its stream is the tripwire — stopped, a 502 foreign_tool, its files gone`, async () => {
     const t = tag();
     const r = await post('/v1/chat/completions', { model: `${id}/m`, tools: TOOLS, messages: [{ role: 'user', content: `Weather ${t} SCENARIO=foreign` }] });
@@ -589,15 +667,16 @@ test('the start-up sweep: session files of keysmith\'s naming older than an hour
 
 /* ----------------------------------------------------------------- drivers, parsers */
 
-test('which driver takes an adapter: the one its bridge.driver names (agy also by its parser); claude ships without one, and an unknown name does not load', () => {
+test('which driver takes an adapter: the one its bridge.driver names (agy also by its parser); claude ships its own, explicit-only still, and an unknown name does not load', () => {
   const at = (cfg) => DRIVERS.filter((d) => d.supports(new CliAdapter('x', { cwd: dir, ...cfg }))).map((d) => d.id);
-  for (const name of ['opencode', 'codex', 'qoder', 'agy']) assert.deepEqual(at(CLI_PROFILES[name]), [name], name);
-  assert.deepEqual(at({ ...CLI_PROFILES.claude, bridge: { driver: 'claude', args: CLAUDE_BRIDGE_ARGS } }), ['claude']);
+  for (const name of ['opencode', 'codex', 'qoder', 'agy', 'claude']) assert.deepEqual(at(CLI_PROFILES[name]), [name], name);
+  assert.equal(CLAUDE_BRIDGE_ARGS, CLI_PROFILES.claude.bridge.args);
   assert.deepEqual(at({ ...CLI_PROFILES.agy, bridge: { args: CLI_PROFILES.agy.bridge.args } }), ['agy'], 'an agy entry written before bridge.driver');
   assert.deepEqual(at({ ...CLI_PROFILES.codex, bridge: { args: CLI_PROFILES.codex.bridge.args } }), [], 'no driver named, no agy parser: no bridge');
   assert.deepEqual(at({ ...CLI_PROFILES.opencode, cwd: undefined, workspaceFiles: undefined, toolMode: 'off' }), [], 'never outside a workspace keysmith owns');
-  assert.equal(CLI_PROFILES.claude.bridge, undefined, 'claude spends the subscription: no bridge settings ship');
-  assert.equal(CLI_PROFILES.claude.toolMode, 'off');
+  assert.equal(CLI_PROFILES.claude.toolMode, 'auto');
+  assert.equal(CLI_PROFILES.claude.explicitOnly, true, 'claude spends the subscription: a request that names it, never an alias');
+  assert.deepEqual(CLI_PROFILES.claude.emulateArgs, CLI_PROFILES.claude.args, 'EMULATE runs the tool-less text argv');
   assert.throws(() => checkAdapter('x', { ...CLI_PROFILES.opencode, bridge: { driver: 'gemini', args: ['{prompt}'] } }), /bridge.driver must be one of/);
 });
 

@@ -191,17 +191,19 @@ as `response.output_item.added`, `response.function_call_arguments.delta` and `.
 SDK's `responses.create` and `responses.stream(...).get_final_response()` read both (checked
 with openai 2.54.0). A failure after the stream started is an `error` event and
 `response.failed`. A request without tools is answered as it always was.
-- **A CLI without one** (`toolMode` absent or `off`: `claude`, `kiro` and the profiles marked
+- **A CLI without one** (`toolMode` absent or `off`: `kiro` and the profiles marked
   `unsafeTools`) is passed by.
 
-Which built-in profile answers how: `agy`, `opencode`, `codex` and `qoder` with `auto` — the MCP
-bridge, and EMULATE where the bridge cannot, through the same tool-less agent and argv as their
-text runs. Each answered a two-turn round trip live both ways (2026-10-20: opencode on
-`evren/deepseek-v4-flash`, codex on `gpt-5.6-luna`, qoder on its default model; agy is the live
-acceptance's). `claude` never (every request spends your subscription; its bridge driver is
-written from its `--help` and never run); `kiro` not yet — its EMULATE argv (`emulateArgs`) is in
-the profile and checked against a stub of its stream, but no live run got past its overage limit,
-so `keysmith set kiro toolMode emulate` is yours to make once one does.
+Which built-in profile answers how: `agy`, `opencode`, `codex`, `qoder` and `claude` with
+`auto` — the MCP bridge, and EMULATE where the bridge cannot, through the same tool-less agent
+and argv as their text runs. Each answered a two-turn round trip live (2026-10-20, both ways:
+opencode on `evren/deepseek-v4-flash`, codex on `gpt-5.6-luna`, qoder on its default model; agy
+is the live acceptance's; 2026-11-03, the bridge: claude on Claude Code 2.1.303 with `haiku` at
+effort low on all three faces, see [Claude Code](#claude-code-explicit-only-tools-over-mcp)).
+`claude` stays explicit-only: a tool request reaches it only by its name, never through an alias,
+since every request spends your Claude subscription. `kiro` not yet — its EMULATE argv
+(`emulateArgs`) is in the profile and checked against a stub of its stream, but no live run got
+past its overage limit, so `keysmith set kiro toolMode emulate` is yours to make once one does.
 
 That is a change of order for a route that mixes the two: a CLI leg with a `toolMode` now takes
 tools where it stands in the chain. In `argon` (`agy/gemini-4-argon-high`, then
@@ -243,7 +245,7 @@ is data, not instructions. The most an instruction hidden in one can do is make 
 write a call — checked against the client's schema, then the client's to approve, as a
 provider's would be.
 
-**The MCP bridge** (agy, opencode, codex, qoder; `toolMode` `auto` or `mcp`). The CLI runs
+**The MCP bridge** (agy, opencode, codex, qoder, claude; `toolMode` `auto` or `mcp`). The CLI runs
 with one MCP server whose tools are the request's own, and the model calls them the way it
 calls any tool. That server is keysmith: the CLI starts a shim (`node src/bridge/shim.js`) that
 relays to the gateway over a Unix socket — 0600, under `~/.local/share/keysmith/run/`, no TCP,
@@ -255,8 +257,8 @@ the result in its next request, as it would to a provider: keysmith finds the se
 belongs to and gives the CLI the result as the call's MCP result, and what it does next — text,
 or its next call — is that request's answer. A turn after the first sends the CLI one tool
 result, not the transcript again. Text the model writes before a call stays in the answer that
-carries it. agy, codex and qoder run the calls of one step one after another (asked for two at
-once, codex and qoder sent the second only after the first one's result), so a step with three
+carries it. agy, codex, qoder and claude run the calls of one step one after another (asked for
+two at once, codex, qoder and Claude Code sent the second only after the first one's result), so a step with three
 calls is three HTTP turns of one call each, whatever `parallel_tool_calls` says. opencode sends
 them at once: the calls that arrive within 600 ms of each other go out in one answer, and the
 next request brings all their results (with `parallel_tool_calls: false`, one call per answer,
@@ -270,10 +272,11 @@ How each CLI is given the server, and kept to it (src/bridge/agy.js, src/bridge/
 | opencode | `OPENCODE_CONFIG` names the session's config: `mcp.<server>` (`local`, its `timeout` past `toolResultTimeoutMs`) and an inline agent (`--agent ks-b-<rid>`), merged under the workspace's deny-all `opencode.json` | permission and tools `"*"` denied, `<server>_*` alone allowed; `--pure`: no plugin |
 | codex | `-c mcp_servers.<server>.…` on its command line, the token in a 0600 file the shim reads (`KEYSMITH_BRIDGE_TOKEN_FILE`), never in the argv; `default_tools_approval_mode="approve"` for that server alone (with `approval_policy="never"` an unapproved MCP call is refused), `tool_timeout_sec` past `toolResultTimeoutMs` | the text argv's: no shell, read-only sandbox, no web search, no user config; `--ephemeral`, so no session on disk |
 | qoder | `--mcp-config <file> --strict-mcp-config`, `--allowed-tools mcp__<server>` | `--tools ""`; `--setting-sources project` and `--settings '{"disableAllHooks":true}'` (with project settings alone, your plugin hooks still ran headless); `--no-session-persistence`; every inherited `QODER_*` variable left out |
+| claude | `--mcp-config <file> --strict-mcp-config` (the token in that 0600 file, never the argv), `--allowedTools mcp__<server>`, `--permission-prompts none`; `MCP_TOOL_TIMEOUT` past `toolResultTimeoutMs` | `--tools ""`; `--setting-sources ""` (no settings file, no CLAUDE.md: with `project`, a CLAUDE.md in a parent directory of the workspace reached the prompt), `--settings '{"disableAllHooks":true}'`, `--disable-slash-commands`; `ENABLE_TOOL_SEARCH=false` (no tool-search tool of Claude Code's own); `--no-session-persistence`; no `CLAUDECODE`/`CLAUDE_CODE_*` variable of a session the gateway was started in. Not `--safe-mode`: it turns `--mcp-config`'s server off too |
 
 A request's tool names must fit under the model's 64-character limit behind the name the CLI
-gives a bridge tool: `mcp_ks<rid6>_` on agy, `ks<rid6>_` on opencode, `mcp__ks<rid6>__` on codex
-and qoder. A longer one is EMULATE's (`fallback: "name_too_long"`).
+gives a bridge tool: `mcp_ks<rid6>_` on agy, `ks<rid6>_` on opencode, `mcp__ks<rid6>__` on codex,
+qoder and claude. A longer one is EMULATE's (`fallback: "name_too_long"`).
 
 A request continues a session only when it is the same conversation: its last assistant turn
 holds exactly the calls the session waits for and one result for each follows it, with nothing
@@ -298,15 +301,16 @@ closed then. A second request carrying a result that another request is already 
   next call or its end. `bridge.toolResultTimeoutMs` (300 s) is how long a session waits for the
   client's result; then the CLI is stopped and its files removed, and the result, when it comes,
   is answered on the cold path — a tool behind a slow human approval still works, at the price
-  of a cold turn. opencode and codex are told to wait 30 s longer than that on a call (their own
-  default is 60 s), so keysmith's clock ends a session first. `bridge.sessionMaxMs` (30 min) and
+  of a cold turn. opencode, codex and Claude Code are told to wait 30 s longer than that on a
+  call (opencode's and codex's own default is 60 s; Claude Code's `MCP_TOOL_TIMEOUT` — a 2 s one
+  cancelled a held call at 2 s), so keysmith's clock ends a session first. `bridge.sessionMaxMs` (30 min) and
   `bridge.maxTurns` (32 calls) cap a session; past them the conversation goes on on a new one. A
   client that leaves in the middle of a turn stops the CLI.
 - **Room.** Each waiting session is a live CLI process. Measured while a call waited: agy 1.4.2
   about 1 GB, most of it the MCP servers of your own agy config, which agy starts for every run
   although the session's agent inherits none of them (they are not offered to the model: a
   one-tool turn cost ~1,300 input tokens); opencode 1.19.3 about 690 MB, qodercli 1.1.59 about
-  370 MB, codex 0.163 about 110 MB (each with the ~50 MB shim). So `bridge.maxSessions` is 2 per
+  370 MB, Claude Code 2.1.303 about 230 MB, codex 0.163 about 110 MB (each with the ~50 MB shim). So `bridge.maxSessions` is 2 per
   adapter, `limits.bridge.maxSessions` 2 in all, and `limits.bridge.maxSessionsPerKey` 1 — a key
   that opens a session over its share gives up its oldest waiting one. With no room, `auto` is
   EMULATE and `mcp` a 503. A waiting session holds no process slot (`maxConcurrent`), so the
@@ -321,25 +325,40 @@ closed then. A second request carrying a result that another request is already 
   `failure: "foreign_tool"`. A call that was with the client goes nowhere: the request that
   brings its result gets the same 502 (another key's request with that history is a new one).
   On codex any item that is not text, reasoning, its plan or a warning is such a call (a shell
-  command, a file change, a web search, a sub-agent, an item type keysmith has never seen);
+  command, a file change, a web search, a sub-agent, an item type keysmith has never seen); on
+  claude any `tool_use` block that is not the bridge's (Claude Code keeps no harness tool here);
   opencode reports a call only once it has finished, so there the tripwire comes after the fact
   of a call its config already denied. keysmith still runs no tool.
 - **Files.** agy: `.agents/agents/ks-b-<rid>.md` in its workspace (0600; it holds the session's
   token) and agy's schema cache for the server, `~/.gemini/antigravity-cli/mcp/ks<rid6>/`.
-  opencode, codex, qoder: `.keysmith-bridge/ks-b-<rid>.*` in the workspace (a 0700 directory;
-  each file 0600). All removed when the session closes, and every session is closed when the
-  gateway stops. A gateway that was killed leaves them; the next `keysmith serve` removes the
-  ones older than an hour. opencode keeps each run's session in its own storage, as it does for
-  a text run; codex (`--ephemeral`) and qoder (`--no-session-persistence`) keep none.
+  opencode, codex, qoder, claude: `.keysmith-bridge/ks-b-<rid>.*` in the workspace (a 0700
+  directory; each file 0600). All removed when the session closes, and every session is closed
+  when the gateway stops. A gateway that was killed leaves them; the next `keysmith serve` removes
+  the ones older than an hour. opencode keeps each run's session in its own storage, as it does
+  for a text run; codex (`--ephemeral`), qoder and claude (`--no-session-persistence`) keep none.
 - **What it rests on.** Behaviour no document promises: agy 1.4.2's `mcpServers` as a list, its
   `eager` key, its `mcp_<server>_<tool>` names, the `server/discover` it asks first, its schema
   cache; opencode's `OPENCODE_CONFIG` merge and inline agents, codex's per-server
-  `default_tools_approval_mode`, qoder's `disableAllHooks`. A CLI that changes one fails the
+  `default_tools_approval_mode`, qoder's `disableAllHooks`, Claude Code's `--setting-sources ""`,
+  `MCP_TOOL_TIMEOUT` and `ENABLE_TOOL_SEARCH`. A CLI that changes one fails the
   readiness gate, and `auto` answers with EMULATE — except an approval codex stops honouring:
   its call is refused before it reaches keysmith, and the model answers in text without it.
 
 The usage row of a bridge turn says which session answered and how it was reached:
 `"bridge": {"session": "ks3f9a0c", "path": "new" | "attached" | "cold", "turn": 2}`.
+
+- **Tokens per turn.** One CLI run answers several HTTP turns, and each answer's `usage` is its
+  own share of the run, what the upstream charged — the harness's system prompt and the cache
+  included (`input` with `cached_tokens`; on `/v1/messages` the uncached `input_tokens` with
+  `cache_read_input_tokens` and `cache_creation_input_tokens`). claude reports each model step as
+  Claude Code prints it (input and cache exact; the output count is the stream's first), and the
+  answer that ends the run reports Claude Code's total less what the earlier answers did, so a
+  session adds up to it exactly. codex and qoder report a run's tokens once, when it ends: the
+  answer that hands a call out has null counts and a `reason` (never a 0), and the answer that
+  ends the session carries the whole run — a session that ends otherwise (its clock, a client
+  that never comes back) reports nothing of what it spent. A call that comes from a step an
+  earlier answer reported (a serial driver's second call of one step) has null counts too, with
+  that reason.
 
 **When no leg answers with tools.** A leg that fails before anything reached the client hands
 the request to the next one; a call handed to the client is an answer, never retried
@@ -520,7 +539,8 @@ hand-written adapter one too.
 | `agy`, MCP bridge | a tool request on the bridge runs `--agent ks-b-<rid>`, a session agent as tool-less as `keysmith-tools` whose one MCP server is keysmith (a Unix socket, a token per session) offering the request's tools and nothing else; each call goes to the client, never run by agy or keysmith; a call to any other tool stops the run (502, the tripwire) | stub agy in the tests; the MCP shape (list, `eager`, `mcp_<server>_<tool>`, `server/discover`, a held tools/call) probed on agy 1.4.2; live, agy 1.4.2 on gemini-3.8-flash-low: two turns of one call through both faces on one agy process, nothing left after |
 | `opencode`, `codex`, `qoder`, MCP bridge | the text argv's tool-less switches, and one MCP server — keysmith, over the same socket and per-session token — offering the request's tools and nothing else: opencode an inline session agent that allows `<server>_*` alone (`OPENCODE_CONFIG`, over the workspace's deny-all `opencode.json`); codex that server approved alone (`approval_policy="never"` refuses any other call), the token in a 0600 file, never the argv; qoder `--strict-mcp-config`, no built-in tool, no hooks, no inherited `QODER_*`; each call goes to the client, never run by the CLI or keysmith; a call to any other tool stops the run (502, the tripwire) | stub CLIs in the tests; live 2026-10-20 on opencode 1.19.3, codex 0.163.0, qodercli 1.1.59: two turns of one call on one process each, opencode's two calls of one step in one answer, and nothing — process, shim, session file — left after a session closed |
 | `kiro` | `--agent keysmith-text`: `tools: []`, `mcpServers: {}`, `includeMcpJson: false`, `resources: []`; `--trust-tools=` trusts nothing; `stopAtToolCall` | argv and agent file accepted by kiro-cli 2.27.1; its first live run was refused for quota before any text |
-| `claude` | `--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--disable-slash-commands`, `--safe-mode`, `--max-turns 1` — a request with an image the same, with `--input-format stream-json` and the prompt on stdin | parsed by Claude Code 2.1.261; the image run live on 2.1.303 (sonnet), both faces |
+| `claude` | `--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--disable-slash-commands`, `--safe-mode`, `--max-turns 1` — a request with an image the same, with `--input-format stream-json` and the prompt on stdin; an EMULATE run the text argv | parsed by Claude Code 2.1.261; the image run live on 2.1.303 (sonnet), both faces |
+| `claude`, MCP bridge | the session's one MCP server (`--mcp-config`, `--strict-mcp-config`) offering the request's tools, allowed alone (`--allowedTools mcp__<server>`); `--tools ""`, `--permission-prompts none`, `--setting-sources ""` (no settings file, no CLAUDE.md), hooks and skills off, `ENABLE_TOOL_SEARCH=false`, no session on disk; each call goes to the client, never run by Claude Code or keysmith; a call to any other tool stops the run (502, the tripwire) | a stub Messages endpoint, Claude Code 2.1.303: the request offered the session's tools and nothing else, no CLAUDE.md in its prompt, two calls of one step sent one after the other; live the same day on `haiku` (effort low): a two-turn round trip on each face, two tools of one step in three turns, nothing — process, shim, session file — left after |
 | `qoder` | `--tools ""`, `--strict-mcp-config` | parsed by qodercli 1.1.59 |
 | `codex` | `--disable shell_tool`, `--sandbox read-only`, `approval_policy="never"`, `web_search="disabled"`, `--disable goals`, `--ignore-user-config` (no MCP servers from your config), plugins/apps/browser/computer-use off, `agents.max_threads=1` | a stub Responses endpoint, codex 0.163.0: gpt-5.5 is offered request_user_input and apply_patch (the read-only sandbox refuses it); gpt-6-* keep code mode's exec (no shell) and sub-agent tools no switch removes — capped at one sub-agent |
 | `opencode` | `--agent keysmith-text` (`permission: {"*": deny}`, `tools: {"*": false}`) and a workspace `opencode.json` denying every tool to any agent; no `--auto`; `stopAtToolCall` | a stub OpenAI endpoint, opencode 1.18.27: no tools offered, a bash call the model made anyway ran nothing; its free tier (`opencode/*`) refuses this run with a 403 |
@@ -578,10 +598,32 @@ read, write and edit stay, and `--max-turns 1` limits the turns after a call, no
 before this keeps serving until it is re-added (`keysmith add cmd`, which arrives disabled) or
 switched off (`keysmith set cmd disabled true`).
 
-**Claude Code: attached, not used.** The `claude` profile is tool-less and explicit-only as
-shipped, so `keysmith add claude` puts it in no alias and no probe, and a re-add (to pin its
-`bin`, say) keeps it that way. That is what a setup whose own work runs on the same Claude
-subscription needs: every request to `claude/…` spends that subscription.
+### Claude Code: explicit-only, tools over MCP
+
+The `claude` profile is explicit-only as shipped, so `keysmith add claude` puts it in no alias and
+no probe, and a re-add (to pin its `bin`, say) keeps it that way. That is what a setup whose own
+work runs on the same Claude subscription needs: every request to `claude/…` spends that
+subscription, and only a request that names it does.
+
+Such a request may offer tools (`toolMode: "auto"`, since 2026-11-03): Claude Code runs with one
+MCP server, keysmith's, whose tools are the request's, and with nothing of its own to call — no
+built-in tool, no settings file, no CLAUDE.md, no hooks, no skills, no tool search, no prompt, no
+session on disk; the token in a 0600 file. Each call it makes goes to the client as `tool_calls`
+(`tool_use` on `/v1/messages`, `function_call` on `/v1/responses`), streamed or not; the
+client's next request brings the result into the same Claude Code process, which answers or calls
+again; any other tool in its stream stops the run (the tripwire). Where the bridge cannot take a
+request (a forced `tool_choice`, no room), EMULATE answers through the tool-less text argv.
+Claude Code 2.1.303, live on `haiku` at effort low through a keysmith gateway:
+
+| Face | Turns | Latency | Tokens (input / cached / output per turn) |
+|---|---|---|---|
+| `/v1/chat/completions`, not streamed | call `get_weather`, then the answer | 6.1 s, 3.5 s | 4290 / 0 / 32, then 4396 / 4288 / 51 |
+| `/v1/messages`, streamed | call, then the answer | 3.5 s, 3.2 s | 4288 / 0 / 32, then 4393 / 4286 / 50 |
+| `/v1/responses`, streamed (`claude/haiku-low`) | call, then the answer | 3.2 s, 2.5 s | 4292 / 0 / 32, then 4399 / 4290 / 52 |
+| `/v1/chat/completions`, two tools in one step | `get_weather`, `get_time` (no model step: null, with the reason), the answer | 3.8 s, 0.02 s, 1.8 s | 4313 / 0 / 32, then null, then 4559 / 4311 / 121 |
+
+Claude Code's own prompt here is about 4.3k tokens, and it is cached after the first turn. A
+waiting session is about 230 MB of Claude Code and 50 MB of shim.
 
 **Images, PDFs, audio, video.** An adapter takes the media its `media` lists (`image`, `pdf`,
 `audio`, `video`; `vision: true` is `image`), and a request that carries some reaches it as the
@@ -944,7 +986,7 @@ tools.
 | `cmd` | cli | verified live against Command Code 1.66.0 — **`unsafeTools`**: a `-p` run approves its own tool calls, so it ships disabled, see [above](#agents-that-could-act-on-this-machine) |
 | `opencode` | cli | verified live against opencode 1.18.27; tool-less agent checked against a stub endpoint (no `--auto`); its free `opencode/*` models refuse the tool-less run (403); answers tool requests (`toolMode: "auto"`: the MCP bridge, EMULATE where it cannot — both live round trips on opencode 1.19.3) |
 | `qoder` | cli | verified with `-p`; its `-o json/stream-json` modes fail inside a nested agent session; tool-less flags parsed by 1.1.59; answers tool requests (`toolMode: "auto"`: the MCP bridge with `-o stream-json`, EMULATE where it cannot — both live round trips on 1.1.59) |
-| `claude` | cli | tool-less flags and stream-json shape checked against Claude Code 2.1.261; takes images and PDFs (`media`: stream-json on stdin; a scanned page transcribed live on 2.1.303 through both faces, a PDF `document` block checked against a stub); explicit-only as shipped |
+| `claude` | cli | tool-less flags and stream-json shape checked against Claude Code 2.1.261; takes images and PDFs (`media`: stream-json on stdin; a scanned page transcribed live on 2.1.303 through both faces, a PDF `document` block checked against a stub); explicit-only as shipped; answers tool requests (`toolMode: "auto"`: the MCP bridge, EMULATE where it cannot — the bridge's round trips live on 2.1.303); its models and their effort levels from Claude Code's `initialize` listing |
 | `agy` | cli | verified live against Antigravity CLI 1.3.3 — your Google login, no key; runs as a tool-less text agent (~600-token prompt instead of ~20k), see [docs/adapters.md](docs/adapters.md#agy-as-a-plain-text-model); answers tool requests too (`toolMode: "auto"`: the MCP bridge, EMULATE where the bridge cannot — see [docs/adapters.md](docs/adapters.md#agy-and-tool-requests-the-mcp-bridge)) |
 | `kiro` | cli | Kiro CLI 2.27.1 — tool-less agent, `stream-json`, model list as JSON; the first live run was refused for quota before any text, see [docs/adapters.md](docs/adapters.md#kiro-as-a-plain-text-model); tool requests pass it by (`toolMode: "off"`): its EMULATE argv is checked against a stub only |
 | `codex` | cli | argv run against a stub Responses endpoint with codex 0.163.0 (read-only, no shell, no web search); gpt-6-* keep sub-agent tools; answers tool requests (`toolMode: "auto"`: the MCP bridge with `exec --json`, EMULATE where it cannot — both live round trips on `gpt-5.6-luna`) |

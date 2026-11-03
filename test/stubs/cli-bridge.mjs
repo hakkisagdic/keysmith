@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * A stub of opencode, codex and qoder with an MCP server (test/bridge-clis.test.js), picked by
+ * A stub of opencode, codex, qoder and Claude Code with an MCP server (test/bridge-clis.test.js), picked by
  * STUB_CLI. Each takes the session's MCP server the way its CLI was seen to take it in the
  * tool-bridge probes and live runs (2026-10-19/20), starts it (the real shim, so the hub is the
  * real one), speaks MCP to it and prints the CLI's own stream:
@@ -17,6 +17,10 @@
  *   qoder     `--mcp-config <file>` (mcpServers). Calls one after the other. Prints
  *             `-o stream-json` lines: system init, assistant (tool_use blocks before the calls
  *             run), user (tool_result), result with usage.
+ *   claude    as qoder (`--mcp-config`, `--allowedTools`), the way Claude Code 2.1.303 printed it
+ *             against a stub Messages endpoint: each content block of a message on a line of its
+ *             own, under the message's id, with the usage of the message's start (output 1); the
+ *             result line the run's total. Calls one after the other.
  *
  * Without an MCP server it answers in plain text, as the CLI would with nothing to call. What it
  * does is picked by `SCENARIO=<name>` in its prompt (the last argv entry; one-call and two-calls
@@ -70,6 +74,14 @@ function serverOf() {
     const str = (v) => JSON.parse(v);
     const table = (v) => Object.fromEntries([...v.matchAll(/(\w+)=("(?:[^"\\]|\\.)*")/g)].map(([, k, x]) => [k, JSON.parse(x)]));
     return { name, command: str(s.command), args: JSON.parse(s.args), env: table(s.env || '{}'), approve: s.default_tools_approval_mode === '"approve"', timeout: Number(s.tool_timeout_sec) };
+  }
+  if (cli === 'claude') {
+    const file = val('--mcp-config');
+    if (!file) return null;
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+    note({ event: 'config', mode: (fs.statSync(file).mode & 0o777).toString(8), strict: argv.includes('--strict-mcp-config'), allowed: val('--allowedTools'), tools: val('--tools'), prompts: val('--permission-prompts'), settings: val('--settings'), sources: val('--setting-sources'), effort: val('--effort'), safeMode: argv.includes('--safe-mode'), persist: !argv.includes('--no-session-persistence'), env: { MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT ?? null, MCP_TIMEOUT: process.env.MCP_TIMEOUT ?? null, ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? null, CLAUDECODE: process.env.CLAUDECODE ?? null } });
+    const [name, s] = Object.entries(cfg.mcpServers || {})[0] || [];
+    return name ? { name, command: s.command, args: s.args || [], env: s.env || {} } : null;
   }
   if (cli === 'qoder') {
     const file = val('--mcp-config');
@@ -147,6 +159,34 @@ const out = {
     step() {},
     end(tokens, result) {
       line({ type: 'result', subtype: 'success', is_error: false, result, usage: { input_tokens: tokens[0], output_tokens: tokens[1] } });
+    },
+  },
+  claude: {
+    // One model step per message: the text before the calls and the calls are message 1, the answer
+    // after the results message 2. Each line carries its message's start usage (output 1).
+    message: 1,
+    start: (n) => ({ input_tokens: 10 * n, cache_creation_input_tokens: 100 * n, cache_read_input_tokens: 1000, output_tokens: 1 }),
+    say(content) {
+      line({ type: 'assistant', message: { id: `msg_stub${this.message}`, type: 'message', role: 'assistant', model: 'claude-stub', content, usage: this.start(this.message) }, session_id: 'cc-stub' });
+    },
+    begin() {
+      line({ type: 'system', subtype: 'init', tools: server ? [`mcp__${server.name}__get_weather`] : [], mcp_servers: server ? [{ name: server.name, status: 'connected' }] : [], model: 'claude-stub' });
+    },
+    text(t) {
+      this.say([{ type: 'text', text: t }]);
+    },
+    announce(name, args, id) {
+      this.say([{ type: 'tool_use', id, name: `mcp__${server.name}__${name}`, input: args }]);
+    },
+    finished(name, args, output, id) {
+      line({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: output }] } });
+    },
+    step(reason) {
+      if (reason === 'tool-calls') this.message++;
+    },
+    end(tokens, result) {
+      // The run's total: both messages' input and cache, and their whole output.
+      line({ type: 'result', subtype: 'success', is_error: false, result, session_id: 'cc-stub', num_turns: 2, usage: { input_tokens: 30, cache_creation_input_tokens: 300, cache_read_input_tokens: 2000, output_tokens: tokens[1] } });
     },
   },
 }[cli];
@@ -261,6 +301,7 @@ if (prompt.includes('<<<TOOL_RESULT')) {
       // A tool of the CLI's own, shown in its stream.
       if (cli === 'opencode') out.finished('bash', { command: 'ls' }, 'a.txt', 'call_bash');
       else if (cli === 'codex') line({ type: 'item.started', item: { id: 'item_x', type: 'command_execution', command: 'ls', status: 'in_progress' } });
+      else if (cli === 'claude') out.say([{ type: 'tool_use', id: 'toolu_x', name: 'Bash', input: { command: 'ls' } }]);
       else line({ type: 'assistant', message: { id: 'msg_x', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_x', name: 'Bash', input: { command: 'ls' } }] } });
       note({ event: 'hang' });
       await sleep(60_000);

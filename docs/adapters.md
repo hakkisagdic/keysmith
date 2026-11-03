@@ -154,7 +154,7 @@ adapter takes (`media`, and `vision` for images).
 | `resumeArgs` | — | template used when a session id exists |
 | `persistSessions` | `false` | the CLI keeps its own threads, so `{noSession}` renders empty and `resumeArgs` becomes reachable |
 | `noSessionFlag` | `--no-session` | what `{noSession}` renders as when the run is not resumed. Claude Code and Qoder refuse `--no-session` and take `--no-session-persistence`; their profiles say so |
-| `parser` | `raw` | one of `cmd-ndjson`, `opencode-ndjson`, `claude-stream-json`, `agy-stream-json`, `kiro-stream-json`, `warp-ndjson`, `codex-json`, `raw` |
+| `parser` | `raw` | one of `cmd-ndjson`, `opencode-ndjson`, `claude-stream-json`, `agy-stream-json`, `kiro-stream-json`, `warp-ndjson`, `codex-json`, `codex-json-final`, `raw` |
 | `modelsFrom` | — | `{ "args": ["--list-models"], "drop": ["preview"], "stdin": "…" }` — run the binary (`stdin` written to it when set), read stdout: one model per line, or JSON (an array, or one under `models`/`data`; the id is `model_id`, `id`, `slug`, `model`, `value` or `name`; `visibility: "hide"` entries are left out), or a stream-json `control_response` (Claude Code's answer to `initialize`). The effort levels a model takes are read from it too: Codex's `supported_reasoning_levels`, Claude Code's `supportedEffortLevels` |
 | `promptVia` | `arg` | `"stdin"` pipes the prompt instead, for CLIs that choke on long argv. A command line cannot carry a NUL character (U+0000): a request with one in its argv (the prompt, a system prompt) is a 400 that quotes none of it, before anything is started — the route goes on to its next leg, which an HTTP upstream can take |
 | `cwd` | process cwd | the agent's workspace: an empty directory keysmith owns (`~/.local/share/keysmith/workspaces/<name>`), created 0700 on first spawn. Every built-in CLI profile sets one, and so does `keysmith add custom`; without it the agent runs in the gateway's own working directory (under launchd, keysmith's source tree). The child's `PWD` is set to it as well: spawn() would leave the gateway's, and opencode takes `PWD` as its project directory |
@@ -473,6 +473,7 @@ then an answer that quoted the injected result:
 | opencode 1.19.3, `evren/deepseek-v4-flash` | 4.7 s + 3.0 s | 4.9 s + 0.4 s | ~690 MB |
 | codex 0.163.0, `gpt-5.6-luna` | 5.2 s + 3.2 s | 5.5 s + 1.8 s | ~110 MB |
 | qodercli 1.1.59, its default model | 11.8 s + 12.1 s | 5.8 s + 4.2 s | ~370 MB |
+| Claude Code 2.1.303, `haiku` at effort low (2026-11-03) | — | 6.1 s + 3.5 s (chat), 3.5 s + 3.2 s (messages, streamed), 3.2 s + 2.5 s (responses, streamed) | ~230 MB |
 
 **EMULATE.** `emulateArgs` is each profile's text argv, as tool-less as it is for text —
 opencode's `keysmith-text` agent and deny-all `opencode.json`, codex's read-only, shell-less
@@ -482,7 +483,8 @@ and the JSON answer format. Each reply is read by the profile's own parser (`ope
 call the CLI's own harness reports before the reply (opencode's `tool_use`, kiro's ACP
 `tool_call`: refused, since the agent has no tools) is passed by; one after the reply ends the
 run there (`stopAtToolCall`), and the reply stands. codex adds its own ~20k-token harness to
-every request, and `raw` reports no token counts for codex or qoder.
+every request, which its counts include (`codex-json-final`: `exec --json`'s turn.completed);
+`raw` reports no token counts for qoder (null, with the reason).
 
 **The bridge.** `bridge.driver` names how the session's one MCP server is given to the CLI, and
 `bridge.args` is the argv, with these placeholders filled in per session besides `{model}` and
@@ -523,15 +525,27 @@ session's MCP config file). The session's files are in `.keysmith-bridge/` in th
   tools behind qoder's own `mcp_get`/`mcp_call` (read as the tool `mcp_call` names; `mcp_get`
   only reads a schema and is no foreign tool). The model sees `mcp__ks<rid6>__<tool>`; a step's
   calls come one after the other, each `tool_use` block printed before it runs.
-- **claude**: `src/bridge/clis.js` has a driver and an argv for it (`CLAUDE_BRIDGE_ARGS`: as
-  qoder's, with Claude Code's `--permission-prompts none` and `--disable-slash-commands`, and
-  without the text argv's `--safe-mode`, which turns MCP servers off), written from `claude
-  --help` and checked against a golden plan only — never run, since every request would spend
-  your Claude subscription. The `claude` profile ships without bridge settings and with
-  `toolMode: "off"`.
+- **claude** (`claude-stream-json`, each assistant message's usage too): `--mcp-config
+  {mcpConfig} --strict-mcp-config` (the token in that 0600 file), `--allowedTools
+  mcp__{server}`, `--tools ""`, `--permission-prompts none`, `--disable-slash-commands`,
+  `--setting-sources ""` — no settings file and no CLAUDE.md: with `project`, a CLAUDE.md in a
+  parent directory of the workspace reached the prompt (2.1.303, against a stub Messages
+  endpoint) — `--settings '{"disableAllHooks":true}'`, `--no-session-persistence`, and
+  `--effort {effort}`. Not the text argv's `--safe-mode`: it turns `--mcp-config`'s server off
+  too. Its environment: `MCP_TOOL_TIMEOUT` 30 s past `toolResultTimeoutMs` (Claude Code honours
+  it: a 2 s one cancelled a held call at 2 s), `MCP_TIMEOUT` the readiness wait,
+  `ENABLE_TOOL_SEARCH=false` (with it on, Claude Code put a tool of its own in front of the
+  request's), and no `CLAUDECODE`/`CLAUDE_CODE_*`/`CLAUDE_AGENT_SDK_*` of a session the gateway
+  was started in. The model sees `mcp__ks<rid6>__<tool>`; asked for two at once, Claude Code sent
+  the second tools/call after the first one's result, so a step's calls go out one per answer.
+  Claude Code keeps no harness tool here: any other `tool_use` block is the tripwire's. The
+  `claude` profile ships it with `toolMode: "auto"`, explicit-only as before. Checked against a
+  stub Messages endpoint (the request offered the session's two tools and nothing else) and live
+  on 2.1.303 (2026-11-03, `haiku`): a two-turn round trip on each face, two tools of one step.
 
-`keysmith set <id> toolMode auto` on an opencode, codex or qoder entry attached before this
-fills in `bridge` (and `emulateArgs`) from the profile, as for agy. With
+`keysmith set <id> toolMode auto` on an opencode, codex, qoder or claude entry attached before
+this fills in `bridge` (and `emulateArgs`) from the profile, as for agy (`keysmith upgrade claude
+--apply` does too). With
 `toolMode: "emulate"` there is no bridge and no process held between requests.
 
 `kiro` carries `emulateArgs` (its text argv) and keeps `toolMode: "off"`: its stream was only
@@ -661,8 +675,8 @@ another effort (in the id or in a field) is a new session, which reads the conve
   `--disable-slash-commands`, `--safe-mode` (no CLAUDE.md, plugins, hooks or custom agents;
   auth and model selection stay), `--max-turns 1`. `{noSession}` is
   `--no-session-persistence`: 2.1.261 refuses `--no-session` as an unknown option. All of it
-  parsed by 2.1.261 with an empty prompt, which it rejects before sending anything; no
-  request went through it. It spends your Claude subscription, so the profile ships
+  parsed by 2.1.261 with an empty prompt, which it rejects before sending anything; requests
+  went through it on 2.1.303 (images, and EMULATE's argv is this one). It spends your Claude subscription, so the profile ships
   `explicitOnly: true`: no alias, no probe, and a re-add keeps it. A request with an image or
   a PDF runs `visionArgs`: the same switches with `--input-format stream-json` and the prompt on
   stdin (see [Media](#media-images-pdfs-audio-video)).

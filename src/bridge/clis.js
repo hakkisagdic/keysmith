@@ -3,12 +3,13 @@ import { joinArgs } from '../util.js';
 import { effortIn, refuseNul } from '../cli-adapter.js';
 import { SHIM } from './agy.js';
 import { KILL_GRACE_MS, bridgeEnv, list, older, rm, spawnGroup, writePrivate } from './proc.js';
+import { CLI_PROFILES } from '../profiles.js';
 
 /**
  * The MCP bridge's drivers for the CLIs that are not agy (design U11): opencode, codex and qoder,
  * as the tool-bridge probes (2026-10-19) saw each of them take a stdio MCP server and wait on a
- * held tools/call; and claude, whose driver is written from its --help and never run (every
- * request spends your Claude subscription; its profile ships without bridge settings).
+ * held tools/call; and claude, as Claude Code 2.1.303 took it (2026-11-03: against a stub Messages
+ * endpoint, then live).
  *
  * Each session gets a server name of its own (`ks<rid6>`) and its files in the adapter's
  * workspace, under `.keysmith-bridge/` (0700; each file 0600, removed when the session closes, and
@@ -46,15 +47,23 @@ import { KILL_GRACE_MS, bridgeEnv, list, older, rm, spawnGroup, writePrivate } f
  *             message that makes the calls (its `tool_use` blocks) is printed before they run; a
  *             `mcp_call` names the tool it calls (parsers.js), and `mcp_get`, which only reads a
  *             tool's schema, is no foreign tool.
- *   claude    as qoder, with Claude Code's own switches (CLAUDE_BRIDGE_ARGS). Never run.
+ *   claude    `claude -p --output-format stream-json --mcp-config <file> --strict-mcp-config` with
+ *             `--tools ""` (no built-in tool), the server's tools allowed (`--allowedTools
+ *             mcp__<server>`), `--permission-prompts none`, `--setting-sources ""` (no settings file
+ *             and no CLAUDE.md — `project` still read the workspace's parent directories'), hooks
+ *             off, skills off, no session written; not `--safe-mode`, which turns MCP servers off.
+ *             MCP_TOOL_TIMEOUT outlasts toolResultTimeoutMs (Claude Code honours it: a 2 s one
+ *             cancelled a held call at 2 s) and ENABLE_TOOL_SEARCH=false keeps every tool of the
+ *             request loaded, with no tool-search tool of Claude Code's to call. Its assistant
+ *             message prints each tool_use block before the call runs.
  *
  * How a step's calls reach the client (`batch`, src/bridge/index.js): codex 0.163 and qoder 1.1.59
  * run them one after another — asked for two at once, each sent its second tools/call only after
  * the first one's result (a held call, 2026-10-20) — so each goes out on its own HTTP turn, as
  * agy's do (`serial`). opencode sends them at once (`gather`): the calls that arrive within
  * `settleMs` of the last one go out in one answer, at the latest STEP_GRACE_MS after the first.
- * claude, never run, is `serial`, which is right either way: a call that comes while another is
- * with the client waits for the next turn.
+ * claude 2.1.303 runs them one after another too (`serial`): asked for two at once, it sent the
+ * second tools/call only after the first one's result.
  */
 
 const DIR = '.keysmith-bridge';
@@ -76,17 +85,8 @@ export function tomlString(s) {
   return JSON.stringify(String(s));
 }
 
-/**
- * claude's bridge argv, from `claude --help` (2.1.261) and never run: every request would spend
- * your Claude subscription, so the `claude` profile has no bridge settings and its toolMode is off.
- * Not `--safe-mode` (the text argv's): it turns MCP servers off.
- */
-export const CLAUDE_BRIDGE_ARGS = [
-  '-p', '--output-format', 'stream-json', '--verbose', '--no-session-persistence',
-  '--tools', '', '--strict-mcp-config', '--mcp-config', '{mcpConfig}', '--allowed-tools', 'mcp__{server}',
-  '--permission-prompts', 'none', '--disable-slash-commands', '--setting-sources', 'project', '--settings', '{"disableAllHooks":true}',
-  ['--model', '{model}'], '{prompt}',
-];
+/** claude's bridge argv: the `claude` profile's (src/profiles.js). */
+export const CLAUDE_BRIDGE_ARGS = CLI_PROFILES.claude.bridge.args;
 
 /**
  * A driver for a CLI whose session lives in files under `.keysmith-bridge/`: `files(adapter,
@@ -278,7 +278,18 @@ export const claudeDriver = fileDriver({
   },
   // A keysmith started inside a Claude Code session inherits its markers; one of them
   // (CLAUDE_AGENT_SDK_MCP_NO_PREFIX) would rename the server's tools. CLAUDE_CONFIG_DIR stays.
-  env(adapter) {
-    return bridgeEnv(adapter, { drop: /^(CLAUDECODE$|CLAUDE_CODE_|CLAUDE_AGENT_SDK_)/ });
+  // Claude Code waits on a call as long as MCP_TOOL_TIMEOUT says: past keysmith's own wait, so
+  // keysmith's clock ends a session first; MCP_TIMEOUT is its readiness wait. ENABLE_TOOL_SEARCH
+  // off: with many tools Claude Code would defer them behind a tool of its own (a placeholder the
+  // model calls to load them), which the tripwire would have to stop.
+  env(adapter, session) {
+    return bridgeEnv(adapter, {
+      drop: /^(CLAUDECODE$|CLAUDE_CODE_|CLAUDE_AGENT_SDK_)/,
+      set: {
+        MCP_TOOL_TIMEOUT: String(session.limits.toolResultTimeoutMs + CALL_TIMEOUT_MARGIN_MS),
+        MCP_TIMEOUT: String(session.limits.readyTimeoutMs),
+        ENABLE_TOOL_SEARCH: 'false',
+      },
+    });
   },
 });
