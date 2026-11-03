@@ -184,6 +184,40 @@ else for (const l of [{ type: 'thread.started', thread_id: 'th' }, { type: 'turn
   assert.equal(await answer(mainEntry.adapters.codex), 'PONG', 'and as main ran it, plain');
 });
 
+// Independent re-check of 88f4cd1: a codex entry from before EMULATE (parser raw, plain `exec`, no
+// emulateArgs, no bridge). `keysmith tools codex emulate` fills in the profile's emulateArgs, which
+// are `exec --json`: under raw that would be the JSONL stream as every answer, so it is not saved,
+// and the command it names brings the entry whole — after which the same `tools` call is saved.
+test('keysmith tools: a codex entry from before EMULATE is not given `exec --json` under parser raw, and the --take it is told brings the entry whole', (t) => {
+  const { run, read, edit } = sandbox(t);
+  assert.equal(run('add', 'codex', '--bin', '/opt/homebrew/bin/codex').status, 0);
+  const plain = (a) => a.filter((x) => x !== '--json' && !(Array.isArray(x) && x.includes('model_reasoning_effort="{effort}"')));
+  edit('codex', (e) => {
+    e.parser = 'raw';
+    e.args = plain(e.args);
+    delete e.emulateArgs;
+    delete e.bridge;
+    e.toolMode = 'off';
+  });
+  const old = read();
+  let r = run('tools', 'codex', 'emulate');
+  assert.notEqual(r.status, 0);
+  assert.match(r.all, /not saved: adapter "codex": its emulateArgs runs `--json`, whose output parser raw would hand back as the answer .* keysmith upgrade codex --take args,parser --apply/);
+  assert.deepEqual(read(), old, 'nothing written');
+  // A bare upgrade adds the profile's emulateArgs the same way: refused, nothing written.
+  r = run('upgrade', '--apply');
+  assert.notEqual(r.status, 0);
+  assert.match(r.all, /not upgraded: codex: .*--take args,parser --apply/);
+  assert.deepEqual(read(), old);
+  r = run('upgrade', 'codex', '--take', 'args,parser', '--apply');
+  assert.equal(r.status, 0, r.all);
+  const now = read().adapters.codex;
+  assert.deepEqual([now.parser, now.args, now.emulateArgs, now.bridge, now.toolMode], ['codex-json-final', CLI_PROFILES.codex.args, CLI_PROFILES.codex.emulateArgs, CLI_PROFILES.codex.bridge, 'off']);
+  r = run('tools', 'codex', 'emulate');
+  assert.equal(r.status, 0, r.all);
+  assert.equal(read().adapters.codex.toolMode, 'emulate');
+});
+
 test('keysmith upgrade: a profile file the entry lacks is added, one it changed is kept — --take replaces it', (t) => {
   const { run, read, edit } = sandbox(t);
   assert.equal(run('add', 'agy', '--bin', '/usr/local/bin/agy').status, 0);

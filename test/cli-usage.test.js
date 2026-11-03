@@ -108,6 +108,26 @@ test('codex-json: an `error` line is the run\'s failure when the turn does not c
   assert.deepEqual(ev.map((e) => e.type), ['error', 'delta', 'done']);
 });
 
+// Independent re-check of 88f4cd1: what codex 0.163.0 printed live (2026-11-03) for a failure it
+// does not retry — a model the ChatGPT account cannot use, exit 1: a warning item (`error` item),
+// the top-level `error` line, then turn.failed with the same message.
+test('codex-json-final: a failure codex does not retry, as 0.163.0 prints it live, is one error (turn.failed\'s), and its warning item is no tool', async () => {
+  const why = '{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The \'gpt-nonexistent-zz\' model is not supported when using Codex with a ChatGPT account.","code":"model_not_found"}}';
+  const events = await all(
+    codexJsonFinal(
+      lines([
+        { type: 'thread.started', thread_id: '01a1a223-8588-7e93-be46-d86e78df91cc' },
+        { type: 'item.completed', item: { id: 'item_0', type: 'error', message: 'Model metadata for `gpt-nonexistent-zz` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.' } },
+        { type: 'turn.started' },
+        { type: 'error', message: why },
+        { type: 'turn.failed', error: { message: why } },
+      ]),
+    ),
+  );
+  assert.deepEqual(events.map((e) => e.type), ['session', 'error', 'done']);
+  assert.equal(events[1].message, `codex: ${why}`);
+});
+
 test('the Anthropic wire: input_tokens is the uncached input, so the cache\'s counts are added to `input`', async () => {
   const up = http.createServer((req, res) => {
     req.resume();
@@ -158,6 +178,17 @@ for (const l of [{ type: 'thread.started', thread_id: 'th' }, { type: 'turn.star
         models: ['m'],
         cwd: path.join(dir, 'ws-cxretry'),
         toolMode: 'emulate',
+      },
+      // codex exec --json on a run whose stream codex is still retrying when keysmith's timeout ends it.
+      cxhang: {
+        kind: 'cli',
+        bin: stubCli('cxhang', `for (const l of [{ type: 'thread.started', thread_id: 'th' }, { type: 'turn.started' }, { type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion)' }]) process.stdout.write(JSON.stringify(l) + '\\n');
+setTimeout(() => {}, 20_000);`),
+        args: ['exec', '--json', '--', '{prompt}'],
+        parser: 'codex-json-final',
+        models: ['m'],
+        cwd: path.join(dir, 'ws-cxhang'),
+        timeoutMs: 1500,
       },
     },
   };
@@ -264,6 +295,19 @@ test('codex: a stream error it retried, then a completed turn, is the answer on 
   assert.equal(JSON.parse(r.text).choices[0].message.content, 'emulated');
   assert.equal(lastRow().toolMode, 'emulate');
   assert.equal(lastRow().status, 'ok');
+});
+
+// Independent re-check of 88f4cd1, not blocking: a run keysmith's timeout ends while codex is still
+// retrying its stream. The held `Reconnecting...` line is reported at the stream's end, before the
+// adapter looks at the exit, so the client gets a 502 "codex: Reconnecting... 1/5" and the usage row
+// that error, with no word of the timeout. main (parser raw, the notice on stderr) answered 504
+// "exited -1 (killed): (timeout after …)". Through a second gateway, a stub like this one: 502 after
+// the adapter's 4 s timeout.
+test('codex: a run the timeout ends while codex retries its stream is a 504 that names the timeout, and the retried error with it', { todo: 'the held Reconnecting line is the 502, the timeout is not mentioned' }, async () => {
+  const r = await post('/v1/chat/completions', { model: 'cxhang/m', messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(r.status, 504, r.text);
+  assert.match(JSON.parse(r.text).error.message, /timeout after 1500ms/);
+  assert.match(lastRow().error, /timeout/);
 });
 
 test('EMULATE through a CLI that reports no tokens: the answer says so the same way', async () => {
