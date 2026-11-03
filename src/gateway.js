@@ -599,7 +599,8 @@ export class Gateway {
   }
 
   /**
-   * Non-streaming convenience used by the faces when stream=false: the text, and the tool calls
+   * Non-streaming convenience used by the faces when stream=false: the text, the usage (or why a
+   * CLI reported none: `usageReason`), and the tool calls
    * an engine handed back for the client to run (`toolCalls`, canonical `tool_call` events), with
    * which engine answered (`toolMode`), why not the one picked first (`fallback`) and, for the MCP
    * bridge, which session answered and how it was reached (`bridge`). `relayed`:
@@ -610,6 +611,7 @@ export class Gateway {
     let text = '';
     let reasoning = '';
     let usage = null;
+    let usageReason = null;
     let sessionId = null;
     let err = null;
     let retries = 0;
@@ -628,11 +630,12 @@ export class Gateway {
       else if (evt.type === 'tool_mode') [toolMode, fallback, bridge] = [evt.mode || null, evt.fallback || null, evt.bridge || null];
       else if (evt.type === 'reasoning') reasoning += evt.text;
       else if (evt.type === 'usage') usage = mergeUsage(usage, evt.usage);
+      else if (evt.type === 'usage_unknown') usageReason ||= evt.reason || null;
       else if (evt.type === 'session') sessionId = sessionId || evt.id;
       else if (evt.type === 'error') err = evt.message;
     }
     if (err && !text && !toolCalls.length) throw new LlmError(err, { status: 502 });
-    return { text, reasoning, usage, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed };
+    return { text, reasoning, usage, usageReason, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed };
   }
 }
 
@@ -645,6 +648,7 @@ function mergeUsage(a, b) {
     output: Math.max(a.output || 0, b.output || 0),
     cacheRead: Math.max(a.cacheRead || 0, b.cacheRead || 0),
     cacheWrite: Math.max(a.cacheWrite || 0, b.cacheWrite || 0),
+    ...(a.reasoning || b.reasoning ? { reasoning: Math.max(a.reasoning || 0, b.reasoning || 0) } : {}),
     ...(a.total || b.total ? { total: Math.max(a.total || 0, b.total || 0) } : {}),
   };
 }

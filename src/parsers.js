@@ -5,7 +5,16 @@
  * Canonical events:
  *   {type:'delta', text}            append to the assistant message
  *   {type:'reasoning', text}        thinking text (only forwarded when the client asked)
- *   {type:'usage', usage:{input,output,cacheRead,cacheWrite}}
+ *   {type:'usage', usage:{input,output,cacheRead,cacheWrite,reasoning?}, scope?}
+ *                                   `input` is every input token the upstream charged, the
+ *                                   ones it read from or wrote to its cache included (OpenAI's
+ *                                   reading of prompt_tokens); `cacheRead`/`cacheWrite` say how
+ *                                   many of them, `reasoning` how many of `output` were thinking.
+ *                                   A parser of a harness that counts the uncached input alone
+ *                                   (Anthropic's input_tokens, opencode's tokens.input) adds the
+ *                                   cache back. `scope: 'run'`: the run's whole spend so far (a
+ *                                   result line), not one model step's — the MCP bridge, whose
+ *                                   one run answers several HTTP turns, reads it that way
  *   {type:'session', id}            resumable conversation id
  *   {type:'error', message, code?}  code 'tool_denied': the run called a tool the
  *                                   harness refused, and answered nothing
@@ -45,9 +54,24 @@ function normaliseUsage(u = {}) {
     cacheRead: pick('cacheReadTokens', 'cache_read_input_tokens', 'cache_read_tokens') || cache.read || 0,
     cacheWrite: pick('cacheWriteTokens', 'cache_creation_input_tokens') || cache.write || 0,
   };
+  const reasoning = pick('reasoning_output_tokens', 'reasoningTokens');
+  if (reasoning) usage.reasoning = reasoning;
   const total = pick('total', 'total_tokens');
   if (total && !usage.input && !usage.output) usage.total = total;
   return usage.input || usage.output || usage.total ? usage : null;
+}
+
+/**
+ * Usage of a harness that counts the uncached input alone — the Anthropic API's `input_tokens`
+ * (Claude Code's result and assistant lines), opencode's `tokens.input` — with the cache read and
+ * written added back into `input`: what the upstream charged as input, the harness's own system
+ * prompt (cached, as a rule) included.
+ */
+function cacheExclusive(u) {
+  const usage = normaliseUsage(u);
+  if (!usage || usage.total) return usage;
+  usage.input += usage.cacheRead + usage.cacheWrite;
+  return usage;
 }
 
 function json(line) {
@@ -163,7 +187,9 @@ export async function* opencodeNdjson(lines) {
         afterText = true;
       }
     } else if (d.type === 'step_finish') {
-      const u = normaliseUsage(part.tokens) || normaliseUsage(part.completion_tokens);
+      // opencode's tokens.input leaves out what was read from the cache (it subtracts it from the
+      // provider's count): added back, so `input` is what the provider charged.
+      const u = cacheExclusive(part.tokens) || normaliseUsage(part.completion_tokens);
       if (u) yield EV.usage(u);
       if (d.sessionID) yield EV.session(d.sessionID);
     } else if (d.type === 'error') {
@@ -185,14 +211,33 @@ export async function* opencodeNdjson(lines) {
  * a `tool` event, once per block id — printed with the assistant message that made the call,
  * before the harness runs it (qodercli 1.1.59: `mcp__<server>__<tool>` for an MCP server's tool;
  * with its lazy MCP, `mcp_call` with the tool's name in `input.toolName`, read as that tool).
+ *
+ * Usage is Anthropic's (`input_tokens` the uncached input, the cache's counts beside it): `input`
+ * here is all three (cacheExclusive). The `result` line's is the run's whole spend (`scope:
+ * 'run'`). `perMessageUsage` (the MCP bridge, where one run answers several HTTP turns): each
+ * assistant message's own usage as well, as it grows — Claude Code 2.1.303 prints the usage of
+ * the message's start on every content block of it (the output count is the stream's first, not
+ * its last), so a message's input and cache counts are exact when its call goes out, its output
+ * count is not, and the result line at the end of the run says what the run spent in all.
  */
-export async function* claudeStreamJson(lines) {
+export async function* claudeStreamJson(lines, { perMessageUsage = false } = {}) {
   const blocks = wholeBlocks(); // per message id
   const tools = new Set();
+  const spentBy = new Map(); // message id -> the usage reported for it so far
   for await (const line of lines) {
     const d = json(line);
     if (!d) continue;
     if (d.type === 'assistant' && Array.isArray(d.message?.content)) {
+      if (perMessageUsage && d.message.usage && typeof d.message.id === 'string') {
+        // Each message's usage once, and after that only what it grew by: a run's messages add up.
+        const now = cacheExclusive(d.message.usage);
+        const was = spentBy.get(d.message.id) || null;
+        const grew = now && usageGrowth(was, now);
+        if (grew) {
+          spentBy.set(d.message.id, now);
+          yield { type: 'usage', usage: grew, scope: 'step' };
+        }
+      }
       for (const block of d.message.content) {
         if (!block || typeof block !== 'object') continue;
         if (block.type === 'text' && typeof block.text === 'string') {
@@ -212,7 +257,8 @@ export async function* claudeStreamJson(lines) {
         }
       }
     } else if (d.type === 'result') {
-      if (d.usage) yield EV.usage(normaliseUsage(d.usage));
+      const u = d.usage ? cacheExclusive(d.usage) : null;
+      if (u) yield { type: 'usage', usage: u, scope: 'run' };
       if (d.session_id) yield EV.session(d.session_id);
       // On a failed run Claude Code leaves `result` null and puts the reason in
       // `errors[]`; the subtype alone ("error_during_execution") tells the user nothing.
@@ -320,6 +366,19 @@ export async function* agyStreamJson(lines, { perStepUsage = false } = {}) {
   // per step, was reported as each step ended).
   if (stepUsage && !perStepUsage && (spent.input || spent.output)) yield EV.usage(spent);
   yield EV.done('stop');
+}
+
+/** What `now` adds to `was` (two reports of one message), per field; null when it adds nothing. */
+function usageGrowth(was, now) {
+  if (!was) return now;
+  const out = {};
+  let any = false;
+  for (const [k, v] of Object.entries(now)) {
+    const d = typeof v === 'number' ? v - (was[k] || 0) : 0;
+    out[k] = d > 0 ? d : 0;
+    if (d > 0) any = true;
+  }
+  return any ? out : null;
 }
 
 /** Text out of an ACP content block: `{type:'text', text}`, an array of them, or a string. */
@@ -457,9 +516,14 @@ const CODEX_QUIET_ITEMS = new Set(['agent_message', 'reasoning', 'todo_list', 'c
  * bridge's tripwire reads (src/bridge/clis.js). `turn.completed` carries the run's usage,
  * `turn.failed` and a top-level `error` line its failure.
  */
-export async function* codexJson(lines) {
+export async function* codexJson(lines, { finalOnly = false } = {}) {
   const tools = new Set();
   let afterText = false; // the last item that said anything was an agent message: a next one is a new paragraph
+  let last = null; // finalOnly: the last agent message so far
+  const flush = function* () {
+    if (last !== null) yield EV.delta(last);
+    last = null;
+  };
   for await (const line of lines) {
     const d = json(line);
     if (!d || typeof d.type !== 'string') continue;
@@ -470,7 +534,8 @@ export async function* codexJson(lines) {
       const kind = typeof it.type === 'string' ? it.type : 'unknown';
       if (kind === 'agent_message') {
         if (d.type === 'item.completed' && typeof it.text === 'string' && it.text) {
-          yield EV.delta(afterText ? `\n\n${it.text}` : it.text);
+          if (finalOnly) last = it.text;
+          else yield EV.delta(afterText ? `\n\n${it.text}` : it.text);
           afterText = true;
         }
       } else if (kind === 'reasoning') {
@@ -486,11 +551,13 @@ export async function* codexJson(lines) {
         }
       }
     } else if (d.type === 'turn.completed') {
+      yield* flush();
       const u = d.usage && typeof d.usage === 'object' ? d.usage : null;
       if (u) {
-        // OpenAI's counts: output_tokens holds the reasoning tokens, input_tokens the cached ones.
-        const usage = normaliseUsage({ input_tokens: u.input_tokens, output_tokens: u.output_tokens, cache_read_input_tokens: u.cached_input_tokens });
-        if (usage) yield EV.usage(usage);
+        // OpenAI's counts: output_tokens holds the reasoning tokens, input_tokens the cached ones —
+        // already what `input` means here. The whole run's, reported once as it ends.
+        const usage = normaliseUsage({ input_tokens: u.input_tokens, output_tokens: u.output_tokens, cache_read_input_tokens: u.cached_input_tokens, reasoning_output_tokens: u.reasoning_output_tokens });
+        if (usage) yield { type: 'usage', usage, scope: 'run' };
       }
     } else if (d.type === 'turn.failed') {
       const why = typeof d.error === 'string' ? d.error : d.error?.message || 'turn failed';
@@ -499,7 +566,17 @@ export async function* codexJson(lines) {
       yield EV.error(truncate(`codex: ${typeof d.message === 'string' ? d.message : 'error'}`, 400));
     }
   }
+  yield* flush();
   yield EV.done('stop');
+}
+
+/**
+ * `codex exec --json` read as a text run: what plain `codex exec` prints on stdout — the last agent
+ * message — and, unlike it, the run's usage (`turn.completed`). An agent message before the last
+ * one (a preamble) is left out, as plain stdout leaves it out.
+ */
+export function codexJsonFinal(lines) {
+  return codexJson(lines, { finalOnly: true });
 }
 
 /** Anything that just prints the answer. */
@@ -519,6 +596,7 @@ export const PARSERS = {
   'kiro-stream-json': kiroStreamJson,
   'warp-ndjson': warpNdjson,
   'codex-json': codexJson,
+  'codex-json-final': codexJsonFinal,
   raw: rawText,
 };
 

@@ -220,7 +220,8 @@ export class McpBridge {
   /**
    * One HTTP turn on the bridge: a `bridge` event first (which session, how it was reached), then
    * text as it comes, and either a `tool_call` (keysmith's id for `face`) with `done` tool_calls,
-   * or the end of the answer — each with the usage of the CLI's steps in this turn. A failure
+   * or the end of the answer — each with the usage of the CLI's steps in this turn (or, when it
+   * has none, a `usage_unknown` that says why). A failure
    * before anything of the answer is thrown with `fallbackReason` (the usage row's `fallback`
    * when auto runs EMULATE instead) and `noFallback` where nothing else may answer.
    */
@@ -397,6 +398,14 @@ export class McpBridge {
     signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted) onAbort();
     const fail = (reason, status, message, extra = {}) => bridgeError(adapter, reason, status, `bridge ${s.server}: ${message}`, { usage, ...extra });
+    // This turn's usage, as the answer reports it: the steps it ran — or, when the CLI reports what
+    // its run spent in all (a result line), that total less what the session's earlier answers
+    // reported — and the reason when there is none, never a 0. What it reports is the session's.
+    const report = () => {
+      if (!usage) return { type: 'usage_unknown', reason: driver.usageAtEnd ? `${adapter.id} reports a run's tokens once, when the run ends: this bridge session's are all on the answer that ends it` : `no model step of ${adapter.id} reported tokens in this turn: its call came from a step whose tokens an earlier answer reported` };
+      s.reported = addUsage(s.reported || null, usage);
+      return { type: 'usage', usage };
+    };
     const handOut = function* () {
       if (grace) t.clearTimeout(grace);
       if (settle) t.clearTimeout(settle);
@@ -411,7 +420,7 @@ export class McpBridge {
       s.hold(outs);
       const names = outs.map((o) => truncate(o.name, 64)).join(', ');
       self.log(`bridge ${s.server}: ${outs.length > 1 ? `calls ${s.turns - outs.length + 1}-${s.turns}` : `call ${s.turns}`} (${names}) handed to the client`);
-      if (usage) yield { type: 'usage', usage };
+      yield report();
       for (const o of outs) yield { type: 'tool_call', id: o.id, name: o.name, arguments: JSON.stringify(o.args), args: o.args };
       delivered = true;
       yield { type: 'done', finishReason: 'tool_calls' };
@@ -440,7 +449,9 @@ export class McpBridge {
             yield h;
           }
         } else if (type === 'usage') {
-          usage = addUsage(usage, evt.usage);
+          // `run`: the run's whole spend so far (Claude Code's and qoder's result line, codex's
+          // turn.completed), which the session's earlier answers reported part of already.
+          usage = evt.scope === 'run' ? lessUsage(evt.usage, s.reported) : addUsage(usage, evt.usage);
         } else if (type === 'tool') {
           const name = String(evt.name || '');
           if (name.startsWith(driver.prefix(s.server))) {
@@ -513,13 +524,13 @@ export class McpBridge {
           }
           const failure = errors.find((e) => e.code !== 'tool_denied') || errors[0] || null;
           if (cut || (!failure && evt.code === 0)) {
-            if (usage) yield { type: 'usage', usage };
+            yield report();
             yield { type: 'done', finishReason: 'stop' };
             return;
           }
           const why = failure ? failure.message : `${adapter.id} exited ${evt.code}${evt.killed ? ' (killed)' : ''}: ${truncate(evt.stderr || 'no output', 200)}`;
           if (!text) throw fail(failure?.code || 'cli_error', 502, why);
-          if (usage) yield { type: 'usage', usage };
+          yield report();
           yield { type: 'error', message: why };
           return;
         } else if (type === 'ready_timeout') {
@@ -596,6 +607,14 @@ export function toolsHash(tools) {
 function isForeign(driver, s, name) {
   const n = String(name || '');
   return !n.startsWith(driver.prefix(s.server)) && !driver.harnessTools.includes(n);
+}
+
+/** `total` less what `before` already reported, per field, never below 0. */
+function lessUsage(total, before) {
+  if (!before) return { ...total };
+  const out = {};
+  for (const [k, v] of Object.entries(total)) out[k] = typeof v === 'number' ? Math.max(0, v - (before[k] || 0)) : v;
+  return out;
 }
 
 function sameList(a, b) {

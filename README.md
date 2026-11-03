@@ -634,7 +634,7 @@ An agent gets a key of its own instead, written to a file only it reads:
 |---|---|---|
 | `launchd-gateway.log` | launchd: `serve`'s stdout + stderr | start banner (address, adapters, the key redacted, tunnel URL); with `KEYSMITH_VERBOSE=1`, adapter failures, retries and skipped alias legs |
 | `keysmith.log` | `keysmith start`: the same stream | the same, for a gateway started without launchd |
-| `usage.jsonl` | the gateway, one line per request | time, model, status, duration, token counts, stream flag, user agent, error message, `retries`/`cutAt`; for a tool request `toolMode`, `toolCalls`, `fallback`, `failure` and `failedLegs` (see [Tool calls](#tool-calls-thinking)); the key's fingerprint (`key: "fp:…"`) and its scope's decision (`scope`, `skipped`) |
+| `usage.jsonl` | the gateway, one line per request | time, model, status, duration, token counts (`input` every input token charged, the cache's included; or `usage: null` with a `usageReason` when the CLI reported none), stream flag, user agent, error message, `retries`/`cutAt`; for a tool request `toolMode`, `toolCalls`, `fallback`, `failure` and `failedLegs` (see [Tool calls](#tool-calls-thinking)); the key's fingerprint (`key: "fp:…"`) and its scope's decision (`scope`, `skipped`) |
 | `launchd-tunnel.log` | launchd: cloudflared | cloudflared's own output |
 
 keysmith does not log prompts, answers, request headers or request URLs, and a request

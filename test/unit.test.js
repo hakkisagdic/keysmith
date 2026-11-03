@@ -135,7 +135,8 @@ test('opencode flushes whole text blocks; only the tail is forwarded', async () 
     ),
   );
   assert.equal(events.filter((e) => e.type === 'delta').map((e) => e.text).join(''), 'Count 1, 2, 3');
-  assert.deepEqual(events.find((e) => e.type === 'usage').usage, { input: 10, output: 5, cacheRead: 2, cacheWrite: 0 });
+  // opencode's tokens.input leaves the cache read out: `input` is what the provider charged.
+  assert.deepEqual(events.find((e) => e.type === 'usage').usage, { input: 12, output: 5, cacheRead: 2, cacheWrite: 0 });
 });
 
 test('opencode prints each text part whole, once: a part is never cut by the length of an earlier one', async () => {

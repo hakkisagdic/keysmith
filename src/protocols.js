@@ -60,7 +60,19 @@ export function openaiResult({ id, model, created, text, usage, finishReason = '
   };
 }
 
+/**
+ * The usage a face is handed: canonical counts (parsers.js: `input` every input token charged, the
+ * cache's included), `{ unknown: reason }` when the CLI that answered reported none — written as
+ * null counts with the reason beside them, never as 0 — or null, when nothing was said at all (an
+ * upstream that sent no usage: the zeros every face wrote before).
+ */
+export function usageUnknown(u) {
+  return !!u && typeof u === 'object' && typeof u.unknown === 'string' ? u.unknown : null;
+}
+
 export function openaiUsage(u) {
+  const unknown = usageUnknown(u);
+  if (unknown) return { prompt_tokens: null, completion_tokens: null, total_tokens: null, prompt_tokens_details: { cached_tokens: null }, completion_tokens_details: { reasoning_tokens: null }, reason: unknown };
   const input = u?.input || 0;
   const output = u?.output || 0;
   return {
@@ -68,7 +80,34 @@ export function openaiUsage(u) {
     completion_tokens: output,
     total_tokens: u?.total || input + output,
     prompt_tokens_details: { cached_tokens: u?.cacheRead || 0 },
-    completion_tokens_details: { reasoning_tokens: 0 },
+    completion_tokens_details: { reasoning_tokens: u?.reasoning || 0 },
+  };
+}
+
+/**
+ * A Messages usage: Anthropic counts the uncached input in `input_tokens` and the cache's two
+ * counts beside it, so the three add up to what `input` holds.
+ */
+export function anthropicUsage(u) {
+  const unknown = usageUnknown(u);
+  if (unknown) return { input_tokens: null, cache_creation_input_tokens: null, cache_read_input_tokens: null, output_tokens: null, reason: unknown };
+  const cacheRead = u?.cacheRead || 0;
+  const cacheWrite = u?.cacheWrite || 0;
+  return { input_tokens: Math.max(0, (u?.input || 0) - cacheRead - cacheWrite), cache_creation_input_tokens: cacheWrite, cache_read_input_tokens: cacheRead, output_tokens: u?.output || 0 };
+}
+
+/** A Responses usage object, with every field the openai SDK's model asks for. */
+export function responsesUsage(u) {
+  const unknown = usageUnknown(u);
+  if (unknown) return { input_tokens: null, input_tokens_details: { cached_tokens: null }, output_tokens: null, output_tokens_details: { reasoning_tokens: null }, total_tokens: null, reason: unknown };
+  const input = u?.input || 0;
+  const output = u?.output || 0;
+  return {
+    input_tokens: input,
+    input_tokens_details: { cached_tokens: u?.cacheRead || 0, cache_write_tokens: u?.cacheWrite || 0 },
+    output_tokens: output,
+    output_tokens_details: { reasoning_tokens: u?.reasoning || 0 },
+    total_tokens: u?.total || input + output,
   };
 }
 
@@ -90,12 +129,12 @@ export function anthropicMessages(body) {
 export function anthropicStreamEvents({ id, model, text, usage }) {
   const msgId = `msg_${id}`;
   return [
-    { event: 'message_start', data: { type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', model, content: [], usage: { input_tokens: usage?.input || 0, output_tokens: 0 } } } },
+    { event: 'message_start', data: { type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', model, content: [], usage: { input_tokens: 0, output_tokens: 0 } } } },
     { event: 'content_block_start', data: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } },
     { event: 'ping', data: { type: 'ping' } },
     { event: 'content_block_delta', data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } } },
     { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
-    { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: usage?.output || 0 } } },
+    { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: anthropicUsage(usage) } },
     { event: 'message_stop', data: { type: 'message_stop' } },
   ];
 }
@@ -109,7 +148,7 @@ export function anthropicResult({ id, model, text, usage }) {
     content: [{ type: 'text', text }],
     stop_reason: 'end_turn',
     stop_sequence: null,
-    usage: { input_tokens: usage?.input || 0, output_tokens: usage?.output || 0 },
+    usage: anthropicUsage(usage),
   };
 }
 
@@ -150,7 +189,7 @@ export function responsesResult({ id, model, text, usage, created }) {
     // Convenience mirror of what `output` contains. The OpenAI SDK exposes this as a
     // string property, so clients that reach for it get a string, not an array.
     output_text: text,
-    usage: { input_tokens: usage?.input || 0, output_tokens: usage?.output || 0, total_tokens: (usage?.input || 0) + (usage?.output || 0) },
+    usage: responsesUsage(usage),
   };
 }
 

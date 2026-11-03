@@ -1,4 +1,4 @@
-import { openaiChunk, openaiResult, anthropicResult } from '../protocols.js';
+import { openaiChunk, openaiResult, anthropicResult, anthropicUsage, responsesUsage } from '../protocols.js';
 import { LlmError } from '../util.js';
 import { FINISH_TOOL_CALLS, isPlainObject, newToolCallId, newToolItemId } from './model.js';
 
@@ -293,7 +293,10 @@ export class AnthropicStream {
     if (error) this._event('error', { type: 'error', error: { type: 'overloaded_error', message: error } });
     this._closeText();
     const stop = error ? 'error' : this.calls ? 'tool_use' : 'end_turn';
-    this._event('message_delta', { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: usage?.output || 0 } });
+    // The whole usage, not the output count alone: a CLI reports its tokens when its run (or turn)
+    // ends, after message_start went out, and an SDK's accumulator takes input and cache counts
+    // from here too. With no usage said at all, the output count of before.
+    this._event('message_delta', { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: usage ? anthropicUsage(usage) : { output_tokens: 0 } });
     this._event('message_stop', { type: 'message_stop' });
     this.ka?.stop();
     this.res.end();
@@ -308,19 +311,6 @@ export class AnthropicStream {
 }
 
 /* -------------------------------------------------------------- OpenAI Responses */
-
-/** A Responses usage object, with every field the openai SDK's model asks for. */
-function responsesUsage(u) {
-  const input = u?.input || 0;
-  const output = u?.output || 0;
-  return {
-    input_tokens: input,
-    input_tokens_details: { cached_tokens: u?.cacheRead || 0, cache_write_tokens: u?.cacheWrite || 0 },
-    output_tokens: output,
-    output_tokens_details: { reasoning_tokens: 0 },
-    total_tokens: u?.total || input + output,
-  };
-}
 
 function messageItem(id, text, status) {
   return { id, type: 'message', status, role: 'assistant', content: status === 'in_progress' ? [] : [{ type: 'output_text', text, annotations: [] }] };

@@ -217,7 +217,8 @@ export function correction(reason) {
  * One tool turn through `adapter` (a CliAdapter): yields `reasoning` as it comes, a `retry` event
  * when the reply is asked for again, `cut` when the run was ended at a tool call of the CLI's own
  * after the reply, then the reply — `tool_call` events (no id: the face makes keysmith's own) or
- * one `delta` — one `usage` (every run added up, `carried` included) and `done`.
+ * one `delta` — one `usage` (every run added up, `carried` included; `usage_unknown` with the
+ * reason when no run reported any) and `done`.
  *
  * Throws an LlmError before anything is yielded but reasoning, retry and cut: 400 for a prompt over
  * `maxPromptChars`, the CLI's own failure (502, or 504 for a run killed at `timeoutMs`), 499 for a
@@ -289,7 +290,7 @@ async function* engine(adapter, { model, spec, messages, signal, minRetryBudgetM
       if (reply.trim()) {
         const parsed = parseReply(reply, spec);
         if (parsed.ok) {
-          yield* answer(parsed, spent.usage);
+          yield* answer(parsed, spent.usage, adapter);
           return;
         }
         reason = parsed.reason;
@@ -316,13 +317,15 @@ async function* engine(adapter, { model, spec, messages, signal, minRetryBudgetM
   }
 }
 
-function* answer(parsed, usage) {
+function* answer(parsed, usage, adapter) {
   if (parsed.calls) {
     for (const c of parsed.calls) yield { type: 'tool_call', name: c.name, arguments: JSON.stringify(c.args), args: c.args };
   } else if (parsed.final) {
     yield { type: 'delta', text: parsed.final };
   }
   if (usage) yield { type: 'usage', usage };
+  // No run said what it spent: said so, never a 0 (cli-adapter.js usageGap).
+  else yield { type: 'usage_unknown', reason: typeof adapter?.usageGap === 'function' ? adapter.usageGap() : `${adapter?.id || 'the CLI'} reported no token counts` };
   yield { type: 'done', finishReason: parsed.calls ? 'tool_calls' : 'stop' };
 }
 

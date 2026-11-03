@@ -251,7 +251,7 @@ export class CliAdapter {
         let carriedSent = false;
         let cut = null; // the tool call the answer was ended at
         let blocked = null; // a tool call before any text, stopped (`stopAtToolCall: 'always'`)
-        for await (let evt of parse(toLines(run.stdout))) {
+        for await (let evt of noteUsageGap(parse(toLines(run.stdout)), () => this.usageGap())) {
           if (evt.type === 'tool') {
             // Before any text the call may be how the model gets to its answer, so the run
             // goes on. After text, the answer exists: stop the process instead of letting
@@ -315,6 +315,16 @@ export class CliAdapter {
     } finally {
       release();
     }
+  }
+
+  /**
+   * Why a run of this CLI has no token counts, for the `usage_unknown` event a face writes as null
+   * counts with this reason (never as 0).
+   */
+  usageGap() {
+    return this.parser === 'raw'
+      ? `${this.id} runs with parser raw: the CLI's plain output carries no token counts`
+      : `${this.id} reported no token counts for this run (parser ${this.parser})`;
   }
 
   _ensureCwd() {
@@ -412,6 +422,23 @@ export class CliAdapter {
       });
     });
     return { stdout: child.stdout, done, stop };
+  }
+}
+
+/**
+ * A parser's events, with `{ type: 'usage_unknown', reason }` in front of its `done` when none of
+ * them was a usage report: a run that says nothing of its tokens is said to have said nothing, so
+ * no face writes a 0 for it.
+ */
+export async function* noteUsageGap(events, reason) {
+  let seen = false;
+  for await (const evt of events) {
+    if (evt.type === 'usage' && evt.usage) seen = true;
+    if (evt.type === 'done' && !seen) {
+      seen = true;
+      yield { type: 'usage_unknown', reason: reason() };
+    }
+    yield evt;
   }
 }
 

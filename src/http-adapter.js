@@ -336,7 +336,11 @@ async function* parseAnthropicStream(body) {
         break;
       case 'message_start': {
         const u = d.message?.usage;
-        if (u) yield { type: 'usage', usage: { input: u.input_tokens || 0, output: u.output_tokens || 0, cacheRead: u.cache_read_input_tokens || 0, cacheWrite: u.cache_creation_input_tokens || 0 } };
+        // Anthropic's input_tokens is the uncached input alone: `input` is everything charged as
+        // input, the cache read and written included (parsers.js, the usage convention).
+        const cacheRead = u?.cache_read_input_tokens || 0;
+        const cacheWrite = u?.cache_creation_input_tokens || 0;
+        if (u) yield { type: 'usage', usage: { input: (u.input_tokens || 0) + cacheRead + cacheWrite, output: u.output_tokens || 0, cacheRead, cacheWrite } };
         break;
       }
       case 'message_delta':

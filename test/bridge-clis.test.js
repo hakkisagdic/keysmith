@@ -430,6 +430,26 @@ test('codex: the preamble, then the call shown before it is sent; the result bac
   assert.ok(rowsOf('cx/m').at(-1).usage?.input > 0, 'the run\'s usage from turn.completed');
 });
 
+test('codex: the answer that hands a call out has no count of its own (codex reports at the run\'s end): null with the reason, never 0; the answer that ends the session carries the whole run', async () => {
+  const t = tag();
+  const c = conversation('cx/m', `Usage ${t}`);
+  const a1 = await c.ask();
+  assert.equal(a1.r.status, 200, a1.r.text);
+  const u1 = JSON.parse(a1.r.text).usage;
+  assert.deepEqual([u1.prompt_tokens, u1.completion_tokens, u1.total_tokens], [null, null, null]);
+  assert.match(u1.reason, /^cx reports a run's tokens once, when the run ends/);
+  const row1 = rowsOf('cx/m').at(-1);
+  assert.equal(row1.usage, null);
+  assert.match(row1.usageReason, /when the run ends/);
+  c.results();
+  const a2 = await c.ask();
+  const u2 = JSON.parse(a2.r.text).usage;
+  // The stub's turn.completed: 1100 in (the cached ones included), 30 out — the session's whole spend.
+  assert.deepEqual([u2.prompt_tokens, u2.completion_tokens, u2.total_tokens], [1100, 30, 1130]);
+  assert.equal(u2.reason, undefined);
+  assert.deepEqual(rowsOf('cx/m').at(-1).usage, { input: 1100, output: 30, cacheRead: 0, cacheWrite: 0 });
+});
+
 test('codex: two calls of one step come one after the other, so they go out on two turns of one process', async () => {
   const t = tag();
   const c = conversation('cx/m', `Two ${t} SCENARIO=two-calls`);
@@ -578,7 +598,7 @@ test('codex-json: agent messages are text (two are two paragraphs), an MCP call 
     { type: 'tool', name: 'command_execution' },
     { type: 'tool', name: 'something_new' },
     { type: 'delta', text: 'Done.' },
-    { type: 'usage', usage: { input: 20000, output: 140, cacheRead: 15000, cacheWrite: 0 } },
+    { type: 'usage', usage: { input: 20000, output: 140, cacheRead: 15000, cacheWrite: 0, reasoning: 20 }, scope: 'run' },
     { type: 'done', finishReason: 'stop' },
   ]);
   const two = await run(codexJson, [{ type: 'item.completed', item: { id: 'a', type: 'agent_message', text: 'One.' } }, { type: 'item.completed', item: { id: 'b', type: 'agent_message', text: 'Two.' } }]);

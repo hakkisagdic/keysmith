@@ -285,6 +285,8 @@ function anthropicAccumulate(events) {
     } else if (event === 'message_delta') {
       message.stop_reason = data.delta.stop_reason;
       message.usage.output_tokens = data.usage.output_tokens;
+      // The SDKs take the input and cache counts of a message_delta too, when it carries them.
+      for (const k of ['input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens']) if (data.usage[k] != null) message.usage[k] = data.usage[k];
     }
   }
   return message;
@@ -328,6 +330,11 @@ const OPENAI_OPTIONAL = [
   'usage.completion_tokens_details.rejected_prediction_tokens',
 ];
 const ANTHROPIC_OPTIONAL = ['usage.cache_creation_input_tokens', 'usage.cache_read_input_tokens', 'usage.service_tier', 'message.usage.cache_creation_input_tokens', 'message.usage.cache_read_input_tokens'];
+/**
+ * What a message_delta's usage may carry beside output_tokens (the SDKs' MessageDeltaUsage has them,
+ * nullable): a CLI reports its tokens when its run ends, after message_start went out.
+ */
+const ANTHROPIC_DELTA_EXTRA = ['usage.input_tokens', 'usage.cache_creation_input_tokens', 'usage.cache_read_input_tokens'];
 
 function openaiKind({ data }) {
   if (data === '[DONE]') return 'done';
@@ -534,8 +541,9 @@ test('Anthropic, streamed: blocks open when they have content, input_json_delta 
   assert.equal(r.status, 200, r.text);
   const events = sse(r.text);
   assert.deepEqual(runs(events, anthropicKind), runs(REF.anthropicStream, anthropicKind));
-  assert.deepEqual(framesMatch(REF.anthropicStream, events, anthropicKind, { optional: ANTHROPIC_OPTIONAL }), []);
+  assert.deepEqual(framesMatch(REF.anthropicStream, events, anthropicKind, { optional: ANTHROPIC_OPTIONAL, extra: ANTHROPIC_DELTA_EXTRA }), []);
   const m = anthropicAccumulate(events);
+  assert.deepEqual(m.usage, { input_tokens: 120, output_tokens: 30, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, 'the counts the answer reported, input included');
   assert.equal(m.content[0].text, 'Let me check.');
   assert.match(m.content[1].id, /^toolu_[0-9a-f]{24}$/);
   assert.deepEqual(m.content[1].input, { city: 'Ankara' });

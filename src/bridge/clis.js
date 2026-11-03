@@ -93,10 +93,14 @@ export const CLAUDE_BRIDGE_ARGS = [
  * session, base)` the files to write (`[{ file, content }]`), `vars(...)` its argv's placeholders,
  * `env(...)` its environment.
  */
-function fileDriver({ id, parser, prefix, harnessTools = [], batch = 'serial', settleMs = 0, files, vars = () => ({}), env = (adapter) => bridgeEnv(adapter) }) {
+function fileDriver({ id, parser, parserOpts = {}, usageAtEnd = false, prefix, harnessTools = [], batch = 'serial', settleMs = 0, files, vars = () => ({}), env = (adapter) => bridgeEnv(adapter) }) {
   return {
     id,
     parser,
+    parserOpts,
+    // The CLI says what a run spent only when the run ends (codex's turn.completed, qoder's result
+    // line): an answer that hands a call out before then has no count of its own (index.js).
+    usageAtEnd,
     harnessTools,
     batch,
     settleMs,
@@ -150,7 +154,7 @@ function fileDriver({ id, parser, prefix, harnessTools = [], batch = 'serial', s
       adapter._ensureCwd();
       try {
         for (const { file, content } of written) writePrivate(file, content);
-        return spawnGroup(adapter, { argv, env: childEnv, stdinText: adapter.promptVia === 'stdin' ? prompt : null, parser, killGraceMs });
+        return spawnGroup(adapter, { argv, env: childEnv, stdinText: adapter.promptVia === 'stdin' ? prompt : null, parser, parserOpts, killGraceMs });
       } catch (e) {
         for (const { file } of written) rm(file);
         throw e;
@@ -215,6 +219,7 @@ export const opencodeDriver = fileDriver({
 export const codexDriver = fileDriver({
   id: 'codex',
   parser: 'codex-json',
+  usageAtEnd: true,
   prefix: (server) => `mcp__${server}__`,
   files(adapter, session, base) {
     return [{ file: `${base}.token`, content: `${session.token}\n` }];
@@ -239,6 +244,7 @@ function mcpConfigFile(session, base) {
 export const qoderDriver = fileDriver({
   id: 'qoder',
   parser: 'claude-stream-json',
+  usageAtEnd: true,
   prefix: (server) => `mcp__${server}__`,
   // qoder's lazy MCP (QODER_MCP_LAZY, left out of its env here): `mcp_get` reads a tool's schema
   // and runs nothing; `mcp_call` is read by the parser as the tool it names.
@@ -257,6 +263,9 @@ export const qoderDriver = fileDriver({
 export const claudeDriver = fileDriver({
   id: 'claude',
   parser: 'claude-stream-json',
+  // Each assistant message's usage as it is printed: an answer that hands a call out reports the
+  // step that made it, and the result line at the end of the run reconciles to Claude Code's total.
+  parserOpts: { perMessageUsage: true },
   prefix: (server) => `mcp__${server}__`,
   files(adapter, session, base) {
     return mcpConfigFile(session, base);
