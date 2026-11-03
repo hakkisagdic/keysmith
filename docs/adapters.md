@@ -547,8 +547,11 @@ session's MCP config file). The session's files are in `.keysmith-bridge/` in th
   without it Claude Code wrote a result over ~50,000 chars to
   `~/.claude/projects/<workspace>/<session>/tool-results/`, left it there after the session, and
   gave the model a 2 KB preview and the path (live, a 60,000-char result made it reach for Read);
-  with it a 190,000-char result reached the model whole and nothing was written. A result over
-  `maxPromptChars` is a 400 before it reaches Claude Code. The model sees `mcp__ks<rid6>__<tool>`; asked for two at once, Claude Code sent
+  with it a 190,000-char result reached the model whole and nothing was written. Claude Code
+  takes `Math.min(_meta, 500000)`: under a `_meta` of 700,000 a 550,032-char result was written
+  there all the same and the model given a 2,436-char preview. So the `_meta` is the smaller of
+  `maxPromptChars` and 500,000, and a result over `maxPromptChars`, or over 500,000 whatever the
+  cap, is a 400 (`result_too_long`) before it reaches Claude Code. The model sees `mcp__ks<rid6>__<tool>`; asked for two at once, Claude Code sent
   the second tools/call after the first one's result, so a step's calls go out one per answer.
   Claude Code keeps no harness tool here: any other `tool_use` block is the tripwire's. The
   `claude` profile ships it with `toolMode: "auto"`, explicit-only as before. Checked against a

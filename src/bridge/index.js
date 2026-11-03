@@ -324,6 +324,13 @@ export class McpBridge {
     if (size > adapter.maxPromptChars) {
       throw bridgeError(adapter, 'result_too_long', 400, `adapter "${adapter.id}": the tool result${results.length > 1 ? 's are' : ' is'} ${size} chars, over maxPromptChars=${adapter.maxPromptChars}`, { noFallback: true });
     }
+    // The CLI's own ceiling on one result (driver.resultMax): past it Claude Code gives its model a
+    // preview and leaves the rest in a file, whatever maxPromptChars says.
+    const ceiling = driver.resultMax?.(adapter);
+    const long = ceiling ? results.find((r) => r.text.length > ceiling) : null;
+    if (long) {
+      throw bridgeError(adapter, 'result_too_long', 400, `adapter "${adapter.id}": a tool result is ${long.text.length} chars, over the ${ceiling} that ${driver.id} gives its model whole in one result (a longer one it shows as a preview); raising maxPromptChars does not move it. Trim the result.`, { noFallback: true });
+    }
     // Claimed now, before the wait for a process slot: a second request for the same result is a 409.
     s.attach();
     let release;

@@ -60,8 +60,11 @@ import { CLI_PROFILES } from '../profiles.js';
  *             call. Each tool is listed with `_meta: {"anthropic/maxResultSizeChars":
  *             maxPromptChars}`: without it 2.1.303 wrote a result over ~50,000 chars to
  *             ~/.claude/projects/<workspace>/<session>/tool-results/ — left there when the session
- *             was gone — and showed the model a 2 KB preview and the path to Read. Its assistant
- *             message prints each tool_use block before the call runs.
+ *             was gone — and showed the model a 2 KB preview and the path to Read. 2.1.303 honours
+ *             the _meta up to 500,000 chars (`Math.min(meta, 500000)`), so past that it is
+ *             500,000, and a longer result is a 400 before it reaches Claude Code (`resultMax`),
+ *             whatever maxPromptChars says. Its assistant message prints each tool_use block
+ *             before the call runs.
  *
  * How a step's calls reach the client (`batch`, src/bridge/index.js): codex 0.163 and qoder 1.1.59
  * run them one after another — asked for two at once, each sent its second tools/call only after
@@ -95,17 +98,29 @@ export function tomlString(s) {
 export const CLAUDE_BRIDGE_ARGS = CLI_PROFILES.claude.bridge.args;
 
 /**
+ * The longest MCP tool result Claude Code gives its model whole, whatever the tool's _meta says:
+ * 2.1.303 takes `Math.min(_meta["anthropic/maxResultSizeChars"], 500000)` as a tool's threshold
+ * (2026-11-03, against a stub Messages endpoint: under a _meta of 700,000 a 450,009-char result
+ * went whole, a 550,032-char one to a file under the config dir's projects/ and the model a
+ * 2,436-char preview).
+ */
+export const CLAUDE_RESULT_CEILING = 500_000;
+
+/**
  * A driver for a CLI whose session lives in files under `.keysmith-bridge/`: `files(adapter,
  * session, base)` the files to write (`[{ file, content }]`), `vars(...)` its argv's placeholders,
- * `env(...)` its environment, `toolMeta(adapter)` the `_meta` its tools are listed with.
+ * `env(...)` its environment, `toolMeta(adapter)` the `_meta` its tools are listed with,
+ * `resultMax(adapter)` the longest one result it takes whole (null: maxPromptChars alone).
  */
-function fileDriver({ id, parser, parserOpts = {}, usageAtEnd = false, prefix, harnessTools = [], batch = 'serial', settleMs = 0, files, vars = () => ({}), env = (adapter) => bridgeEnv(adapter), toolMeta = () => null }) {
+function fileDriver({ id, parser, parserOpts = {}, usageAtEnd = false, prefix, harnessTools = [], batch = 'serial', settleMs = 0, files, vars = () => ({}), env = (adapter) => bridgeEnv(adapter), toolMeta = () => null, resultMax = () => null }) {
   return {
     id,
     parser,
     parserOpts,
     /** The `_meta` each of the session's tools is listed with (tools/list), or null for none. */
     toolMeta,
+    /** The longest one tool result the CLI gives its model whole, or null for no ceiling of its own (index.js _attach). */
+    resultMax,
     // The CLI says what a run spent only when the run ends (codex's turn.completed, qoder's result
     // line): an answer that hands a call out before then has no count of its own (index.js).
     usageAtEnd,
@@ -303,10 +318,14 @@ export const claudeDriver = fileDriver({
       },
     });
   },
-  // A result as long as the adapter takes one (a longer one is a 400 before it reaches the CLI:
-  // index.js _attach) goes to the model whole, never to a file under ~/.claude/projects/.
+  // A result as long as the adapter takes one, up to Claude Code's own ceiling (a longer one is a
+  // 400 before it reaches the CLI: index.js _attach), goes to the model whole, never to a file
+  // under ~/.claude/projects/.
   toolMeta(adapter) {
-    const max = adapter.maxPromptChars;
+    const max = Math.min(adapter.maxPromptChars, CLAUDE_RESULT_CEILING);
     return Number.isFinite(max) && max > 0 ? { 'anthropic/maxResultSizeChars': max } : null;
+  },
+  resultMax() {
+    return CLAUDE_RESULT_CEILING;
   },
 });

@@ -19,7 +19,7 @@ import { CLI_PROFILES } from '../src/profiles.js';
 import { CliAdapter } from '../src/cli-adapter.js';
 import { SESSION_DEFAULTS } from '../src/bridge/hub.js';
 import { SHIM } from '../src/bridge/agy.js';
-import { CLAUDE_BRIDGE_ARGS, claudeDriver, codexDriver, opencodeDriver, qoderDriver } from '../src/bridge/clis.js';
+import { CLAUDE_BRIDGE_ARGS, CLAUDE_RESULT_CEILING, claudeDriver, codexDriver, opencodeDriver, qoderDriver } from '../src/bridge/clis.js';
 import { DRIVERS } from '../src/bridge/drivers.js';
 import { claudeStreamJson, codexJson } from '../src/parsers.js';
 
@@ -747,27 +747,52 @@ test('claude: each tool the hub lists to Claude Code takes a result as long as t
 });
 
 // A finding of the independent re-check of 2026-11-03 (Claude Code 2.1.303 against a stub Messages
-// endpoint): the _meta above is honoured only up to 500,000 chars. Marked todo until the bridge does
-// what it says.
+// endpoint): the _meta above is honoured only up to 500,000 chars. With maxPromptChars 700,000 a
+// 550,032-char result was written to <config dir>/projects/<workspace>/<session>/tool-results/ (0644,
+// left after the run) and the model given a 2,436-char preview. The stub models that ceiling.
 
-test('claude: an entry whose maxPromptChars is over Claude Code\'s 500,000-char ceiling for a tool\'s _meta never has a result spilled — a longer one is a 400 before Claude Code, or reaches the model whole', {
-  todo: 'Claude Code 2.1.303 takes `Math.min(_meta["anthropic/maxResultSizeChars"], 500000)` as a tool\'s threshold: with `keysmith set claude maxPromptChars 700000` (the cap the 400 tells a client to raise) a 550,032-char result was written to <config dir>/projects/<workspace>/<session>/tool-results/toolu_….json (557 KB, 0644, left after the run) and the model got a 2,436-char preview — blocker 1 again, past 500,000. driver.toolMeta and the attach check want the smaller of maxPromptChars and 500,000',
-}, async (ctx) => {
+test('claude: an entry whose maxPromptChars is over Claude Code\'s 500,000-char ceiling for a tool\'s _meta never has a result spilled — its tools say 500,000, a result of 500,000 chars reaches the model whole and a longer one is a 400 before Claude Code', async (ctx) => {
   ctx.after(closeAll);
-  const t = tag();
+  assert.equal(gateway.adapters.get('ccw').maxPromptChars, 600_000);
+  // At the ceiling: listed with it, and the result reaches the model whole.
+  const t1 = tag();
+  const fits = (c) => `${c.args.city}:` + 'w'.repeat(500_000 - c.args.city.length - 1);
+  const c1 = conversation('ccw/m', `Weather ${t1}`);
+  assert.equal((await c1.ask()).r.status, 200);
+  const [s1] = startsOf(t1);
+  assert.deepEqual(eventsOf(s1.pid).find((e) => e.event === 'mcp').meta, [{ 'anthropic/maxResultSizeChars': 500_000 }], 'the smaller of maxPromptChars and Claude Code\'s ceiling');
+  c1.results(fits);
+  const b1 = await c1.ask();
+  assert.equal(b1.r.status, 200, b1.r.text);
+  assert.equal(fits({ args: { city: 'Ankara' } }).length, 500_000);
+  assert.equal(b1.text, `Weather: ${fits({ args: { city: 'Ankara' } })}`, 'the result reached the model whole');
+  assert.ok(!eventsOf(s1.pid).some((e) => e.event === 'spilled'), 'no result left in a file of Claude Code\'s');
+
+  // Past it: a 400 that says why, before Claude Code has the result; the session still waits on it.
+  const t2 = tag();
   const big = (c) => `${c.args.city}:` + 'z'.repeat(550_000);
-  const c = conversation('ccw/m', `Weather ${t}`);
-  const a1 = await c.ask();
-  assert.equal(a1.r.status, 200, a1.r.text);
-  const [start] = startsOf(t);
-  c.results(big);
-  const a2 = await c.ask();
-  assert.ok(!eventsOf(start.pid).some((e) => e.event === 'spilled'), 'no result left in a file of Claude Code\'s');
-  if (a2.r.status === 400) assert.match(JSON.parse(a2.r.text).error.message, /tool result/);
-  else {
-    assert.equal(a2.r.status, 200, a2.r.text);
-    assert.equal(a2.text, `Weather: ${big({ args: { city: 'Ankara' } })}`, 'the result reached the model whole');
-  }
+  const c2 = conversation('ccw/m', `Weather ${t2}`);
+  assert.equal((await c2.ask()).r.status, 200);
+  const [s2] = startsOf(t2);
+  c2.results(big);
+  const b2 = await c2.ask();
+  assert.equal(b2.r.status, 400, b2.r.text);
+  assert.match(JSON.parse(b2.r.text).error.message, /a tool result is 550007 chars, over the 500000 that claude gives its model whole in one result .*raising maxPromptChars does not move it/);
+  assert.equal(rowsOf('ccw/m').at(-1).failure, 'result_too_long');
+  assert.ok(!eventsOf(s2.pid).some((e) => e.event === 'spilled' || e.event === 'result'), 'Claude Code never had it');
+  // The same session takes the result trimmed.
+  c2.history.at(-1).content = 'Ankara: trimmed';
+  const b3 = await c2.ask();
+  assert.equal(b3.r.status, 200, b3.r.text);
+  assert.equal(b3.text, 'Weather: Ankara: trimmed');
+  assert.equal(startsOf(t2).length, 1, 'on the session that waited, no other run');
+
+  // Under maxPromptChars 500,000 or less the ceiling never comes into it (cc, 200,000: its own 400).
+  assert.deepEqual(claudeDriver.toolMeta({ maxPromptChars: 200_000 }), { 'anthropic/maxResultSizeChars': 200_000 });
+  assert.deepEqual(claudeDriver.toolMeta({ maxPromptChars: 500_000 }), { 'anthropic/maxResultSizeChars': 500_000 });
+  assert.deepEqual(claudeDriver.toolMeta({ maxPromptChars: 700_000 }), { 'anthropic/maxResultSizeChars': CLAUDE_RESULT_CEILING });
+  assert.equal(CLAUDE_RESULT_CEILING, 500_000);
+  for (const d of [codexDriver, opencodeDriver, qoderDriver]) assert.equal(d.resultMax({ maxPromptChars: 700_000 }), null, `${d.id}: no ceiling of its own`);
 });
 
 test('the other CLIs\' tools are listed with no _meta: what claude reads off a tool is claude\'s alone', async () => {
