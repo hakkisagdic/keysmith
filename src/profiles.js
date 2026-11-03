@@ -522,11 +522,15 @@ export const CLI_PROFILES = {
  * when it is slow, cold or out of quota.
  */
 /**
- * Parsers a built-in CLI profile shipped before its current one, so an entry attached then is still
- * known as made from it (`keysmith set`, `upgrade`): codex ran plain `exec` (raw) until its text runs
- * took `--json` for their usage.
+ * Parsers a built-in CLI profile shipped before its current one, each with the argv token that
+ * ended it: an entry attached then is still known as made from the profile (`keysmith set`,
+ * `upgrade`), and its text argv and parser change together or not at all — an entry whose argv
+ * has the token under the former parser, or lacks it under the profile's, is refused at load
+ * (src/cli-adapter.js). codex ran plain `exec` (raw) until its text runs took `--json` for their
+ * usage: `exec --json` read as raw answers with codex's JSONL event stream, plain `exec` read as
+ * codex-json-final with nothing.
  */
-export const FORMER_PARSERS = { codex: ['raw'] };
+export const FORMER_PARSERS = { codex: { raw: '--json' } };
 
 export const HTTP_PROFILES = {
   // `media`: what the API itself takes in a user turn (src/media.js). Audio reaches only OpenAI's

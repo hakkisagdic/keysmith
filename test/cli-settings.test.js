@@ -137,6 +137,53 @@ test('keysmith upgrade: a codex entry attached when its text runs were plain `ex
   assert.equal(now.args[1], '--json');
 });
 
+test('keysmith upgrade: a codex entry of parser raw takes `exec --json` only with its parser — a part refused, with the one command that brings the rest — and then answers with text', async (t) => {
+  const { run, read, edit } = sandbox(t);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-codex-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // A codex that prints what the real one does: the JSONL event stream with --json, the last message without.
+  const bin = path.join(dir, 'codex');
+  fs.writeFileSync(bin, `#!/usr/bin/env node
+const json = process.argv.includes('--json');
+if (!json) process.stdout.write('PONG\\n');
+else for (const l of [{ type: 'thread.started', thread_id: 'th' }, { type: 'turn.started' }, { type: 'item.completed', item: { id: 'i0', type: 'agent_message', text: 'PONG' } }, { type: 'turn.completed', usage: { input_tokens: 9, cached_input_tokens: 0, output_tokens: 1 } }]) process.stdout.write(JSON.stringify(l) + '\\n');
+`, { mode: 0o755 });
+  assert.equal(run('add', 'codex', '--bin', bin).status, 0);
+  // As main attached it: plain `exec` under parser raw, no {effort} anywhere.
+  const noEffort = (a) => a.filter((x) => !(Array.isArray(x) && x.includes('model_reasoning_effort="{effort}"')));
+  const plain = (a) => noEffort(a).filter((x) => x !== '--json');
+  edit('codex', (e) => {
+    e.parser = 'raw';
+    e.args = plain(e.args);
+    e.emulateArgs = plain(e.emulateArgs);
+    e.bridge.args = noEffort(e.bridge.args);
+    e.cwd = path.join(dir, 'ws');
+  });
+  const mainEntry = read();
+  let r = run('upgrade', 'codex', '--take', 'emulateArgs,bridge', '--apply');
+  assert.notEqual(r.status, 0, 'emulateArgs alone would be `exec --json` read as raw');
+  assert.match(r.all, /not upgraded: codex: adapter "codex": its emulateArgs runs `--json`, whose output parser raw would hand back as the answer .* --take args,parser --apply/);
+  assert.match(r.all, /^ {2}with the fields you named: keysmith upgrade codex --take emulateArgs,bridge,args,parser --apply$/m);
+  assert.deepEqual(read(), mainEntry, 'nothing written');
+  r = run('upgrade', 'codex', '--take', 'args', '--apply');
+  assert.notEqual(r.status, 0, 'the advice before this fix');
+  assert.match(r.all, /its args runs `--json`.*--take emulateArgs,parser --apply[\s\S]*with the fields you named: keysmith upgrade codex --take args,emulateArgs,parser --apply/);
+  assert.deepEqual(read(), mainEntry);
+  r = run('upgrade', 'codex', '--take', 'emulateArgs,bridge,args,parser', '--apply');
+  assert.equal(r.status, 0, r.all);
+  const now = read().adapters.codex;
+  assert.equal(now.parser, 'codex-json-final');
+  assert.deepEqual([now.args, now.emulateArgs, now.bridge], [CLI_PROFILES.codex.args, CLI_PROFILES.codex.emulateArgs, CLI_PROFILES.codex.bridge]);
+  const { CliAdapter } = await import('../src/cli-adapter.js');
+  const answer = async (cfg) => {
+    let text = '';
+    for await (const e of new CliAdapter('codex', cfg).complete({ model: 'gpt-x', messages: [{ role: 'user', content: 'say PONG' }] })) if (e.type === 'delta') text += e.text;
+    return text;
+  };
+  assert.equal(await answer(now), 'PONG', 'the text, not the JSONL');
+  assert.equal(await answer(mainEntry.adapters.codex), 'PONG', 'and as main ran it, plain');
+});
+
 test('keysmith upgrade: a profile file the entry lacks is added, one it changed is kept — --take replaces it', (t) => {
   const { run, read, edit } = sandbox(t);
   assert.equal(run('add', 'agy', '--bin', '/usr/local/bin/agy').status, 0);

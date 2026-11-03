@@ -72,7 +72,7 @@ test('codex-json-final: what plain `codex exec` prints — the last agent messag
 // sets its failure flag only when !will_retry), then goes on to turn.completed and exits 0. Plain
 // `codex exec` (parser raw, before this branch) printed that notice on stderr and the answer on
 // stdout. Through a stub that prints this run, every face answered 502 "codex: Reconnecting… 1/5".
-test('codex-json-final: a stream error codex retries ("Reconnecting... 1/5") and a turn that then completes is the answer, not a failure', { todo: 'a retried stream error is read as the run\'s failure: 502 for an answer codex gave' }, async () => {
+test('codex-json-final: a stream error codex retries ("Reconnecting... 1/5") and a turn that then completes is the answer, not a failure', async () => {
   const events = await all(
     codexJsonFinal(
       lines([
@@ -86,6 +86,26 @@ test('codex-json-final: a stream error codex retries ("Reconnecting... 1/5") and
   );
   assert.deepEqual(events.filter((e) => e.type === 'delta'), [{ type: 'delta', text: 'PONG' }]);
   assert.deepEqual(events.filter((e) => e.type === 'error'), [], 'codex retried and answered: no error reaches the client');
+});
+
+test('codex-json: an `error` line is the run\'s failure when the turn does not complete — turn.failed says it once, and an end with no turn says the held line', async () => {
+  const RETRY = { type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion)' };
+  const errors = async (parser, list) => (await all(parser(lines(list)))).filter((e) => e.type === 'error');
+  const { codexJson } = await import('../src/parsers.js');
+  for (const parser of [codexJson, codexJsonFinal]) {
+    // The bridge's parser too: its run is one turn, and a retried error inside it is no failure.
+    assert.deepEqual(await errors(parser, [{ type: 'turn.started' }, RETRY, { type: 'item.completed', item: { id: 'a', type: 'agent_message', text: 'ok' } }, { type: 'turn.completed' }]), [], parser.name);
+    // Retries spent: codex prints the error it will not retry, then turn.failed — one failure, turn.failed's.
+    assert.deepEqual(await errors(parser, [{ type: 'turn.started' }, RETRY, { type: 'error', message: 'stream disconnected: gave up' }, { type: 'turn.failed', error: { message: 'stream disconnected: gave up' } }]), [{ type: 'error', message: 'codex: stream disconnected: gave up' }], parser.name);
+    // turn.failed that names nothing: the held line names it.
+    assert.deepEqual(await errors(parser, [{ type: 'turn.started' }, { type: 'error', message: 'quota exceeded' }, { type: 'turn.failed' }]), [{ type: 'error', message: 'codex: quota exceeded' }], parser.name);
+    // No turn at all (a refused login, a bad flag), or a run that stopped mid-turn: the line is the failure.
+    assert.deepEqual(await errors(parser, [{ type: 'error', message: 'not logged in' }]), [{ type: 'error', message: 'codex: not logged in' }], parser.name);
+    assert.deepEqual(await errors(parser, [{ type: 'turn.started' }, RETRY]), [{ type: 'error', message: `codex: ${RETRY.message}` }], parser.name);
+  }
+  // A final message left unsent when the run stopped: the error goes first, as it was printed first (a 502, not a half answer).
+  const ev = await all(codexJsonFinal(lines([{ type: 'turn.started' }, RETRY, { type: 'item.completed', item: { id: 'a', type: 'agent_message', text: 'half' } }])));
+  assert.deepEqual(ev.map((e) => e.type), ['error', 'delta', 'done']);
 });
 
 test('the Anthropic wire: input_tokens is the uncached input, so the cache\'s counts are added to `input`', async () => {
@@ -128,6 +148,17 @@ before(async () => {
       plain: { kind: 'cli', bin: stubCli('plain', `const p = process.argv.at(-1); process.stdout.write(p.includes('Answer format') ? '{"final":"emulated"}' : 'plain answer');`), args: ['{prompt}'], parser: 'raw', models: ['m'], cwd: path.join(dir, 'ws-plain'), toolMode: 'emulate' },
       // Claude Code's stream, its cache counts and all.
       cc: { kind: 'cli', bin: stubCli('cc', `process.stdout.write(${JSON.stringify(claudeOut)} + '\\n');`), args: ['{prompt}'], parser: 'claude-stream-json', models: ['m'] },
+      // codex exec --json on a run whose stream codex retried once, then completed (exit 0).
+      cxretry: {
+        kind: 'cli',
+        bin: stubCli('cxretry', `const p = process.argv.at(-1); const text = p.includes('Answer format') ? '{"final":"emulated"}' : 'PONG';
+for (const l of [{ type: 'thread.started', thread_id: 'th' }, { type: 'turn.started' }, { type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion: error sending request)' }, { type: 'item.completed', item: { id: 'i0', type: 'agent_message', text } }, { type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 } }]) process.stdout.write(JSON.stringify(l) + '\\n');`),
+        args: ['exec', '--json', '--', '{prompt}'],
+        parser: 'codex-json-final',
+        models: ['m'],
+        cwd: path.join(dir, 'ws-cxretry'),
+        toolMode: 'emulate',
+      },
     },
   };
   gateway = new Gateway(cfg, { log: () => {} });
@@ -198,6 +229,41 @@ test('Claude Code\'s counts: every input token on the OpenAI faces (the cached o
   }
   assert.deepEqual(faces.chat[1].usage, { input: 12017, output: 52, cacheRead: 10000, cacheWrite: 2003 });
   assert.equal(faces.chat[1].usageReason, undefined);
+});
+
+test('codex: a stream error it retried, then a completed turn, is the answer on every face, streamed or not, with its usage — and through EMULATE', async () => {
+  const msgs = [{ role: 'user', content: 'hi' }];
+  const text = {
+    chat: (t) => JSON.parse(t).choices[0].message.content,
+    chatStream: (t) => sse(t).map((c) => c.choices?.[0]?.delta?.content || '').join(''),
+    messages: (t) => JSON.parse(t).content.map((b) => b.text).join(''),
+    messagesStream: (t) => sse(t).map((e) => e.delta?.text || '').join(''),
+    responses: (t) => JSON.parse(t).output.flatMap((o) => o.content || []).map((c) => c.text).join(''),
+    responsesStream: (t) => sse(t).filter((e) => e.type === 'response.output_text.delta').map((e) => e.delta).join(''),
+  };
+  const asks = {
+    chat: ['/v1/chat/completions', { model: 'cxretry/m', messages: msgs }],
+    chatStream: ['/v1/chat/completions', { model: 'cxretry/m', messages: msgs, stream: true }],
+    messages: ['/v1/messages', { model: 'cxretry/m', max_tokens: 64, messages: msgs }],
+    messagesStream: ['/v1/messages', { model: 'cxretry/m', max_tokens: 64, messages: msgs, stream: true }],
+    responses: ['/v1/responses', { model: 'cxretry/m', input: 'hi' }],
+    responsesStream: ['/v1/responses', { model: 'cxretry/m', input: 'hi', stream: true }],
+  };
+  for (const [face, [route, body]] of Object.entries(asks)) {
+    const r = await post(route, body);
+    assert.equal(r.status, 200, `${face}: ${r.text}`);
+    assert.doesNotMatch(r.text, /Reconnecting/, face);
+    assert.equal(text[face](r.text), 'PONG', face);
+    const row = lastRow();
+    assert.equal(row.status, 'ok', face);
+    assert.deepEqual([row.usage?.input, row.usage?.output], [100, 5], face);
+  }
+  const tools = [{ type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {} } } }];
+  const r = await post('/v1/chat/completions', { model: 'cxretry/m', tools, messages: msgs });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(JSON.parse(r.text).choices[0].message.content, 'emulated');
+  assert.equal(lastRow().toolMode, 'emulate');
+  assert.equal(lastRow().status, 'ok');
 });
 
 test('EMULATE through a CLI that reports no tokens: the answer says so the same way', async () => {

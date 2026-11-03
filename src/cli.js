@@ -411,7 +411,7 @@ function profileFor(id, entry) {
   const parser = entry.parser || 'raw';
   for (const [name, p] of Object.entries(CLI_PROFILES)) {
     // An entry attached before its profile changed parser (codex: raw, before `--json`) is still that profile's.
-    if (path.basename(String(p.bin)) === bin && ((p.parser || 'raw') === parser || FORMER_PARSERS[name]?.includes(parser))) return [name, p];
+    if (path.basename(String(p.bin)) === bin && ((p.parser || 'raw') === parser || Object.hasOwn(FORMER_PARSERS[name] || {}, parser))) return [name, p];
   }
   return null;
 }
@@ -611,7 +611,10 @@ function cmdUpgrade(flags) {
     try {
       checkAdapter(id, plan.next);
     } catch (e) {
-      refused.push(`${id}: ${e.message}`);
+      // A refusal that names fields to take together (an argv and the parser that reads it):
+      // the one command that takes them with the ones asked for.
+      const together = e.take?.length && take.length ? [...new Set([...take, ...e.take])] : null;
+      refused.push(`${id}: ${e.message}${together ? `\n  with the fields you named: keysmith upgrade ${id} --take ${together.join(',')} --apply` : ''}`);
     }
     plans.push([id, plan]);
   }

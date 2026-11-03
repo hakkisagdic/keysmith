@@ -7,6 +7,7 @@ import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, age
 import { checkToolMode } from './tools/router.js';
 import { checkMedia, hasMedia, mediaPrompt } from './media.js';
 import { takesEffort } from './effort.js';
+import { CLI_PROFILES, FORMER_PARSERS } from './profiles.js';
 
 /**
  * Run a coding CLI once per request and turn its stdout into a chat completion.
@@ -91,15 +92,21 @@ export class CliAdapter {
     }
     // Answers only a request that names it: never an alias leg, never probed.
     this.explicitOnly = !!cfg.explicitOnly || this.unsafeTools;
+    // An entry of a built-in profile that changed parser along with its argv (FORMER_PARSERS — codex:
+    // plain `exec` under raw, then `exec --json` under codex-json-final) runs the two together or
+    // not at all. `upgrade --take` brings one field at a time, and an entry left half-way answers
+    // every request with codex's JSONL event stream (200 OK) or with nothing: refused here, with the
+    // fields that bring it whole.
+    this._lineage = parserLineage(this.bin, this.parser);
+    checkLineage(id, this._lineage, this._textTemplates());
     // A CLI that takes a reasoning effort: every argv template it has says where (`{effort}`), and
     // its catalogue which levels each model takes (src/effort.js). An entry upgraded in part (the
     // bridge's argv has it, `args` not yet) takes none, so no path of it runs a request's effort
     // and another refuses it: `effortGap` names the templates that lack it.
-    const templates = { args: this.args, resumeArgs: this.resumeArgs, emulateArgs: this.emulateArgs, visionArgs: this.visionArgs, 'bridge.args': this.bridge?.args };
-    const present = Object.entries(templates).filter(([, t]) => Array.isArray(t));
+    const present = [...this._textTemplates(), ...(Array.isArray(this.bridge?.args) ? [['bridge.args', this.bridge.args]] : [])];
     const lacking = present.filter(([, t]) => !takesEffort(t)).map(([k]) => k);
     this.takesEffort = present.length > 0 && !lacking.length;
-    this.effortGap = lacking.length && lacking.length < present.length ? `${id}'s ${lacking.join(', ')} take${lacking.length > 1 ? '' : 's'} no {effort} — keysmith upgrade ${id} --take ${lacking.join(',')} --apply brings the profile's` : null;
+    this.effortGap = lacking.length && lacking.length < present.length ? `${id}'s ${lacking.join(', ')} take${lacking.length > 1 ? '' : 's'} no {effort} — keysmith upgrade ${id} --take ${this.takeFor(lacking).join(',')} --apply brings the profile's` : null;
     this.env = cfg.env || {};
     this.timeoutMs = cfg.timeoutMs ?? 300_000;
     this.priority = cfg.priority ?? 200;
@@ -117,6 +124,28 @@ export class CliAdapter {
 
   get resumable() {
     return !!(this.resumeArgs && this.persistSessions);
+  }
+
+  /** The argv templates whose output `this.parser` reads, as `[field, template]`: every one the entry has but the bridge's. */
+  _textTemplates() {
+    return Object.entries({ args: this.args, resumeArgs: this.resumeArgs, emulateArgs: this.emulateArgs, visionArgs: this.visionArgs }).filter(([, t]) => Array.isArray(t));
+  }
+
+  /**
+   * The `keysmith upgrade <id> --take` list that brings these fields from the built-in profile, as
+   * the command takes them: the bridge's argv is `bridge`; and on an entry still on a parser its
+   * profile had before (codex: raw), a field whose profile argv has the token that parser cannot
+   * read (`--json`) brings the parser, and with it every text template still without the token —
+   * `--take args` alone would be refused at load (checkLineage).
+   */
+  takeFor(fields) {
+    const take = fields.map((f) => (f === 'bridge.args' ? 'bridge' : f));
+    const l = this._lineage;
+    if (l?.former && fields.some((f) => hasToken(l.profile[f], l.token))) {
+      for (const [field, t] of this._textTemplates()) if (!hasToken(t, l.token) && Object.hasOwn(l.profile, field)) take.push(field);
+      take.push('parser');
+    }
+    return [...new Set(take)];
   }
 
   async models() {
@@ -221,7 +250,8 @@ export class CliAdapter {
    */
   emulateRun({ text, model, effort = null, timeoutMs, signal }) {
     const tpl = this.emulateArgs || this.args;
-    effortIn(this.id, this.emulateArgs ? 'emulateArgs' : 'args', tpl, effort);
+    const field = this.emulateArgs ? 'emulateArgs' : 'args';
+    effortIn(this.id, field, tpl, effort, this.takeFor([field]));
     const argv = joinArgs(tpl, {
       model: model || '',
       effort: effort || '',
@@ -259,7 +289,8 @@ export class CliAdapter {
     const useResume = !!(session && this.resumable) && !rendered && !vision;
     const stdinFor = (text) => (vision ? vision.stdin(text) : this.promptVia === 'stdin' ? text : null);
     const tpl = vision ? this.visionArgs : useResume ? this.resumeArgs : this.args;
-    effortIn(this.id, vision ? 'visionArgs' : useResume ? 'resumeArgs' : 'args', tpl, effort);
+    const field = vision ? 'visionArgs' : useResume ? 'resumeArgs' : 'args';
+    effortIn(this.id, field, tpl, effort, this.takeFor([field]));
     const argvFor = (text) => {
       const argv = joinArgs(tpl, {
         model: model || '',
@@ -499,11 +530,58 @@ export async function* noteUsageGap(events, reason) {
 /**
  * An effort for an argv template that has no `{effort}`: a 400 that says how to get one — never
  * the run without it (an adapter whose argv takes no effort anywhere is handed none: effort.js).
+ * `take`: the `--take` list that brings it (CliAdapter.takeFor); the bridge's argv is `bridge`.
  */
-export function effortIn(adapterId, field, tpl, effort) {
+export function effortIn(adapterId, field, tpl, effort, take = [field === 'bridge.args' ? 'bridge' : field]) {
   if (effort && !takesEffort(tpl)) {
-    throw new LlmError(`adapter "${adapterId}": its ${field} has no {effort}, so this run cannot take effort "${effort}" — keysmith upgrade ${adapterId} --take ${field} brings the profile's`, { status: 400, type: 'invalid_request_error', provider: adapterId });
+    throw new LlmError(`adapter "${adapterId}": its ${field} has no {effort}, so this run cannot take effort "${effort}" — keysmith upgrade ${adapterId} --take ${take.join(',')} --apply brings the profile's`, { status: 400, type: 'invalid_request_error', provider: adapterId });
   }
+}
+
+/** Whether an argv template holds this token, in an optional group or not. */
+function hasToken(tpl, token) {
+  return Array.isArray(tpl) && tpl.flat(Infinity).includes(token);
+}
+
+/**
+ * The built-in profile an entry is of when that profile changed parser (FORMER_PARSERS), judged as
+ * `keysmith set` judges it — the binary's name — and only on the parser the profile runs now or
+ * one it ran before: `{ name, profile, parser, token, former }`, `token` the argv token that ended
+ * the former parser, `former` whether the entry runs it. Null for any other entry.
+ */
+function parserLineage(bin, parser) {
+  const base = path.basename(String(bin));
+  for (const [name, formers] of Object.entries(FORMER_PARSERS)) {
+    const profile = CLI_PROFILES[name];
+    if (!profile || path.basename(String(profile.bin)) !== base) continue;
+    if (Object.hasOwn(formers, parser)) return { name, profile, parser, token: formers[parser], former: true };
+    const tokens = Object.values(formers);
+    if ((profile.parser || 'raw') === parser && tokens.length === 1) return { name, profile, parser, token: tokens[0], former: false };
+  }
+  return null;
+}
+
+/**
+ * An entry of such a profile whose text argv and parser disagree: the token under the former parser
+ * (`exec --json` read as raw — every answer codex's event stream, 200 OK), or no token under the
+ * profile's (plain `exec` read as codex-json-final — every answer empty). The error names the
+ * `--take` list that brings the entry whole, as `take` too, so `keysmith upgrade` can add the
+ * fields it was asked for.
+ */
+function checkLineage(id, lineage, templates) {
+  if (!lineage) return;
+  const { token, former, profile } = lineage;
+  const odd = templates.filter(([, t]) => hasToken(t, token) === former).map(([k]) => k);
+  if (!odd.length) return;
+  const lacking = templates.filter(([, t]) => !hasToken(t, token)).map(([k]) => k);
+  const take = [...lacking.filter((f) => Object.hasOwn(profile, f)), ...(former ? ['parser'] : [])];
+  const own = lacking.filter((f) => !Object.hasOwn(profile, f));
+  const what = former
+    ? `its ${odd.join(', ')} run${odd.length > 1 ? '' : 's'} \`${token}\`, whose output parser ${lineage.parser} would hand back as the answer — every reply ${lineage.name}'s event stream`
+    : `its ${odd.join(', ')} run${odd.length > 1 ? '' : 's'} without \`${token}\`, and parser ${lineage.parser} reads only what \`${token}\` prints — every answer would be empty`;
+  const fix = take.length ? ` — keysmith upgrade ${id} --take ${take.join(',')} --apply brings the "${lineage.name}" profile's argv and parser together` : '';
+  const rest = own.length ? `${take.length ? '; ' : ' — '}the profile has no ${own.join(', ')}: give ${own.length > 1 ? 'them' : 'it'} \`${token}\` or take ${own.length > 1 ? 'them' : 'it'} out` : '';
+  throw Object.assign(new Error(`adapter "${id}": ${what}${fix}${rest}`), { take });
 }
 
 /** Below this much of `timeoutMs` left, a refused run is reported instead of retried. */

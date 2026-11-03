@@ -243,15 +243,43 @@ test('an entry upgraded in part (`{effort}` in some templates, not all) takes no
 });
 
 // A finding of the independent test of 2026-11-03: a codex entry attached before (parser raw, plain
-// `exec`) upgraded in part (`--take emulateArgs,bridge`) is told to `--take args`. That brings
-// `exec --json` and leaves parser raw, so every text answer is codex's JSONL event stream, 200 OK.
-test('a codex entry upgraded in part is told to take its parser along with args: `exec --json` is never read as raw', { todo: 'the advice names args alone, and args with --json under parser raw answers with the JSONL' }, async () => {
-  const { CliAdapter } = await import('../src/cli-adapter.js');
+// `exec`) upgraded in part (`--take emulateArgs,bridge`) was told to `--take args`. That brought
+// `exec --json` and left parser raw, so every text answer was codex's JSONL event stream, 200 OK.
+// The advice takes the parser along, and an entry whose text argv and parser disagree does not load.
+test('a codex entry upgraded in part is told to take its parser along with args: `exec --json` is never read as raw', async () => {
+  const { CliAdapter, effortIn } = await import('../src/cli-adapter.js');
   const p = structuredClone(CLI_PROFILES.codex);
-  const plain = (a) => a.filter((t) => t !== '--json' && !(Array.isArray(t) && t.includes('model_reasoning_effort="{effort}"')));
-  const half = new CliAdapter('codex', { ...p, args: plain(p.args), parser: 'raw' });
-  assert.equal(half.takesEffort, false);
-  assert.match(half.effortGap, /--take args,parser\b|--take parser,args\b/, half.effortGap);
+  const noEffort = (a) => a.filter((t) => !(Array.isArray(t) && t.includes('model_reasoning_effort="{effort}"')));
+  const plain = (a) => noEffort(a).filter((t) => t !== '--json');
+  // As attached before (raw, plain exec), the bridge taken: its text runs take no effort, and the advice brings their parser too.
+  const before = new CliAdapter('codex', { ...p, args: plain(p.args), emulateArgs: plain(p.emulateArgs), parser: 'raw' });
+  assert.equal(before.takesEffort, false);
+  assert.match(before.effortGap, /codex's args, emulateArgs take no \{effort\} — keysmith upgrade codex --take args,emulateArgs,parser --apply brings the profile's/);
+  assert.deepEqual(before.takeFor(['args']), ['args', 'emulateArgs', 'parser']);
+  assert.throws(() => effortIn('codex', 'args', before.args, 'high', before.takeFor(['args'])), (e) => e.status === 400 && /--take args,emulateArgs,parser --apply/.test(e.message));
+  // The entry the test left: emulateArgs taken (`exec --json`), args and parser not. Refused, with what brings it whole.
+  assert.throws(
+    () => new CliAdapter('codex', { ...p, args: plain(p.args), parser: 'raw' }),
+    (e) => {
+      assert.match(e.message, /^adapter "codex": its emulateArgs runs `--json`, whose output parser raw would hand back as the answer — every reply codex's event stream — keysmith upgrade codex --take args,parser --apply brings the "codex" profile's argv and parser together$/);
+      assert.deepEqual(e.take, ['args', 'parser']);
+      return true;
+    },
+  );
+  // What `--take args` alone, the old advice, would have left: refused the same way.
+  assert.throws(() => new CliAdapter('codex', { ...p, emulateArgs: plain(p.emulateArgs), parser: 'raw' }), /its args runs `--json`.* --take emulateArgs,parser --apply/);
+  // The other half, the profile's parser over plain `exec`, answers nothing: refused too.
+  assert.throws(() => new CliAdapter('codex', { ...p, args: plain(p.args) }), /its args runs without `--json`, and parser codex-json-final reads only what `--json` prints — every answer would be empty — keysmith upgrade codex --take args --apply/);
+  // Known by its binary under any id; a template the profile has none of is the entry's to fix.
+  assert.throws(() => new CliAdapter('cx', { ...p, bin: '/opt/homebrew/bin/codex', parser: 'raw' }), /^Error: adapter "cx": its args, emulateArgs run `--json`.* keysmith upgrade cx --take parser --apply/);
+  assert.throws(() => new CliAdapter('codex', { ...p, resumeArgs: plain(p.args), persistSessions: true }), /its resumeArgs runs without `--json`.* — the profile has no resumeArgs: give it `--json` or take it out$/);
+  // Another CLI on raw with `--json` in its argv is its own business; the whole profile loads.
+  assert.doesNotThrow(() => new CliAdapter('mine', { ...p, bin: '/usr/local/bin/mycli', parser: 'raw' }));
+  assert.equal(new CliAdapter('codex', p).effortGap, null);
+  // The bridge's argv is taken as `bridge`, the field `upgrade --take` knows.
+  const bridgeHalf = new CliAdapter('codex', { ...p, bridge: { ...p.bridge, args: noEffort(p.bridge.args) } });
+  assert.match(bridgeHalf.effortGap, /codex's bridge\.args takes no \{effort\} — keysmith upgrade codex --take bridge --apply/);
+  assert.throws(() => effortIn('codex', 'bridge.args', bridgeHalf.bridge.args, 'high'), /--take bridge --apply/);
 });
 
 test('an alias leg that names an effort id of a model the adapter declares is no unusable leg', () => {

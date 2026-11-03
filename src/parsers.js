@@ -514,12 +514,21 @@ const CODEX_QUIET_ITEMS = new Set(['agent_message', 'reasoning', 'todo_list', 'c
  * and anything else (`command_execution`, `file_change`, `web_search`, a sub-agent's call, a type
  * this parser has never seen) a `tool` event named by its type, once per item. That is what the
  * bridge's tripwire reads (src/bridge/clis.js). `turn.completed` carries the run's usage,
- * `turn.failed` and a top-level `error` line its failure.
+ * `turn.failed` its failure.
+ *
+ * A top-level `error` line is a failure only if the turn does not complete after it. codex prints
+ * a stream error it retries that way too — `{"type":"error","message":"Reconnecting... 1/5 (stream
+ * disconnected before completion: …)"}`, then the turn goes on to turn.completed and codex exits 0
+ * (its JSONL processor turns every error notification into an `error` line; only one it will not
+ * retry fails the run). So the line is held: turn.completed drops it, turn.failed says the failure
+ * itself (the held message when it gives none), and a stream that ends with neither reports it.
+ * Plain `codex exec` printed the same notice on stderr, and its answer stood.
  */
 export async function* codexJson(lines, { finalOnly = false } = {}) {
   const tools = new Set();
   let afterText = false; // the last item that said anything was an agent message: a next one is a new paragraph
   let last = null; // finalOnly: the last agent message so far
+  let held = null; // the last top-level `error` line's message, until the turn says how it ended
   const flush = function* () {
     if (last !== null) yield EV.delta(last);
     last = null;
@@ -551,6 +560,7 @@ export async function* codexJson(lines, { finalOnly = false } = {}) {
         }
       }
     } else if (d.type === 'turn.completed') {
+      held = null; // codex retried and the turn completed: not the run's failure
       yield* flush();
       const u = d.usage && typeof d.usage === 'object' ? d.usage : null;
       if (u) {
@@ -560,12 +570,16 @@ export async function* codexJson(lines, { finalOnly = false } = {}) {
         if (usage) yield { type: 'usage', usage, scope: 'run' };
       }
     } else if (d.type === 'turn.failed') {
-      const why = typeof d.error === 'string' ? d.error : d.error?.message || 'turn failed';
+      const why = typeof d.error === 'string' && d.error ? d.error : d.error?.message || held || 'turn failed';
+      held = null;
       yield EV.error(truncate(`codex: ${why}`, 400));
     } else if (d.type === 'error') {
-      yield EV.error(truncate(`codex: ${typeof d.message === 'string' ? d.message : 'error'}`, 400));
+      held = typeof d.message === 'string' && d.message ? d.message : 'error';
     }
   }
+  // Neither turn.completed nor turn.failed after it (codex stopped before a turn, or mid-turn):
+  // the error line is the run's failure, ahead of a final message left unsent, as it was printed.
+  if (held !== null) yield EV.error(truncate(`codex: ${held}`, 400));
   yield* flush();
   yield EV.done('stop');
 }
