@@ -478,6 +478,31 @@ it existed) passes tool requests to the API leg, as it always did. Each leg spen
 quota: your Antigravity login for agy, the API key's (free tier: about 20 requests a day per
 model) for google.
 
+## Reasoning effort on codex and Claude Code
+
+A request's effort reaches the `codex` and `claude` CLIs: `reasoning_effort` or
+`reasoning: {effort}` on `/v1/chat/completions` and `/v1/responses`, `output_config: {effort}`
+on `/v1/messages`, streamed or not, text and tool runs alike — codex gets
+`-c model_reasoning_effort="<level>"`, Claude Code `--effort <level>`. A client that cannot send
+one (OpenBot) names it in the model id, as agy does: `codex/gpt-6-astra-xhigh`, `claude/sonnet-max`.
+`GET /v1/models` lists those ids from each CLI's own catalogue — `codex debug models`, and
+Claude Code's answer to an `initialize` request (no prompt, nothing spent) — one per level the
+model takes, and a scoped key reaches them as its patterns are written (`codex/gpt-6-astra*`
+does, `codex/gpt-6-astra` does not).
+
+```bash
+curl -s localhost:8787/v1/chat/completions -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"codex/gpt-6-astra","reasoning_effort":"xhigh","messages":[{"role":"user","content":"…"}]}'
+```
+
+A level the model does not take is a 400 that names the ones it does, from the catalogue
+(gpt-6-astra: low, medium, high, xhigh, max, ultra; gpt-6-luna has no ultra; Haiku 4.5 takes
+none) — never a guess, never the request without it. No effort named is the argv of before, so
+the CLI's own default. Other CLIs (agy, opencode, qoder) are handed no effort, as before, and the
+usage row says so (`effortIgnored`). An MCP bridge session keeps the effort it started at; a
+continuation at another one is a new session (the cold path). Details:
+[docs/adapters.md](docs/adapters.md#reasoning-effort-on-a-cli).
+
 ## Agents that could act on this machine
 
 A CLI adapter runs an agent, and an agent has tools: a shell, file edits, MCP servers. Behind

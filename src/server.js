@@ -21,6 +21,7 @@ import { upstreamError } from './http-adapter.js';
 import { failureOf, scopeError } from './gateway.js';
 import { authEnabled, describeScope, parseKeys, scopeWarnings, targetDecision } from './keys.js';
 import { DailyQuota, overCapMessage } from './quota.js';
+import { requestEffort } from './effort.js';
 
 const MAX_BODY = 32 * 1024 * 1024;
 const STREAM_HOLD_MS = 10_000;
@@ -341,6 +342,9 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   // tools runs on the event loop every other client of this gateway shares.
   const offered = openaiToolCount(body);
   if (offered > MAX_TOOLS) throw new LlmError(`this request offers ${offered} tools; at most ${MAX_TOOLS} are taken (OpenAI's limit)`, { status: 400, type: 'invalid_request_error' });
+  // The reasoning effort the client chose (reasoning_effort, reasoning.effort): a CLI leg whose argv
+  // takes one runs at it, checked against its catalogue (src/effort.js).
+  const effort = requestEffort(body, 'openai');
   // A client that offered the older `functions` reads a call back as message.function_call.
   const legacy = openaiLegacy(body);
 
@@ -358,7 +362,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
   if (!stream) {
-    const { text, reasoning, usage: u, usageReason, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, scope, tools });
+    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, scope, tools, effort });
     if (relayed) {
       // An HTTP leg's answer went out verbatim, with its own usage row.
       meta.done = true;
@@ -368,7 +372,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     // Written before the row: an answer the face cannot write is the error row, not an `ok` one.
     const payload = openaiCompletion({ id, model: requested, created, text, usage: faceUsage(u, usageReason), reasoning: body.include_reasoning ? reasoning || null : null, toolCalls: calls, legacy });
     meta.done = true;
-    record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, usageReason), stream: false, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }) });
+    record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, usageReason), stream: false, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }), ...effortMarks(ran) });
     // The header carries the session for clients that read headers; the body carries it
     // for the ones that do not (curl, `keysmith chat`), and OpenAI SDKs ignore extras.
     if (sid) payload.keysmith = { session: sid, resumed: !!publicId };
@@ -376,7 +380,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     return json(res, 200, payload, sid);
   }
 
-  const events = await held(gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, scope, tools }), holdMs);
+  const events = await held(gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, scope, tools, effort }), holdMs);
   if (res.headersSent) {
     // An HTTP leg is answering verbatim — its status, its headers, its bytes — and writes its
     // own usage row: what is left here is waiting for it to finish.
@@ -392,6 +396,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   face.open();
   let u = null;
   let uReason = null;
+  let ran = null;
   let sid = null;
   let errMessage = null;
   let retries = 0;
@@ -420,6 +425,8 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
       u = mergeUsage(u, evt.usage);
     } else if (evt.type === 'usage_unknown') {
       uReason ||= evt.reason;
+    } else if (evt.type === 'effort') {
+      ran = evt;
     } else if (evt.type === 'session') {
       sid = evt.id;
     } else if (evt.type === 'error') {
@@ -434,7 +441,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   // engine reported after the answer began replaces that chunk with the error frame.
   face.finish({ usage: faceUsage(u, uReason), keysmith: sid ? { session: sid, resumed: !!publicId } : null, error: errMessage });
   meta.done = true;
-  record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, uReason), stream: true, error: errMessage, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }) });
+  record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, uReason), stream: true, error: errMessage, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }), ...effortMarks(ran) });
 }
 
 async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null }) {
@@ -450,6 +457,8 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   // The same bound as the chat face's: what an engine is handed (a prompt, a tools/list) has one.
   const offered = Array.isArray(body.tools) ? body.tools.length : 0;
   if (offered > MAX_TOOLS) throw new LlmError(`this request offers ${offered} tools; at most ${MAX_TOOLS} are taken`, { status: 400, type: 'invalid_request_error' });
+  // The Messages API's effort: output_config.effort.
+  const effort = requestEffort(body, 'anthropic');
   // Tools on this face reach a CLI leg with a toolMode; an HTTP leg is not handed them (there is
   // no verbatim relay for the Messages wire), so a route of those answers in text — or, when
   // tool_choice asks for a call, with an error.
@@ -457,15 +466,15 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   const tools = offered ? { spec: anthropicToolSpec(body), messages: anthropicToolMessages(body), face: 'anthropic', state: out, caller, relay: null } : null;
   // The Messages API defaults to a single JSON reply; SSE only when asked.
   if (!stream) {
-    const { text, usage: u, usageReason, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort });
     const calls = toolCalls.map((c) => faceCall(c, 'anthropic'));
     meta.done = true;
-    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, usageReason), stream: false, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }) });
+    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, usageReason), stream: false, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }), ...effortMarks(ran) });
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
     // Session goes out as a header only: Anthropic clients schema-check the body.
     return json(res, 200, anthropicMessage({ id, model: body.model, text, usage: faceUsage(u, usageReason), toolCalls: calls }), sid);
   }
-  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools }), holdMs);
+  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort }), holdMs);
   startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
   const face = new AnthropicStream(res, { id, model: body.model, keepaliveMs });
   meta.face = face;
@@ -474,6 +483,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   // id — use stream=false (or /v1/chat/completions) when you need to continue a CLI thread.
   let u = null;
   let uReason = null;
+  let ran = null;
   let errMessage = null;
   let retries = 0;
   let cutAt = null;
@@ -484,6 +494,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
     if (evt.type === 'retry') retries++;
     else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'usage_unknown') uReason ||= evt.reason;
+    else if (evt.type === 'effort') ran = evt;
     else if (evt.type === 'delta') face.text(evt.text);
     else if (evt.type === 'tool_call') face.toolCall(faceCall(evt, 'anthropic'));
     else if (evt.type === 'tool_mode') [toolMode, fallback, bridge] = [evt.mode || null, evt.fallback || null, evt.bridge || null];
@@ -493,7 +504,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   }
   face.finish({ usage: faceUsage(u, uReason), error: errMessage });
   meta.done = true;
-  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, uReason), stream: true, error: errMessage, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }) });
+  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, uReason), stream: true, error: errMessage, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }), ...effortMarks(ran) });
   void log;
 }
 
@@ -515,23 +526,26 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
   // The same bound as the other faces': what an engine is handed (a prompt, a tools/list) has one.
   const offered = responsesToolCount(body);
   if (offered > MAX_TOOLS) throw new LlmError(`this request offers ${offered} tools; at most ${MAX_TOOLS} are taken`, { status: 400, type: 'invalid_request_error' });
+  // The Responses API's effort: reasoning.effort (reasoning_effort read too, as on the chat face).
+  const effort = requestEffort(body, 'openai');
   // Tools on this face reach a CLI leg with a toolMode (design U12), as on /v1/messages: no HTTP leg
   // is handed them (there is no verbatim relay for the Responses wire), so a route of those
   // answers in text — or, when tool_choice asks for a call, with an error.
-  if (offered) return await responsesWithTools(req, res, gateway, body, { usage, caller, holdMs, keepaliveMs, scope, id, created, stream, session, meta, t0 });
+  if (offered) return await responsesWithTools(req, res, gateway, body, { usage, caller, holdMs, keepaliveMs, scope, id, created, stream, session, meta, t0, effort });
   if (!stream) {
-    const { text, usage: u, usageReason, session: sid, retries, cutAt, toolCalls } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), scope });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), scope, effort });
     if (toolCalls.length) throw noResponsesToolCalls();
     meta.done = true;
-    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, ...usageMarks(null, u, usageReason), stream: false, via: '/v1/responses', ...marks({ retries, cutAt }) });
+    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, ...usageMarks(null, u, usageReason), stream: false, via: '/v1/responses', ...marks({ retries, cutAt }), ...effortMarks(ran) });
     return json(res, 200, responsesResult({ id, model: body.model, text, usage: faceUsage(u, usageReason), created }), sid);
   }
-  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), scope }), holdMs);
+  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), scope, effort }), holdMs);
   startSse(res, 'text/event-stream');
   for (const e of responsesStreamEventsHead({ id, model: body.model })) sseEvent(res, e.event, e.data);
   let full = '';
   let u = null;
   let uReason = null;
+  let ran = null;
   let errMessage = null;
   let retries = 0;
   let cutAt = null;
@@ -539,6 +553,7 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     if (evt.type === 'retry') retries++;
     else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'usage_unknown') uReason ||= evt.reason;
+    else if (evt.type === 'effort') ran = evt;
     else if (evt.type === 'delta') {
       full += evt.text;
       sseEvent(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: `msg_${id}`, output_index: 0, content_index: 0, delta: evt.text });
@@ -552,7 +567,7 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
   sseEvent(res, 'response.completed', { type: 'response.completed', response: { id: `resp_${id}`, object: 'response', model: body.model, status: errMessage ? 'failed' : 'completed', usage: responsesUsage(faceUsage(u, uReason)) } });
   res.end();
   meta.done = true;
-  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(null, u, uReason), stream: true, error: errMessage, via: '/v1/responses', ...marks({ retries, cutAt }) });
+  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(null, u, uReason), stream: true, error: errMessage, via: '/v1/responses', ...marks({ retries, cutAt }), ...effortMarks(ran) });
   void log;
 }
 
@@ -562,27 +577,28 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
  * text — streamed or not, with the usage row of the other faces (toolMode, toolCalls, fallback,
  * the bridge's session).
  */
-async function responsesWithTools(req, res, gateway, body, { usage, caller, holdMs, keepaliveMs, scope, id, created, stream, session, meta, t0 }) {
+async function responsesWithTools(req, res, gateway, body, { usage, caller, holdMs, keepaliveMs, scope, id, created, stream, session, meta, t0, effort = null }) {
   const out = { mode: null };
   const tools = { spec: responsesToolSpec(body), messages: responsesToolMessages(body), face: 'responses', state: out, caller, relay: null };
   const messages = responsesMessages(body);
   const request = { tools: body.tools, tool_choice: body.tool_choice, parallel_tool_calls: body.parallel_tool_calls };
   if (!stream) {
-    const { text, usage: u, usageReason, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), scope, tools });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), scope, tools, effort });
     const calls = toolCalls.map((c) => faceCall(c, 'responses'));
     const payload = responsesBody({ id, model: body.model, created, text, usage: faceUsage(u, usageReason), toolCalls: calls, request });
     meta.done = true;
-    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, usageReason), stream: false, via: '/v1/responses', ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }) });
+    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, usageReason), stream: false, via: '/v1/responses', ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }), ...effortMarks(ran) });
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
     return json(res, 200, payload, sid);
   }
-  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), scope, tools }), holdMs);
+  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), scope, tools, effort }), holdMs);
   startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
   const face = new ResponsesStream(res, { id, model: body.model, created, request, keepaliveMs });
   meta.face = face;
   face.open();
   let u = null;
   let uReason = null;
+  let ran = null;
   let errMessage = null;
   let retries = 0;
   let cutAt = null;
@@ -593,6 +609,7 @@ async function responsesWithTools(req, res, gateway, body, { usage, caller, hold
     if (evt.type === 'retry') retries++;
     else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'usage_unknown') uReason ||= evt.reason;
+    else if (evt.type === 'effort') ran = evt;
     else if (evt.type === 'delta') face.text(evt.text);
     else if (evt.type === 'tool_call') face.toolCall(faceCall(evt, 'responses'));
     else if (evt.type === 'tool_mode') [toolMode, fallback, bridge] = [evt.mode || null, evt.fallback || null, evt.bridge || null];
@@ -602,7 +619,7 @@ async function responsesWithTools(req, res, gateway, body, { usage, caller, hold
   }
   face.finish({ usage: faceUsage(u, uReason), error: errMessage });
   meta.done = true;
-  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, uReason), stream: true, error: errMessage, via: '/v1/responses', ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }) });
+  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, uReason), stream: true, error: errMessage, via: '/v1/responses', ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }), ...effortMarks(ran) });
 }
 
 /**
@@ -792,6 +809,15 @@ function marks({ retries = 0, cutAt = null, toolMode = null, toolCalls = 0, fall
 }
 
 /**
+ * The reasoning effort a CLI leg ran at (`effort`), or — for a CLI whose argv takes none — that the
+ * client's was not applied (`effortIgnored`): a gateway event (`effort`), for the usage row.
+ */
+function effortMarks(evt) {
+  if (!evt) return {};
+  return evt.effort ? { effort: evt.effort } : evt.ignored ? { effortIgnored: evt.ignored } : {};
+}
+
+/**
  * A session id arrives either as the `x-keysmith-session` header or as a `session`
  * field on the body. The header is what a proxy or SDK middleware can always send;
  * the body field is what `curl` and CLI users actually reach for, and every face
@@ -831,7 +857,7 @@ function sseEvent(res, name, data) {
  * run ended at a tool call (`cut`), which engine runs (`tool_mode`), a session id, a usage
  * report or the reason there is none. None of them is an answer, so none of them opens a held stream.
  */
-const QUIET_EVENTS = new Set(['retry', 'cut', 'tool_mode', 'session', 'usage', 'usage_unknown']);
+const QUIET_EVENTS = new Set(['retry', 'cut', 'tool_mode', 'session', 'usage', 'usage_unknown', 'effort']);
 const HOLD_EXPIRED = Symbol('hold expired');
 
 /**

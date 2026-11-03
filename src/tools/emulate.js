@@ -239,7 +239,7 @@ export async function* emulate(adapter, opts = {}) {
   }
 }
 
-async function* engine(adapter, { model, spec, messages, signal, minRetryBudgetMs = MIN_RETRY_BUDGET_MS, newNonce: make = newNonce }, spent) {
+async function* engine(adapter, { model, effort = null, spec, messages, signal, minRetryBudgetMs = MIN_RETRY_BUDGET_MS, newNonce: make = newNonce }, spent) {
   adapter.ready();
   const prompt = renderPrompt({ spec, messages, newNonce: make });
   if (prompt.length > adapter.maxPromptChars) {
@@ -256,7 +256,7 @@ async function* engine(adapter, { model, spec, messages, signal, minRetryBudgetM
     for (let attempt = 0; ; attempt++) {
       spent.retries = attempt;
       const text = attempt === 0 ? prompt : `${correction(reason)}\n\n${prompt}`;
-      const run = adapter.emulateRun({ text, model, timeoutMs: Math.max(1_000, deadline - Date.now()), signal });
+      const run = adapter.emulateRun({ text, model, effort, timeoutMs: Math.max(1_000, deadline - Date.now()), signal });
       let reply = '';
       let runUsage = null;
       let cut = null;

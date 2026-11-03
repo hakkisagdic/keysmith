@@ -2,7 +2,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expand } from '../config.js';
 import { joinArgs } from '../util.js';
-import { refuseNul } from '../cli-adapter.js';
+import { effortIn, refuseNul } from '../cli-adapter.js';
 import { KILL_GRACE_MS, bridgeEnv, list, older, rm, spawnGroup, writePrivate } from './proc.js';
 
 export { KILL_GRACE_MS };
@@ -142,8 +142,10 @@ export const agyDriver = {
    * file removed again.
    */
   spawn(adapter, { session, model, prompt, killGraceMs = KILL_GRACE_MS }) {
+    effortIn(adapter.id, 'bridge.args', adapter.bridge.args, session.effort);
     const argv = joinArgs(adapter.bridge.args, {
       model: model || '',
+      effort: session.effort || '',
       prompt: adapter.promptVia === 'stdin' ? '' : prompt,
       agent: this.agentName(session),
       printTimeout: `${Math.ceil(session.limits.sessionMaxMs / 1000)}s`,

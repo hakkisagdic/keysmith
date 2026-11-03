@@ -155,7 +155,7 @@ adapter takes (`media`, and `vision` for images).
 | `persistSessions` | `false` | the CLI keeps its own threads, so `{noSession}` renders empty and `resumeArgs` becomes reachable |
 | `noSessionFlag` | `--no-session` | what `{noSession}` renders as when the run is not resumed. Claude Code and Qoder refuse `--no-session` and take `--no-session-persistence`; their profiles say so |
 | `parser` | `raw` | one of `cmd-ndjson`, `opencode-ndjson`, `claude-stream-json`, `agy-stream-json`, `kiro-stream-json`, `warp-ndjson`, `codex-json`, `raw` |
-| `modelsFrom` | — | `{ "args": ["--list-models"], "drop": ["preview"] }` — run the binary, read stdout: one model per line, or JSON (an array, or one under `models`/`data`; the id is `model_id`, `id`, `slug`, `model` or `name`; `visibility: "hide"` entries are left out) |
+| `modelsFrom` | — | `{ "args": ["--list-models"], "drop": ["preview"], "stdin": "…" }` — run the binary (`stdin` written to it when set), read stdout: one model per line, or JSON (an array, or one under `models`/`data`; the id is `model_id`, `id`, `slug`, `model`, `value` or `name`; `visibility: "hide"` entries are left out), or a stream-json `control_response` (Claude Code's answer to `initialize`). The effort levels a model takes are read from it too: Codex's `supported_reasoning_levels`, Claude Code's `supportedEffortLevels` |
 | `promptVia` | `arg` | `"stdin"` pipes the prompt instead, for CLIs that choke on long argv. A command line cannot carry a NUL character (U+0000): a request with one in its argv (the prompt, a system prompt) is a 400 that quotes none of it, before anything is started — the route goes on to its next leg, which an HTTP upstream can take |
 | `cwd` | process cwd | the agent's workspace: an empty directory keysmith owns (`~/.local/share/keysmith/workspaces/<name>`), created 0700 on first spawn. Every built-in CLI profile sets one, and so does `keysmith add custom`; without it the agent runs in the gateway's own working directory (under launchd, keysmith's source tree). The child's `PWD` is set to it as well: spawn() would leave the gateway's, and opencode takes `PWD` as its project directory |
 | `workspaceFiles` | — | `{ "relative/path": "content" }` — files keysmith keeps inside a configured `cwd` (0600), put back before a spawn whenever they drift. Needs `cwd`; a path that leaves it is refused at load. See [agy as a plain text model](#agy-as-a-plain-text-model) |
@@ -178,13 +178,18 @@ adapter takes (`media`, and `vision` for images).
 ["-p", "{noSession}", ["--model", "{model}"], "{prompt}"]
 ```
 
-- `{model}`, `{prompt}`, `{system}`, `{session}`, `{maxTokens}`, `{noSession}` are substituted.
+- `{model}`, `{prompt}`, `{system}`, `{session}`, `{maxTokens}`, `{noSession}`, `{effort}` are substituted.
 - A **whole-token placeholder** keeps its value as one argv entry — a prompt with spaces
   and newlines is never word-split, and if it is empty the token disappears instead of
   leaving `""` on the command line.
 - A **nested array is a group**: `["--model", "{model}"]` is dropped *whole* when the
   placeholder has no value. Without this, a model-less request leaves `--model` behind
-  and the CLI eats your prompt as its argument.
+  and the CLI eats your prompt as its argument. A placeholder inside a token counts too:
+  `["-c", "model_reasoning_effort=\"{effort}\""]` goes whole when there is no effort.
+- `{effort}` is the reasoning effort a request chose, checked against the CLI's catalogue
+  (see [Reasoning effort](#reasoning-effort-on-a-cli)). An adapter with `{effort}` in none of its
+  templates is handed no effort, as before; one with it in some templates and not the one a
+  request runs (an entry half upgraded) answers a request that names an effort with a 400.
 - `{noSession}` is the adapter filling in `--no-session-persistence` (or the CLI's
   equivalent) only when it is *not* going to resume. One template covers both modes.
 
@@ -620,6 +625,34 @@ opencode's free models (`opencode/*`, e.g. `opencode/big-pickle`) refused this r
 the deny-all config too; the same model answered only the default agent with its tools, which
 keysmith does not run. A provider you configured in opencode with your own key is not subject
 to that check (not run live from here).
+
+### Reasoning effort on a CLI
+
+A request chooses an effort in its API's own spelling — `reasoning_effort` or
+`reasoning: {effort}` on `/v1/chat/completions` and `/v1/responses`, `output_config: {effort}`
+on `/v1/messages` (two spellings that disagree are a 400) — or, for a client that cannot send
+one (OpenBot), in the model id: `codex/gpt-6-astra-xhigh` is `gpt-6-astra` at `xhigh`, the
+way agy's own catalogue spells `gemini-4-argon-high`. `GET /v1/models` lists one such id per
+level the catalogue gives a model (`keysmith.effort`, `keysmith.upstream`), and a key's scope
+decides them as written: `codex/gpt-6-astra*` reaches them, `codex/gpt-6-astra` alone does not.
+
+The level is checked against the CLI's own catalogue and nothing else: `codex debug models`
+(`supported_reasoning_levels`, per model: gpt-6-astra takes low, medium, high, xhigh, max and
+ultra on codex 0.163), Claude Code's answer to `initialize` (`supportedEffortLevels`: low,
+medium, high, xhigh, max on 2.1.303's current models; Haiku 4.5 none), or a declared
+`models` entry's `efforts`. A level the model does not list is a 400 that names the ones it
+does; a model with no levels, or one the catalogue does not list, takes no effort (400) — never
+guessed. A model id and a field that name two levels are a 400. A catalogue that cannot be
+read is a 503 for a request that names an effort, and changes nothing for one that does not.
+
+The `codex` profile carries it as `-c model_reasoning_effort="{effort}"`, the `claude` profile
+as `--effort {effort}`, on every argv (text, EMULATE, vision, the MCP bridge). A request that
+names none runs the argv it always did: the CLI's own default. A CLI whose argv takes no
+effort (agy, opencode, qoder, kiro, an entry attached before `{effort}`) is handed none, as
+before, and the usage row says so (`effortIgnored`); the row of a run that took one says which
+(`effort`). An MCP bridge session keeps the effort it started at: a continuation that names
+another effort (in the id or in a field) is a new session, which reads the conversation so far
+(the cold path); `codex/gpt-6-astra-xhigh` and `codex/gpt-6-astra` with `xhigh` are one session.
 
 ### Claude Code, Qoder and Codex without tools
 

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { joinArgs } from '../util.js';
-import { refuseNul } from '../cli-adapter.js';
+import { effortIn, refuseNul } from '../cli-adapter.js';
 import { SHIM } from './agy.js';
 import { KILL_GRACE_MS, bridgeEnv, list, older, rm, spawnGroup, writePrivate } from './proc.js';
 
@@ -127,9 +127,12 @@ function fileDriver({ id, parser, parserOpts = {}, usageAtEnd = false, prefix, h
 
     /** The argv, the files and the environment of one session's run — what spawn() starts; nothing written. */
     plan(adapter, { session, model, prompt }) {
+      // A session's effort is its own, from its first turn to its last (index.js: another one is another session).
+      effortIn(adapter.id, 'bridge.args', adapter.bridge.args, session.effort);
       const written = this.files(adapter, session);
       const argv = joinArgs(adapter.bridge.args, {
         model: model || '',
+        effort: session.effort || '',
         prompt: adapter.promptVia === 'stdin' ? '' : prompt,
         agent: this.agentName(session),
         server: session.server,

@@ -278,6 +278,9 @@ export class Session {
     this.adapterId = o.adapterId;
     this.caller = o.caller ?? '';
     this.target = o.target ?? '';
+    // The reasoning effort its CLI was started with (src/effort.js): a request with another one is
+    // not this session's (index.js match()), so a session keeps its effort to its end.
+    this.effort = o.effort ?? null;
     this.tools = o.tools || [];
     this.toolsHash = o.toolsHash ?? null;
     this.prefixHash = o.prefixHash ?? null;

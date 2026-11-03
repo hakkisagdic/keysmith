@@ -57,6 +57,8 @@ before(async () => {
       oc: around('opencode', 'opencode'),
       cx: around('codex', 'codex'),
       cxna: around('codex', 'codex', { bridge: { args: NO_APPROVAL(CLI_PROFILES.codex.bridge.args) } }),
+      // The codex profile with a catalogue of its own (declared models, with the levels each takes).
+      cxe: around('codex', 'codex', { models: [{ id: 'm', efforts: ['low', 'high'] }], cwd: path.join(dir, 'ws-codex-e') }),
       qd: around('qoder', 'qoder'),
       oct: around('opencode', 'opencode', { bridge: { toolResultTimeoutMs: 1_200 }, cwd: path.join(dir, 'ws-opencode-t') }),
     },
@@ -448,6 +450,40 @@ test('codex: the answer that hands a call out has no count of its own (codex rep
   assert.deepEqual([u2.prompt_tokens, u2.completion_tokens, u2.total_tokens], [1100, 30, 1130]);
   assert.equal(u2.reason, undefined);
   assert.deepEqual(rowsOf('cx/m').at(-1).usage, { input: 1100, output: 30, cacheRead: 0, cacheWrite: 0 });
+});
+
+test('codex: a bridge session keeps the effort it started at — spelled in the field or in the model id alike; a continuation at another effort is a new session, the cold path', async () => {
+  const t = tag();
+  // Started as `m-high`, continued as `m` with reasoning_effort high: one model, one effort, one session.
+  const first = [{ role: 'user', content: `Effort ${t}` }];
+  let r = await post('/v1/chat/completions', { model: 'cxe/m-high', tools: TOOLS, messages: first });
+  assert.equal(r.status, 200, r.text);
+  const a1 = chat(r);
+  const [start] = startsOf(t);
+  assert.ok(start.argv.includes('model_reasoning_effort="high"'), 'the session\'s CLI runs at the effort');
+  assert.equal(start.argv[start.argv.indexOf('--model') + 1], 'm', 'the base model, the suffix read off');
+  const history = [...first, { role: 'assistant', content: a1.text, tool_calls: a1.calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.args) } })) }, ...a1.calls.map((c) => ({ role: 'tool', tool_call_id: c.id, content: `RESULT for ${c.args.city}` }))];
+  r = await post('/v1/chat/completions', { model: 'cxe/m', reasoning_effort: 'high', tools: TOOLS, messages: history });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(chat(r).text, 'Weather: RESULT for Ankara');
+  assert.equal(startsOf(t).length, 1);
+  assert.equal(rowsOf('cxe/m').at(-1).bridge.path, 'attached');
+  assert.equal(rowsOf('cxe/m').at(-1).effort, 'high');
+
+  // Started at high, continued at low: the waiting session is not that conversation's any more.
+  const t2 = tag();
+  const c = conversation('cxe/m', `Effort ${t2}`, { reasoning_effort: 'high' });
+  await c.ask();
+  c.results();
+  r = await post('/v1/chat/completions', { model: 'cxe/m', reasoning_effort: 'low', tools: TOOLS, messages: c.history });
+  assert.equal(r.status, 200, r.text);
+  assert.match(chat(r).text, /^From the history: RESULT for Ankara/);
+  const starts = startsOf(t2);
+  assert.equal(starts.length, 2, 'a new session, with the conversation so far');
+  assert.ok(starts[1].argv.includes('model_reasoning_effort="low"'));
+  assert.equal(rowsOf('cxe/m').at(-1).bridge.path, 'cold');
+  assert.ok(log.some((m) => /bridge ks[0-9a-f]+: opened for cxe\/m, with the conversation so far \(the effort changed\)/.test(m)));
+  await closeAll();
 });
 
 test('codex: two calls of one step come one after the other, so they go out on two turns of one process', async () => {

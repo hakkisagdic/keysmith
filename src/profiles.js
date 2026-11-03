@@ -158,6 +158,13 @@ const OPENCODE_WORKSPACE_CONFIG = `${JSON.stringify(
  * go (the codex profile says what each one removes, and what no switch does). One list, so every
  * run of codex keysmith makes — text, EMULATE, the MCP bridge — takes the tools away the same way.
  */
+/**
+ * The reasoning effort a request chose (src/effort.js), as codex takes it: `-c
+ * model_reasoning_effort="<level>"`, a level `codex debug models` lists for the model
+ * (`supported_reasoning_levels`). Left out with no effort: codex's own default for the model.
+ */
+const CODEX_EFFORT = ['-c', 'model_reasoning_effort="{effort}"'];
+
 const CODEX_TOOL_LESS = [
   '--skip-git-repo-check',
   '--ephemeral',
@@ -185,7 +192,7 @@ const CODEX_TOOL_LESS = [
  * A text (and EMULATE) run of codex: `exec --json`, read by codex-json-final as plain `codex exec`
  * prints it — the last agent message — with what plain stdout leaves out: the run's usage.
  */
-const codexArgs = () => ['exec', '--json', ...CODEX_TOOL_LESS, ['--model', '{model}'], '--', '{prompt}'];
+const codexArgs = () => ['exec', '--json', ...CODEX_TOOL_LESS, [...CODEX_EFFORT], ['--model', '{model}'], '--', '{prompt}'];
 /**
  * The bridge's codex run: the same switches, `--json`, and the session's one MCP server
  * (`{server}`, its command, args and env filled in per session by src/bridge/clis.js).
@@ -200,6 +207,7 @@ const codexBridgeArgs = () => [
   '-c', 'mcp_servers.{server}.default_tools_approval_mode="approve"',
   '-c', 'mcp_servers.{server}.startup_timeout_sec={readyTimeoutSec}',
   '-c', 'mcp_servers.{server}.tool_timeout_sec={toolTimeoutSec}',
+  [...CODEX_EFFORT],
   ['--model', '{model}'],
   '--',
   '{prompt}',
@@ -305,19 +313,23 @@ export const CLI_PROFILES = {
     // --mcp-config) starts no MCP server, `--permission-prompts none` denies anything that
     // would still ask, `--disable-slash-commands` turns skills off and `--safe-mode` leaves
     // out CLAUDE.md, plugins, hooks and custom agents — auth and model selection stay.
-    args: ['-p', '--output-format', 'stream-json', '--verbose', '{noSession}', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', ['--model', '{model}'], '{prompt}'],
-    resumeArgs: ['-p', '--output-format', 'stream-json', '--verbose', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', '--resume', '{session}', '{prompt}'],
+    // `--effort` the request's reasoning effort (src/effort.js), a level Claude Code's own listing
+    // gives for the model (`supportedEffortLevels`); left out with none: Claude Code's default.
+    args: ['-p', '--output-format', 'stream-json', '--verbose', '{noSession}', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', ['--effort', '{effort}'], ['--model', '{model}'], '{prompt}'],
+    resumeArgs: ['-p', '--output-format', 'stream-json', '--verbose', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', ['--effort', '{effort}'], '--resume', '{session}', '{prompt}'],
     // A request that carries an image or a PDF runs `visionArgs`: the same tool-less switches, and
     // the prompt on stdin as one stream-json user message, its media as base64 `image` / `document`
     // blocks (src/media.js). Claude Code passes those blocks on to the model as they are. No
     // `{prompt}`: stdin is the prompt.
     media: ['image', 'pdf'],
-    visionArgs: ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '{noSession}', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', ['--model', '{model}']],
+    visionArgs: ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '{noSession}', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', ['--effort', '{effort}'], ['--model', '{model}']],
     persistSessions: false,
     // Claude Code 2.1.261 refuses `--no-session` ("unknown option"); this is its spelling.
     noSessionFlag: '--no-session-persistence',
     parser: 'claude-stream-json',
-    modelsFrom: null,
+    // Claude Code's model listing is its answer to an `initialize` control request on stdin
+    // (stream-json): each model with the effort levels it takes. No prompt is sent, nothing is spent.
+    modelsFrom: { args: ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '--no-session-persistence', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode'], stdin: `${JSON.stringify({ type: 'control_request', request_id: 'keysmith-models', request: { subtype: 'initialize' } })}\n` },
     cwd: '~/.local/share/keysmith/workspaces/claude',
     // Every request spends your Claude subscription, so it answers only a request that names
     // it: never an alias leg, never probed. `keysmith set claude explicitOnly false` opts out.
@@ -326,8 +338,8 @@ export const CLI_PROFILES = {
     toolMode: 'off',
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Claude Code 2.1.261 — every flag here is listed by `claude --help` and parsed by 2.1.261 (checked with an empty prompt, which it refuses before any request); `--max-turns` is undocumented but parsed. The stream-json `result` line carries usage/session_id. No live request was sent through this argv. Claude Code 2.1.303 (2026-11-03): `visionArgs` with one stream-json user message on stdin (a text block and a base64 JPEG block) was run against a stub Messages endpoint (ANTHROPIC_BASE_URL): the image block reached it as sent, and stdout was the same assistant/result lines. Live the same day, through a keysmith gateway on sonnet: a scanned typewritten polytonic Greek page (943×1500 JPEG) sent as a data: URL on /v1/chat/completions and as a base64 source on /v1/messages came back transcribed, line for line. A `document` block (base64 PDF) in that stdin message reached a stub Messages endpoint as sent, too (2.1.303, 2026-11-03).',
-    note: 'Runs without tools (`--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--safe-mode`) in an empty keysmith-owned workspace. Declare `models: ["sonnet", "opus"]` or pass the id through; Claude Code has no offline model listing. A failed run prints one `result` line with is_error and the reason in `errors[]` — the parser surfaces it rather than returning an empty completion. It takes images and PDFs (`media`): a request that carries one — inline, or a URL keysmith fetches from the public internet — runs `visionArgs`, the prompt on stdin as stream-json with the media in it. It spends your Claude subscription, so the profile is explicit-only: it answers `claude/<model>` and is in no alias and no `doctor --probe-models`. To put it in a route anyway: `keysmith set claude explicitOnly false`.',
+    provenance: 'Claude Code 2.1.261 — every flag here is listed by `claude --help` and parsed by 2.1.261 (checked with an empty prompt, which it refuses before any request); `--max-turns` is undocumented but parsed. The stream-json `result` line carries usage/session_id. No live request was sent through this argv. Claude Code 2.1.303 (2026-11-03): `visionArgs` with one stream-json user message on stdin (a text block and a base64 JPEG block) was run against a stub Messages endpoint (ANTHROPIC_BASE_URL): the image block reached it as sent, and stdout was the same assistant/result lines. Live the same day, through a keysmith gateway on sonnet: a scanned typewritten polytonic Greek page (943×1500 JPEG) sent as a data: URL on /v1/chat/completions and as a base64 source on /v1/messages came back transcribed, line for line. A `document` block (base64 PDF) in that stdin message reached a stub Messages endpoint as sent, too (2.1.303, 2026-11-03). `modelsFrom` (2.1.303): an `initialize` control request on stdin, stdin closed, is answered with one control_response line — the models, each with its `supportedEffortLevels` — and an exit 0 in ~4 s, no prompt sent; `--effort` takes low, medium, high, xhigh, max (`claude --help`).',
+    note: 'Runs without tools (`--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--safe-mode`) in an empty keysmith-owned workspace. Its models are what Claude Code answers an `initialize` control request with (no prompt, nothing spent), each with the effort levels it takes: a request\'s `reasoning_effort` / `output_config.effort` (or an id like `claude/sonnet-high`) runs `--effort <level>`, a level the model does not take is a 400. A failed run prints one `result` line with is_error and the reason in `errors[]` — the parser surfaces it rather than returning an empty completion. It takes images and PDFs (`media`): a request that carries one — inline, or a URL keysmith fetches from the public internet — runs `visionArgs`, the prompt on stdin as stream-json with the media in it. It spends your Claude subscription, so the profile is explicit-only: it answers `claude/<model>` and is in no alias and no `doctor --probe-models`. To put it in a route anyway: `keysmith set claude explicitOnly false`.',
   },
   agy: {
     kind: 'cli',

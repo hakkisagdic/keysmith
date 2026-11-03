@@ -137,15 +137,15 @@ export function pickEngine(adapter, spec, mcp, ctx = {}) {
  * A failure says which engine failed (`toolMode`, and `fallback` when it was not auto's first
  * pick) next to what the engine spent (`usage`, `retries`: emulate.js), for the usage row.
  */
-export async function* toolEvents({ adapter, model, target = null }, { spec, messages, plain, signal, includeReasoning = false, maxTokens, state = null, mcp = null, log = () => {}, caller = '', face = 'openai' }) {
-  const ctx = { messages, caller, target: target || `${adapter.id}/${model}` };
+export async function* toolEvents({ adapter, model, target = null, effort = null }, { spec, messages, plain, signal, includeReasoning = false, maxTokens, state = null, mcp = null, log = () => {}, caller = '', face = 'openai' }) {
+  const ctx = { messages, caller, target: target || `${adapter.id}/${model}`, effort };
   const pick = pickEngine(adapter, spec, mcp, ctx);
   if (pick.engine === 'plain') {
     // tool_choice none: the model may not call a tool, so the CLI answers in text — with the
     // history (earlier calls, fenced results) rendered the EMULATE way, and no session resumed.
     if (state) state.mode = 'emulate';
     const rendered = { system: '', prompt: renderPrompt({ spec, messages }) };
-    const events = adapter.complete({ model, messages: plain, session: null, signal, maxTokens, includeReasoning, rendered });
+    const events = adapter.complete({ model, messages: plain, session: null, signal, maxTokens, includeReasoning, effort, rendered });
     yield* withMode(dropSessions(events), 'emulate', null);
     return;
   }
@@ -197,7 +197,7 @@ export async function* toolEvents({ adapter, model, target = null }, { spec, mes
     }
   }
   if (state) state.mode = 'emulate';
-  yield* withMode(emulate(adapter, { model, spec, messages, signal, carried }), 'emulate', fallback);
+  yield* withMode(emulate(adapter, { model, effort, spec, messages, signal, carried }), 'emulate', fallback);
 }
 
 /** `tool_mode` in front of the first event that is part of the answer (or its end); a failure marked with the engine's mode. */

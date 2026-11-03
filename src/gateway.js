@@ -10,6 +10,7 @@ import { describeUnsupported, toolEvents, toolPath } from './tools/router.js';
 import { addUsage } from './tools/emulate.js';
 import { McpBridge } from './bridge/index.js';
 import { DRIVERS } from './bridge/drivers.js';
+import { resolveEffort, suffixedIds } from './effort.js';
 
 /**
  * The gateway: config in, one model catalogue + one streaming `complete()` out.
@@ -225,24 +226,35 @@ export class Gateway {
       this.publicAdapters.filter((a) => this.adapterVisible(a.id, scope)).map(async (a) => {
         if (refresh) a._modelCache = null;
         try {
-          for (const m of await a.models()) {
+          const list = await a.models();
+          const entry = (id, m, extra = {}) => ({
+            id: `${a.id}/${id}`,
+            object: 'model',
+            owned_by: `keysmith:${a.id}`,
+            keysmith: {
+              adapter: a.id,
+              kind: a.kind,
+              upstream: m.id,
+              name: m.name || null,
+              contextWindow: m.contextWindow || m.context_window || null,
+              maxOutput: m.maxOutput || null,
+              priority: a.priority,
+              note: m.note || null,
+              ...(m.efforts && a.takesEffort ? { efforts: m.efforts } : {}),
+              ...extra,
+            },
+          });
+          for (const m of list) {
             if (!m?.id) continue;
-            if (scope && !this.checkTarget(a.id, m.id, scope).ok) continue;
-            models.push({
-              id: `${a.id}/${m.id}`,
-              object: 'model',
-              owned_by: `keysmith:${a.id}`,
-              keysmith: {
-                adapter: a.id,
-                kind: a.kind,
-                upstream: m.id,
-                name: m.name || null,
-                contextWindow: m.contextWindow || m.context_window || null,
-                maxOutput: m.maxOutput || null,
-                priority: a.priority,
-                note: m.note || null,
-              },
-            });
+            if (!scope || this.checkTarget(a.id, m.id, scope).ok) models.push(entry(m.id, m));
+            // A client that cannot send an effort (OpenBot) names one in the model id: one id per
+            // level the catalogue lists for the model, on a CLI whose argv takes an effort. A scope
+            // decides it as written: `codex/gpt-6-astra*` reaches `codex/gpt-6-astra-xhigh`.
+            if (!a.takesEffort) continue;
+            for (const { id, level } of suffixedIds(list, m)) {
+              if (scope && !this.checkTarget(a.id, id, scope).ok) continue;
+              models.push(entry(id, m, { effort: level, name: m.name ? `${m.name} (effort ${level})` : null }));
+            }
           }
         } catch (e) {
           errors.push(redactSecrets(`${a.id}: ${e.message}`));
@@ -375,12 +387,12 @@ export class Gateway {
    * upstream session, so a chat app gets genuine multi-turn (and prompt-cache)
    * behaviour out of a tool that was never meant to answer HTTP.
    */
-  async *complete({ model, messages, session, signal, maxTokens, temperature, includeReasoning = false, exclude = null, scope = null, tools = null }) {
+  async *complete({ model, messages, session, signal, maxTokens, temperature, includeReasoning = false, exclude = null, scope = null, tools = null, effort = null }) {
     const chain = this.resolve(model, { exclude, scope });
     const publicId = session || newSessionId();
     const known = session ? this.sessions.get(publicId) : null;
     const run = { publicId, known, reportedSession: false, includeReasoning, signal };
-    const args = { messages, maxTokens, temperature, includeReasoning, signal };
+    const args = { messages, maxTokens, temperature, includeReasoning, signal, effort };
     if (tools) return yield* this._toolRoute(model, chain, args, run, tools);
     yield* this._failover(chain, args, run, null);
   }
@@ -399,16 +411,20 @@ export class Gateway {
       // call the client may already be running) is not restarted on the next leg either.
       const state = { emitted: false };
       try {
+        // The leg's model and effort: an effort-suffixed id read off, a level checked against the
+        // CLI's catalogue (src/effort.js) — a 400 there is this leg refusing, like any other.
+        const planned = await effortPlan(leg, args.effort);
         const events = adapter.complete({
-          model: upstreamModel,
+          model: planned.model,
           messages: args.messages,
           session: canResume ? run.known.upstreamSession : null,
           signal: args.signal,
           maxTokens: args.maxTokens,
           temperature: args.temperature,
           includeReasoning: args.includeReasoning,
+          ...(planned.effort ? { effort: planned.effort } : {}),
         });
-        yield* this._leg(leg, events, run, state, { canResume, sessions: true });
+        yield* this._leg({ ...leg, model: planned.model }, withEffort(events, planned), run, state, { canResume, sessions: true });
         return;
       } catch (e) {
         const err = this._legFailed(leg, e, state, args.signal, chain.length > 1 ? 'trying next candidate' : 'giving up');
@@ -425,7 +441,18 @@ export class Gateway {
    * CLI session and maps none.
    */
   async *_leg({ adapter, model: upstreamModel }, events, run, state, { canResume = false, sessions = true } = {}) {
+    // Which effort the leg ran at is said once its answer is: a leg that fails before answering
+    // takes its `effort` event with it.
+    let effort = null;
     for await (const evt of events) {
+      if (evt.type === 'effort') {
+        effort = evt;
+        continue;
+      }
+      if (effort && (evt.type === 'delta' || evt.type === 'tool_call' || evt.type === 'done')) {
+        yield effort;
+        effort = null;
+      }
       // One rule for both adapter kinds: chain-of-thought is only ever forwarded to
       // a client that asked for it. Providers and CLIs emit it freely; a UI that
       // shows it unasked is a surprise, and it costs output tokens.
@@ -471,6 +498,7 @@ export class Gateway {
       }
       yield evt;
     }
+    if (effort) yield effort;
     if (sessions && !run.reportedSession && run.known) {
       run.reportedSession = true;
       yield { type: 'session', id: run.publicId, resumed: true };
@@ -542,7 +570,11 @@ export class Gateway {
       }
       const st = { emitted: false };
       try {
-        const events = toolEvents(leg, {
+        const planned = await effortPlan(leg, args.effort);
+        // A bridge session is the model's at an effort, whichever way the request spelled it: an
+        // effort-suffixed id and the base id with the same effort are one conversation.
+        const engineLeg = { ...leg, model: planned.model, effort: planned.effort, target: planned.model !== leg.model ? `${leg.adapter.id}/${planned.model}` : leg.target };
+        const events = toolEvents(engineLeg, {
           spec,
           messages: tools.messages,
           plain: args.messages,
@@ -555,7 +587,7 @@ export class Gateway {
           caller,
           face,
         });
-        yield* this._leg(leg, events, run, st, { sessions: false });
+        yield* this._leg(engineLeg, withEffort(events, planned), run, st, { sessions: false });
         return;
       } catch (e) {
         const err = this._legFailed(leg, e, st, args.signal, more);
@@ -612,6 +644,7 @@ export class Gateway {
     let reasoning = '';
     let usage = null;
     let usageReason = null;
+    let effort = null;
     let sessionId = null;
     let err = null;
     let retries = 0;
@@ -631,12 +664,29 @@ export class Gateway {
       else if (evt.type === 'reasoning') reasoning += evt.text;
       else if (evt.type === 'usage') usage = mergeUsage(usage, evt.usage);
       else if (evt.type === 'usage_unknown') usageReason ||= evt.reason || null;
+      else if (evt.type === 'effort') effort = evt;
       else if (evt.type === 'session') sessionId = sessionId || evt.id;
       else if (evt.type === 'error') err = evt.message;
     }
     if (err && !text && !toolCalls.length) throw new LlmError(err, { status: 502 });
-    return { text, reasoning, usage, usageReason, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed };
+    return { text, reasoning, usage, usageReason, effort, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed };
   }
+}
+
+/**
+ * A leg's model and effort (src/effort.js): a CLI's checked against its catalogue, an HTTP leg's
+ * as it was (its body is keysmith's own on a plain completion, the client's on the relay).
+ */
+async function effortPlan(leg, effort) {
+  if (leg.adapter.kind !== 'cli') return { model: leg.model, effort: null };
+  return resolveEffort(leg.adapter, leg.model, effort);
+}
+
+/** A leg's events with its effort in front (`{ type: 'effort', effort }`, or `ignored` and why), for the usage row. */
+async function* withEffort(events, planned) {
+  if (planned.effort) yield { type: 'effort', effort: planned.effort };
+  else if (planned.ignored) yield { type: 'effort', ignored: planned.ignored };
+  yield* events;
 }
 
 function mergeUsage(a, b) {
@@ -763,7 +813,9 @@ function knownModels(adapter) {
   }
   const cached = adapter._modelCache;
   if (Array.isArray(cached?.list) && cached.list.length && Date.now() - (cached.at || 0) < 600_000) {
-    return { ids: cached.list.map((m) => m?.id || m).filter(Boolean), from: 'last-read model list' };
+    // An effort-suffixed id (`gpt-6-astra-xhigh`) is the catalogue's too, on a CLI that takes an effort.
+    const ids = cached.list.flatMap((m) => [m?.id || m, ...(adapter.takesEffort ? suffixedIds(cached.list, m).map((x) => x.id) : [])]).filter(Boolean);
+    return { ids, from: 'last-read model list' };
   }
   return null;
 }

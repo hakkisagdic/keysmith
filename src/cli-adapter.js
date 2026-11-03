@@ -6,6 +6,7 @@ import { expand } from './config.js';
 import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, agentCleanEnv } from './util.js';
 import { checkToolMode } from './tools/router.js';
 import { checkMedia, hasMedia, mediaPrompt } from './media.js';
+import { takesEffort } from './effort.js';
 
 /**
  * Run a coding CLI once per request and turn its stdout into a chat completion.
@@ -90,6 +91,9 @@ export class CliAdapter {
     }
     // Answers only a request that names it: never an alias leg, never probed.
     this.explicitOnly = !!cfg.explicitOnly || this.unsafeTools;
+    // A CLI that takes a reasoning effort: one of its argv templates says where (`{effort}`), and
+    // its catalogue which levels each model takes (src/effort.js).
+    this.takesEffort = [this.args, this.resumeArgs, this.emulateArgs, this.visionArgs, this.bridge?.args].some(takesEffort);
     this.env = cfg.env || {};
     this.timeoutMs = cfg.timeoutMs ?? 300_000;
     this.priority = cfg.priority ?? 200;
@@ -120,9 +124,30 @@ export class CliAdapter {
       return list;
     }
     if (!this.modelsFrom) return [];
+    const list = await this._listModels();
+    this._modelCache = { at: Date.now(), list };
+    return list;
+  }
+
+  /**
+   * The catalogue an effort is checked against (src/effort.js): the models, with the levels each
+   * takes. A declared `models` list whose entries say nothing of efforts leaves them to the CLI's
+   * own listing (`modelsFrom`), when it has one — a level is never guessed.
+   */
+  async effortCatalogue() {
+    const list = await this.models();
+    if (!this.declaredModels || list.some((m) => Array.isArray(m?.efforts)) || !this.modelsFrom) return list;
+    if (this._listedCache && Date.now() - this._listedCache.at < 600_000) return this._listedCache.list;
+    const listed = await this._listModels();
+    this._listedCache = { at: Date.now(), list: listed };
+    return listed;
+  }
+
+  /** The CLI's own model listing (`modelsFrom`), read now. */
+  async _listModels() {
     if (!which(this.bin)) throw new LlmError(`${this.bin} is not on PATH`, { status: 503, provider: this.id });
     const spec = this.modelsFrom;
-    const out = await this._spawn({ args: spec.args || ['--list-models'], timeoutMs: spec.timeoutMs ?? 30_000 });
+    const out = await this._spawn({ args: spec.args || ['--list-models'], stdin: typeof spec.stdin === 'string' ? spec.stdin : null, timeoutMs: spec.timeoutMs ?? 30_000 });
     if (out.code !== 0) throw new LlmError(`${this.bin} ${spec.args?.join(' ')} exited ${out.code}: ${truncate(out.stderr, 160)}`, { status: 502, provider: this.id });
     // CLIs print their picker verbatim: section headers ("Open Source"), counts, and
     // one model per line with an optional description after two or more spaces or a
@@ -133,11 +158,7 @@ export class CliAdapter {
     // Some CLIs list their models as JSON (`kiro-cli chat --list-models --format json`,
     // `oz model list --output-format json`, `codex debug models`): read that as JSON.
     const fromJson = jsonModelList(out.stdout || out.stderr);
-    if (fromJson) {
-      const list = fromJson.filter((m) => !spec.drop?.some((d) => m.id.startsWith(d)));
-      this._modelCache = { at: Date.now(), list };
-      return list;
-    }
+    if (fromJson) return fromJson.filter((m) => !spec.drop?.some((d) => m.id.startsWith(d)));
     const list = [];
     for (const line of (out.stdout || out.stderr).split('\n')) {
       const m = line.trim().match(/^(\S+)(?:(?:\t|\s{2,})\s*(.+))?$/);
@@ -147,7 +168,6 @@ export class CliAdapter {
       if (spec.drop?.some((d) => id.startsWith(d))) continue;
       list.push({ id, ...(m[2] ? { name: m[2].trim() } : {}) });
     }
-    this._modelCache = { at: Date.now(), list };
     return list;
   }
 
@@ -175,9 +195,12 @@ export class CliAdapter {
    * is `emulateArgs` (or `args`), and nothing is resumed. `{ events, stop, done }`: the parser's
    * events, a stop switch, and the process outcome. The caller holds a slot (acquire()).
    */
-  emulateRun({ text, model, timeoutMs, signal }) {
-    const argv = joinArgs(this.emulateArgs || this.args, {
+  emulateRun({ text, model, effort = null, timeoutMs, signal }) {
+    const tpl = this.emulateArgs || this.args;
+    effortIn(this.id, this.emulateArgs ? 'emulateArgs' : 'args', tpl, effort);
+    const argv = joinArgs(tpl, {
       model: model || '',
+      effort: effort || '',
       prompt: this.promptVia === 'stdin' ? '' : text,
       system: '',
       session: '',
@@ -192,7 +215,7 @@ export class CliAdapter {
    * One completion. `rendered` ({ system, prompt }) is a prompt a tool engine wrote itself in
    * place of the flattened `messages` (router.js, tool_choice none); such a run is never resumed.
    */
-  async *complete({ model, messages, session, signal, maxTokens, rendered = null }) {
+  async *complete({ model, messages, session, signal, maxTokens, effort = null, rendered = null }) {
     this.ready();
 
     // A request with media, on a CLI that takes some of it: the prompt goes on stdin, media and all.
@@ -211,9 +234,12 @@ export class CliAdapter {
     const body = keepSystem && system && !this.systemFlag ? `<system>\n${system}\n</system>\n\n${prompt}` : prompt;
     const useResume = !!(session && this.resumable) && !rendered && !vision;
     const stdinFor = (text) => (vision ? vision.stdin(text) : this.promptVia === 'stdin' ? text : null);
+    const tpl = vision ? this.visionArgs : useResume ? this.resumeArgs : this.args;
+    effortIn(this.id, vision ? 'visionArgs' : useResume ? 'resumeArgs' : 'args', tpl, effort);
     const argvFor = (text) => {
-      const argv = joinArgs(vision ? this.visionArgs : useResume ? this.resumeArgs : this.args, {
+      const argv = joinArgs(tpl, {
         model: model || '',
+        effort: effort || '',
         prompt: this.promptVia === 'stdin' || vision ? '' : text,
         system: keepSystem ? system || '' : '',
         session: useResume ? session : '',
@@ -363,9 +389,13 @@ export class CliAdapter {
     return { ...agentCleanEnv(), PWD: this.cwd, ...this.env };
   }
 
-  _spawn({ args, timeoutMs }) {
+  _spawn({ args, stdin = null, timeoutMs }) {
     this._ensureCwd();
-    const child = spawnCli(this.id, which(this.bin) || this.bin, args, { cwd: this.cwd, env: this._childEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawnCli(this.id, which(this.bin) || this.bin, args, { cwd: this.cwd, env: this._childEnv(), stdio: [stdin != null ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+    if (stdin != null) {
+      child.stdin.on('error', () => {});
+      child.stdin.end(stdin);
+    }
     return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
@@ -439,6 +469,16 @@ export async function* noteUsageGap(events, reason) {
       yield { type: 'usage_unknown', reason: reason() };
     }
     yield evt;
+  }
+}
+
+/**
+ * An effort for an argv template that has no `{effort}`: a 400 that says how to get one — never
+ * the run without it (an adapter whose argv takes no effort anywhere is handed none: effort.js).
+ */
+export function effortIn(adapterId, field, tpl, effort) {
+  if (effort && !takesEffort(tpl)) {
+    throw new LlmError(`adapter "${adapterId}": its ${field} has no {effort}, so this run cannot take effort "${effort}" — keysmith upgrade ${adapterId} --take ${field} brings the profile's`, { status: 400, type: 'invalid_request_error', provider: adapterId });
   }
 }
 
@@ -536,20 +576,26 @@ export function autoApproveFlag(cfg) {
 
 /**
  * A model listing printed as JSON — an array, or an object holding one under `models` or
- * `data` — as `[{id, name?, contextWindow?}]`; null when the text is not that, so the
- * line-by-line reading takes over. The id is the first of `model_id` (Kiro), `id` (oz,
- * OpenAI-shaped), `slug` (Codex), `model`, `name`; an entry marked `visibility: "hide"` or
- * `hidden: true` is a model the CLI itself keeps out of its picker, so it stays out here too.
+ * `data` — as `[{id, name?, contextWindow?, efforts?, defaultEffort?}]`; null when the text is
+ * not that, so the line-by-line reading takes over. The id is the first of `model_id` (Kiro), `id`
+ * (oz, OpenAI-shaped), `slug` (Codex), `model`, `value` (Claude Code), `name`; an entry marked
+ * `visibility: "hide"` or `hidden: true` is a model the CLI itself keeps out of its picker, so it
+ * stays out here too. `efforts`: the reasoning efforts the CLI says the model takes — Codex's
+ * `supported_reasoning_levels`, Claude Code's `supportedEffortLevels` — the only place a level is
+ * ever checked against (src/effort.js). Claude Code prints its listing as the answer to an
+ * `initialize` control request (stream-json on stdin): that line's `models` are read.
  */
-function jsonModelList(text) {
+export function jsonModelList(text) {
   const s = String(text || '').trim();
   if (!/^[[{]/.test(s)) return null;
   let v;
   try {
     v = JSON.parse(s);
+    if (v?.type === 'control_response') v = controlResponse(s);
   } catch {
-    return null;
+    v = controlResponse(s);
   }
+  if (!v) return null;
   const rows = Array.isArray(v) ? v : Array.isArray(v?.models) ? v.models : Array.isArray(v?.data) ? v.data : null;
   if (!rows) return null;
   const list = [];
@@ -559,13 +605,37 @@ function jsonModelList(text) {
       continue;
     }
     if (!r || typeof r !== 'object' || r.visibility === 'hide' || r.hidden === true) continue;
-    const id = [r.model_id, r.id, r.slug, r.model, r.name].find((x) => typeof x === 'string' && x.trim());
+    const id = [r.model_id, r.id, r.slug, r.model, r.value, r.name].find((x) => typeof x === 'string' && x.trim());
     if (!id) continue;
     const name = [r.display_name, r.displayName, r.description, r.model_name].find((x) => typeof x === 'string' && x.trim() && x !== id);
     const ctx = [r.context_window_tokens, r.context_window, r.contextWindow].find((x) => typeof x === 'number' && x > 0);
-    list.push({ id: id.trim(), ...(name ? { name: name.trim() } : {}), ...(ctx ? { contextWindow: ctx } : {}) });
+    const efforts = effortLevels(r.supported_reasoning_levels ?? r.supportedEffortLevels);
+    const resolved = typeof r.resolvedModel === 'string' && r.resolvedModel.trim() && r.resolvedModel !== id ? r.resolvedModel.trim() : null;
+    const defaultEffort = typeof r.default_reasoning_level === 'string' && r.default_reasoning_level ? r.default_reasoning_level : null;
+    list.push({ id: id.trim(), ...(name ? { name: name.trim() } : {}), ...(ctx ? { contextWindow: ctx } : {}), ...(efforts ? { efforts } : {}), ...(defaultEffort ? { defaultEffort } : {}), ...(resolved ? { resolved } : {}) });
   }
   return list;
+}
+
+/** A listing's effort levels — strings, or `{effort}` objects (Codex) — as a list of names; null when it has none. */
+function effortLevels(v) {
+  if (!Array.isArray(v)) return null;
+  const out = v.map((x) => (typeof x === 'string' ? x : typeof x?.effort === 'string' ? x.effort : null)).filter((x) => x && /^[a-z0-9_-]{1,32}$/i.test(x));
+  return out.length ? [...new Set(out)] : null;
+}
+
+/** The `response` of a stream-json control_response line among `text`'s lines (Claude Code's answer to `initialize`), or null. */
+function controlResponse(text) {
+  for (const line of text.split('\n')) {
+    let d;
+    try {
+      d = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (d?.type === 'control_response' && d.response && typeof d.response === 'object') return d.response.response ?? d.response;
+  }
+  return null;
 }
 
 /** An argv template other than `args`: a list (of strings, and of groups), or absent. */

@@ -23,18 +23,25 @@ export function joinArgs(templates, vars) {
     }
     // A nested group is a flag + its value: it is included only when every
     // placeholder inside it resolves to something, so `["-m","{model}"]` never
-    // leaves a bare `-m` behind for a model-less request.
+    // leaves a bare `-m` behind for a model-less request — and
+    // `["-c","model_reasoning_effort=\"{effort}\""]` no empty setting for an effort-less one.
     const parts = [];
     let skip = false;
+    const empty = (v) => v === undefined || v === null || v === '';
     for (const g of t) {
       if (typeof g === 'string' && /^\{(\w+)\}$/.test(g)) {
         const v = vars[g.slice(1, -1)];
-        if (v === undefined || v === null || v === '') {
+        if (empty(v)) {
           skip = true;
           break;
         }
         parts.push(String(v));
       } else {
+        // A placeholder inside a token: the group goes when it has no value, as a whole-token one does.
+        if ([...String(g).matchAll(/\{(\w+)\}/g)].some(([, k]) => empty(vars[k]))) {
+          skip = true;
+          break;
+        }
         parts.push(expandTemplate(String(g), vars));
       }
     }

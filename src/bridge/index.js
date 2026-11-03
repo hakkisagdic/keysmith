@@ -27,8 +27,8 @@ import { startFailure } from '../cli-adapter.js';
  *                  input that follows each call with its output reads as one turn), followed by
  *                  one result for each of its calls and nothing else (a user turn after the result is
  *                  the cold path: agy takes a result while it waits, not a user turn), from the
- *                  same gateway key, to the same target, with the same tools and the same
- *                  system/user turns before it, and every call id of the conversation in the
+ *                  same gateway key, to the same target at the same reasoning effort, with the
+ *                  same tools and the same system/user turns before it, and every call id of the conversation in the
  *                  order the session knows: the result goes to the CLI as the call's MCP result
  *                  (isError from the client's is_error), and what the CLI does next is that
  *                  request's answer — text, or its next call
@@ -135,14 +135,14 @@ export class McpBridge {
    * retryAfter? }` — the reason is the usage row's `fallback` when auto turns to EMULATE. A
    * continuation of a live session is always the bridge's.
    */
-  check(adapter, spec, { messages = [], caller = '', target = '' } = {}) {
+  check(adapter, spec, { messages = [], caller = '', target = '', effort = null } = {}) {
     const driver = this.driverFor(adapter);
     if (!driver) return { ok: false, reason: 'no_bridge' };
     // The older functions/function_call: the call goes out with no id and its result comes back
     // with none, so no later request could continue the session — every turn would leave an agy
     // waiting on a call nobody can answer, until its clock or the next eviction.
     if (spec.legacy) return { ok: false, reason: 'legacy', status: 400, why: 'the older functions/function_call carry no call id, so no later request could continue a session: send tools instead, or use toolMode emulate or auto' };
-    const m = this.match(adapter, spec, messages, { caller, target });
+    const m = this.match(adapter, spec, messages, { caller, target, effort });
     if (m.session) return { ok: true };
     // A session that gives up its place for the new one this request opens (maxTurns, a result with user text).
     if (m.retire) return { ok: true };
@@ -169,7 +169,7 @@ export class McpBridge {
    * cold path), `late` that its session existed and is gone, `retire` the session of this very
    * conversation that gives way to the new one (`{ session, reason }`: run() closes it).
    */
-  match(adapter, spec, messages, { caller = '', target = '' } = {}) {
+  match(adapter, spec, messages, { caller = '', target = '', effort = null } = {}) {
     const tail = continuation(messages);
     if (!tail) return { kind: 'new', why: callIds(messages).length ? 'the request does not end in tool results' : null, late: false };
     const last = tail.ids[tail.ids.length - 1];
@@ -184,6 +184,7 @@ export class McpBridge {
     if (s.caller !== caller) return { kind: 'new', why: 'no live session', late: false };
     const differs =
       s.adapterId !== adapter.id || s.target !== target ? 'the target changed'
+      : (s.effort || null) !== (effort || null) ? 'the effort changed'
       : s.toolsHash !== toolsHash(spec.tools) ? 'the tools changed'
       : s.prefixHash !== prefixHash(tail.before) ? 'the system or user turns changed'
       : !sameList(s.idSeq, callIds(messages)) ? 'the calls in the history changed'
@@ -225,11 +226,11 @@ export class McpBridge {
    * before anything of the answer is thrown with `fallbackReason` (the usage row's `fallback`
    * when auto runs EMULATE instead) and `noFallback` where nothing else may answer.
    */
-  async *run(adapter, { model, spec, messages, signal = null, caller = '', target = '', face = 'openai' } = {}) {
+  async *run(adapter, { model, spec, messages, signal = null, caller = '', target = '', face = 'openai', effort = null } = {}) {
     const driver = this.driverFor(adapter);
     if (!driver) throw bridgeError(adapter, 'no_bridge', 503, `adapter "${adapter.id}" has no MCP bridge driver`);
     target ||= `${adapter.id}/${model}`;
-    const m = this.match(adapter, spec, messages, { caller, target });
+    const m = this.match(adapter, spec, messages, { caller, target, effort });
     if (m.kind === 'busy') {
       // The CLI is answering this continuation for another request: two answers to one call are
       // one too many, and no other leg should make a second either.
@@ -241,7 +242,7 @@ export class McpBridge {
       // conversation on in its place — for as long as the call's tombstone lives.
       throw bridgeError(adapter, 'foreign_tool', 502, `bridge: the session this tool result belongs to was stopped when ${adapter.id} reached for a tool of its own (the tripwire); the conversation is not carried on`, { noFallback: true, routeEnd: true });
     }
-    const o = { model, spec, messages, signal, caller, target, face };
+    const o = { model, spec, messages, signal, caller, target, face, effort };
     if (m.kind === 'attach') {
       yield* this._attach(adapter, driver, m.session, m.results, o);
       return;
@@ -285,6 +286,7 @@ export class McpBridge {
         adapterId: adapter.id,
         caller: o.caller,
         target: o.target,
+        effort: o.effort || null,
         tools: o.spec.tools,
         listing: this.listing(o.spec),
         toolsHash: toolsHash(o.spec.tools),

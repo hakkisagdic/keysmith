@@ -56,7 +56,7 @@ test('keysmith set <adapter> shows each field beside the profile\'s — and neve
   assert.match(r.stdout, /^ {2}= parser +"claude-stream-json"$/m);
   assert.match(r.stdout, /^ {2}· models +\["sonnet"\]$/m);
   assert.match(r.stdout, /^ {2}\+ media +— +profile: \["image","pdf"\]$/m);
-  assert.match(r.stdout, /^ {2}\+ visionArgs +— +profile: \[17 items\]$/m);
+  assert.match(r.stdout, /^ {2}\+ visionArgs +— +profile: \[18 items\]$/m);
   assert.match(r.stdout, /^ {2}· env +\{ANTHROPIC_API_KEY\}$/m);
   assert.doesNotMatch(r.all, /should-not-print/);
   assert.match(r.stdout, /also settable: .*maxImages, maxImageBytes/);
@@ -89,7 +89,7 @@ test('keysmith upgrade: a dry run lists what the profile gained; --apply adds it
   assert.equal(r.status, 0, r.all);
   assert.match(r.stdout, /^claude ← "claude"$/m);
   assert.match(r.stdout, /^ {2}\+ media +\["image","pdf"\]$/m);
-  assert.match(r.stdout, /^ {2}\+ visionArgs +\[17 items\]$/m);
+  assert.match(r.stdout, /^ {2}\+ visionArgs +\[18 items\]$/m);
   assert.match(r.stdout, /^ {2}~ provenance +the profile's current text$/m);
   assert.match(r.stdout, /^ {2}= timeoutMs +yours: 120000 · profile: 300000$/m);
   assert.match(r.stdout, /^ {2}= bin +yours: "\/usr\/local\/bin\/claude" · profile: "claude"$/m);
