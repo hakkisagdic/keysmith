@@ -6,7 +6,7 @@ import { addUsage, renderPrompt } from '../tools/emulate.js';
 import { isPlainObject, newToolCallId } from '../tools/model.js';
 import { namesFit } from '../tools/router.js';
 import { HUB_DEFAULTS, Hub, SESSION_DEFAULTS } from './hub.js';
-import { MAX_INVALID_CALLS, toolListing } from './mcp.js';
+import { MAX_INVALID_CALLS, toolListing, withToolMeta } from './mcp.js';
 import { DRIVERS } from './drivers.js';
 import { KILL_GRACE_MS } from './proc.js';
 import { startFailure } from '../cli-adapter.js';
@@ -288,7 +288,8 @@ export class McpBridge {
         target: o.target,
         effort: o.effort || null,
         tools: o.spec.tools,
-        listing: this.listing(o.spec),
+        // The request's tools/list, with what this CLI reads off each listed tool (driver.toolMeta).
+        listing: withToolMeta(this.listing(o.spec), driver.toolMeta?.(adapter)),
         toolsHash: toolsHash(o.spec.tools),
         prefixHash: prefixHash(o.messages),
         idSeq: callIds(o.messages),

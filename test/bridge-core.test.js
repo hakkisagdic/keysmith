@@ -13,7 +13,7 @@ import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Hub, PROGRESS_MS, RETRY_AFTER_S } from '../src/bridge/hub.js';
-import { LATEST_PROTOCOL, MAX_INVALID_CALLS, toolListing } from '../src/bridge/mcp.js';
+import { LATEST_PROTOCOL, MAX_INVALID_CALLS, toolListing, withToolMeta } from '../src/bridge/mcp.js';
 import { knownSecrets } from '../src/redact.js';
 
 const SHIM = fileURLToPath(new URL('../src/bridge/shim.js', import.meta.url));
@@ -174,6 +174,14 @@ test('the handshake agy 1.4.2 makes: server/discover is refused (-32601), initia
   c.close();
   await c.exited;
   await s.close('done');
+});
+
+test('withToolMeta: each listed tool gets the driver\'s _meta over its own; none leaves the listing as it is', () => {
+  const listing = [{ name: 'a', description: '', inputSchema: { type: 'object' } }, { name: 'b', description: '', inputSchema: { type: 'object' }, _meta: { keep: 1, 'anthropic/maxResultSizeChars': 5 } }];
+  const meta = { 'anthropic/maxResultSizeChars': 200_000 };
+  assert.deepEqual(withToolMeta(listing, meta).map((t) => t._meta), [meta, { keep: 1, 'anthropic/maxResultSizeChars': 200_000 }]);
+  assert.equal(listing[0]._meta, undefined, 'the request\'s own listing is not changed: another driver lists it too');
+  for (const none of [null, undefined, {}]) assert.equal(withToolMeta(listing, none), listing);
 });
 
 test('tools/call waits for the client\'s result, which goes back as the call\'s MCP result; isError comes from the client', async () => {

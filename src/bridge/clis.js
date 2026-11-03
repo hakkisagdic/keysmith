@@ -51,10 +51,16 @@ import { CLI_PROFILES } from '../profiles.js';
  *             `--tools ""` (no built-in tool), the server's tools allowed (`--allowedTools
  *             mcp__<server>`), `--permission-prompts none`, `--setting-sources ""` (no settings file
  *             and no CLAUDE.md — `project` still read the workspace's parent directories'), hooks
- *             off, skills off, no session written; not `--safe-mode`, which turns MCP servers off.
- *             MCP_TOOL_TIMEOUT outlasts toolResultTimeoutMs (Claude Code honours it: a 2 s one
- *             cancelled a held call at 2 s) and ENABLE_TOOL_SEARCH=false keeps every tool of the
- *             request loaded, with no tool-search tool of Claude Code's to call. Its assistant
+ *             off, auto-memory off (`autoMemoryEnabled: false` and CLAUDE_CODE_DISABLE_AUTO_MEMORY:
+ *             `--setting-sources ""` left it on, and its MEMORY.md and "keep memories with the
+ *             Write tool" reached the prompt), skills off, no session written; not `--safe-mode`,
+ *             which turns MCP servers off. MCP_TOOL_TIMEOUT outlasts toolResultTimeoutMs (Claude
+ *             Code honours it: a 2 s one cancelled a held call at 2 s) and ENABLE_TOOL_SEARCH=false
+ *             keeps every tool of the request loaded, with no tool-search tool of Claude Code's to
+ *             call. Each tool is listed with `_meta: {"anthropic/maxResultSizeChars":
+ *             maxPromptChars}`: without it 2.1.303 wrote a result over ~50,000 chars to
+ *             ~/.claude/projects/<workspace>/<session>/tool-results/ — left there when the session
+ *             was gone — and showed the model a 2 KB preview and the path to Read. Its assistant
  *             message prints each tool_use block before the call runs.
  *
  * How a step's calls reach the client (`batch`, src/bridge/index.js): codex 0.163 and qoder 1.1.59
@@ -91,13 +97,15 @@ export const CLAUDE_BRIDGE_ARGS = CLI_PROFILES.claude.bridge.args;
 /**
  * A driver for a CLI whose session lives in files under `.keysmith-bridge/`: `files(adapter,
  * session, base)` the files to write (`[{ file, content }]`), `vars(...)` its argv's placeholders,
- * `env(...)` its environment.
+ * `env(...)` its environment, `toolMeta(adapter)` the `_meta` its tools are listed with.
  */
-function fileDriver({ id, parser, parserOpts = {}, usageAtEnd = false, prefix, harnessTools = [], batch = 'serial', settleMs = 0, files, vars = () => ({}), env = (adapter) => bridgeEnv(adapter) }) {
+function fileDriver({ id, parser, parserOpts = {}, usageAtEnd = false, prefix, harnessTools = [], batch = 'serial', settleMs = 0, files, vars = () => ({}), env = (adapter) => bridgeEnv(adapter), toolMeta = () => null }) {
   return {
     id,
     parser,
     parserOpts,
+    /** The `_meta` each of the session's tools is listed with (tools/list), or null for none. */
+    toolMeta,
     // The CLI says what a run spent only when the run ends (codex's turn.completed, qoder's result
     // line): an answer that hands a call out before then has no count of its own (index.js).
     usageAtEnd,
@@ -281,7 +289,9 @@ export const claudeDriver = fileDriver({
   // Claude Code waits on a call as long as MCP_TOOL_TIMEOUT says: past keysmith's own wait, so
   // keysmith's clock ends a session first; MCP_TIMEOUT is its readiness wait. ENABLE_TOOL_SEARCH
   // off: with many tools Claude Code would defer them behind a tool of its own (a placeholder the
-  // model calls to load them), which the tripwire would have to stop.
+  // model calls to load them), which the tripwire would have to stop. Auto-memory off here as well
+  // as in the profile's `--settings`: an entry's `bridge.args` copied before that are kept as
+  // they are (`keysmith upgrade`), and this reaches every run all the same.
   env(adapter, session) {
     return bridgeEnv(adapter, {
       drop: /^(CLAUDECODE$|CLAUDE_CODE_|CLAUDE_AGENT_SDK_)/,
@@ -289,7 +299,14 @@ export const claudeDriver = fileDriver({
         MCP_TOOL_TIMEOUT: String(session.limits.toolResultTimeoutMs + CALL_TIMEOUT_MARGIN_MS),
         MCP_TIMEOUT: String(session.limits.readyTimeoutMs),
         ENABLE_TOOL_SEARCH: 'false',
+        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
       },
     });
+  },
+  // A result as long as the adapter takes one (a longer one is a 400 before it reaches the CLI:
+  // index.js _attach) goes to the model whole, never to a file under ~/.claude/projects/.
+  toolMeta(adapter) {
+    const max = adapter.maxPromptChars;
+    return Number.isFinite(max) && max > 0 ? { 'anthropic/maxResultSizeChars': max } : null;
   },
 });

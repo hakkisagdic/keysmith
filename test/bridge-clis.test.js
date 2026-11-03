@@ -45,6 +45,8 @@ function around(name, cli, { bridge = {}, ...extra } = {}) {
     ...extra,
   };
 }
+/** The `--settings` Claude Code's bridge argv is given. */
+const CLAUDE_SETTINGS = CLAUDE_BRIDGE_ARGS[CLAUDE_BRIDGE_ARGS.indexOf('--settings') + 1];
 const NO_APPROVAL = (args) => args.filter((a, i) => !(a === '-c' && /default_tools_approval_mode/.test(args[i + 1] || '')) && !/default_tools_approval_mode/.test(a));
 
 before(async () => {
@@ -65,6 +67,8 @@ before(async () => {
       oct: around('opencode', 'opencode', { bridge: { toolResultTimeoutMs: 1_200 }, cwd: path.join(dir, 'ws-opencode-t') }),
       // Claude Code's profile with a short clock: a client that never comes back.
       cct: around('claude', 'claude', { bridge: { toolResultTimeoutMs: 1_200 }, cwd: path.join(dir, 'ws-claude-t'), models: [{ id: 'm', efforts: ['low', 'high'] }] }),
+      // An entry copied from the profile before auto-memory was off in its argv, with a cap of its own.
+      ccx: around('claude', 'claude', { bridge: { args: CLAUDE_BRIDGE_ARGS.map((a) => (a === CLAUDE_SETTINGS ? '{"disableAllHooks":true}' : a)) }, cwd: path.join(dir, 'ws-claude-x'), maxPromptChars: 300_000, models: [{ id: 'm' }] }),
     },
   };
   gateway = new Gateway(cfg, { log: (m) => log.push(m) });
@@ -223,7 +227,7 @@ function planOf(driver, cfg) {
   const adapter = new CliAdapter(driver.id, { ...cfg, cwd: '/ws/' + driver.id, toolMode: cfg.toolMode === 'off' ? 'off' : 'mcp' });
   const p = driver.plan(adapter, { session: fakeSession(), model: 'm1', prompt: 'PROMPT' });
   const norm = (s) => s.split(process.execPath).join('<NODE>').split(SHIM).join('<SHIM>').split(adapter.cwd).join('<CWD>');
-  const env = Object.fromEntries(['OPENCODE_CONFIG', 'PWD'].filter((k) => p.env[k] !== undefined).map((k) => [k, norm(p.env[k])]));
+  const env = Object.fromEntries(['OPENCODE_CONFIG', 'PWD', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY'].filter((k) => p.env[k] !== undefined).map((k) => [k, norm(p.env[k])]));
   return {
     argv: p.argv.map(norm),
     files: p.files.map(({ file, content }) => ({ file: norm(file), content: /\.json$/.test(file) ? JSON.parse(norm(content)) : norm(content) })),
@@ -257,11 +261,13 @@ test('golden: what each driver starts for one session — the argv, the session\
     assert.equal(argv[argv.indexOf('--tools') + 1], '', `${name}: no built-in tool`);
     assert.ok(argv.includes('--strict-mcp-config'));
     assert.equal(argv[argv.indexOf(name === 'claude' ? '--allowedTools' : '--allowed-tools') + 1], 'mcp__ks012345');
-    assert.equal(argv[argv.indexOf('--settings') + 1], '{"disableAllHooks":true}');
+    assert.equal(JSON.parse(argv[argv.indexOf('--settings') + 1]).disableAllHooks, true, `${name}: no hooks`);
     assert.ok(!argv.some((a) => a.includes('TOKEN-0123')), `${name}: the token is in the 0600 file, not the argv`);
   }
   assert.ok(!plans.claude.argv.includes('--safe-mode'), 'claude: --safe-mode would turn the MCP server off');
   const cc = plans.claude.argv;
+  assert.deepEqual(JSON.parse(cc[cc.indexOf('--settings') + 1]), { disableAllHooks: true, autoMemoryEnabled: false }, 'claude: no hooks, no auto-memory (--setting-sources "" leaves it on)');
+  assert.equal(plans.claude.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1', 'claude: auto-memory off in its environment too, whatever an entry\'s argv says');
   assert.equal(cc[cc.indexOf('--setting-sources') + 1], '', 'claude: no settings file and no CLAUDE.md (`project` read the parent directories\' CLAUDE.md)');
   assert.equal(cc[cc.indexOf('--permission-prompts') + 1], 'none');
   assert.ok(cc.includes('--no-session-persistence') && cc.includes('--disable-slash-commands'));
@@ -577,8 +583,9 @@ test('claude: what its run is given — the session\'s server alone, allowed; no
   const server = eventsOf(start.pid).find((e) => e.event === 'server').server.name;
   assert.deepEqual(
     [cfg.mode, cfg.strict, cfg.allowed, cfg.tools, cfg.prompts, cfg.sources, cfg.settings, cfg.safeMode, cfg.persist, cfg.effort],
-    ['600', true, `mcp__${server}`, '', 'none', '', '{"disableAllHooks":true}', false, false, 'high'],
+    ['600', true, `mcp__${server}`, '', 'none', '', '{"disableAllHooks":true,"autoMemoryEnabled":false}', false, false, 'high'],
   );
+  assert.equal(cfg.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1', 'no auto-memory: no MEMORY.md and no "keep memories with Write" in its prompt');
   assert.equal(Number(cfg.env.MCP_TOOL_TIMEOUT), 60_000 + 30_000, 'Claude Code waits on a call 30 s past toolResultTimeoutMs');
   assert.equal(cfg.env.ENABLE_TOOL_SEARCH, 'false');
   assert.equal(cfg.env.CLAUDECODE, null, 'no marker of a Claude Code session the gateway was started in');
@@ -678,39 +685,75 @@ test('claude: a client that never comes back — at toolResultTimeoutMs Claude C
   assert.ok(await until(() => !sessionFiles('claude-t').length), 'nothing left after');
 });
 
-// Blocking findings of the independent test of 2026-11-03, against Claude Code 2.1.303 itself (a stub
-// Messages endpoint, then live on haiku). Marked todo until the bridge does what they say.
+// Two findings of the independent test of 2026-11-03, against Claude Code 2.1.303 itself (a stub
+// Messages endpoint, then live on haiku): auto-memory stayed on under --setting-sources "", and a
+// result over ~50,000 chars was written under ~/.claude/projects/…/tool-results while the model got
+// a 2 KB preview of it. Either way a plain request made the model reach for Read (the tripwire, 502).
 
-test('claude: Claude Code\'s auto-memory is off on the bridge (autoMemoryEnabled false) — no MEMORY.md and no "write it with the Write tool" section in its prompt', {
-  todo: 'with --setting-sources "" Claude Code 2.1.303 still loads ~/.claude/projects/<workspace>/memory/MEMORY.md into the prompt as instructions and tells the model to keep memories with the Write tool; live on haiku a "remember that my favourite colour is teal" request reached for Read and the tripwire ended it (502). --settings \'{"disableAllHooks":true,"autoMemoryEnabled":false}\' (or CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 set after the CLAUDE_CODE_ drop) takes both out',
-}, async () => {
-  const t = tag();
-  const c = conversation('cc/m', `Weather ${t}`);
+test('claude: Claude Code\'s auto-memory is off on the bridge — autoMemoryEnabled false in its --settings, and CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 in its environment, an entry\'s older argv and an inherited 0 notwithstanding', async () => {
+  const saved = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY;
+  process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '0';
   try {
-    const a1 = await c.ask();
-    assert.equal(a1.r.status, 200, a1.r.text);
-    const [start] = startsOf(t);
-    const cfg = eventsOf(start.pid).find((e) => e.event === 'config');
-    assert.ok(JSON.parse(cfg.settings).autoMemoryEnabled === false || cfg.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY === '1', `auto-memory left on: --settings ${cfg.settings}`);
+    for (const id of ['cc', 'ccx']) {
+      const t = tag();
+      const c = conversation(`${id}/m`, `Weather ${t}`);
+      const a1 = await c.ask();
+      assert.equal(a1.r.status, 200, a1.r.text);
+      const [start] = startsOf(t);
+      const cfg = eventsOf(start.pid).find((e) => e.event === 'config');
+      assert.equal(cfg.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1', `${id}: auto-memory off in its environment`);
+      assert.equal(JSON.parse(cfg.settings).disableAllHooks, true, `${id}: no hooks`);
+      // The profile's argv says it too; an entry copied before that keeps its own argv (keysmith upgrade).
+      assert.equal(JSON.parse(cfg.settings).autoMemoryEnabled, id === 'cc' ? false : undefined, `${id}: --settings ${cfg.settings}`);
+      c.results();
+      assert.equal((await c.ask()).text, 'Weather: RESULT for Ankara');
+    }
   } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY;
+    else process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = saved;
     await closeAll();
   }
 });
 
-test('claude: each tool the hub lists to Claude Code takes a result as long as the adapter takes one (_meta "anthropic/maxResultSizeChars" ≥ maxPromptChars)', {
-  todo: 'Claude Code 2.1.303 writes an MCP result over ~50,000 chars to ~/.claude/projects/<workspace>/<session>/tool-results/ (left there after the session is gone) and hands the model a 2 KB preview and the path: live on haiku a 60,000-char result made it reach for Read and the tripwire ended the turn (502). A tools/list entry with _meta {"anthropic/maxResultSizeChars": N} let a 300,000-char result through whole',
-}, async () => {
-  const t = tag();
-  const c = conversation('cc/m', `Weather ${t}`);
-  try {
+test('claude: each tool the hub lists to Claude Code takes a result as long as the adapter takes one (_meta "anthropic/maxResultSizeChars" = maxPromptChars) — a 60,000-char result reaches the model whole, and nothing spills to a file', async (ctx) => {
+  ctx.after(closeAll);
+  for (const [id, ws] of [['cc', 'claude'], ['ccx', 'claude-x']]) {
+    const t = tag();
+    const big = (c) => `${c.args.city}:` + 'x'.repeat(60_000);
+    const c = conversation(`${id}/m`, `Weather ${t}`);
     const a1 = await c.ask();
     assert.equal(a1.r.status, 200, a1.r.text);
     const [start] = startsOf(t);
-    const meta = eventsOf(start.pid).find((e) => e.event === 'mcp').meta;
-    const max = gateway.adapters.get('cc').maxPromptChars;
-    assert.ok(meta.length > 0 && meta.every((m) => (m?.['anthropic/maxResultSizeChars'] ?? 0) >= max), `tools/list _meta: ${JSON.stringify(meta)}`);
-  } finally {
-    await closeAll();
+    const max = gateway.adapters.get(id).maxPromptChars;
+    assert.equal(max, id === 'cc' ? 200_000 : 300_000);
+    assert.deepEqual(eventsOf(start.pid).find((e) => e.event === 'mcp').meta, [{ 'anthropic/maxResultSizeChars': max }], `${id}: each listed tool says how long a result it takes`);
+    c.results(big);
+    const a2 = await c.ask();
+    assert.equal(a2.r.status, 200, a2.r.text);
+    assert.equal(a2.text, `Weather: ${big({ args: { city: 'Ankara' } })}`, `${id}: the result reached the model whole`);
+    assert.ok(!eventsOf(start.pid).some((e) => e.event === 'spilled'), `${id}: no result left in a file of Claude Code's`);
+    assert.ok(await until(() => !sessionFiles(ws).length), 'nothing left after');
+  }
+  // A result over maxPromptChars never reaches Claude Code: the request is a 400.
+  const t = tag();
+  const c = conversation('cc/m', `Weather ${t}`);
+  await c.ask();
+  c.results(() => 'y'.repeat(200_001));
+  const a2 = await c.ask();
+  assert.equal(a2.r.status, 400, a2.r.text);
+  assert.match(JSON.parse(a2.r.text).error.message, /over maxPromptChars=200000/);
+});
+
+test('the other CLIs\' tools are listed with no _meta: what claude reads off a tool is claude\'s alone', async () => {
+  for (const id of ['oc', 'cx', 'qd']) {
+    const t = tag();
+    const c = conversation(`${id}/m`, `Weather ${t}`);
+    const a1 = await c.ask();
+    assert.equal(a1.r.status, 200, a1.r.text);
+    const [start] = startsOf(t);
+    assert.deepEqual(eventsOf(start.pid).find((e) => e.event === 'mcp').meta, [null], id);
+    c.results();
+    await c.ask();
   }
 });
 

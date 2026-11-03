@@ -531,13 +531,24 @@ session's MCP config file). The session's files are in `.keysmith-bridge/` in th
   mcp__{server}`, `--tools ""`, `--permission-prompts none`, `--disable-slash-commands`,
   `--setting-sources ""` — no settings file and no CLAUDE.md: with `project`, a CLAUDE.md in a
   parent directory of the workspace reached the prompt (2.1.303, against a stub Messages
-  endpoint) — `--settings '{"disableAllHooks":true}'`, `--no-session-persistence`, and
-  `--effort {effort}`. Not the text argv's `--safe-mode`: it turns `--mcp-config`'s server off
-  too. Its environment: `MCP_TOOL_TIMEOUT` 30 s past `toolResultTimeoutMs` (Claude Code honours
-  it: a 2 s one cancelled a held call at 2 s), `MCP_TIMEOUT` the readiness wait,
-  `ENABLE_TOOL_SEARCH=false` (with it on, Claude Code put a tool of its own in front of the
-  request's), and no `CLAUDECODE`/`CLAUDE_CODE_*`/`CLAUDE_AGENT_SDK_*` of a session the gateway
-  was started in. The model sees `mcp__ks<rid6>__<tool>`; asked for two at once, Claude Code sent
+  endpoint) — `--settings '{"disableAllHooks":true,"autoMemoryEnabled":false}'`,
+  `--no-session-persistence`, and `--effort {effort}`. Not the text argv's `--safe-mode`: it
+  turns `--mcp-config`'s server off too. Its environment: `MCP_TOOL_TIMEOUT` 30 s past
+  `toolResultTimeoutMs` (Claude Code honours it: a 2 s one cancelled a held call at 2 s),
+  `MCP_TIMEOUT` the readiness wait, `ENABLE_TOOL_SEARCH=false` (with it on, Claude Code put a
+  tool of its own in front of the request's), `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, and no
+  `CLAUDECODE`/`CLAUDE_CODE_*`/`CLAUDE_AGENT_SDK_*` of a session the gateway was started in.
+  Auto-memory is off twice, in the argv and the environment, because `--setting-sources ""`
+  leaves it on: `~/.claude/projects/<workspace>/memory/MEMORY.md` reached the prompt as
+  instructions, with ~2,300 chars telling the model to keep memories with the Write tool, and
+  live a "remember that my favourite colour is teal" request reached for Read — the tripwire's,
+  a 502. The environment reaches an entry whose `bridge.args` were copied before the argv said
+  it. Each tool is listed with `_meta: {"anthropic/maxResultSizeChars": maxPromptChars}`:
+  without it Claude Code wrote a result over ~50,000 chars to
+  `~/.claude/projects/<workspace>/<session>/tool-results/`, left it there after the session, and
+  gave the model a 2 KB preview and the path (live, a 60,000-char result made it reach for Read);
+  with it a 190,000-char result reached the model whole and nothing was written. A result over
+  `maxPromptChars` is a 400 before it reaches Claude Code. The model sees `mcp__ks<rid6>__<tool>`; asked for two at once, Claude Code sent
   the second tools/call after the first one's result, so a step's calls go out one per answer.
   Claude Code keeps no harness tool here: any other `tool_use` block is the tripwire's. The
   `claude` profile ships it with `toolMode: "auto"`, explicit-only as before. Checked against a

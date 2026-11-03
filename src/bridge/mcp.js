@@ -53,6 +53,16 @@ export function toolListing(tools) {
   return (tools || []).map((t) => ({ name: t.name, description: t.description || '', inputSchema: objectSchema(deref(t.parameters)) }));
 }
 
+/**
+ * A tools/list with `meta` as each entry's `_meta` (over any it has): what a CLI reads off a
+ * listed tool beyond its schema (claude's `anthropic/maxResultSizeChars`). The listing as it is
+ * with none.
+ */
+export function withToolMeta(listing, meta) {
+  if (!isPlainObject(meta) || !Object.keys(meta).length) return listing;
+  return listing.map((t) => ({ ...t, _meta: { ...(isPlainObject(t._meta) ? t._meta : {}), ...meta } }));
+}
+
 function objectSchema(s) {
   if (!isPlainObject(s)) return { type: 'object' };
   return s.type === undefined ? { type: 'object', ...s } : s;

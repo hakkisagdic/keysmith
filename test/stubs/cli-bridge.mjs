@@ -20,7 +20,10 @@
  *   claude    as qoder (`--mcp-config`, `--allowedTools`), the way Claude Code 2.1.303 printed it
  *             against a stub Messages endpoint: each content block of a message on a line of its
  *             own, under the message's id, with the usage of the message's start (output 1); the
- *             result line the run's total. Calls one after the other.
+ *             result line the run's total. Calls one after the other. A result longer than the
+ *             tool's `_meta["anthropic/maxResultSizeChars"]` (50,000 with none: 2.1.303 kept
+ *             49,220 chars whole and spilled 73,820) reaches the model as 2.1.303 gave it: a
+ *             2,000-char preview, the rest left in a file (noted `spilled`, not written).
  *
  * Without an MCP server it answers in plain text, as the CLI would with nothing to call. What it
  * does is picked by `SCENARIO=<name>` in its prompt (the last argv entry; one-call and two-calls
@@ -232,6 +235,10 @@ const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabiliti
 mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
 const list = await rpc('tools/list', {});
 note({ event: 'mcp', protocolVersion: init.result?.protocolVersion ?? null, tools: list.result?.tools?.map((t) => t.name) ?? null, meta: list.result?.tools?.map((t) => t._meta ?? null) ?? null });
+/** Claude Code 2.1.303: how long a tool's result may be before the model gets a preview of it instead. */
+const SPILL_AT = 50_000;
+const PREVIEW = 2_000;
+const spillAt = (name) => list.result?.tools?.find((t) => t.name === name)?._meta?.['anthropic/maxResultSizeChars'] ?? SPILL_AT;
 
 let seq = 0;
 /** One call: shown (where the CLI shows it first), sent, its result read, shown finished. */
@@ -245,7 +252,11 @@ async function call(name, args, { via = null } = {}) {
     return { text: null, refused: true };
   }
   const r = await rpc('tools/call', { name, arguments: args, _meta: { progressToken: `tok-${id}` } });
-  const text = (r.result?.content || []).map((c) => c.text).join('');
+  let text = (r.result?.content || []).map((c) => c.text).join('');
+  if (cli === 'claude' && text.length > spillAt(name)) {
+    note({ event: 'spilled', name, length: text.length });
+    text = `Output too large (${text.length} chars). Full output saved to: tool-results/${id}.txt\n\nPreview (first 2KB):\n${text.slice(0, PREVIEW)}`;
+  }
   note({ event: 'result', name, isError: !!r.result?.isError, text });
   out.finished(cli === 'opencode' ? `${server.name}_${name}` : name, args, text, id);
   return { text, isError: !!r.result?.isError };

@@ -198,7 +198,7 @@
       "--setting-sources",
       "",
       "--settings",
-      "{\"disableAllHooks\":true}",
+      "{\"disableAllHooks\":true,\"autoMemoryEnabled\":false}",
       "--model",
       "m1",
       "PROMPT"
@@ -223,7 +223,8 @@
       }
     ],
     "env": {
-      "PWD": "<CWD>"
+      "PWD": "<CWD>",
+      "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"
     }
   }
 }
