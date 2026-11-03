@@ -23,6 +23,14 @@
  * (The same request also ran to agy's 280 s print timeout in 2 of 9 calls. That was not
  * this tool: both were one response step that kept writing past its answer, as if it were
  * the rest of the transcript. `stopAtToolCall` does not end those.)
+ *
+ * agy 1.4.12 (2026-11-03) holds the agent as 1.3.3 did: a one-word answer 658 input tokens
+ * (the default agent 15,651), and a request to run `ls` in a directory with a marker file
+ * got no tool step — with this prompt, and with a neutral one that invited tools. Its `init`
+ * event lists 60 tools (run_command, write_to_file, browser_*, …) for every agent alike: that
+ * is agy's catalogue, not what the model is offered. `tools: []` now leaves three tools:
+ * `manage_task`, and `list_resources` / `read_resource`, which with `inheritMcp: false` are
+ * refused ("server default is not allowed in this context"; a file:// uri read nothing).
  */
 const AGY_TEXT_AGENT_NAME = 'keysmith-text';
 const AGY_TEXT_AGENT = `---
@@ -323,8 +331,9 @@ export const CLI_PROFILES = {
     // `-p` takes the prompt as its own value, so it goes last: anything after it is read as
     // the prompt (agy refuses `-p --output-format …` rather than guessing).
     // `--agent keysmith-text` is the tool-less agent below. Without it every call is agy's
-    // full coding agent: a ~20k-token harness prompt, every MCP server booted, and tools
-    // that headless mode then refuses, so a model that reaches for one answers nothing.
+    // full coding agent: a ~16–20k-token harness prompt, every MCP server booted, and tools.
+    // On agy 1.3.3 headless mode refused them; on 1.4.12 it runs read-only commands unasked
+    // (`ls -A` and `cat` ran, `touch` was refused), so anyone with a key could read files.
     args: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '280s', '--agent', AGY_TEXT_AGENT_NAME, ['--model', '{model}'], '-p', '{prompt}'],
     resumeArgs: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '280s', '--conversation', '{session}', '--agent', AGY_TEXT_AGENT_NAME, ['--model', '{model}'], '-p', '{prompt}'],
     // agy writes every run to disk as a conversation whether asked or not; there is no
@@ -335,15 +344,16 @@ export const CLI_PROFILES = {
     // An empty directory keysmith owns: headless agy may read inside its workspace, and
     // nothing in it is the workspace you are standing in. agy finds project agents in
     // `.agents/agents/` under its cwd, so the tool-less agent lives there and is rewritten
-    // whenever it drifts — an agent name agy cannot find is silently the full harness.
+    // whenever it drifts — an agent name agy cannot find is silently the full harness, the
+    // one that runs commands.
     cwd: '~/.local/share/keysmith/workspaces/agy',
     workspaceFiles: {
       [`.agents/agents/${AGY_TEXT_AGENT_NAME}.md`]: AGY_TEXT_AGENT,
       [`.agents/agents/${AGY_TOOLS_AGENT_NAME}.md`]: AGY_TOOLS_AGENT,
     },
     toolDenialRetry: AGY_TOOL_DENIAL_RETRY,
-    // agy keeps `manage_task` on every agent; after the answer, a call to it is the model
-    // starting over. The answer ends there.
+    // agy keeps `manage_task` on every agent (1.4.12: `list_resources` and `read_resource`
+    // too); after the answer, a call to one is the model starting over. The answer ends there.
     stopAtToolCall: true,
     // A request that offers tools: agy answers it (design §4: Argon first), through the MCP
     // bridge where it can (src/bridge: a session agent whose only tools are the request's, the
@@ -360,8 +370,8 @@ export const CLI_PROFILES = {
     bridge: { driver: 'agy', args: ['--output-format', 'stream-json', '--disable-slash-commands', '--print-timeout', '{printTimeout}', '--agent', '{agent}', ['--model', '{model}'], '-p', '{prompt}'] },
     timeoutMs: 300_000,
     maxConcurrent: 2,
-    provenance: 'Antigravity CLI (agy) 1.3.3 — `agy --output-format stream-json -p` emits init / step_update (agent_response text_delta, per-step usage) / result; `agy models` prints id<TAB>name; `--conversation <id>` resumes; `--agent <name>` loads a markdown agent from `.agents/agents/` (unknown names fall back to the default agent without an error). agy 1.4.2 (the tool-bridge probes, design §2–3): a `tools: []` agent answered the JSON tool protocol (`tool_calls` / `final`) on gemini-4-argon-high, 7 of 7 strictly parseable, in 9–44 s a turn; `--mode auto|accept-edits` approves tool calls. An agent with `mcpServers` as a list (a stdio server, each tool `eager: true`) asks the server `server/discover` (and takes -32601), then initialize / tools/list; the model sees `mcp_<server>_<tool>`, the server gets the tool\'s own name and arguments, the calls of one step come one after the other, a tools/call held 15 s was waited for, and the schemas land in ~/.gemini/antigravity-cli/mcp/<server>/.',
-    note: 'Uses your Antigravity login, no key. Runs agy as the tool-less `keysmith-text` agent: ~600 input tokens for a one-word answer instead of the default agent\'s ~20k, no MCP servers booted, no tools to be refused. If a model still answers with a refused tool call, keysmith retries once with a stricter instruction (logged, and counted as `retries` in the usage log). agy keeps one tool, `manage_task`, on every agent: once the answer has text, a call to it ends the run (`stopAtToolCall`, `cutAt` in the usage log) instead of producing a second answer. A request that offers tools is answered too (`toolMode: "auto"`): through the MCP bridge — a session agent whose only tools are the request\'s, each call handed to the client while agy waits on it, its result sent back into the same agy process — or, where the bridge cannot (a tool_choice that forces a call, a tool name too long, no room), the tool-less `keysmith-tools` agent writing the calls as JSON. Either way keysmith hands the calls to the client as tool_calls, and agy runs none of them. For agy\'s full coding agent drop `--agent keysmith-text` from args/resumeArgs and set `stopAtToolCall` to false — you get its harness prompt, MCP start-up and headless tool refusals back. Each run leaves a conversation under ~/.gemini/antigravity-cli/conversations.',
+    provenance: 'Antigravity CLI (agy) 1.3.3 — `agy --output-format stream-json -p` emits init / step_update (agent_response text_delta, per-step usage) / result; `agy models` prints id<TAB>name; `--conversation <id>` resumes; `--agent <name>` loads a markdown agent from `.agents/agents/` (unknown names fall back to the default agent without an error). agy 1.4.2 (the tool-bridge probes, design §2–3): a `tools: []` agent answered the JSON tool protocol (`tool_calls` / `final`) on gemini-4-argon-high, 7 of 7 strictly parseable, in 9–44 s a turn; `--mode auto|accept-edits` approves tool calls. An agent with `mcpServers` as a list (a stdio server, each tool `eager: true`) asks the server `server/discover` (and takes -32601), then initialize / tools/list; the model sees `mcp_<server>_<tool>`, the server gets the tool\'s own name and arguments, the calls of one step come one after the other, a tools/call held 15 s was waited for, and the schemas land in ~/.gemini/antigravity-cli/mcp/<server>/. agy 1.4.12 (2026-11-03, gemini-3.8-flash-low, empty scratch directories): `keysmith-text` 658 input tokens for a one-word answer (the default agent 15,651); asked to run `ls -A` beside a marker file, `keysmith-text`, `keysmith-tools` and a `tools: []` agent with a neutral prompt ran nothing. `init.tools` lists the same 60 tools for every agent (agy\'s catalogue). `tools: []` leaves `manage_task`, `list_resources` and `read_resource`; with no MCP server the last two are refused, with a bridge-style agent (a stub server without resources) they answer "no resources" and send it no resources/* request. The default agent, headless, ran `ls -A` and `cat` unasked and was refused `touch` (denied_actions RunCommand).',
+    note: 'Uses your Antigravity login, no key. Runs agy as the tool-less `keysmith-text` agent: ~600 input tokens for a one-word answer instead of the default agent\'s ~20k, no MCP servers booted, no tools to be refused. If a model still answers with a refused tool call, keysmith retries once with a stricter instruction (logged, and counted as `retries` in the usage log). agy keeps a few tools of its own on every agent — `manage_task`, and on 1.4.12 `list_resources` / `read_resource`, which find nothing to read here: once the answer has text, a call to one ends the run (`stopAtToolCall`, `cutAt` in the usage log) instead of producing a second answer. A request that offers tools is answered too (`toolMode: "auto"`): through the MCP bridge — a session agent whose only tools are the request\'s, each call handed to the client while agy waits on it, its result sent back into the same agy process — or, where the bridge cannot (a tool_choice that forces a call, a tool name too long, no room), the tool-less `keysmith-tools` agent writing the calls as JSON. Either way keysmith hands the calls to the client as tool_calls, and agy runs none of them. For agy\'s full coding agent drop `--agent keysmith-text` from args/resumeArgs and set `stopAtToolCall` to false — you get its harness prompt and MCP start-up back, and on agy 1.4.12 an agent that runs read-only commands (`ls`, `cat`) without asking: anyone with a key can read files on this machine. Each run leaves a conversation under ~/.gemini/antigravity-cli/conversations.',
   },
   codex: {
     kind: 'cli',

@@ -54,8 +54,14 @@ const AGENT_PROMPT = [
 
 export const agyDriver = {
   id: 'agy',
-  /** The tools agy keeps on every agent; one of them is not a foreign tool (stopAtToolCall decides). */
-  harnessTools: ['manage_task'],
+  /**
+   * The tools agy keeps on every agent; one of them is not a foreign tool (stopAtToolCall decides).
+   * agy 1.4.12 keeps two more beside `manage_task`, and neither runs anything here: with a session's
+   * agent (a stub server, no resources capability) `list_resources` answered "does not have any
+   * resources" and `read_resource` (a file:// uri) "does not support resources", and no resources/*
+   * request reached the server; with no server at all (`keysmith-text`) both are refused.
+   */
+  harnessTools: ['manage_task', 'list_resources', 'read_resource'],
   /**
    * How the calls of one model step reach the client: agy runs them one after the other (the next
    * one comes after the previous one's result), so one call per HTTP turn — and each call's step

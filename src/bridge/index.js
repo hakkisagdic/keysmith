@@ -452,10 +452,10 @@ export class McpBridge {
               if (batch.length && s.steps >= s.taken) return yield* handOut();
             }
           } else if (driver.harnessTools.includes(name)) {
-            // A tool the harness keeps that runs nothing (agy's manage_task, which no agent file
-            // removes; opencode's invalid; qoder's mcp_get): after text the answer is complete
-            // (stopAtToolCall); before, it does nothing (agy's headless mode refuses manage_task)
-            // and the model goes on.
+            // A tool the harness keeps that runs nothing (agy's manage_task and resource tools, which
+            // no agent file removes; opencode's invalid; qoder's mcp_get): after text the answer is
+            // complete (stopAtToolCall); before, it does nothing (agy: no task to list, no resource
+            // to read) and the model goes on.
             if (adapter.stopAtToolCall && text && !cut) {
               cut = name;
               s.proc?.stop(`answer complete, stopped at a call to ${name}`);

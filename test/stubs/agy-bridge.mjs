@@ -246,6 +246,24 @@ async function bridge() {
       note({ event: 'ran-foreign' });
       return void (await sleep(60_000));
     }
+    case 'resources-then-call': {
+      // agy 1.4.12 keeps list_resources and read_resource on every agent. Called on a server with
+      // no resources capability they answer from agy itself — no resources/* request reaches it —
+      // and the model goes on to the bridge's tool. (Live, read_resource failed too fast to show a
+      // tool step, only an `unknown` one; here both show, as a slower one would.)
+      respond('', usage1);
+      for (const [name, parameters, state] of [
+        ['list_resources', { ServerName: server.name }, 'DONE'],
+        ['read_resource', { ServerName: server.name, Uri: 'file:///etc/hosts' }, 'ERROR'],
+      ]) {
+        const at = stepIndex++;
+        step({ step_index: at, state: 'ACTIVE', step_type: 'tool', tool_name: name, tool_info: { name, parameters } });
+        step({ step_index: at, state, step_type: 'unknown' });
+      }
+      note({ event: 'resources-shown' });
+      const r = await call('get_weather', { city: 'Ankara' });
+      return finish(`Weather: ${r.text}`);
+    }
     case 'answer-then-manage-task': {
       respond('', usage1);
       const r = await call('get_weather', { city: 'Ankara' });

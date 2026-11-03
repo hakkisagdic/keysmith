@@ -694,6 +694,22 @@ test('an answer followed by manage_task ends there (stopAtToolCall): the text st
   assert.ok(await until(() => clean([run.pid])));
 });
 
+test('agy 1.4.12\'s list_resources and read_resource before a call are the harness\'s, not the tripwire\'s: the session goes on', async () => {
+  const t = tag();
+  const c = conversation('openai', { user: `Weather? SCENARIO=resources-then-call ${t}` });
+  const one = await c.ask();
+  assert.equal(one.r.status, 200, one.r.text);
+  assert.equal(one.calls.length, 1);
+  assert.equal(one.calls[0].name, 'get_weather');
+  const [run] = runsOf(t);
+  assert.ok(stub().some((e) => e.event === 'resources-shown' && e.pid === run.pid));
+  c.result();
+  assert.equal((await c.ask()).text, 'Weather: RESULT for Ankara');
+  assert.equal(lastRow().failure, undefined);
+  assert.ok(!log.some((l) => /SECURITY: agy reached for a tool of its own \("(list|read)_resource/.test(l)));
+  assert.ok(await until(() => clean([run.pid])));
+});
+
 test('a tool name too long for mcp_ks<rid6>_ under Gemini\'s 64 is EMULATE\'s; so is a request with no room — and with toolMode mcp, no room is a 503', async () => {
   const long = 'x'.repeat(52);
   let before = stub().length;
