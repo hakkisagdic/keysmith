@@ -44,6 +44,10 @@ const scenario = (prompt.match(/SCENARIO=([a-z0-9-]+)/) || [])[1] || 'one-call';
 const LOG = process.env.CLI_BRIDGE_LOG;
 const note = (o) => LOG && fs.appendFileSync(LOG, JSON.stringify({ pid: process.pid, cli, ...o }) + '\n');
 const line = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+// stdout blocks, as a CLI's does before it exits: on macOS a pipe's writes are otherwise
+// asynchronous, and process.exit() below dropped what was still queued (under load, a
+// 500,000-char answer and its result line).
+process.stdout._handle?.setBlocking?.(true);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const val = (flag) => (argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : null);
 
