@@ -44,6 +44,8 @@ export class Gateway {
         // way it takes out the gateway's own (redact.js).
         registerSecrets([prepared._apiKey]);
         if (prepared.kind !== 'cli' && prepared.thoughtSignatures) prepared._signatureStore = this._signatureStore(prepared);
+        // Whether a media URL a request sends is fetched (public addresses only) or refused: the gateway's call, not an adapter's.
+        prepared._fetchMedia = cfg.fetchMedia !== false;
         const adapter = prepared.kind === 'cli' ? new CliAdapter(id, prepared) : new HttpAdapter(id, prepared);
         this.adapters.set(id, adapter);
         if (adapter.unsafeTools && !adapter.disabled) this.log(`adapter "${id}" can run commands and edit files (unsafeTools) and is enabled: it answers requests that name it, never an alias`);

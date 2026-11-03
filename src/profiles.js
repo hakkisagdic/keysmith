@@ -295,10 +295,11 @@ export const CLI_PROFILES = {
     // out CLAUDE.md, plugins, hooks and custom agents — auth and model selection stay.
     args: ['-p', '--output-format', 'stream-json', '--verbose', '{noSession}', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', ['--model', '{model}'], '{prompt}'],
     resumeArgs: ['-p', '--output-format', 'stream-json', '--verbose', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', '--resume', '{session}', '{prompt}'],
-    // A request that carries an image runs `visionArgs`: the same tool-less switches, and the
-    // prompt on stdin as one stream-json user message, its images as base64 blocks (src/images.js).
-    // Claude Code passes those blocks on to the model as they are. No `{prompt}`: stdin is the prompt.
-    vision: true,
+    // A request that carries an image or a PDF runs `visionArgs`: the same tool-less switches, and
+    // the prompt on stdin as one stream-json user message, its media as base64 `image` / `document`
+    // blocks (src/media.js). Claude Code passes those blocks on to the model as they are. No
+    // `{prompt}`: stdin is the prompt.
+    media: ['image', 'pdf'],
     visionArgs: ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', '{noSession}', '--max-turns', '1', '--tools', '', '--strict-mcp-config', '--permission-prompts', 'none', '--disable-slash-commands', '--safe-mode', ['--model', '{model}']],
     persistSessions: false,
     // Claude Code 2.1.261 refuses `--no-session` ("unknown option"); this is its spelling.
@@ -313,8 +314,8 @@ export const CLI_PROFILES = {
     toolMode: 'off',
     timeoutMs: 300_000,
     maxConcurrent: 1,
-    provenance: 'Claude Code 2.1.261 — every flag here is listed by `claude --help` and parsed by 2.1.261 (checked with an empty prompt, which it refuses before any request); `--max-turns` is undocumented but parsed. The stream-json `result` line carries usage/session_id. No live request was sent through this argv. Claude Code 2.1.303 (2026-11-03): `visionArgs` with one stream-json user message on stdin (a text block and a base64 JPEG block) was run against a stub Messages endpoint (ANTHROPIC_BASE_URL): the image block reached it as sent, and stdout was the same assistant/result lines. Live the same day, through a keysmith gateway on sonnet: a scanned typewritten polytonic Greek page (943×1500 JPEG) sent as a data: URL on /v1/chat/completions and as a base64 source on /v1/messages came back transcribed, line for line.',
-    note: 'Runs without tools (`--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--safe-mode`) in an empty keysmith-owned workspace. Declare `models: ["sonnet", "opus"]` or pass the id through; Claude Code has no offline model listing. A failed run prints one `result` line with is_error and the reason in `errors[]` — the parser surfaces it rather than returning an empty completion. It sees images (`vision: true`): a request with an inline image — a base64 data: URL on /v1/chat/completions, a base64 source on /v1/messages — runs `visionArgs`, the prompt on stdin as stream-json with the images in it. An image URL is refused, not fetched. It spends your Claude subscription, so the profile is explicit-only: it answers `claude/<model>` and is in no alias and no `doctor --probe-models`. To put it in a route anyway: `keysmith set claude explicitOnly false`.',
+    provenance: 'Claude Code 2.1.261 — every flag here is listed by `claude --help` and parsed by 2.1.261 (checked with an empty prompt, which it refuses before any request); `--max-turns` is undocumented but parsed. The stream-json `result` line carries usage/session_id. No live request was sent through this argv. Claude Code 2.1.303 (2026-11-03): `visionArgs` with one stream-json user message on stdin (a text block and a base64 JPEG block) was run against a stub Messages endpoint (ANTHROPIC_BASE_URL): the image block reached it as sent, and stdout was the same assistant/result lines. Live the same day, through a keysmith gateway on sonnet: a scanned typewritten polytonic Greek page (943×1500 JPEG) sent as a data: URL on /v1/chat/completions and as a base64 source on /v1/messages came back transcribed, line for line. A `document` block (base64 PDF) in that stdin message reached a stub Messages endpoint as sent, too (2.1.303, 2026-11-03).',
+    note: 'Runs without tools (`--tools ""`, `--strict-mcp-config`, `--permission-prompts none`, `--safe-mode`) in an empty keysmith-owned workspace. Declare `models: ["sonnet", "opus"]` or pass the id through; Claude Code has no offline model listing. A failed run prints one `result` line with is_error and the reason in `errors[]` — the parser surfaces it rather than returning an empty completion. It takes images and PDFs (`media`): a request that carries one — inline, or a URL keysmith fetches from the public internet — runs `visionArgs`, the prompt on stdin as stream-json with the media in it. It spends your Claude subscription, so the profile is explicit-only: it answers `claude/<model>` and is in no alias and no `doctor --probe-models`. To put it in a route anyway: `keysmith set claude explicitOnly false`.',
   },
   agy: {
     kind: 'cli',
@@ -471,8 +472,10 @@ export const CLI_PROFILES = {
  * when it is slow, cold or out of quota.
  */
 export const HTTP_PROFILES = {
-  openai: { kind: 'http', wire: 'openai', baseUrl: 'https://api.openai.com/v1', apiKey: '{env:OPENAI_API_KEY}' },
-  anthropic: { kind: 'http', wire: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', apiKey: '{env:ANTHROPIC_API_KEY}' },
+  // `media`: what the API itself takes in a user turn (src/media.js). Audio reaches only OpenAI's
+  // audio models; another model on the same API answers a request with audio with its own error.
+  openai: { kind: 'http', wire: 'openai', baseUrl: 'https://api.openai.com/v1', apiKey: '{env:OPENAI_API_KEY}', media: ['image', 'pdf', 'audio'] },
+  anthropic: { kind: 'http', wire: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', apiKey: '{env:ANTHROPIC_API_KEY}', media: ['image', 'pdf'] },
   openrouter: { kind: 'http', wire: 'openai', baseUrl: 'https://openrouter.ai/api/v1', apiKey: '{env:OPENROUTER_API_KEY}' },
   groq: { kind: 'http', wire: 'openai', baseUrl: 'https://api.groq.com/openai/v1', apiKey: '{env:GROQ_API_KEY}' },
   deepseek: { kind: 'http', wire: 'openai', baseUrl: 'https://api.deepseek.com/v1', apiKey: '{env:DEEPSEEK_API_KEY}' },
@@ -487,6 +490,10 @@ export const HTTP_PROFILES = {
     thoughtSignatures: true,
     // /models lists `models/gemini-3.8-flash`; requests take `gemini-3.8-flash`.
     stripModelPrefix: 'models/',
+    // Images (`image_url`, a data: URL; read live on gemini-3.5-flash) and audio (`input_audio`,
+    // as Google's OpenAI-compatibility page shows it). A PDF as a `file` part and a `video_url` part
+    // are refused: 400 `Invalid content part type` (2026-11-03).
+    media: ['image', 'audio'],
     provenance: "Google's OpenAI-compatible Gemini endpoint — Bearer auth, /chat/completions with tools, tool_choice and streaming; Gemini 3 thought signatures ride on tool_calls[].extra_content.google.thought_signature (ai.google.dev OpenAI compatibility; Vertex AI 'Thought signatures', checked 2026-10-16)",
     note: "Unlike `agy`, this is the API itself: tools, tool_choice and tool_calls go through verbatim. A key made in Google AI Studio; on the free tier each model allows about 20 requests a day per project (429 RESOURCE_EXHAUSTED, passed on as 429), shared with anything else using the same key. Keep a key that already lives in a project's .env where it is: --key '{dotenv:~/project/.env#GOOGLE_API_KEY}'.",
   },
@@ -501,6 +508,10 @@ export const HTTP_PROFILES = {
     apiKey: '{env:COPILOT_API_TOKEN}',
     headers: { 'editor-version': 'vscode/1.104.1', 'copilot-integration-id': 'vscode-chat', 'openai-intent': 'chat' },
     priority: 60,
+    // Images only, and a request with one carries the header Copilot's own clients send with an
+    // image (not checked live here).
+    media: ['image'],
+    mediaHeaders: { 'copilot-vision-request': 'true' },
     provenance: 'api.githubcopilot.com, OAuth device token (ghu_…) verified against /models and /chat/completions',
     note: 'Copilot answers /chat/completions, but /models lists far more than your plan will actually run — the premium ids reply model_not_supported. `keysmith doctor --probe-models` finds the truth; declare that subset under `models` to keep the picker honest.',
   },

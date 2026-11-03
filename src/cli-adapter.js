@@ -5,7 +5,7 @@ import { getParser, toLines } from './parsers.js';
 import { expand } from './config.js';
 import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, agentCleanEnv } from './util.js';
 import { checkToolMode } from './tools/router.js';
-import { IMAGE_LIMITS, hasImages, visionPrompt } from './images.js';
+import { checkMedia, hasMedia, mediaPrompt } from './media.js';
 
 /**
  * Run a coding CLI once per request and turn its stdout into a chat completion.
@@ -64,13 +64,18 @@ export class CliAdapter {
     // agent. And the MCP bridge's own settings, its argv among them (design U7).
     this.emulateArgs = checkTemplate(id, 'emulateArgs', cfg.emulateArgs);
     this.bridge = checkBridge(id, cfg.bridge);
-    // A CLI that sees images (`vision: true`): a request that carries one runs `visionArgs`, its
-    // prompt on stdin as one stream-json user message with the images in it (src/images.js).
-    // Any other CLI reads an image as `[image omitted by keysmith]`.
-    this.vision = checkVision(id, cfg);
+    // A CLI that takes media (`media`, `vision: true` for images): a request that carries some runs
+    // `visionArgs`, its prompt on stdin as one stream-json user message with the media in it
+    // (src/media.js). Any other CLI reads each item as a label: `[image omitted by keysmith]`.
+    const { kinds, limits } = checkMedia(id, cfg, { wire: 'anthropic', where: 'to a CLI (its stream-json input is an Anthropic message)' });
+    if (kinds.length && !cfg.visionArgs) {
+      const field = cfg.vision ? 'vision' : 'media';
+      throw new Error(`adapter "${id}": ${field} needs visionArgs — the argv of a run whose prompt, media included, goes on stdin as stream-json (\`keysmith set ${id} ${field} ${cfg.vision ? 'true' : kinds.join(',')}\` fills the built-in profile's)`);
+    }
+    this.media = kinds;
+    this.vision = kinds.includes('image');
     this.visionArgs = checkTemplate(id, 'visionArgs', cfg.visionArgs);
-    this.maxImages = cfg.maxImages ?? IMAGE_LIMITS.maxImages;
-    this.maxImageBytes = cfg.maxImageBytes ?? IMAGE_LIMITS.maxImageBytes;
+    this.mediaOpts = { adapterId: id, kinds, limits, fetchUrls: cfg._fetchMedia !== false };
     // An argv that auto-approves the agent's tool calls (`opencode --auto`, `--yolo`, …) is an
     // agent that acts on this machine for whoever holds a key. That is never a default: it
     // loads only when the entry says so with `unsafeTools`, which keeps it out of every alias
@@ -190,9 +195,11 @@ export class CliAdapter {
   async *complete({ model, messages, session, signal, maxTokens, rendered = null }) {
     this.ready();
 
-    // A request with an image, on a CLI that sees them: the prompt goes on stdin, images and all.
-    const vision = this.vision && !rendered && hasImages(messages) ? visionPrompt(messages, { adapterId: this.id, maxImages: this.maxImages, maxImageBytes: this.maxImageBytes }) : null;
-    const { system, prompt } = vision || rendered || flattenMessages(messages);
+    // A request with media, on a CLI that takes some of it: the prompt goes on stdin, media and all.
+    // One whose media this CLI takes none of runs as text, each item its label.
+    const withMedia = this.media.length && !rendered && hasMedia(messages) ? await mediaPrompt(messages, this.mediaOpts, { signal }) : null;
+    const vision = withMedia?.media ? withMedia : null;
+    const { system, prompt } = vision || rendered || withMedia || flattenMessages(messages);
     if (!prompt && !system) throw new LlmError('nothing to send: the message list is empty after flattening', { status: 400, provider: this.id });
     if (prompt.length > this.maxPromptChars) {
       throw new LlmError(
@@ -541,21 +548,6 @@ function checkTemplate(id, field, tpl) {
     throw new Error(`adapter "${id}": ${field} must be an argv template — a list of strings and [flag, value] groups, like args`);
   }
   return tpl;
-}
-
-/**
- * `vision`: true or false (absent). True needs `visionArgs`, the argv of a run whose prompt is on
- * stdin; and the image caps, when set, are whole numbers above 0.
- */
-function checkVision(id, cfg) {
-  if (cfg.vision != null && typeof cfg.vision !== 'boolean') throw new Error(`adapter "${id}": vision must be true or false`);
-  if (cfg.vision && !cfg.visionArgs) {
-    throw new Error(`adapter "${id}": vision needs visionArgs — the argv of a run whose prompt, images included, goes on stdin as stream-json (\`keysmith set ${id} vision true\` fills the built-in profile's)`);
-  }
-  for (const k of ['maxImages', 'maxImageBytes']) {
-    if (cfg[k] != null && !(Number.isInteger(cfg[k]) && cfg[k] > 0)) throw new Error(`adapter "${id}": ${k} must be a whole number above 0`);
-  }
-  return !!cfg.vision;
 }
 
 /** The bridge drivers there are (src/bridge/drivers.js), by the name `bridge.driver` takes. */

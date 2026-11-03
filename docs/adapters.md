@@ -28,6 +28,12 @@ Two kinds:
 | `explicitOnly` | `false` | answers only a request that names it: never an alias leg (refused by `keysmith alias`, skipped and reported when hand-edited in), never probed by `doctor --probe-models`. The `claude` profile ships it; `keysmith add <profile> --explicit-only` sets it on any other, a re-add keeps it, `keysmith set <id> explicitOnly false` drops it. It does not keep any *key* away from the adapter: a key's scope does that (`keysmith key add <label> --deny <adapter>`, see the README's "Keys with a scope") |
 | `note` | — | shown in listings; the place to write down what you learned |
 | `headers` | `{}` | extra request headers, HTTP only |
+| `media` | — | the kinds of media the adapter takes: any of `image`, `pdf`, `audio`, `video`. A request that carries one goes to it as the thing itself, any other kind as a label. A CLI and the `anthropic` wire take `image` and `pdf` only; anything else there is a load error. `keysmith set <id> media image,pdf` writes the list. See [Media](#media-images-pdfs-audio-video) |
+| `vision` | `false` | `true` puts `image` among `media`. `false` beside a `media` that lists `image` is a load error; `keysmith vision <id> off` takes image out of both |
+| `maxImages` | `20` | images one request may carry to this adapter; more is a 400 |
+| `maxImageBytes` | `5242880` | the largest image, decoded, this adapter takes; larger is a 400 |
+| `maxFiles` | `5` | PDFs, audio and video files one request may carry to this adapter; more is a 400 |
+| `maxFileBytes` | `20971520` | the largest PDF, audio or video file, decoded, this adapter takes; larger is a 400 |
 
 Every field of an attached adapter can be changed with
 `keysmith set <adapter> <field> <value>` (JSON when it parses, a string otherwise; `--unset`
@@ -51,6 +57,93 @@ failover otherwise answers your `chat` request from a provider you did not choos
 Legs pointing into a *dynamic* catalogue (a CLI with no `models`, whose list comes from
 `modelsFrom`) are not checked at startup: that would mean spawning every adapter on the way
 to a listening socket. `keysmith doctor --probe-models` spends the requests instead.
+
+## Media: images, PDFs, audio, video
+
+An adapter takes the kinds its `media` lists — `image`, `pdf`, `audio`, `video`; `vision: true`
+is `image`. A request that carries one of those reaches it as the thing itself. Any other kind,
+and every item on an adapter with no `media`, reads as a label in its place: `[image omitted by
+keysmith]`, `[PDF omitted by keysmith]`, `[audio omitted by keysmith]`, `[video omitted by
+keysmith]`, and `[file omitted by keysmith]` for a file whose part says nothing of its kind. A
+model handed the text knows something was there.
+
+What each face takes:
+
+| Face | Image | PDF | Audio | Video |
+|---|---|---|---|---|
+| `/v1/chat/completions` | `image_url` (its `detail` kept) | `file` (`file_data`) | `input_audio` | `video_url` (vLLM's and OpenRouter's shape) |
+| `/v1/messages` | `image`, a `base64` or `url` source | `document`, a `base64` or `url` source | — | — |
+| `/v1/responses` | `input_image` | `input_file` (`file_data` or `file_url`) | `input_audio` | — |
+
+The kind and type are read off the bytes, not the part: JPEG, PNG, GIF, WebP; PDF; WAV, MP3,
+AAC, FLAC, Ogg, M4A; MP4, QuickTime, WebM. A declared type that disagrees is corrected, a PDF
+sent as an `image_url` is a PDF, and anything else is a 400. A file with neither a type nor a
+name is read to learn what it is. An uploaded-file reference (`file_id`, a `file` source) is
+refused: keysmith keeps no files. A `document` whose source is text is no media, and reads as it
+always has.
+
+**Where it goes.**
+
+- **An HTTP upstream** gets each user turn that carries media as a content array — its text and
+  its media in their order — in its own wire. On `openai`: `image_url` (a data: URL),
+  `input_audio` (`data`, and the `format` the bytes have: `wav`, `mp3`, `aac`, `flac`, `ogg` or
+  `m4a`), `file` for a PDF (`filename`, `file_data` as a data: URL), `video_url` (a data: URL).
+  On `anthropic`: base64 `image` and `document` blocks, a PDF's file name as its `title`. Media
+  goes up in a user turn only — neither API takes it in a system or assistant turn, where it
+  stays the label — and a turn whose media all became labels goes up as text. `mediaHeaders` go
+  with a request that carries media up, and with no other.
+- **A CLI** runs `visionArgs` instead of `args`: the prompt is flattened exactly as for any
+  other run, and goes to the CLI's stdin as one Claude Code stream-json user message, the text
+  cut where each item was and the items between as base64 `image` / `document` blocks:
+
+  ```json
+  {"type":"user","message":{"role":"user","content":[{"type":"text","text":"User: Transcribe:\n"},{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"/9j/4AAQ…"}},{"type":"text","text":"\nthe first page"}]}}
+  ```
+
+  So `visionArgs` has no `{prompt}`, and takes stdin as stream-json (`--input-format
+  stream-json` for Claude Code); the rest of it is the text run's tool-less argv. A request
+  whose media the CLI takes none of runs `args`, its items as labels. No temporary file is
+  written, and a media run is never resumed.
+- **The tool relay** — a request with `tools` to an HTTP upstream on the openai wire — is
+  verbatim, as before: what the client sent goes up unread, URLs and all.
+
+**URLs.** A URL (`http` or `https`) is fetched by keysmith and sent inline, to an upstream and a
+CLI alike — only from the public internet. The gateway can sit behind a tunnel, and a fetch on a
+key holder's behalf must not reach this machine, its network or a cloud's metadata service: an
+address in a loopback, private (10/8, 172.16/12, 192.168/16), shared (100.64/10), link-local
+(169.254/16, fe80::/10), unique-local (fc00::/7), documentation, multicast or reserved range is
+refused, written as an address or reached by name — every address a name resolves to is
+checked, and the connection goes to the address that was checked, so a name that resolves anew
+in between (DNS rebinding) changes nothing. A redirect is followed, at most 3, each checked as
+the first; the whole fetch has 20 seconds; the size cap is counted as the bytes arrive; nothing
+of the client's goes along (no key, no cookie, no credentials from the URL). A URL is fetched
+once per request: every leg of a route reads the same bytes. A failure is a 400 that names the
+URL's host and never its path or query (which may be a signed token). `"fetchMedia": false` at
+the top of the config refuses every URL instead.
+
+**Limits.** Per adapter: `maxImages` (20) and `maxImageBytes` (5 MB decoded) for images;
+`maxFiles` (5) and `maxFileBytes` (20 MB decoded) for PDFs, audio and video. Every item is read
+before anything is sent or started, so a bad one is a 400 that costs nothing — no upstream
+request, no process. An error never quotes media data. `GET /v1/keysmith/routes` says what each
+adapter takes (`media`, and `vision` for images).
+
+**What is known to work.**
+
+- The `claude` profile takes `image` and `pdf`. Claude Code 2.1.303 sent an image block and a
+  `document` block from such a stdin message on to a stub Messages endpoint as they were; live,
+  on sonnet, a scanned typewritten Greek page sent through `/v1/chat/completions` and
+  `/v1/messages` came back transcribed. agy 1.4.12 takes stream-json on stdin too, and refuses an
+  image block in it (`only "text"`), so the `agy` profile has none.
+- The HTTP profiles: `openai` takes `image`, `pdf` and `audio` (audio reaches only OpenAI's audio
+  models; another answers with its own error), `anthropic` `image` and `pdf`, `google` `image`
+  and `audio`, `copilot` `image`, with `copilot-vision-request: true` (not checked live). Gemini's
+  OpenAI-compatible endpoint, live on 2026-11-03: an image (`image_url`, a data: URL) through
+  keysmith came back read on `gemini-3.5-flash`; a PDF as a `file` part and a video as a
+  `video_url` part were refused, 400 `Invalid content part type`, so the profile takes neither.
+  Audio (`input_audio`) is on Google's page and was not run. The others take none: what a local server or OpenRouter sees
+  depends on the model it runs — `keysmith set <id> media image` when yours does.
+- An entry attached before this has no `media`: `keysmith upgrade <id> --apply` brings its
+  profile's (or `keysmith vision <id> on`, for images).
 
 ## CLI fields
 
@@ -77,10 +170,7 @@ to a listening socket. `keysmith doctor --probe-models` spends the requests inst
 | `stripSystemPrompt` | `false` | drop system turns instead of inlining them |
 | `systemFlag` | — | e.g. `"--system-prompt"`: passed as `--system-prompt <text>` when a system turn exists |
 | `maxPromptChars` | `200000` | refuses a request rather than handing a 400 KB argv to a subprocess |
-| `vision` | `false` | the CLI sees images: a request that carries one runs `visionArgs`, its prompt on stdin as a stream-json user message with the images in it. Needs `visionArgs`; `keysmith set <id> vision true` (or `keysmith vision <id> on`) fills them in from the entry's built-in profile when it lacks them, and `keysmith upgrade <id>` brings both. See [Images: a CLI that sees them](#images-a-cli-that-sees-them) |
-| `visionArgs` | — | the argv template of a run that carries images, read by the auto-approve check like every other template. No `{prompt}`: stdin is the prompt; `{session}` is always empty |
-| `maxImages` | `20` | images one request may carry to this adapter; more is a 400 |
-| `maxImageBytes` | `5242880` | the largest image, decoded, this adapter takes; larger is a 400 |
+| `visionArgs` | — | the argv template of a run that carries media, which a CLI with `media` (or `vision`) needs: its prompt goes on stdin as one stream-json user message with the media in it, so it has no `{prompt}`, and `{session}` is always empty. Read by the auto-approve check like every other template. `keysmith set <id> vision true` (or `media …`, or `keysmith vision <id> on`) fills it in from the entry's built-in profile when it lacks one, and `keysmith upgrade <id>` brings it |
 
 ### The argv template
 
@@ -111,43 +201,12 @@ Assistant: …
 User: …
 ```
 
-Images are not dropped silently. A CLI that cannot see them reads each one as
-`[image omitted by keysmith]`, because a vision request that arrives as text must say so —
-an OpenAI Chat `image_url`, an Anthropic `image` block and a Responses `input_image` alike.
-
-### Images: a CLI that sees them
-
-A CLI with `vision: true` (the `claude` profile) gets the images themselves. A request that
-carries one runs `visionArgs` instead of `args`: the prompt is flattened exactly as above, and
-goes to the CLI's stdin as one Claude Code stream-json user message, the text cut where each
-image was and the images between as base64 blocks:
-
-```json
-{"type":"user","message":{"role":"user","content":[{"type":"text","text":"User: Transcribe:\n"},{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"/9j/4AAQ…"}},{"type":"text","text":"\nthe first page"}]}}
-```
-
-So `visionArgs` has no `{prompt}`, and takes stdin as stream-json (`--input-format
-stream-json` for Claude Code); the rest of it is the text run's tool-less argv. A request
-without an image runs `args` as before. No temporary file is written, and a vision run is
-never resumed.
-
-What is taken, on each face: a data: URL with `;base64` (`image_url` on
-`/v1/chat/completions`, `input_image` on `/v1/responses`) and a `base64` source on
-`/v1/messages`. The type is read off the bytes — JPEG, PNG, GIF or WebP; a declared
-`media_type` that disagrees is corrected, anything else is a 400. A URL is refused with a
-400 that names its host and no more, never fetched: the gateway can sit behind a tunnel, and
-a fetch on a key holder's behalf would reach whatever this machine can. An uploaded-file
-reference (`file_id`, a `file` source) is refused too. Each image is at most `maxImageBytes`
-(5 MB decoded) and a request carries at most `maxImages` (20); both are per adapter, and
-every image is read before any process starts, so a bad one costs nothing. An error never
-quotes image data. `GET /v1/keysmith/routes` says which adapters see images (`vision`).
-
-Only Claude Code is known to take images this way: Claude Code 2.1.303 sent such a message's
-image block on to the model as it was (checked against a stub Messages endpoint), and live, on
-sonnet, a scanned typewritten Greek page sent through `/v1/chat/completions` and `/v1/messages`
-came back transcribed. agy 1.4.12
-takes stream-json on stdin too, and refuses an image block in it (`only "text"`), so the `agy`
-profile has no `vision`. HTTP adapters are handed the text with the label, as before.
+Media is not dropped silently. A CLI that cannot take an item reads it as a label naming its
+kind — `[image omitted by keysmith]`, `[PDF omitted by keysmith]`, `[audio omitted by
+keysmith]`, `[video omitted by keysmith]` — because a request that arrives as text must say
+what it lost. One that can (`media`; the `claude` profile takes images and PDFs) runs
+`visionArgs`, its prompt on stdin with the media in it: see
+[Media](#media-images-pdfs-audio-video).
 
 ### Parsers, and the event contract
 
@@ -557,9 +616,9 @@ to that check (not run live from here).
   `--no-session-persistence`: 2.1.261 refuses `--no-session` as an unknown option. All of it
   parsed by 2.1.261 with an empty prompt, which it rejects before sending anything; no
   request went through it. It spends your Claude subscription, so the profile ships
-  `explicitOnly: true`: no alias, no probe, and a re-add keeps it. A request with an image
-  runs `visionArgs`: the same switches with `--input-format stream-json` and the prompt on
-  stdin (see [Images](#images-a-cli-that-sees-them)).
+  `explicitOnly: true`: no alias, no probe, and a re-add keeps it. A request with an image or
+  a PDF runs `visionArgs`: the same switches with `--input-format stream-json` and the prompt on
+  stdin (see [Media](#media-images-pdfs-audio-video)).
 - `qoder`: `--tools ""` and `--strict-mcp-config`; `{noSession}` is
   `--no-session-persistence` (1.1.59 refuses `--no-session` too).
 - `codex`: `--disable shell_tool` takes the shell away (`--disable unified_exec` is passed
@@ -596,6 +655,7 @@ right before the prompt — it would take the prompt as a tool name.
 | `baseUrl` | required | `…/v1` or `…/v1/` both fine; a route suffix you pasted by accident is trimmed |
 | `wire` | `openai` | `openai` → `POST {base}/chat/completions`; `anthropic` → `POST {base}/messages` with `x-api-key`. Set it explicitly — the other shape is not guessed from a hostname. |
 | `apiKey` | — | a secret *reference*, see below; `false` for no auth (local servers) |
+| `mediaHeaders` | — | headers sent with a request that carries media up, and with no other: the `copilot` profile's `{"copilot-vision-request": "true"}`, the header Copilot's own clients send with an image (not checked live here). See [Media](#media-images-pdfs-audio-video) |
 | `rawChat` behaviour | automatic | when a request carries `tools`, keysmith forwards the body verbatim to the first HTTP candidate and streams its answer unchanged, so real `tool_calls` survive. When every candidate refuses, the client gets the refusal with the provider's own status (and `retry-after`) — an earlier leg's 429/503 over a later leg's other refusal |
 | `thoughtSignatures` | `false` | Gemini 3 (the `google` profile): remember `tool_calls[].extra_content.google.thought_signature` as answers pass through the tool relay, and put it back on a replayed call that lost it — the same call: same gateway key, id, function name and (parsed) arguments, told apart by the conversation before it when that is not enough; a call with no function name gets nothing. `true`, or `{ "maxEntries": 4096, "maxBytes": 16777216, "maxAgeMs": 21600000 }`; in memory, one store per upstream URL shared by every adapter on it (the largest limits win), never logged |
 | `stripModelPrefix` | — | dropped from ids `/models` returns: `"models/"` for Google, whose listing says `models/gemini-3.8-flash` and whose requests take `gemini-3.8-flash`. A key's deny glob holds for both spellings: `google/gemini-4-*` keeps `google/models/gemini-4-argon` out too |

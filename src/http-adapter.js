@@ -1,6 +1,7 @@
 import { LlmError } from './util.js';
 import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { redactSecrets } from './redact.js';
+import { checkMedia, hasMedia, upstreamMessages } from './media.js';
 
 /**
  * Talk to an HTTP upstream that already speaks a chat API and translate its stream
@@ -45,6 +46,16 @@ export class HttpAdapter {
     // Gateway hands every adapter on one upstream URL the same store; alone, it has its own.
     const ts = cfg.thoughtSignatures;
     this.thoughtSignatures = ts ? cfg._signatureStore || new ThoughtSignatures(limitsFrom(ts)) : null;
+    // The media this upstream takes (`media`, `vision: true` for images): a user turn that carries
+    // some goes up as a content array in the wire's own shapes (src/media.js). Any other upstream
+    // is handed the text, each item a label: `[image omitted by keysmith]`.
+    const { kinds, limits } = checkMedia(id, cfg, { wire: this.wire, where: 'on the anthropic wire' });
+    this.media = kinds;
+    this.vision = kinds.includes('image');
+    this.mediaOpts = { adapterId: id, wire: this.wire, kinds, limits, fetchUrls: cfg._fetchMedia !== false };
+    // Headers sent only with a request that carries media up: Copilot's clients send
+    // `copilot-vision-request: true` with an image.
+    this.mediaHeaders = checkHeaders(id, 'mediaHeaders', cfg.mediaHeaders);
   }
 
   get resumeArgs() {
@@ -162,6 +173,9 @@ export class HttpAdapter {
   }
 
   async *complete({ model, messages, maxTokens, temperature, signal, includeReasoning }) {
+    // Read before anything is sent: a bad image is a 400 and the upstream never sees the request.
+    if (this.media.length && hasMedia(messages)) messages = await upstreamMessages(messages, this.mediaOpts, { signal });
+    const withMedia = messages.some((m) => Array.isArray(m.content));
     const controller = new AbortController();
     const onAbort = () => controller.abort(new Error('client disconnected'));
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -194,7 +208,7 @@ export class HttpAdapter {
     try {
       res = await fetch(this.route(isAnthropic ? '/messages' : '/chat/completions'), {
         method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'text/event-stream', ...this.authHeaders(), ...this.headers },
+        headers: { 'content-type': 'application/json', accept: 'text/event-stream', ...this.authHeaders(), ...this.headers, ...(withMedia ? this.mediaHeaders : {}) },
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
@@ -253,6 +267,15 @@ function withoutEffortIfSet(params, body) {
     else out.google = rest;
   }
   return out;
+}
+
+/** A header map: names to strings. Absent is none. */
+function checkHeaders(id, field, headers) {
+  if (headers == null) return {};
+  if (typeof headers !== 'object' || Array.isArray(headers) || Object.values(headers).some((v) => typeof v !== 'string')) {
+    throw new Error(`adapter "${id}": ${field} must map header names to strings, e.g. {"copilot-vision-request": "true"}`);
+  }
+  return headers;
 }
 
 /** `modelParams` must map a model id (or `"*"`) to an object of request fields; a load error otherwise. */

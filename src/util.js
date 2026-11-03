@@ -48,11 +48,11 @@ export function joinArgs(templates, vars) {
  * string. The system turn is hoisted out when `systemVar` is set, so the adapter can
  * pass it through a dedicated flag instead of burying it in the user text.
  */
-export function flattenMessages(messages, { systemSeparator = '\n\n', roleSeparator = '\n\n', includeSystem = true, image } = {}) {
+export function flattenMessages(messages, { systemSeparator = '\n\n', roleSeparator = '\n\n', includeSystem = true, media } = {}) {
   const sys = [];
   const turns = [];
   for (const m of messages || []) {
-    const text = contentToText(m.content, { image });
+    const text = contentToText(m.content, { media });
     if (!text) continue;
     if (m.role === 'system') {
       if (includeSystem) sys.push(text);
@@ -67,17 +67,63 @@ export function flattenMessages(messages, { systemSeparator = '\n\n', roleSepara
 
 export const IMAGE_OMITTED = '[image omitted by keysmith]';
 
-/** An image part as a client sends one: OpenAI Chat `image_url`, Anthropic `image`, Responses `input_image`. */
-export function isImagePart(part) {
-  return !!part && typeof part === 'object' && (part.type === 'image_url' || part.type === 'image' || part.type === 'input_image');
+/** How a message names each kind of media: `[PDF omitted by keysmith]`. `file` is one whose kind its part does not say. */
+const KIND_NAMES = { image: 'image', pdf: 'PDF', audio: 'audio', video: 'video', file: 'file' };
+
+export function kindName(kind) {
+  return KIND_NAMES[kind] || 'file';
+}
+
+/** The text that stands where media was, for a reader that cannot take it. */
+export function mediaOmitted(kind) {
+  return `[${kindName(kind)} omitted by keysmith]`;
 }
 
 /**
- * Message content as text. An image becomes `image(part)`: the IMAGE_OMITTED label by default,
- * because a vision request that arrives as text must say so; a CLI that takes images
- * (src/images.js) marks the spot instead and puts the image back there.
+ * A media part as a client sends one: an image (OpenAI Chat `image_url`, Anthropic `image`,
+ * Responses `input_image`), audio (`input_audio`), video (`video_url`, the shape vLLM and
+ * OpenRouter take), a file (Chat `file`, Responses `input_file`) or an Anthropic `document`
+ * with bytes in it. A `document` whose source is text is no media: it reads as it always has
+ * (test/fixtures/flatten-snapshot.json).
  */
-export function contentToText(content, { image = () => IMAGE_OMITTED } = {}) {
+export function isMediaPart(part) {
+  if (!part || typeof part !== 'object') return false;
+  if (part.type === 'document') return part.source?.type !== 'text' && part.source?.type !== 'content';
+  return ['image_url', 'image', 'input_image', 'input_audio', 'video_url', 'file', 'input_file'].includes(part.type);
+}
+
+/**
+ * The kind a media part says it is, before a byte of it is read: what its type names, or for a
+ * file, its data: URL's type or its file name. `file` when neither tells. The bytes decide in the
+ * end (src/media.js): this is what a label says, and what a reader that takes no such kind skips.
+ */
+export function declaredKind(part) {
+  switch (part?.type) {
+    case 'image_url':
+    case 'image':
+    case 'input_image':
+      return 'image';
+    case 'input_audio':
+      return 'audio';
+    case 'video_url':
+      return 'video';
+    case 'document':
+      return 'pdf';
+    default: {
+      const f = part?.type === 'file' ? part.file || {} : part || {};
+      const type = (/^data:([^;,]*)/i.exec(String(f.file_data ?? ''))?.[1] || '').toLowerCase();
+      if (type === 'application/pdf' || /\.pdf$/i.test(String(f.filename ?? f.file_url ?? ''))) return 'pdf';
+      return ['image', 'audio', 'video'].find((k) => type.startsWith(`${k}/`)) || 'file';
+    }
+  }
+}
+
+/**
+ * Message content as text. Media becomes `media(part)`: a label naming its kind by default
+ * (`[image omitted by keysmith]`), because a request that arrives as text must say what it lost;
+ * an adapter that takes media (src/media.js) marks the spot instead and puts it back there.
+ */
+export function contentToText(content, { media = (part) => mediaOmitted(declaredKind(part)) } = {}) {
   if (content == null) return '';
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -86,7 +132,7 @@ export function contentToText(content, { image = () => IMAGE_OMITTED } = {}) {
         if (typeof part === 'string') return part;
         if (!part || typeof part !== 'object') return '';
         if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') return part.text || '';
-        if (isImagePart(part)) return image(part);
+        if (isMediaPart(part)) return media(part);
         return part.text || '';
       })
       .filter(Boolean)
@@ -97,12 +143,12 @@ export function contentToText(content, { image = () => IMAGE_OMITTED } = {}) {
 
 /**
  * A message as the protocol faces build it (`{ role, content }`, the content as text), with its
- * original parts kept as `msg.parts` when they hold an image: what a CLI that takes images reads
- * (src/images.js). Every other reader goes on reading the text. Not enumerable, so the message
+ * original parts kept as `msg.parts` when they hold media: what an adapter that takes media reads
+ * (src/media.js). Every other reader goes on reading the text. Not enumerable, so the message
  * still reads, compares and serializes as `{ role, content }`, and a copy of it is text alone.
  */
-export function keepImageParts(msg, content) {
-  if (Array.isArray(content) && content.some(isImagePart)) Object.defineProperty(msg, 'parts', { value: content, enumerable: false });
+export function keepMediaParts(msg, content) {
+  if (Array.isArray(content) && content.some(isMediaPart)) Object.defineProperty(msg, 'parts', { value: content, enumerable: false });
   return msg;
 }
 

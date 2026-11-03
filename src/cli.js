@@ -33,7 +33,7 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith upgrade [<adapter>…]      what its built-in profile has and it lacks (a dry run); --apply writes it,
                                      --take <field,…> replaces a field you changed with the profile's
   keysmith enable|disable <adapter>  serve it, or stop: set <adapter> disabled false|true
-  keysmith vision <adapter> on|off   let a CLI see images: set <adapter> vision true|false
+  keysmith vision <adapter> on|off   let an adapter see images: set <adapter> vision true|false
   keysmith tools <adapter> <mode>    how a CLI takes tool requests, off|emulate|mcp|auto: set <adapter> toolMode <mode>
   keysmith alias [<name> <leg>…]     list aliases, or set one; --prepend/--append/--drop <leg>, --delete
   keysmith adapters                  list profiles and what is attached
@@ -355,9 +355,14 @@ function cmdSet(flags) {
       value = raw;
     }
   }
+  // `media image,pdf` is the list it reads as: the shell is no place to write JSON in.
+  if (field === 'media' && typeof value === 'string') value = value.split(',').map((k) => k.trim()).filter(Boolean);
   const next = { ...entry };
   if (flags.unset) delete next[field];
   else next[field] = value;
+  // `vision false` means no images, whichever field said there were: image leaves `media` too.
+  const imageOff = field === 'vision' && value === false && Array.isArray(next.media) && next.media.includes('image');
+  if (imageOff) next.media = next.media.filter((k) => k !== 'image');
   // The mark comes with its consequence: a CLI that kept its own tools takes no tool request, so
   // marking it turns its tool engine off — the way a re-add keeps the mark — rather than failing.
   const engineOff = field === 'unsafeTools' && next.unsafeTools === true && typeof next.toolMode === 'string' && next.toolMode !== 'off' ? next.toolMode : null;
@@ -365,8 +370,9 @@ function cmdSet(flags) {
   // A tool engine needs its templates: an entry attached before they existed gets the ones its
   // built-in profile has and it lacks (never one it has), when the profile is the same CLI.
   const filled = field === 'toolMode' && !flags.unset && typeof value === 'string' && value !== 'off' && kindOf(next) === 'cli' ? fillToolTemplates(id, next) : null;
-  // Likewise images: `vision true` brings the profile's visionArgs, when the entry has none.
-  const filledVision = field === 'vision' && !flags.unset && value === true && kindOf(next) === 'cli' ? fillVisionArgs(id, next) : null;
+  // Likewise media: `vision true` (or a `media` list) brings the profile's visionArgs, when the entry has none.
+  const mediaOn = (field === 'vision' && value === true) || (field === 'media' && Array.isArray(value) && value.length > 0);
+  const filledVision = mediaOn && !flags.unset && kindOf(next) === 'cli' ? fillVisionArgs(id, next) : null;
   // A tool-capable CLI is served only by someone who said so: turning it on, taking the mark
   // off, or changing what it runs and how it is stopped needs the flag that names what it means.
   const unsafe = unsafeChange(entry, next, field);
@@ -390,6 +396,7 @@ function cmdSet(flags) {
   out(`${flags.unset ? 'removed' : 'set'} ${id}.${field} → ${rel(configPath())}`);
   if (filled) out(`  ${filled}`);
   if (filledVision) out(`  ${filledVision}`);
+  if (imageOff) out(`  and image out of ${id}.media → ${JSON.stringify(next.media)}`);
   if (engineOff) out(`  and ${id}.toolMode ${engineOff} → off: a CLI marked unsafeTools takes no tool request (after unsafeTools false: keysmith set ${id} toolMode ${engineOff})`);
   if (unsafe) out(`! "${id}": ${unsafe}, with --allow-unsafe-tools. It can run commands and edit files on this machine${next.disabled ? ' once it is enabled' : ''}; it is still never an alias leg.`);
   noteRestart(`${id}.${field}`);
@@ -409,7 +416,7 @@ function profileFor(id, entry) {
 }
 
 /**
- * `keysmith set <id> vision true`: the built-in profile's visionArgs, when the entry has none and
+ * `keysmith set <id> vision true` (or `media …`): the built-in profile's visionArgs, when the entry has none and
  * its profile has them. What was done, in one line, or null (the entry's own visionArgs stand, or
  * there is no profile to take them from — and checkAdapter then says what is missing).
  */
@@ -480,8 +487,8 @@ function showValue(field, v) {
 
 /** Fields worth knowing about that an entry may not have yet, by kind (docs/adapters.md has them all). */
 const SETTABLE = {
-  cli: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'models', 'defaultModel', 'toolMode', 'vision', 'maxImages', 'maxImageBytes', 'stopAtToolCall', 'stripSystemPrompt', 'systemFlag', 'promptVia', 'env'],
-  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures'],
+  cli: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'models', 'defaultModel', 'toolMode', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'stopAtToolCall', 'stripSystemPrompt', 'systemFlag', 'promptVia', 'env'],
+  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
 };
 
 /**

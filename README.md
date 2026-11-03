@@ -558,16 +558,23 @@ shipped, so `keysmith add claude` puts it in no alias and no probe, and a re-add
 `bin`, say) keeps it that way. That is what a setup whose own work runs on the same Claude
 subscription needs: every request to `claude/…` spends that subscription.
 
-**Images.** `claude/<model>` sees the images a request carries: inline base64, as a data: URL
-on `/v1/chat/completions` (`image_url`) and `/v1/responses` (`input_image`), or a base64
-source on `/v1/messages`. The prompt goes to Claude Code's stdin as one stream-json message
-with the images in place, through the same tool-less switches. An image URL is a 400, never
-fetched (a gateway behind a tunnel would fetch whatever this machine can reach); so is an
-image over 5 MB or more than 20 in one request (`maxImageBytes`, `maxImages` per adapter).
-Every other adapter reads an image as `[image omitted by keysmith]`, as before. A `claude`
-entry attached before this gets it with `keysmith upgrade claude --apply` (or `keysmith vision
-claude on`). Details:
-[docs/adapters.md](docs/adapters.md#images-a-cli-that-sees-them).
+**Images, PDFs, audio, video.** An adapter takes the media its `media` lists (`image`, `pdf`,
+`audio`, `video`; `vision: true` is `image`), and a request that carries some reaches it as the
+thing itself: `claude/<model>` gets images and PDFs on Claude Code's stdin as one stream-json
+message, through the same tool-less switches; an HTTP upstream gets each user turn as a
+content array in its own wire — OpenAI `image_url` / `input_audio` / `file` / `video_url`,
+Anthropic `image` / `document`. The faces take each kind in their own shape (`image_url`,
+`input_audio`, `file`, `video_url` on `/v1/chat/completions`; `image`, `document` on
+`/v1/messages`; `input_image`, `input_file`, `input_audio` on `/v1/responses`), inline or as a
+URL, which keysmith fetches from the public internet only — never from this machine or its
+network, by address, by name or by redirect (`"fetchMedia": false` refuses URLs instead). The
+kind is read off the bytes. Per adapter, at most 20 images of 5 MB and 5 files of 20 MB
+(`maxImages`, `maxImageBytes`, `maxFiles`, `maxFileBytes`); every item is read before anything
+is sent, so a bad one is a 400 that costs nothing. A kind an adapter does not take reads as a
+label, `[image omitted by keysmith]`, `[PDF omitted by keysmith]` … The `claude`, `openai`,
+`anthropic`, `google` and `copilot` profiles ship their `media`; an entry attached before this
+gets it with `keysmith upgrade <id> --apply`. Details:
+[docs/adapters.md](docs/adapters.md#media-images-pdfs-audio-video).
 
 **Ollaya** ([ollaya.dev](https://ollaya.dev)) is out of scope: it is a local runtime for
 decision models — typed questions answered with calibrated probabilities over their
@@ -865,7 +872,7 @@ change it without opening the file that holds the gateway key:
 | `keysmith set <adapter> <field> <value>` | one field; the value is JSON when it parses. `--unset` removes it |
 | `keysmith upgrade [<adapter>…]` | what its built-in profile gained since the entry was copied — a dry run. `--apply` writes it |
 | `keysmith enable \| disable <adapter>` | `set <adapter> disabled false\|true` |
-| `keysmith vision <adapter> on\|off` | `set <adapter> vision true\|false`, the profile's `visionArgs` filled in when the entry lacks them |
+| `keysmith vision <adapter> on\|off` | `set <adapter> vision true\|false`: images on or off (off takes `image` out of `media` too), a CLI's `visionArgs` filled in from its profile when the entry lacks them |
 | `keysmith tools <adapter> off\|emulate\|mcp\|auto` | `set <adapter> toolMode …`, the tool engine's templates filled in the same way |
 
 Each goes through `set`'s checks: a value the gateway would not load is refused before it
@@ -879,13 +886,15 @@ keysmith set claude models '["sonnet","opus"]'   # what /v1/models lists for it
 keysmith set claude timeoutMs 600000             # a run may take ten minutes
 keysmith set claude maxImages 5                  # images per request (20)
 keysmith set claude maxImageBytes 2097152        # the largest image, decoded (5 MB)
+keysmith set ollama media image                  # a local vision model: images go up as image_url
+keysmith set google maxFileBytes 10485760        # the largest PDF, audio or video file, decoded (20 MB)
 keysmith set agy maxConcurrent 4                 # processes at once
 keysmith set codex explicitOnly true             # answers codex/… by name only: no alias, no probe
 keysmith set copilot priority 10                 # first in the flat listing
 keysmith set google modelParams '{"gemini-4-argon":{"reasoning_effort":"high"}}'
 ```
 
-**`keysmith upgrade`.** A profile gains things — `vision` on `claude`, a tool engine's
+**`keysmith upgrade`.** A profile gains things — `media` on `claude`, `openai`, `google`…, a tool engine's
 templates on `agy`, `opencode`, `codex` and `qoder` — and an entry copied before that does not
 have them. `upgrade` compares each entry with the profile it was made from (a CLI by its binary
 and parser, an HTTP adapter by its `baseUrl` and wire) and says, per field:
@@ -910,16 +919,16 @@ tools.
 | `cmd` | cli | verified live against Command Code 1.66.0 — **`unsafeTools`**: a `-p` run approves its own tool calls, so it ships disabled, see [above](#agents-that-could-act-on-this-machine) |
 | `opencode` | cli | verified live against opencode 1.18.27; tool-less agent checked against a stub endpoint (no `--auto`); its free `opencode/*` models refuse the tool-less run (403); answers tool requests (`toolMode: "auto"`: the MCP bridge, EMULATE where it cannot — both live round trips on opencode 1.19.3) |
 | `qoder` | cli | verified with `-p`; its `-o json/stream-json` modes fail inside a nested agent session; tool-less flags parsed by 1.1.59; answers tool requests (`toolMode: "auto"`: the MCP bridge with `-o stream-json`, EMULATE where it cannot — both live round trips on 1.1.59) |
-| `claude` | cli | tool-less flags and stream-json shape checked against Claude Code 2.1.261; sees images (`vision: true`: stream-json on stdin; a scanned page transcribed live on 2.1.303 through both faces); explicit-only as shipped |
+| `claude` | cli | tool-less flags and stream-json shape checked against Claude Code 2.1.261; takes images and PDFs (`media`: stream-json on stdin; a scanned page transcribed live on 2.1.303 through both faces, a PDF `document` block checked against a stub); explicit-only as shipped |
 | `agy` | cli | verified live against Antigravity CLI 1.3.3 — your Google login, no key; runs as a tool-less text agent (~600-token prompt instead of ~20k), see [docs/adapters.md](docs/adapters.md#agy-as-a-plain-text-model); answers tool requests too (`toolMode: "auto"`: the MCP bridge, EMULATE where the bridge cannot — see [docs/adapters.md](docs/adapters.md#agy-and-tool-requests-the-mcp-bridge)) |
 | `kiro` | cli | Kiro CLI 2.27.1 — tool-less agent, `stream-json`, model list as JSON; the first live run was refused for quota before any text, see [docs/adapters.md](docs/adapters.md#kiro-as-a-plain-text-model); tool requests pass it by (`toolMode: "off"`): its EMULATE argv is checked against a stub only |
 | `codex` | cli | argv run against a stub Responses endpoint with codex 0.163.0 (read-only, no shell, no web search); gpt-6-* keep sub-agent tools; answers tool requests (`toolMode: "auto"`: the MCP bridge with `exec --json`, EMULATE where it cannot — both live round trips on `gpt-5.6-luna`) |
 | `warp` | cli | Warp's `oz` agent CLI, ndjson verified live — **`unsafeTools`**: ships disabled, never an alias leg, see [above](#agents-that-could-act-on-this-machine) |
 | `gemini` | cli | documented argv shape, not run against a live install — **`unsafeTools`** until a tool-less argv is checked: ships disabled |
-| `openai`, `anthropic`, `openrouter`, `groq`, `deepseek`, `together` | http | standard endpoints |
-| `google` | http | verified live against Gemini's OpenAI-compatible endpoint: tools, streaming, thought signatures — see [above](#gemini-with-tools-the-google-profile) |
+| `openai`, `anthropic`, `openrouter`, `groq`, `deepseek`, `together` | http | standard endpoints; `openai` takes images, PDFs and audio, `anthropic` images and PDFs (`media`, from their API references) |
+| `google` | http | verified live against Gemini's OpenAI-compatible endpoint: tools, streaming, thought signatures — see [above](#gemini-with-tools-the-google-profile); takes images (read live on `gemini-3.5-flash`) and audio; refuses a PDF `file` part and `video_url` |
 | `ollama`, `lmstudio`, `llamacpp`, `vllm` | http | local servers, no key |
-| `copilot` | http | verified live against `api.githubcopilot.com` with an OAuth device token |
+| `copilot` | http | verified live against `api.githubcopilot.com` with an OAuth device token; takes images with `copilot-vision-request: true` (not checked live) |
 
 `keysmith adapters` lists them; `keysmith add <profile>` copies one into your config
 where every field stays yours. Adding an agent nobody has heard of is a config edit:
