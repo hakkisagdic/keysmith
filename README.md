@@ -838,11 +838,15 @@ spawner: an unauthenticated public gateway is a denial-of-wallet machine.
 On macOS, `keysmith install-service` writes two LaunchAgents
 (`~/Library/LaunchAgents/dev.keysmith.{gateway,tunnel}.plist`) so the gateway — and
 the named tunnel, when configured — come back at login without a terminal. It embeds
-absolute, symlink-resolved binary paths (an fnm multishell path dies with the shell
-that minted it) and a PATH that can find your CLIs, stops the foreground `keysmith
-start` / `tunnel run` processes it is replacing, and lets launchd's throttled retry
-rebind the port. `keysmith uninstall-service` reverses it. Quick tunnels are not
-persisted: a random hostname that changes every start earns nothing from a service.
+absolute binary paths and a PATH that can find your CLIs, written so they outlive the shell
+that ran it and follow the upgrades you make: an fnm multishell path (which dies with that
+shell) and a path in your default fnm version go through `<fnm>/aliases/default/…`, another
+fnm version through its own directory, a Homebrew keg (`…/Cellar/node/26.12.0/…`, gone after
+`brew upgrade`) through `…/opt/<formula>/…`. It stops the foreground `keysmith start` /
+`tunnel run` processes it is replacing, and lets launchd's throttled retry rebind the port.
+`keysmith install-service --dry-run` prints the agents it would write and touches nothing.
+`keysmith uninstall-service` reverses it. Quick tunnels are not persisted: a random hostname
+that changes every start earns nothing from a service.
 
 The gateway agent is `ProcessType: Interactive`. Without it launchd runs the gateway, and
 every CLI the gateway spawns, at utility priority with throttled I/O; on a busy machine

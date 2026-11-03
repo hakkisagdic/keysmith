@@ -40,7 +40,7 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith models [--refresh]        what this gateway exposes, and from where
   keysmith serve [--port N]          run the gateway  (http://127.0.0.1:<port>/v1)
   keysmith start | stop | status     keep it running in the background
-  keysmith install-service           run gateway (+ named tunnel) at login via launchd
+  keysmith install-service           run gateway (+ named tunnel) at login via launchd; --dry-run prints the agents instead
   keysmith uninstall-service         remove those launchd agents
   keysmith chat <model> <prompt>     one-shot request against your own gateway
   keysmith doctor [--probe-models]   is each adapter actually alive, and at what cost
@@ -945,7 +945,7 @@ function cmdStop() {
 
 /* ---------------------------------------------------------------------- service */
 
-function cmdInstallService() {
+function cmdInstallService(flags = {}) {
   const cfg = loadOrFail();
   const named = cfg.tunnel?.name && cfg.tunnel?.configFile ? cfg.tunnel : null;
   if (!named) {
@@ -955,6 +955,14 @@ function cmdInstallService() {
   const cloudflared = named ? tunnel.cloudflaredBin() : null;
   if (named && !cloudflared) fail('named tunnel configured but cloudflared is not on PATH — install it first');
   if (named && !fs.existsSync(named.configFile)) fail(`ingress file missing: ${rel(named.configFile)} — re-run \`keysmith tunnel setup <hostname> --yes\``);
+
+  // What would be written, and nothing else: no file, no launchctl, no handover.
+  if (flags.dryRun) {
+    out(`${path.join(service.launchAgentsDir(), `${service.labels.gateway}.plist`)}:\n${service.gatewayPlist({ nodeBin: process.execPath, entry: currentEntry(), port: cfg.port })}`);
+    if (named) out(`${path.join(service.launchAgentsDir(), `${service.labels.tunnel}.plist`)}:\n${service.tunnelPlist({ cloudflared, name: named.name, configFile: named.configFile })}`);
+    out('dry run: nothing written, nothing loaded — without --dry-run these replace the agents and restart them');
+    return;
+  }
 
   const res = service.installService({
     nodeBin: process.execPath,

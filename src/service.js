@@ -36,19 +36,54 @@ const TUNNEL_LABEL = 'dev.keysmith.tunnel';
 
 export const labels = { gateway: GATEWAY_LABEL, tunnel: TUNNEL_LABEL };
 
-/** Realpath a binary: launchd must not be pointed at an fnm multishell shim. */
-function resolveBin(bin) {
+/**
+ * A binary or PATH directory as launchd should keep it: a path that still leads to the same
+ * program after the shell that installed the agents is gone, and after an upgrade it follows.
+ *  - fnm: a per-shell multishell link (`…/fnm_multishells/<pid>_<ts>/…`) disappears with its
+ *    shell, and `node-versions/<v>/…` stays on <v> after `fnm default` moves on. A path in the
+ *    version the default alias points to is written through it (`<fnmDir>/aliases/default/…`),
+ *    one in any other version as that version's own path.
+ *  - Homebrew: a keg (`…/Cellar/node/26.12.0/…`, which is what process.execPath reports) is
+ *    gone after `brew upgrade`; it is written through `…/opt/<formula>/…` while that points at it.
+ *  - Anything else as written — a Homebrew `bin/` link, `~/.local/bin/…` — except a multishell
+ *    link fnm does not keep versions behind (`fnm use system`): that one is its real path.
+ * `fnmDir` is where fnm keeps its versions: $FNM_DIR, else ~/.local/share/fnm.
+ */
+export function stablePath(p, { fnmDir = process.env.FNM_DIR || path.join(os.homedir(), '.local', 'share', 'fnm') } = {}) {
+  const real = realpathOr(p);
+  if (!real) return p;
+  const versions = realpathOr(path.join(fnmDir, 'node-versions'));
+  if (versions && real.startsWith(versions + path.sep)) {
+    const [version, installation, ...tail] = real.slice(versions.length + 1).split(path.sep);
+    const home = path.join(versions, version, installation || '');
+    return realpathOr(path.join(fnmDir, 'aliases', 'default')) === home ? path.join(fnmDir, 'aliases', 'default', ...tail) : real;
+  }
+  const keg = /^(.+)\/Cellar\/([^/]+)\/([^/]+)(\/.*)?$/.exec(real);
+  if (keg) {
+    const [, prefix, formula, version, tail = ''] = keg;
+    const opt = path.join(prefix, 'opt', formula);
+    if (realpathOr(opt) === path.join(prefix, 'Cellar', formula, version)) return opt + tail;
+  }
+  return /(^|\/)fnm_multishells\//.test(p) ? real : p;
+}
+
+function realpathOr(p) {
   try {
-    return realpathSync(bin);
+    return realpathSync(p);
   } catch {
-    return bin;
+    return null;
   }
 }
 
-/** A PATH that actually finds the user's CLIs under launchd's minimal env. */
-function servicePath() {
+/** A binary for launchd to run: stablePath(), never an fnm multishell shim. */
+function resolveBin(bin) {
+  return stablePath(bin);
+}
+
+/** A PATH that actually finds the user's CLIs under launchd's minimal env, each directory as stablePath() keeps it. */
+export function servicePath(pathVar = process.env.PATH, opts = {}) {
   const seen = new Set();
-  const dirs = [...(process.env.PATH || '').split(':'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'];
+  const dirs = [...(pathVar || '').split(':'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'].map((d) => (d ? stablePath(d, opts) : d));
   return dirs.filter((d) => d && !seen.has(d) && seen.add(d)).join(':');
 }
 
