@@ -492,7 +492,7 @@ export function codexJsonFinal(lines) {
  * Universal JSON/NDJSON/text stream parser (`harness-json`) for the extended CLI harness ecosystem:
  * Gemini CLI, Kilo, Qwen Code, Cline, Goose, Kimi CLI, MiniMax, Grok, Pi, Oh-My-Pi, DSH, Aider,
  * Mimo, Jcode, Mistral Vibe, Hermes, OpenHands, CheetahClaws, OpenSquilla, Nanobot, ZeroClaw,
- * Docker Agent, Fast-Agent, and Dcode.
+ * Docker Agent, Fast-Agent, Dcode, Traycer CLI, Factory Droid, Devin, Copilot CLI, Cursor, Amp, and Reasonix.
  */
 export async function* harnessJson(lines) {
   const blocks = wholeBlocks();
@@ -541,6 +541,8 @@ export async function* harnessJson(lines) {
       d.sessionId ||
       d.sessionID ||
       d.thread_id ||
+      d.threadId ||
+      d.taskId ||
       d.conversation_id ||
       d.chat_id ||
       d.session?.id ||
@@ -758,8 +760,8 @@ export async function* harnessJson(lines) {
       continue;
     }
 
-    // 12. Result / completion / single-object JSON envelopes (`result`, `response`, `output`)
-    if (d.type === 'result' || d.response != null || d.result != null || d.output != null) {
+    // 12. Result / completion / single-object JSON envelopes (`result`, `response`, `output`, `reply`)
+    if (d.type === 'result' || d.response != null || d.result != null || d.output != null || d.reply != null) {
       if (d.is_error || d.status === 'error' || d.subtype === 'error') {
         const why =
           (typeof d.error === 'string' && d.error) ||
@@ -775,6 +777,9 @@ export async function* harnessJson(lines) {
           (typeof d.result === 'string' && d.result) ||
           (typeof d.result?.response === 'string' && d.result.response) ||
           (typeof d.output === 'string' && d.output) ||
+          (typeof d.reply === 'string' && d.reply) ||
+          (typeof d.reply?.text === 'string' && d.reply.text) ||
+          (typeof d.reply?.message === 'string' && d.reply.message) ||
           (typeof d.content === 'string' && d.content) ||
           (typeof d.text === 'string' && d.text) ||
           '';

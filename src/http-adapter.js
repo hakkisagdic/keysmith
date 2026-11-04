@@ -13,6 +13,7 @@ const UHP_TOOL_MODES = ['off', 'emulate', 'uhp', 'auto'];
  *   openai     POST {base}/chat/completions  — OpenAI, evren, Ollama, OpenRouter, vLLM, GitHub Copilot…
  *   anthropic  POST {base}/messages          — Claude Messages API and clones
  *   uhp        POST {base}/responses         — Unified Harness Protocol (HarnessRouter CE / Cloud, Keysmith UHP)
+ *   traycer    GET  {base}/api/traycer/models & POST {base}/inference/{anthropic/messages,openai/responses,{xai,meta,openrouter}/chat/completions}
  */
 export class HttpAdapter {
   constructor(id, cfg) {
@@ -32,6 +33,7 @@ export class HttpAdapter {
     // drops the prefix, so the catalogue, alias checks and requests all use the short id.
     this.stripModelPrefix = typeof cfg.stripModelPrefix === 'string' ? cfg.stripModelPrefix : null;
     this._modelCache = null; // same 10-minute shape as CliAdapter's, so /v1/models does not refetch every provider on every poll
+    this._traycerModels = null; // Map<modelId, { provider, upstreamModelId, efforts, defaultEffort }>
     this.defaultModel = cfg.defaultModel || null;
     this.note = cfg.note || null;
     // Answers only a request that names it: never an alias leg, never probed (Gateway.resolve).
@@ -40,10 +42,10 @@ export class HttpAdapter {
     this.harnessId = typeof cfg.harnessId === 'string' && cfg.harnessId.trim() ? cfg.harnessId.trim() : null;
     this.backend = typeof cfg.backend === 'string' && cfg.backend.trim() ? cfg.backend.trim() : null;
     this.uhpVersion = typeof cfg.uhpVersion === 'string' && cfg.uhpVersion.trim() ? cfg.uhpVersion.trim() : '2026-10-19';
-    if (this.wire === 'uhp') {
+    if (this.wire === 'uhp' || this.wire === 'traycer') {
       const mode = cfg.toolMode ?? 'auto';
       if (!UHP_TOOL_MODES.includes(mode)) {
-        throw new Error(`adapter "${id}": toolMode on the uhp wire must be one of ${UHP_TOOL_MODES.join(', ')} — got ${JSON.stringify(mode)}`);
+        throw new Error(`adapter "${id}": toolMode on the ${this.wire} wire must be one of ${UHP_TOOL_MODES.join(', ')} — got ${JSON.stringify(mode)}`);
       }
       this.toolMode = mode;
       this.maxPromptChars = cfg.maxPromptChars ?? 500_000;
@@ -90,7 +92,7 @@ export class HttpAdapter {
   }
 
   /**
-   * Run one EMULATE tool turn over UHP when the upstream does not execute client tools natively
+   * Run one EMULATE tool turn over UHP or Traycer when the upstream does not execute client tools natively
    * (e.g. HarnessRouter CE, which reports `ignored_fields: ["tools"]`).
    */
   emulateRun({ text, model, effort = null, timeoutMs = this.timeoutMs, signal }) {
@@ -139,6 +141,9 @@ export class HttpAdapter {
   }
 
   route(suffix) {
+    if (this.wire === 'traycer') {
+      return this.baseUrl.replace(/\/(?:api\/traycer\/models|inference\/.*)$/, '') + suffix;
+    }
     const tail = this.wire === 'anthropic' ? '/messages' : this.wire === 'uhp' ? '/responses' : '/chat/completions';
     return this.baseUrl.replace(new RegExp(tail + '$'), '') + suffix;
   }
@@ -197,6 +202,21 @@ export class HttpAdapter {
     return { model: s, backend: this.backend || undefined, harnessId: this.harnessId || undefined };
   }
 
+  /**
+   * Resolve a Traycer model ID to `{ provider, upstreamModelId }` using the cached
+   * `/api/traycer/models` catalog (fetching it once if not yet cached) or prefix heuristics.
+   */
+  async _resolveTraycerModel(model) {
+    const upstream = this.upstreamModel(model) || this.defaultModel || '';
+    if (!this._traycerModels && !this._declared) {
+      await this.models().catch(() => null);
+    }
+    if (this._traycerModels?.has(upstream)) {
+      return this._traycerModels.get(upstream);
+    }
+    return inferTraycerRoute(upstream);
+  }
+
   /** `modelParams` for one upstream model id: the `"*"` entry, then the model's own on top (own entries only). */
   paramsFor(upstream) {
     if (!this.modelParams) return {};
@@ -213,15 +233,16 @@ export class HttpAdapter {
       this._modelCache = { at: Date.now(), list };
       return list;
     }
+    const modelsPath = this.wire === 'traycer' ? '/api/traycer/models' : '/models';
     let res;
     try {
-      res = await fetch(this.route('/models'), { headers: { ...this.authHeaders(), ...this.headers }, signal: AbortSignal.timeout(20_000) });
+      res = await fetch(this.route(modelsPath), { headers: { ...this.authHeaders(), ...this.headers }, signal: AbortSignal.timeout(20_000) });
     } catch (e) {
       throw new LlmError(`${this.id}: ${e.message}`, { status: 502, provider: this.id, retriable: true });
     }
-    if (!res.ok) throw new LlmError(`${this.id}: /models returned ${res.status}`, { status: 502, provider: this.id });
+    if (!res.ok) throw new LlmError(`${this.id}: ${modelsPath} returned ${res.status}`, { status: 502, provider: this.id });
     const body = await res.json().catch(() => null);
-    if (!body) throw new LlmError(`${this.id}: /models returned no JSON`, { status: 502, provider: this.id });
+    if (!body) throw new LlmError(`${this.id}: ${modelsPath} returned no JSON`, { status: 502, provider: this.id });
     const strip = (id) => (this.stripModelPrefix && typeof id === 'string' && id.startsWith(this.stripModelPrefix) ? id.slice(this.stripModelPrefix.length) : id);
     const fetched = [];
     const seen = new Set();
@@ -230,6 +251,43 @@ export class HttpAdapter {
       seen.add(item.id);
       fetched.push(item);
     };
+    if (this.wire === 'traycer') {
+      const map = new Map();
+      const list = Array.isArray(body) ? body : body.data || body.models || [];
+      for (const m of list) {
+        if (!m || typeof m !== 'object') continue;
+        const id = strip(m.id || m.name);
+        if (!id) continue;
+        const provider = typeof m.provider === 'string' && m.provider ? m.provider : inferTraycerRoute(id).provider;
+        const upstreamModelId = typeof m.upstreamModelId === 'string' && m.upstreamModelId ? m.upstreamModelId : id;
+        const efforts = Array.isArray(m.supportedReasoningEfforts)
+          ? m.supportedReasoningEfforts.map((e) => (typeof e === 'string' ? e : e?.id)).filter(Boolean)
+          : Array.isArray(m.efforts || m.reasoning)
+            ? m.efforts || m.reasoning
+            : undefined;
+        const defaultEffort = m.defaultReasoningEffort || m.defaultEffort || undefined;
+        const meta = {
+          id,
+          provider,
+          upstreamModelId,
+          ...(efforts?.length ? { efforts } : {}),
+          ...(defaultEffort ? { defaultEffort } : {}),
+        };
+        map.set(id, meta);
+        if (upstreamModelId !== id) map.set(upstreamModelId, meta);
+        push({
+          id,
+          name: m.name || id,
+          contextWindow: m.contextWindow || m.context_window || m.context_length,
+          maxOutput: m.maxOutputTokens || m.max_output_tokens,
+          ...(efforts?.length ? { efforts } : {}),
+          ...(defaultEffort ? { defaultEffort } : {}),
+        });
+      }
+      this._traycerModels = map;
+      this._modelCache = { at: Date.now(), list: fetched };
+      return fetched;
+    }
     if (body.backends && typeof body.backends === 'object' && !Array.isArray(body.backends)) {
       for (const m of body.data || body.models || []) {
         const entry = typeof m === 'string' ? { id: strip(m) } : { id: strip(m.id || m.name), name: m.name };
@@ -357,16 +415,36 @@ export class HttpAdapter {
     trace = null,
     idempotencyKey = null,
   }) {
+    const isTraycer = this.wire === 'traycer';
+    const traycerTarget = isTraycer ? await this._resolveTraycerModel(model) : null;
+    const effectiveWire = isTraycer
+      ? traycerTarget.provider === 'anthropic'
+        ? 'anthropic'
+        : traycerTarget.provider === 'openai'
+          ? 'uhp'
+          : 'openai'
+      : this.wire;
+    const effectiveModel = isTraycer ? traycerTarget.upstreamModelId : this.upstreamModel(model);
+
+    if (rendered && typeof rendered.prompt === 'string' && effectiveWire !== 'uhp') {
+      messages = [
+        ...(rendered.system ? [{ role: 'system', content: rendered.system }] : []),
+        { role: 'user', content: rendered.prompt },
+      ];
+    }
+
     // Read before anything is sent: a bad image is a 400 and the upstream never sees the request.
-    if (this.media.length && hasMedia(messages)) messages = await upstreamMessages(messages, this.mediaOpts, { signal });
+    if (this.media.length && hasMedia(messages)) {
+      messages = await upstreamMessages(messages, { ...this.mediaOpts, wire: effectiveWire }, { signal });
+    }
     const withMedia = messages.some((m) => Array.isArray(m.content));
     const controller = new AbortController();
     const onAbort = () => controller.abort(new Error('client disconnected'));
     signal?.addEventListener('abort', onAbort, { once: true });
     const budgetMs = timeoutMs || this.timeoutMs;
     const timer = setTimeout(() => controller.abort(new Error(`timeout after ${budgetMs}ms`)), budgetMs);
-    const isAnthropic = this.wire === 'anthropic';
-    const isUhp = this.wire === 'uhp';
+    const isAnthropic = effectiveWire === 'anthropic';
+    const isUhp = effectiveWire === 'uhp';
     const system = messages.find((m) => m.role === 'system');
     // `modelParams` go first, so the fields keysmith builds (model, messages, stream…) win.
     const payload = { ...this.paramsFor(this.upstreamModel(model)) };
@@ -374,20 +452,21 @@ export class HttpAdapter {
       Object.assign(
         payload,
         buildUhpPayload(this, payload, {
-          model,
+          model: effectiveModel,
           messages,
-          session,
+          session: isTraycer ? null : session,
           maxTokens,
           effort,
           rendered,
           tools,
           toolChoice,
-          harnessId,
+          harnessId: isTraycer ? null : harnessId,
+          rawModel: isTraycer,
         }),
       );
     } else if (isAnthropic) {
       Object.assign(payload, {
-        model: this.upstreamModel(model),
+        model: effectiveModel,
         // The Messages API requires max_tokens: the client's, else the model's own in `modelParams`, else 4096.
         // Built after `modelParams`, a bare 4096 here overwrote the model's value every time, and a thinking
         // model ran out of answer on any long reply.
@@ -399,7 +478,7 @@ export class HttpAdapter {
       });
     } else {
       Object.assign(payload, {
-        model: this.upstreamModel(model),
+        model: effectiveModel,
         messages,
         stream: true,
         stream_options: { include_usage: true },
@@ -409,7 +488,18 @@ export class HttpAdapter {
       });
     }
 
-    const endpoint = isUhp ? '/responses' : isAnthropic ? '/messages' : '/chat/completions';
+    const endpoint = isTraycer
+      ? traycerTarget.provider === 'anthropic'
+        ? '/inference/anthropic/messages'
+        : traycerTarget.provider === 'openai'
+          ? '/inference/openai/responses'
+          : `/inference/${traycerTarget.provider}/chat/completions`
+      : isUhp
+        ? '/responses'
+        : isAnthropic
+          ? '/messages'
+          : '/chat/completions';
+    const extraHeaders = isTraycer && isAnthropic ? { 'anthropic-version': '2023-06-01' } : {};
     let res;
     try {
       res = await fetch(this.route(endpoint), {
@@ -418,6 +508,7 @@ export class HttpAdapter {
           'content-type': 'application/json',
           accept: 'text/event-stream',
           ...this.authHeaders({ traceparent: trace?.traceparent, tracestate: trace?.tracestate, idempotencyKey }),
+          ...extraHeaders,
           ...this.headers,
           ...(withMedia ? this.mediaHeaders : {}),
         },
@@ -455,11 +546,28 @@ export class HttpAdapter {
 }
 
 /**
+ * Infer a Traycer inference provider and upstream model ID when the model was not found in
+ * `/api/traycer/models` (or before `/api/traycer/models` has been fetched).
+ */
+export function inferTraycerRoute(model) {
+  const s = String(model || '').trim();
+  const explicit = s.match(/^(openai|anthropic|xai|meta|openrouter)\/(.+)$/i);
+  if (explicit) {
+    return { provider: explicit[1].toLowerCase(), upstreamModelId: explicit[2] };
+  }
+  if (/^claude-/i.test(s)) return { provider: 'anthropic', upstreamModelId: s };
+  if (/^(gpt-|o\d)/i.test(s)) return { provider: 'openai', upstreamModelId: s };
+  if (/^grok-/i.test(s)) return { provider: 'xai', upstreamModelId: s };
+  if (/^(muse-|llama-)/i.test(s)) return { provider: 'meta', upstreamModelId: s };
+  return { provider: 'openrouter', upstreamModelId: s };
+}
+
+/**
  * Build a UHP `POST /v1/responses` request body from Keysmith's canonical turn inputs.
  */
-function buildUhpPayload(adapter, baseParams, { model, messages, session, maxTokens, effort, rendered, tools, toolChoice, harnessId }) {
-  const upstream = adapter.upstreamModel(model);
-  const target = adapter.parseUhpTarget(upstream);
+function buildUhpPayload(adapter, baseParams, { model, messages, session, maxTokens, effort, rendered, tools, toolChoice, harnessId, rawModel = false }) {
+  const upstream = rawModel ? model : adapter.upstreamModel(model);
+  const target = rawModel ? { model: upstream } : adapter.parseUhpTarget(upstream);
   const out = { stream: true };
   if (target.model) out.model = target.model;
   else delete out.model;
@@ -1007,7 +1115,12 @@ export function describeErrorBody(text) {
     let j = JSON.parse(t);
     if (Array.isArray(j)) j = j[0] || {};
     const m = j.error?.message || j.message || (typeof j.error === 'string' ? j.error : null);
-    const kind = typeof j.error?.status === 'string' ? `${j.error.status}: ` : '';
+    const kind =
+      typeof j.error?.status === 'string'
+        ? `${j.error.status}: `
+        : typeof j.error === 'string' && typeof j.message === 'string' && j.error !== j.message
+          ? `${j.error}: `
+          : '';
     if (m) return `${kind}${m}`.slice(0, 600);
   } catch {}
   return t.slice(0, 600);

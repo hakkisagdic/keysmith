@@ -428,7 +428,7 @@ export class Gateway {
         // The leg's model and effort: an effort-suffixed id read off, a level checked against the
         // CLI's catalogue (src/effort.js) — a 400 there is this leg refusing, like any other.
         const planned = await effortPlan(leg, args.effort);
-        const legEffort = planned.effort || (adapter.wire === 'uhp' ? args.effort : null);
+        const legEffort = planned.effort || (adapter.wire === 'uhp' || adapter.wire === 'traycer' ? args.effort : null);
         const events = adapter.complete({
           model: planned.model,
           messages: args.messages,
@@ -588,7 +588,7 @@ export class Gateway {
       const st = { emitted: false };
       try {
         const planned = await effortPlan(leg, args.effort);
-        const legEffort = planned.effort || (leg.adapter.wire === 'uhp' ? args.effort : null);
+        const legEffort = planned.effort || (leg.adapter.wire === 'uhp' || leg.adapter.wire === 'traycer' ? args.effort : null);
         // A bridge session is the model's at an effort, whichever way the request spelled it: an
         // effort-suffixed id and the base id with the same effort are one conversation.
         const engineLeg = { ...leg, model: planned.model, effort: legEffort, target: planned.model !== leg.model ? `${leg.adapter.id}/${planned.model}` : leg.target };
@@ -863,6 +863,9 @@ export function prepareAdapter(id, raw) {
       resolved = resolveSecret(ref);
     } catch (e) {
       throw new Error(`apiKey reference: ${e.message}`);
+    }
+    if (!resolved && cfg.apiKeyEnv) {
+      resolved = process.env[cfg.apiKeyEnv] || null;
     }
     if (!resolved) {
       const hint = typeof ref === 'string' && ref.startsWith('{env:') ? ` (env ${ref.slice(5, -1)} is unset)` : ` (${ref})`;

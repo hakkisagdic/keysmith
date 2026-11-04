@@ -9,6 +9,7 @@ import { emulate, renderPrompt } from './emulate.js';
  *   an HTTP upstream on the openai wire   the body goes up verbatim (`passthrough`), on the chat face
  *   an HTTP upstream on the uhp wire      native UHP `/responses` tools, or EMULATE when the upstream
  *                                         ignores `tools` (e.g. HarnessRouter CE)
+ *   an HTTP upstream on the traycer wire  EMULATE across Traycer's multi-provider inference endpoints
  *   a CLI with toolMode other than off    a tool engine answers: EMULATE (emulate.js) or the MCP bridge
  *   anything else                         cannot answer with a tool call: left for the plain completion
  *
@@ -67,7 +68,7 @@ export function checkToolMode(id, cfg) {
  */
 export function toolPath(adapter, spec, face) {
   if (adapter.kind === 'http') {
-    if (adapter.wire === 'uhp') {
+    if (adapter.wire === 'uhp' || adapter.wire === 'traycer') {
       const mode = adapter.toolMode || 'auto';
       if (mode === 'off' || spec.unsupported?.length) return 'skip';
       return 'engine';
@@ -85,7 +86,7 @@ export function toolPath(adapter, spec, face) {
 }
 
 /**
- * Which engine runs a tool request on a CLI or UHP leg: `{ engine: 'plain' | 'emulate' | 'mcp' | 'uhp',
+ * Which engine runs a tool request on a CLI or UHP/Traycer leg: `{ engine: 'plain' | 'emulate' | 'mcp' | 'uhp',
  * fallback? }`, or a thrown LlmError when this leg cannot take it (the route moves on).
  * `mcp` is the bridge (src/bridge/index.js; null when no adapter has one): `check(adapter, spec,
  * ctx)` says whether it can take this request now — `{ ok: true }` or `{ ok: false, reason,
@@ -93,6 +94,11 @@ export function toolPath(adapter, spec, face) {
  * continues one of its sessions, which is always the bridge's.
  */
 export function pickEngine(adapter, spec, mcp, ctx = {}) {
+  if (adapter.kind === 'http' && adapter.wire === 'traycer') {
+    const choice = spec.choice?.mode || 'auto';
+    if (choice === 'none') return { engine: 'plain' };
+    return { engine: 'emulate' };
+  }
   if (adapter.kind === 'http' && adapter.wire === 'uhp') {
     const mode = adapter.toolMode || 'auto';
     const choice = spec.choice?.mode || 'auto';

@@ -230,6 +230,8 @@ const NESTED_AGENT_MARKERS = [
   'QODER_SESSION_TYPE',
   'CLAUDE_AGENT_SDK_ENTRYPOINT',
   'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDECODE',
+  'TRAYCER_AGENT_CLI_SURFACE',
 ];
 
 export function agentCleanEnv(base = process.env) {

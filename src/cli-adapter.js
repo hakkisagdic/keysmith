@@ -677,15 +677,15 @@ export function autoApproveFlag(cfg) {
 }
 
 /**
- * A model listing printed as JSON — an array, or an object holding one under `models` or
- * `data` — as `[{id, name?, contextWindow?, efforts?, defaultEffort?}]`; null when the text is
- * not that, so the line-by-line reading takes over. The id is the first of `model_id` (Kiro), `id`
- * (oz, OpenAI-shaped), `slug` (Codex), `model`, `value` (Claude Code), `name`; an entry marked
- * `visibility: "hide"` or `hidden: true` is a model the CLI itself keeps out of its picker, so it
- * stays out here too. `efforts`: the reasoning efforts the CLI says the model takes — Codex's
- * `supported_reasoning_levels`, Claude Code's `supportedEffortLevels` — the only place a level is
- * ever checked against (src/effort.js). Claude Code prints its listing as the answer to an
- * `initialize` control request (stream-json on stdin): that line's `models` are read.
+ * A model listing printed as JSON — an array, or an object holding one under `models`, `data`,
+ * or `agents` (Traycer CLI `agent list`) — as `[{id, name?, contextWindow?, efforts?, defaultEffort?}]`;
+ * null when the text is not that, so the line-by-line reading takes over. The id is the first of
+ * `model_id` (Kiro), `id` (oz, OpenAI-shaped, Traycer agents), `slug` (Codex), `model`, `value`
+ * (Claude Code), `name`; an entry marked `visibility: "hide"` or `hidden: true` is a model the CLI
+ * itself keeps out of its picker, so it stays out here too. `efforts`: the reasoning efforts the
+ * CLI says the model takes — Codex's `supported_reasoning_levels`, Claude Code's `supportedEffortLevels` —
+ * the only place a level is ever checked against (src/effort.js). Claude Code prints its listing as
+ * the answer to an `initialize` control request (stream-json on stdin): that line's `models` are read.
  */
 export function jsonModelList(text) {
   const s = String(text || '').trim();
@@ -698,7 +698,15 @@ export function jsonModelList(text) {
     v = controlResponse(s);
   }
   if (!v) return null;
-  const rows = Array.isArray(v) ? v : Array.isArray(v?.models) ? v.models : Array.isArray(v?.data) ? v.data : null;
+  const rows = Array.isArray(v)
+    ? v
+    : Array.isArray(v?.models)
+      ? v.models
+      : Array.isArray(v?.data)
+        ? v.data
+        : Array.isArray(v?.agents)
+          ? v.agents
+          : null;
   if (!rows) return null;
   const list = [];
   for (const r of rows) {
@@ -709,7 +717,7 @@ export function jsonModelList(text) {
     if (!r || typeof r !== 'object' || r.visibility === 'hide' || r.hidden === true) continue;
     const id = [r.model_id, r.id, r.slug, r.model, r.value, r.name].find((x) => typeof x === 'string' && x.trim());
     if (!id) continue;
-    const name = [r.display_name, r.displayName, r.description, r.model_name].find((x) => typeof x === 'string' && x.trim() && x !== id);
+    const name = [r.display_name, r.displayName, r.description, r.model_name, r.name].find((x) => typeof x === 'string' && x.trim() && x !== id);
     const ctx = [r.context_window_tokens, r.context_window, r.contextWindow].find((x) => typeof x === 'number' && x > 0);
     const efforts = effortLevels(r.supported_reasoning_levels ?? r.supportedEffortLevels);
     const resolved = typeof r.resolvedModel === 'string' && r.resolvedModel.trim() && r.resolvedModel !== id ? r.resolvedModel.trim() : null;

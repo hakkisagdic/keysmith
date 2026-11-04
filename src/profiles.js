@@ -742,6 +742,65 @@ export const CLI_PROFILES = {
     provenance: 'dcode CLI (`dcode run --format json`) — JSON event stream (`message.delta`, `tool.start`, `run.end`)',
     note: 'Not verified tool-less: dcode retains built-in tools in `run` mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set dcode disabled false --allow-unsafe-tools`.',
   }),
+  'traycer-cli': harnessCliProfile('traycer-cli', {
+    bin: '~/.traycer/cli/bin/traycer',
+    args: ['--json', '--quiet', '--no-progress', 'agent', 'send', '--to', '{model}', '--message', '{prompt}', '--expect-reply'],
+    modelsFrom: { args: ['--json', '--quiet', '--no-progress', 'agent', 'list'] },
+    parser: 'harness-json',
+    provenance: 'Traycer CLI (`~/.traycer/cli/bin/traycer --json --quiet --no-progress agent send --to <agent> --message <prompt> --expect-reply`) — verified against Traycer host-runtime CLI',
+    note: 'Not verified tool-less: Traycer CLI messages an agent inside the active Traycer Task (`--to <agentId|role>`), and that agent runs with whatever tools its Task workspace allows. Marked `unsafeTools`: added disabled, never an alias leg, never probed. For Traycer\'s direct LLM catalog (`gpt-6-astra`, `claude-fable-5`, `grok-4.7`, `muse-wonder-1.0`, `glm-5.3-flash`, …), use the `traycer` HTTP profile (`keysmith add traycer`) instead.',
+  }),
+  droid: harnessCliProfile('droid', {
+    bin: 'droid',
+    args: ['exec', '--output-format', 'json', '--disabled-tools', 'all', '--disable-builtin-skills', ['-r', '{effort}'], ['-m', '{model}'], '{prompt}'],
+    resumeArgs: ['exec', '--output-format', 'json', '--disabled-tools', 'all', '--disable-builtin-skills', '-s', '{session}', ['-r', '{effort}'], ['-m', '{model}'], '{prompt}'],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'Factory Droid CLI (`droid exec --output-format json --disabled-tools all --disable-builtin-skills`) — verified against Traycer-bundled `droid` binary',
+    note: 'Not verified tool-less: `--disabled-tools all` and `--disable-builtin-skills` disable built-in tools and skills according to `droid exec --help`, but have not been verified live against a stub endpoint. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set droid disabled false --allow-unsafe-tools`.',
+  }),
+  devin: harnessCliProfile('devin', {
+    bin: 'devin',
+    args: ['-p', '{prompt}', '--respect-workspace-trust', 'false', ['--model', '{model}']],
+    resumeArgs: ['-p', '{prompt}', '--respect-workspace-trust', 'false', '-r', '{session}', ['--model', '{model}']],
+    persistSessions: true,
+    modelsFrom: { args: ['models'] },
+    parser: 'harness-json',
+    provenance: 'Cognition Devin CLI (`devin -p <prompt> --respect-workspace-trust false`) — verified against Traycer-bundled `devin` 3000.11.3 (`~/.traycer/host/providers/devin`)',
+    note: 'Not verified tool-less: Devin CLI retains its coding tools in print mode (`-p`). Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set devin disabled false --allow-unsafe-tools`.',
+  }),
+  'copilot-cli': harnessCliProfile('copilot-cli', {
+    bin: 'copilot',
+    args: ['-p', '{prompt}', '--output-format', 'json', '--disable-builtin-mcps', '--no-ask-user', '--no-custom-instructions', ['--effort', '{effort}'], ['--model', '{model}']],
+    resumeArgs: ['-p', '{prompt}', '--output-format', 'json', '--disable-builtin-mcps', '--no-ask-user', '--no-custom-instructions', '--resume', '{session}', ['--effort', '{effort}'], ['--model', '{model}']],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'GitHub Copilot CLI (`copilot -p <prompt> --output-format json --disable-builtin-mcps --no-ask-user --no-custom-instructions`) — verified against Traycer-bundled `copilot` 1.0.82 (`~/.traycer/host/providers/copilot`)',
+    note: 'Not verified tool-less: GitHub Copilot CLI keeps built-in read tools in `-p` mode unless restricted per tool. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set copilot-cli disabled false --allow-unsafe-tools`.',
+  }),
+  cursor: harnessCliProfile('cursor', {
+    bin: 'cursor-agent',
+    args: ['-p', '--output-format', 'json', ['--model', '{model}'], '{prompt}'],
+    parser: 'harness-json',
+    provenance: 'Cursor Agent CLI (`cursor-agent -p --output-format json`) — from Traycer host-runtime provider pack',
+    note: 'Not verified tool-less: Cursor Agent CLI retains built-in tools in print mode (`-p`). Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set cursor disabled false --allow-unsafe-tools`.',
+  }),
+  amp: harnessCliProfile('amp', {
+    bin: 'amp',
+    args: ['--execute', '--stream-json', ['--effort', '{effort}'], ['--mode', '{model}'], '{prompt}'],
+    resumeArgs: ['threads', 'continue', '{session}', '--execute', '--stream-json', ['--effort', '{effort}'], ['--mode', '{model}'], '{prompt}'],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'Sourcegraph Amp CLI (`amp --execute --stream-json`) — from Traycer host-runtime Amp provider (`PROVIDERS.json`)',
+    note: 'Not verified tool-less: Sourcegraph Amp CLI executes agent tools in `--execute` mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set amp disabled false --allow-unsafe-tools`.',
+  }),
+  reasonix: harnessCliProfile('reasonix', {
+    bin: 'reasonix',
+    args: [['--model', '{model}'], '{prompt}'],
+    parser: 'harness-json',
+    provenance: 'DeepSeek Reasonix CLI (`reasonix --model <model> <prompt>`) — from Traycer host-runtime `PROVIDERS.json` (`@reasonix/cli`)',
+    note: 'Not verified tool-less: Reasonix CLI retains its built-in coding tools. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set reasonix disabled false --allow-unsafe-tools`.',
+  }),
 };
 
 /**
@@ -815,9 +874,21 @@ export const HTTP_PROFILES = {
     provenance: 'HarnessRouter Community Edition & Cloud UHP (/v1/responses, /v1/models, /v1/harnesses, /v1/uhp)',
     note: 'Connects a running HarnessRouter instance (local Community Edition on 127.0.0.1:8000 or Cloud at https://api.harnessrouter.ai/v1) as an upstream adapter over UHP. Set HARNESSROUTER_API_KEY (or --key) when talking to an authenticated instance. Address models as harnessrouter/<model>, harnessrouter/<backend>/<model> (e.g. harnessrouter/claude/claude-sonnet-4-6), or a custom harness as harnessrouter/chrn_<id>.',
   },
+  traycer: {
+    kind: 'http',
+    wire: 'traycer',
+    baseUrl: 'https://server.traycer.ai',
+    apiKey: '{json:~/.traycer/cli/credentials#token}',
+    apiKeyEnv: 'TRAYCER_BEARER_TOKEN',
+    headers: { 'x-traycer-account-context': 'PERSONAL' },
+    media: ['image', 'pdf'],
+    explicitOnly: true,
+    provenance: 'Traycer inference gateway (https://server.traycer.ai/api/traycer/models & /inference/{openai,anthropic,xai,meta,openrouter}) — verified live against GET /api/traycer/models (32 models across openai, anthropic, xai, meta, openrouter) and POST /inference/{anthropic/messages,openai/responses,{xai,meta,openrouter}/chat/completions}',
+    note: 'Uses your Traycer sign-in (~/.traycer/cli/credentials, or TRAYCER_BEARER_TOKEN) and Traycer inference credits, so it is explicit-only: it answers traycer/<model> and is in no alias and no doctor --probe-models (`keysmith set traycer explicitOnly false` opts out). Routes each model to its native Traycer inference endpoint (/inference/anthropic/messages, /inference/openai/responses, or /inference/{xai,meta,openrouter}/chat/completions) with x-traycer-account-context: PERSONAL.',
+  },
 };
 
-/** Canonical profile aliases matching HarnessRouter backend naming conventions. */
+/** Canonical profile aliases matching HarnessRouter and Traycer backend naming conventions. */
 export const PROFILE_ALIASES = {
   'claude-code': 'claude',
   'codex-cli': 'codex',
@@ -825,6 +896,9 @@ export const PROFILE_ALIASES = {
   'kimi-cli': 'kimi',
   kilocode: 'kilo',
   'qwen-code': 'qwen',
+  'cursor-agent': 'cursor',
+  'factory-droid': 'droid',
+  'github-copilot-cli': 'copilot-cli',
 };
 
 export function getProfile(name) {
