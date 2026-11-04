@@ -1,8 +1,10 @@
 /**
  * Token usage on the CLI paths: what each CLI reports, read one way (`input` every input token the
  * upstream charged, the ones read from or written to its cache included — the harness's own system
- * prompt with them), and written on every face; where a CLI reports none, null counts and the
- * reason, never a 0. No CLI, no model: stub CLIs print each one's stream.
+ * prompt with them), and written on every face; where a CLI reports none, the face says so
+ * (`keysmith_usage: "unknown"` and the reason, 0 only where a client's parser requires a number —
+ * src/protocols.js) and the usage row is null, never a 0. No CLI, no model: stub CLIs print each
+ * one's stream.
  */
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -234,12 +236,25 @@ async function usageOnEveryFace(model, extra = {}) {
   return out;
 }
 
-test('a CLI that reports no tokens: null counts and the reason on every face, streamed or not, and in the usage row — never a 0', async () => {
+test('a CLI that reports no tokens: on every face, streamed or not, the marker and the reason, null where the clients\' parsers take null and 0 only where they require a number; in the usage row null — never a 0', async () => {
   const faces = await usageOnEveryFace('plain/m');
+  // The wire rule (src/protocols.js, usageUnknown): what the AI SDK's schemas require, field by field
+  // (test/wire-conformance.test.js runs them). message_delta is the streamed Messages answer's usage.
+  const expected = {
+    chat: { prompt_tokens: null, completion_tokens: null, total_tokens: null, cached: null },
+    messages: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null },
+    messagesStream: { input_tokens: null, output_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null },
+    responses: { input_tokens: 0, output_tokens: 0, total_tokens: 0, cached: null, reasoning: null },
+  };
+  expected.chatStream = expected.chat;
+  expected.responsesStream = expected.responses;
   for (const [face, [u, row]] of Object.entries(faces)) {
+    assert.equal(u.keysmith_usage, 'unknown', face);
     assert.match(u.reason, /plain runs with parser raw: the CLI's plain output carries no token counts/, face);
-    const counts = face.startsWith('chat') ? [u.prompt_tokens, u.completion_tokens] : [u.input_tokens, u.output_tokens];
-    assert.deepEqual(counts, [null, null], face);
+    const seen = { ...u };
+    if (face.startsWith('chat')) seen.cached = u.prompt_tokens_details.cached_tokens;
+    if (face.startsWith('responses')) [seen.cached, seen.reasoning] = [u.input_tokens_details.cached_tokens, u.output_tokens_details.reasoning_tokens];
+    for (const [k, v] of Object.entries(expected[face])) assert.equal(seen[k], v, `${face}: ${k}`);
     assert.equal(row.usage, null, face);
     assert.match(row.usageReason, /parser raw/, face);
   }
@@ -317,6 +332,7 @@ test('EMULATE through a CLI that reports no tokens: the answer says so the same 
   const body = JSON.parse(r.text);
   assert.equal(body.choices[0].message.content, 'emulated');
   assert.equal(body.usage.prompt_tokens, null);
+  assert.equal(body.usage.keysmith_usage, 'unknown');
   assert.match(body.usage.reason, /parser raw/);
   assert.equal(lastRow().toolMode, 'emulate');
   assert.equal(lastRow().usage, null);

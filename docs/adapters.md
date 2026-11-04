@@ -268,9 +268,11 @@ it back in each API's own reading: `prompt_tokens` / `input_tokens` with
 
 When an upstream reports only a total, keysmith keeps the total and **invents no split** —
 the split is exactly what people use to reason about quota. When a CLI run reports nothing at
-all (`raw`, `warp-ndjson`, a run stopped before its usage line), the answer says so: its
-usage is null counts with a `reason`, on every face, and the usage row is `usage: null`
-with a `usageReason` — never a 0, which reads as a free request.
+all (`raw`, `warp-ndjson`, a run stopped before its usage line), the answer says so, on every
+face: its usage carries `"keysmith_usage": "unknown"` and a `reason`, a count is null where the
+clients' parsers take null and 0 only where they require a number (face by face:
+[Unknown usage on the wire](clients.md#unknown-usage-on-the-wire)); and the usage row is
+`usage: null` with a `usageReason` — never a 0, which reads as a free request.
 
 ### agy as a plain text model
 

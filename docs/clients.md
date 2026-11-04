@@ -256,6 +256,42 @@ event on `/v1/messages`). The `openai` SDK raises that in the middle of the iter
 `APIError` with no `status_code`, and does not retry it: catch it around the loop and send the
 request again if you want the retry.
 
+## Unknown usage on the wire
+
+A CLI does not always say what an answer spent: codex and qoder report a run's tokens once, when
+the run ends, so on the MCP bridge the answer that hands a call out has none yet; `raw` and
+`warp-ndjson` runs report none at all. Such an answer's `usage` object says so in two fields of
+keysmith's own, which every SDK ignores:
+
+```
+"keysmith_usage": "unknown"                          only on an answer with no counts
+"reason": "cx reports a run's tokens once, when the run ends: …"
+```
+
+and each count in it is **null where the clients' parsers take null, 0 only where one of them
+requires a number**. A 0 next to `keysmith_usage` is no count. The parsers that decide it are
+the Vercel AI SDK's (`@ai-sdk/anthropic`, `@ai-sdk/openai`, `@ai-sdk/openai-compatible`): they
+check every chunk against a schema and end the run on one that fails it (CopilotKit's OpenBot
+stopped at its first tool turn on a null `output_tokens`). The official `anthropic` and `openai`
+SDKs read usage without checking it.
+
+| Face | 0 (a number is required) | null |
+|---|---|---|
+| `/v1/chat/completions` | — | `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_tokens`, `reasoning_tokens` |
+| `/v1/messages`, a whole Message (not streamed) | `input_tokens`, `output_tokens` | `cache_creation_input_tokens`, `cache_read_input_tokens` |
+| `/v1/messages`, `message_delta` (streamed) | `output_tokens` | `input_tokens` (message_start said 0), the cache's two counts |
+| `/v1/responses`, a Response and `response.completed` | `input_tokens`, `output_tokens`, `total_tokens` | `cached_tokens`, `reasoning_tokens` |
+
+So an AI SDK app adds 0 for such a turn to its totals, and the answer that ends the session
+carries the whole run. `@ai-sdk/anthropic` keeps the usage object whole in
+`providerMetadata.anthropic.usage`, marker and reason included; the OpenAI providers keep the
+counts only. The usage log is no wire: its row is `usage: null` with a `usageReason`, never a 0
+([adapters.md](adapters.md#parsers-and-the-event-contract)). Checked with ai 6.0.264 (`@ai-sdk/anthropic` 3.0.111,
+`@ai-sdk/openai` 3.0.99: what OpenBot runs), ai 7.0.162 (`@ai-sdk/anthropic` 4.0.96,
+`@ai-sdk/openai` 4.0.108, `@ai-sdk/openai-compatible` 3.0.84), `@anthropic-ai/sdk` 1.4.0 and
+`openai` 7.5.0 / 7.50.0 — `test/wire-conformance.test.js` runs each of them against a stub
+gateway (`npm ci` first: they are pinned devDependencies).
+
 ## curl
 
 ```bash

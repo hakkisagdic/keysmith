@@ -62,17 +62,40 @@ export function openaiResult({ id, model, created, text, usage, finishReason = '
 
 /**
  * The usage a face is handed: canonical counts (parsers.js: `input` every input token charged, the
- * cache's included), `{ unknown: reason }` when the CLI that answered reported none — written as
- * null counts with the reason beside them, never as 0 — or null, when nothing was said at all (an
- * upstream that sent no usage: the zeros every face wrote before).
+ * cache's included), `{ unknown: reason }` when the CLI that answered reported none, or null, when
+ * nothing was said at all (an upstream that sent no usage: the zeros every face wrote before).
+ *
+ * Unknown usage on the wire — the rule. A count the CLI did not report is null wherever the clients'
+ * parsers take null, and 0 only where one of them requires a number: the AI SDK's providers
+ * (@ai-sdk/anthropic, @ai-sdk/openai, @ai-sdk/openai-compatible) check every chunk and body
+ * against a zod schema and abort the run on one that fails it (OpenBot, 2026-11-04: 21 of 21 runs
+ * at their first tool turn, "expected number … usage.output_tokens"). The official anthropic and
+ * openai SDKs read usage without checking it; on the Anthropic wire their types agree with the AI
+ * SDK's schemas. Such a 0 is no count, and the object says so: `keysmith_usage: "unknown"`, and
+ * the reason in `reason`. Per face (test/wire-conformance.test.js runs those parsers):
+ *
+ *   /v1/chat/completions  every count null: nullish in the chunk and body schemas of
+ *                         @ai-sdk/openai (chat) and @ai-sdk/openai-compatible
+ *   /v1/messages          output_tokens 0 (a number in message_delta and in a Message); input_tokens
+ *                         0 in a whole Message, null in message_delta (nullish there; message_start
+ *                         said 0); the cache's two counts null
+ *   /v1/responses         input_tokens, output_tokens and total_tokens 0 (numbers in a Response and
+ *                         in response.completed; @ai-sdk/openai 4.x takes total_tokens as a number
+ *                         or nothing); the details' counts null (nullish there)
+ *
+ * The usage row (usage.jsonl) is no wire: it keeps `usage: null` with `usageReason`, never a 0.
  */
 export function usageUnknown(u) {
   return !!u && typeof u === 'object' && typeof u.unknown === 'string' ? u.unknown : null;
 }
 
+/** What marks a face's usage object as no count: the extension fields of the rule above. */
+export const USAGE_UNKNOWN = 'unknown';
+const unknownMarks = (reason) => ({ keysmith_usage: USAGE_UNKNOWN, reason });
+
 export function openaiUsage(u) {
   const unknown = usageUnknown(u);
-  if (unknown) return { prompt_tokens: null, completion_tokens: null, total_tokens: null, prompt_tokens_details: { cached_tokens: null }, completion_tokens_details: { reasoning_tokens: null }, reason: unknown };
+  if (unknown) return { prompt_tokens: null, completion_tokens: null, total_tokens: null, prompt_tokens_details: { cached_tokens: null }, completion_tokens_details: { reasoning_tokens: null }, ...unknownMarks(unknown) };
   const input = u?.input || 0;
   const output = u?.output || 0;
   return {
@@ -85,21 +108,31 @@ export function openaiUsage(u) {
 }
 
 /**
- * A Messages usage: Anthropic counts the uncached input in `input_tokens` and the cache's two
- * counts beside it, so the three add up to what `input` holds.
+ * A Messages usage, a whole Message's: Anthropic counts the uncached input in `input_tokens` and
+ * the cache's two counts beside it, so the three add up to what `input` holds. Unknown: the two
+ * counts a Message requires are 0, the cache's null (the rule, usageUnknown above).
  */
 export function anthropicUsage(u) {
   const unknown = usageUnknown(u);
-  if (unknown) return { input_tokens: null, cache_creation_input_tokens: null, cache_read_input_tokens: null, output_tokens: null, reason: unknown };
+  if (unknown) return { input_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null, output_tokens: 0, ...unknownMarks(unknown) };
   const cacheRead = u?.cacheRead || 0;
   const cacheWrite = u?.cacheWrite || 0;
   return { input_tokens: Math.max(0, (u?.input || 0) - cacheRead - cacheWrite), cache_creation_input_tokens: cacheWrite, cache_read_input_tokens: cacheRead, output_tokens: u?.output || 0 };
 }
 
-/** A Responses usage object, with every field the openai SDK's model asks for. */
+/**
+ * message_delta's usage: a Message's, but an unknown `input_tokens` stays null — nullable in
+ * message_delta (MessageDeltaUsage), and a client keeps message_start's count when it is.
+ */
+export function anthropicDeltaUsage(u) {
+  const usage = anthropicUsage(u);
+  return usageUnknown(u) ? { ...usage, input_tokens: null } : usage;
+}
+
+/** A Responses usage object, with every field the openai SDK's model asks for. Unknown: the three totals 0, the details' counts null (the rule, usageUnknown above). */
 export function responsesUsage(u) {
   const unknown = usageUnknown(u);
-  if (unknown) return { input_tokens: null, input_tokens_details: { cached_tokens: null }, output_tokens: null, output_tokens_details: { reasoning_tokens: null }, total_tokens: null, reason: unknown };
+  if (unknown) return { input_tokens: 0, input_tokens_details: { cached_tokens: null }, output_tokens: 0, output_tokens_details: { reasoning_tokens: null }, total_tokens: 0, ...unknownMarks(unknown) };
   const input = u?.input || 0;
   const output = u?.output || 0;
   return {
@@ -134,7 +167,7 @@ export function anthropicStreamEvents({ id, model, text, usage }) {
     { event: 'ping', data: { type: 'ping' } },
     { event: 'content_block_delta', data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } } },
     { event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } },
-    { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: anthropicUsage(usage) } },
+    { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: anthropicDeltaUsage(usage) } },
     { event: 'message_stop', data: { type: 'message_stop' } },
   ];
 }

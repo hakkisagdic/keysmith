@@ -1,4 +1,4 @@
-import { openaiChunk, openaiResult, anthropicResult, anthropicUsage, responsesUsage } from '../protocols.js';
+import { openaiChunk, openaiResult, anthropicResult, anthropicDeltaUsage, responsesUsage } from '../protocols.js';
 import { LlmError } from '../util.js';
 import { FINISH_TOOL_CALLS, isPlainObject, newToolCallId, newToolItemId } from './model.js';
 
@@ -295,8 +295,9 @@ export class AnthropicStream {
     const stop = error ? 'error' : this.calls ? 'tool_use' : 'end_turn';
     // The whole usage, not the output count alone: a CLI reports its tokens when its run (or turn)
     // ends, after message_start went out, and an SDK's accumulator takes input and cache counts
-    // from here too. With no usage said at all, the output count of before.
-    this._event('message_delta', { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: usage ? anthropicUsage(usage) : { output_tokens: 0 } });
+    // from here too. With no usage said at all, the output count of before. Unknown usage: 0 where
+    // message_delta requires a number, null elsewhere, and the marker (protocols.js, the wire rule).
+    this._event('message_delta', { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: usage ? anthropicDeltaUsage(usage) : { output_tokens: 0 } });
     this._event('message_stop', { type: 'message_stop' });
     this.ka?.stop();
     this.res.end();

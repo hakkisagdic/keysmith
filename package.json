@@ -37,5 +37,17 @@
     "docs"
   ],
   "dependencies": {},
-  "devDependencies": {}
+  "devDependencies": {
+    "@ai-sdk/anthropic": "4.0.96",
+    "@ai-sdk/openai": "4.0.108",
+    "@ai-sdk/openai-compatible": "3.0.84",
+    "@anthropic-ai/sdk": "1.4.0",
+    "ai": "7.0.162",
+    "openai": "7.50.0",
+    "openbot-ai": "npm:ai@6.0.264",
+    "openbot-ai-sdk-anthropic": "npm:@ai-sdk/anthropic@3.0.111",
+    "openbot-ai-sdk-openai": "npm:@ai-sdk/openai@3.0.99",
+    "openbot-openai": "npm:openai@7.5.0",
+    "zod": "4.6.7"
+  }
 }

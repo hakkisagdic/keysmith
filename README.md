@@ -364,10 +364,13 @@ The usage row of a bridge turn says which session answered and how it was reache
   Claude Code prints it (input and cache exact; the output count is the stream's first), and the
   answer that ends the run reports Claude Code's total less what the earlier answers did, so a
   session adds up to it exactly. codex and qoder report a run's tokens once, when it ends: the
-  answer that hands a call out has null counts and a `reason` (never a 0), and the answer that
+  answer that hands a call out has no counts — its usage says `"keysmith_usage": "unknown"` and
+  the `reason`, a count is null where the client's parser takes null and 0 only where it requires
+  a number ([Unknown usage on the wire](docs/clients.md#unknown-usage-on-the-wire)), and its usage
+  row is null, never a 0 — and the answer that
   ends the session carries the whole run — a session that ends otherwise (its clock, a client
   that never comes back) reports nothing of what it spent. A call that comes from a step an
-  earlier answer reported (a serial driver's second call of one step) has null counts too, with
+  earlier answer reported (a serial driver's second call of one step) has no counts either, with
   that reason.
 
 **When no leg answers with tools.** A leg that fails before anything reached the client hands

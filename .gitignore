@@ -1,4 +1,5 @@
-# No dependencies, so only node_modules would ever appear; kept for completeness.
+# No runtime dependencies. The devDependencies (the client SDKs test/wire-conformance.test.js
+# runs, pinned in package-lock.json) install here with `npm ci`.
 node_modules/
 .npm/
 
