@@ -16,8 +16,9 @@ import { logDir, precreatePrivateLogs } from './logfiles.js';
  * (a quick tunnel's hostname is random per start; persisting it buys nothing).
  *
  * `keysmith start` (nohup) and these agents fight over the same port, so
- * install hands over explicitly: old pidfile process is stopped after the
- * agent is loaded, and launchd's throttled retry picks the port up.
+ * install hands over explicitly: a hand-started gateway in the pidfile is stopped
+ * after the agent is loaded (never launchd's own, which writes the same pidfile),
+ * and launchd's throttled retry picks the port up.
  */
 
 export function launchAgentsDir() {
@@ -165,34 +166,82 @@ function uid() {
   return process.getuid();
 }
 
-function bootout(label) {
+/** launchctl, returning its stdout; a non-zero exit throws, with launchctl's own stderr on it. */
+function launchctl(args) {
+  return execFileSync('launchctl', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+}
+
+function bootout(label, run = launchctl) {
   try {
-    execFileSync('launchctl', ['bootout', `gui/${uid()}/${label}`], { stdio: 'pipe' });
+    run(['bootout', `gui/${uid()}/${label}`]);
     return true;
   } catch {
     return false;
   }
 }
 
-function bootstrap(file) {
-  execFileSync('launchctl', ['bootstrap', `gui/${uid()}`, file], { stdio: ['ignore', 'pipe', 'pipe'] });
-}
-
-export function isLoaded(label) {
+export function isLoaded(label, run = launchctl) {
   try {
-    execFileSync('launchctl', ['print', `gui/${uid()}/${label}`], { stdio: 'pipe' });
+    run(['print', `gui/${uid()}/${label}`]);
     return true;
   } catch {
     return false;
+  }
+}
+
+/** The pid launchd reports for a loaded agent's running process; null when it is not loaded or not running. */
+export function launchdPid(label, run = launchctl) {
+  try {
+    const m = /^\tpid = (\d+)$/m.exec(run(['print', `gui/${uid()}/${label}`]));
+    return m ? Number(m[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** What launchctl said on stderr, first line ("Bootstrap failed: 5: Input/output error"). */
+function launchctlError(e) {
+  return String(e?.stderr || e?.message || e).trim().split('\n')[0];
+}
+
+/**
+ * Replace a loaded agent with `file`. bootout returns while launchd may still hold the label —
+ * the old process is closing — and a bootstrap in that window fails ("Bootstrap failed: 5:
+ * Input/output error"), which leaves the agent down. So: wait until `launchctl print` no longer
+ * finds the label, then bootstrap, again every `intervalMs` until it takes. Past `timeoutMs` it
+ * gives up with the command that finishes the job by hand. `run` stands in for launchctl in tests.
+ */
+export async function reloadAgent(label, file, { run = launchctl, timeoutMs = 30_000, intervalMs = 1000 } = {}) {
+  const domain = `gui/${uid()}`;
+  const deadline = Date.now() + timeoutMs;
+  const wait = () => new Promise((resolve) => setTimeout(resolve, intervalMs));
+  bootout(label, run);
+  while (isLoaded(label, run)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`${label}: launchd still holds the old agent ${timeoutMs / 1000}s after bootout — once \`launchctl print ${domain}/${label}\` fails, load the new one: launchctl bootstrap ${domain} ${file}`);
+    }
+    await wait();
+  }
+  for (;;) {
+    try {
+      run(['bootstrap', domain, file]);
+      return;
+    } catch (e) {
+      if (Date.now() >= deadline) {
+        throw new Error(`${label} did not load (${launchctlError(e)}), retried for ${timeoutMs / 1000}s — load it by hand: launchctl bootstrap ${domain} ${file}`);
+      }
+      await wait();
+    }
   }
 }
 
 /**
  * Write + load the agents. `nodeBin` and `cloudflared` should be absolute paths
  * (e.g. process.execPath and tunnel.cloudflaredBin()). A named tunnel config
- * yields two agents; otherwise only the gateway.
+ * yields two agents; otherwise only the gateway. An agent that did not load is in
+ * `failed` ({ label, error }); the others are loaded all the same.
  */
-export function installService({ nodeBin, entry, port, cloudflared = null, tunnelName = null, tunnelConfig = null }) {
+export async function installService({ nodeBin, entry, port, cloudflared = null, tunnelName = null, tunnelConfig = null }, reload = {}) {
   const dir = launchAgentsDir();
   fs.mkdirSync(dir, { recursive: true });
   // launchd creates a missing StandardOutPath with the default umask — 0644, readable by
@@ -212,11 +261,28 @@ export function installService({ nodeBin, entry, port, cloudflared = null, tunne
     written.push(tunnelFile);
   }
 
+  const failed = [];
   for (const file of written) {
-    bootout(path.basename(file).replace(/\.plist$/, ''));
-    bootstrap(file);
+    const label = path.basename(file).replace(/\.plist$/, '');
+    try {
+      await reloadAgent(label, file, reload);
+    } catch (e) {
+      failed.push({ label, error: e.message });
+    }
   }
-  return { files: written, tunnel: tunnelFile != null };
+  return { files: written, tunnel: tunnelFile != null, failed };
+}
+
+/**
+ * The gateway the handover stops once the agents are loaded: the pidfile's process when it is
+ * alive and is not the one launchd runs for the gateway agent (`launchdPid`). Both write the same
+ * pidfile, so a record alone does not say which; stopping launchd's own would take down the
+ * gateway just started. Null when there is nothing to stop.
+ */
+export function handoverPid(rec, { launchdPid = null, alive }) {
+  const pid = Number(rec?.pid);
+  if (!Number.isInteger(pid) || pid <= 0 || pid === launchdPid) return null;
+  return alive(pid) ? pid : null;
 }
 
 export function uninstallService() {

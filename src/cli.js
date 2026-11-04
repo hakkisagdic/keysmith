@@ -956,7 +956,7 @@ function cmdStop() {
 
 /* ---------------------------------------------------------------------- service */
 
-function cmdInstallService(flags = {}) {
+async function cmdInstallService(flags = {}) {
   const cfg = loadOrFail();
   const named = cfg.tunnel?.name && cfg.tunnel?.configFile ? cfg.tunnel : null;
   if (!named) {
@@ -975,7 +975,7 @@ function cmdInstallService(flags = {}) {
     return;
   }
 
-  const res = service.installService({
+  const res = await service.installService({
     nodeBin: process.execPath,
     entry: currentEntry(),
     port: cfg.port,
@@ -983,20 +983,27 @@ function cmdInstallService(flags = {}) {
     tunnelName: named?.name,
     tunnelConfig: named?.configFile,
   });
+  const failedLabels = new Set(res.failed.map((f) => f.label));
 
   // Handover: launchd's gateway may have already tried and failed to bind while the
-  // old foreground one held the port (throttled retry picks it up within ~10s).
-  const rec = readPid();
-  if (rec && alive(rec.pid)) {
-    process.kill(rec.pid, 'SIGTERM');
-    removePid();
-    out(`handover: stopped foreground gateway pid ${rec.pid}`);
+  // old foreground one held the port (throttled retry picks it up within ~10s). Only
+  // when the agent that replaces it loaded, and never launchd's own gateway.
+  if (!failedLabels.has(service.labels.gateway)) {
+    const pid = service.handoverPid(readPid(), { launchdPid: service.launchdPid(service.labels.gateway), alive });
+    if (pid) {
+      process.kill(pid, 'SIGTERM');
+      removePid();
+      out(`handover: stopped foreground gateway pid ${pid}`);
+    }
   }
-  killStrayTunnel(named?.configFile);
+  if (!failedLabels.has(service.labels.tunnel)) killStrayTunnel(named?.configFile);
 
   secureLogFiles();
   out(`installed:\n${res.files.map((f) => `  ${f}`).join('\n')}`);
   out(`logs: ${service.logDir()}/launchd-*.log (0600 in a 0700 directory; the key appears there redacted)`);
+  if (res.failed.length) {
+    fail(`not loaded:\n${res.failed.map((f) => `  ${f.error}`).join('\n')}\n(a gateway or tunnel started by hand was left running)`);
+  }
   out(`verify: launchctl list | grep keysmith   (gateway answers within ~10s of the handover)`);
 }
 

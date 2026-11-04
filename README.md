@@ -958,8 +958,12 @@ absolute binary paths and a PATH that can find your CLIs, written so they outliv
 that ran it and follow the upgrades you make: an fnm multishell path (which dies with that
 shell) and a path in your default fnm version go through `<fnm>/aliases/default/…`, another
 fnm version through its own directory, a Homebrew keg (`…/Cellar/node/26.12.0/…`, gone after
-`brew upgrade`) through `…/opt/<formula>/…`. It stops the foreground `keysmith start` /
-`tunnel run` processes it is replacing, and lets launchd's throttled retry rebind the port.
+`brew upgrade`) through `…/opt/<formula>/…`. Re-running it replaces the loaded agents: it
+waits until launchd has let go of the old one before loading the new, and retries a load
+launchd refuses ("Bootstrap failed: 5") for up to 30 s, then says which agent is down and the
+`launchctl bootstrap …` that loads it. It stops the foreground `keysmith start` / `tunnel run`
+processes it is replacing — never launchd's own gateway, which writes the same pidfile — and
+lets launchd's throttled retry rebind the port.
 `keysmith install-service --dry-run` prints the agents it would write and touches nothing.
 `keysmith uninstall-service` reverses it. Quick tunnels are not persisted: a random hostname
 that changes every start earns nothing from a service.
