@@ -244,7 +244,8 @@ test('a CLI that reports no tokens: on every face, streamed or not, the marker a
     chat: { prompt_tokens: null, completion_tokens: null, total_tokens: null, cached: null },
     messages: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null },
     messagesStream: { input_tokens: null, output_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null },
-    responses: { input_tokens: 0, output_tokens: 0, total_tokens: 0, cached: null, reasoning: null },
+    // Codex CLI reads every Responses count into an integer, the details' ones included.
+    responses: { input_tokens: 0, output_tokens: 0, total_tokens: 0, cached: 0, reasoning: 0 },
   };
   expected.chatStream = expected.chat;
   expected.responsesStream = expected.responses;

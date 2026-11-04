@@ -377,7 +377,8 @@ for (const pkg of ['openai', 'openbot-openai']) {
         assert.deepEqual(calls.map((o) => [o.name, JSON.parse(o.arguments)]), [['get_weather', { city: 'Ankara' }]], label());
         const u = first.usage;
         assert.deepEqual([u.input_tokens, u.output_tokens, u.total_tokens], [0, 0, 0], label());
-        assert.deepEqual([u.input_tokens_details.cached_tokens, u.output_tokens_details.reasoning_tokens], [null, null], label());
+        // 0 in the details too: Codex CLI (0.163.0) takes no null there (src/protocols.js, the rule).
+        assert.deepEqual([u.input_tokens_details.cached_tokens, u.output_tokens_details.reasoning_tokens], [0, 0], label());
         assert.equal(u.keysmith_usage, 'unknown', label());
         assert.match(u.reason, CODEX_GAP, label());
         for (const o of first.output) history.push(o);

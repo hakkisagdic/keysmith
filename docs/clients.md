@@ -270,27 +270,29 @@ keysmith's own, which every SDK ignores:
 
 and each count in it is **null where the clients' parsers take null, 0 only where one of them
 requires a number**. A 0 next to `keysmith_usage` is no count. The parsers that decide it are
-the Vercel AI SDK's (`@ai-sdk/anthropic`, `@ai-sdk/openai`, `@ai-sdk/openai-compatible`): they
+the Vercel AI SDK's (`@ai-sdk/anthropic`, `@ai-sdk/openai`, `@ai-sdk/openai-compatible`), which
 check every chunk against a schema and end the run on one that fails it (CopilotKit's OpenBot
-stopped at its first tool turn on a null `output_tokens`). The official `anthropic` and `openai`
-SDKs read usage without checking it.
+stopped at its first tool turn on a null `output_tokens`), and Codex CLI's, which reads a
+Responses usage into integers (0.163.0: `failed to parse ResponseCompleted: invalid type: null,
+expected i64`). The official `anthropic` and `openai` SDKs read usage without checking it.
 
 | Face | 0 (a number is required) | null |
 |---|---|---|
 | `/v1/chat/completions` | — | `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_tokens`, `reasoning_tokens` |
 | `/v1/messages`, a whole Message (not streamed) | `input_tokens`, `output_tokens` | `cache_creation_input_tokens`, `cache_read_input_tokens` |
 | `/v1/messages`, `message_delta` (streamed) | `output_tokens` | `input_tokens` (message_start said 0), the cache's two counts |
-| `/v1/responses`, a Response and `response.completed` | `input_tokens`, `output_tokens`, `total_tokens` | `cached_tokens`, `reasoning_tokens` |
+| `/v1/responses`, a Response and `response.completed` | `input_tokens`, `output_tokens`, `total_tokens`, `cached_tokens`, `reasoning_tokens` | — |
 
 So an AI SDK app adds 0 for such a turn to its totals, and the answer that ends the session
 carries the whole run. `@ai-sdk/anthropic` keeps the usage object whole in
 `providerMetadata.anthropic.usage`, marker and reason included; the OpenAI providers keep the
 counts only. The usage log is no wire: its row is `usage: null` with a `usageReason`, never a 0
-([adapters.md](adapters.md#parsers-and-the-event-contract)). Checked with ai 6.0.264 (`@ai-sdk/anthropic` 3.0.111,
-`@ai-sdk/openai` 3.0.99: what OpenBot runs), ai 7.0.162 (`@ai-sdk/anthropic` 4.0.96,
-`@ai-sdk/openai` 4.0.108, `@ai-sdk/openai-compatible` 3.0.84), `@anthropic-ai/sdk` 1.4.0 and
-`openai` 7.5.0 / 7.50.0 — `test/wire-conformance.test.js` runs each of them against a stub
-gateway (`npm ci` first: they are pinned devDependencies).
+([adapters.md](adapters.md#parsers-and-the-event-contract)). Checked with ai 6.0.264
+(`@ai-sdk/anthropic` 3.0.111, `@ai-sdk/openai` 3.0.99: what OpenBot runs), ai 7.0.162
+(`@ai-sdk/anthropic` 4.0.96, `@ai-sdk/openai` 4.0.108, `@ai-sdk/openai-compatible` 3.0.84),
+`@anthropic-ai/sdk` 1.4.0 and `openai` 7.5.0 / 7.50.0 — `test/wire-conformance.test.js` runs each
+of them against a stub gateway (`npm ci` first: they are pinned devDependencies) — and Codex CLI
+0.163.0 against a stub Responses server, by hand.
 
 ## curl
 

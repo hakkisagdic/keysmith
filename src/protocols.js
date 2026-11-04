@@ -69,19 +69,23 @@ export function openaiResult({ id, model, created, text, usage, finishReason = '
  * parsers take null, and 0 only where one of them requires a number: the AI SDK's providers
  * (@ai-sdk/anthropic, @ai-sdk/openai, @ai-sdk/openai-compatible) check every chunk and body
  * against a zod schema and abort the run on one that fails it (OpenBot, 2026-11-04: 21 of 21 runs
- * at their first tool turn, "expected number … usage.output_tokens"). The official anthropic and
- * openai SDKs read usage without checking it; on the Anthropic wire their types agree with the AI
- * SDK's schemas. Such a 0 is no count, and the object says so: `keysmith_usage: "unknown"`, and
- * the reason in `reason`. Per face (test/wire-conformance.test.js runs those parsers):
+ * at their first tool turn, "expected number … usage.output_tokens"), and Codex CLI reads a
+ * Responses usage into integers (0.163.0 against a stub server, 2026-11-04: "failed to parse
+ * ResponseCompleted: invalid type: null, expected i64" for a null total and for a null count in
+ * either details object). The official anthropic and openai SDKs read usage without checking it;
+ * their types agree with the parsers on the Anthropic wire and on Responses. Such a 0 is no count,
+ * and the object says so: `keysmith_usage: "unknown"`, and the reason in `reason`. Per face
+ * (test/wire-conformance.test.js runs the SDKs' parsers):
  *
  *   /v1/chat/completions  every count null: nullish in the chunk and body schemas of
  *                         @ai-sdk/openai (chat) and @ai-sdk/openai-compatible
  *   /v1/messages          output_tokens 0 (a number in message_delta and in a Message); input_tokens
  *                         0 in a whole Message, null in message_delta (nullish there; message_start
  *                         said 0); the cache's two counts null
- *   /v1/responses         input_tokens, output_tokens and total_tokens 0 (numbers in a Response and
- *                         in response.completed; @ai-sdk/openai 4.x takes total_tokens as a number
- *                         or nothing); the details' counts null (nullish there)
+ *   /v1/responses         every count 0: input_tokens and output_tokens are numbers in the AI SDK's
+ *                         schemas (total_tokens a number or nothing in @ai-sdk/openai 4.x), and
+ *                         Codex takes no null in the totals or in the details' cached_tokens and
+ *                         reasoning_tokens
  *
  * The usage row (usage.jsonl) is no wire: it keeps `usage: null` with `usageReason`, never a 0.
  */
@@ -129,10 +133,10 @@ export function anthropicDeltaUsage(u) {
   return usageUnknown(u) ? { ...usage, input_tokens: null } : usage;
 }
 
-/** A Responses usage object, with every field the openai SDK's model asks for. Unknown: the three totals 0, the details' counts null (the rule, usageUnknown above). */
+/** A Responses usage object, with every field the openai SDK's model asks for. Unknown: every count 0, and the marker (the rule, usageUnknown above). */
 export function responsesUsage(u) {
   const unknown = usageUnknown(u);
-  if (unknown) return { input_tokens: 0, input_tokens_details: { cached_tokens: null }, output_tokens: 0, output_tokens_details: { reasoning_tokens: null }, total_tokens: 0, ...unknownMarks(unknown) };
+  if (unknown) return { input_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens: 0, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 0, ...unknownMarks(unknown) };
   const input = u?.input || 0;
   const output = u?.output || 0;
   return {
