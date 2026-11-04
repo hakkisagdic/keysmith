@@ -103,7 +103,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now =
 
     if (route === '/healthz') return send(res, 200, { 'content-type': 'application/json' }, JSON.stringify({ ok: true, uptime_s: Math.round((Date.now() - startedAt) / 1000), adapters: gateway.publicAdapters.length, failed_to_load: Object.keys(gateway.loadErrors).length, alias_warnings: Object.keys(gateway.aliasIssues).length }));
     // Unauthenticated UHP protocol discovery endpoint (UHP 2026-10-19).
-    if ((route === '/v1/uhp' || route === '/uhp') && req.method === 'GET') {
+    if ((route === '/v1/uhp' || route === '/uhp' || route === '/.well-known/uhp') && req.method === 'GET') {
       return json(res, 200, {
         object: 'uhp.info',
         uhp_version: negotiatedUhpVersion,
@@ -396,7 +396,7 @@ function describeAdapters(gateway) {
     explicit_only: !!a.explicitOnly,
     unsafe_tools: !!a.unsafeTools,
     // How it takes a request that offers tools: a CLI's toolMode, an HTTP upstream's relay.
-    tool_mode: a.kind === 'cli' ? a.toolMode || 'off' : (a.wire || 'openai') === 'openai' || a.wire === 'uhp' ? 'passthrough' : 'off',
+    tool_mode: a.kind === 'cli' ? a.toolMode || 'off' : a.wire === 'traycer' ? ((a.toolMode || 'auto') === 'off' ? 'off' : 'emulate') : (a.wire || 'openai') === 'openai' || a.wire === 'uhp' ? 'passthrough' : 'off',
     // The media it takes (image, pdf, audio, video); one it does not take reads as a text label.
     vision: !!a.vision,
     media: a.media || [],
@@ -407,7 +407,7 @@ function describeAdapters(gateway) {
  * Describe an adapter in UHP `harness` format (`GET /v1/harnesses` & `GET /v1/harnesses/:id`).
  */
 function describeHarness(a) {
-  const toolMode = a.kind === 'cli' ? a.toolMode || 'off' : (a.wire || 'openai') === 'openai' || a.wire === 'uhp' ? 'passthrough' : 'off';
+  const toolMode = a.kind === 'cli' ? a.toolMode || 'off' : a.wire === 'traycer' ? ((a.toolMode || 'auto') === 'off' ? 'off' : 'emulate') : (a.wire || 'openai') === 'openai' || a.wire === 'uhp' ? 'passthrough' : 'off';
   return {
     id: a.id,
     object: 'harness',

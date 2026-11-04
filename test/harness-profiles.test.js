@@ -323,6 +323,20 @@ test('Traycer HTTP profile (`wire: "traycer"`): discovers 5-provider catalog fro
   cleanups.push(() => new Promise((r) => srv.close(r)));
   const ksUrl = `http://127.0.0.1:${srv.address().port}`;
 
+  // 0. UHP discovery (/.well-known/uhp) & /v1/harnesses capability metadata
+  const uhpRes = await fetch(`${ksUrl}/.well-known/uhp`);
+  assert.equal(uhpRes.status, 200);
+  const uhpBody = await uhpRes.json();
+  assert.equal(uhpBody.object, 'uhp.info');
+  const hRes = await fetch(`${ksUrl}/v1/harnesses`);
+  assert.equal(hRes.status, 200);
+  const hBody = await hRes.json();
+  const trHarness = hBody.data.find((h) => h.id === 'traycer');
+  assert.ok(trHarness);
+  assert.equal(trHarness.wire, 'traycer');
+  assert.equal(trHarness.capabilities.client_tools, true);
+  assert.equal(trHarness.capabilities.tool_mode, 'emulate');
+
   // 1. Model catalog discovery via /v1/models
   const mRes = await fetch(`${ksUrl}/v1/models`);
   assert.equal(mRes.status, 200);
