@@ -18,7 +18,7 @@ import { LlmError, contentToText, declaredKind, flattenMessages, isMediaPart, ki
  *                         message with the media as blocks where they were (mediaPrompt)
  *   an HTTP upstream      each user turn as a content array in the upstream's wire: OpenAI
  *                         `image_url` / `input_audio` / `file` / `video_url`, Anthropic `image` /
- *                         `document` (upstreamMessages)
+ *                         `document`, UHP/Responses `input_image` / `input_file` (upstreamMessages)
  *
  * Inline data is taken as sent, its kind and type read off the bytes. A URL is fetched by keysmith,
  * http(s) only and only from the public internet (fetchMedia): the gateway can sit behind a
@@ -256,11 +256,15 @@ function taken(part, read, kinds) {
 
 const dataUrl = (m) => `data:${m.mediaType};base64,${m.data}`;
 
-/** One read item as a content block of `wire`: `anthropic` (also a CLI's stream-json) or `openai`. */
+/** One read item as a content block of `wire`: `anthropic` (also a CLI's stream-json), `uhp` (Responses), or `openai`. */
 function wireBlock(m, wire) {
   if (wire === 'anthropic') {
     if (m.kind === 'image') return { type: 'image', source: { type: 'base64', media_type: m.mediaType, data: m.data } };
     return { type: 'document', source: { type: 'base64', media_type: m.mediaType, data: m.data }, ...(m.name ? { title: m.name } : {}) };
+  }
+  if (wire === 'uhp') {
+    if (m.kind === 'image') return { type: 'input_image', image_url: dataUrl(m), ...(m.detail ? { detail: m.detail } : {}) };
+    return { type: 'input_file', filename: m.name || 'document.pdf', file_data: dataUrl(m) };
   }
   switch (m.kind) {
     case 'image':
@@ -328,18 +332,19 @@ export async function upstreamMessages(messages, opts, { signal } = {}) {
     if (!turns.includes(m)) return m;
     const content = contentBlocks(m.parts, read, opts);
     // A turn whose media all became labels is text again, as it is for an upstream that takes none.
-    return { role: m.role, content: content.every((b) => b.type === 'text') ? content.map((b) => b.text).join('\n') : content };
+    return { role: m.role, content: content.every((b) => b.type === 'text' || b.type === 'input_text') ? content.map((b) => b.text).join('\n') : content };
   });
 }
 
 function contentBlocks(parts, read, { wire, kinds }) {
   const blocks = [];
   let text = [];
+  const textType = wire === 'uhp' ? 'input_text' : 'text';
   // Text between two items is one block, joined as contentToText joins it; one of whitespace alone is dropped.
   const flush = () => {
     const t = text.join('\n');
     text = [];
-    if (t.trim()) blocks.push({ type: 'text', text: t });
+    if (t.trim()) blocks.push({ type: textType, text: t });
   };
   for (const part of parts) {
     if (!isMediaPart(part)) {

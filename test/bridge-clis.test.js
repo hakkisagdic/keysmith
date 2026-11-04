@@ -859,7 +859,7 @@ test('the start-up sweep: session files of keysmith\'s naming older than an hour
 
 test('which driver takes an adapter: the one its bridge.driver names (agy also by its parser); claude ships its own, explicit-only still, and an unknown name does not load', () => {
   const at = (cfg) => DRIVERS.filter((d) => d.supports(new CliAdapter('x', { cwd: dir, ...cfg }))).map((d) => d.id);
-  for (const name of ['opencode', 'codex', 'qoder', 'agy', 'claude']) assert.deepEqual(at(CLI_PROFILES[name]), [name], name);
+  for (const name of ['opencode', 'codex', 'qoder', 'agy', 'claude', 'gemini', 'kimi']) assert.deepEqual(at(CLI_PROFILES[name]), [name], name);
   assert.equal(CLAUDE_BRIDGE_ARGS, CLI_PROFILES.claude.bridge.args);
   assert.deepEqual(at({ ...CLI_PROFILES.agy, bridge: { args: CLI_PROFILES.agy.bridge.args } }), ['agy'], 'an agy entry written before bridge.driver');
   assert.deepEqual(at({ ...CLI_PROFILES.codex, bridge: { args: CLI_PROFILES.codex.bridge.args } }), [], 'no driver named, no agy parser: no bridge');
@@ -867,7 +867,7 @@ test('which driver takes an adapter: the one its bridge.driver names (agy also b
   assert.equal(CLI_PROFILES.claude.toolMode, 'auto');
   assert.equal(CLI_PROFILES.claude.explicitOnly, true, 'claude spends the subscription: a request that names it, never an alias');
   assert.deepEqual(CLI_PROFILES.claude.emulateArgs, CLI_PROFILES.claude.args, 'EMULATE runs the tool-less text argv');
-  assert.throws(() => checkAdapter('x', { ...CLI_PROFILES.opencode, bridge: { driver: 'gemini', args: ['{prompt}'] } }), /bridge.driver must be one of/);
+  assert.throws(() => checkAdapter('x', { ...CLI_PROFILES.opencode, bridge: { driver: 'nosuch', args: ['{prompt}'] } }), /bridge.driver must be one of/);
 });
 
 const run = async (parser, list) => {

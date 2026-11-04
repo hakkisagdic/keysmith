@@ -21,58 +21,6 @@ import { CLI_PROFILES } from '../profiles.js';
  * approved: a call to it goes to keysmith, which hands it to the client). A call in the CLI's
  * stream to any other tool is the tripwire's (src/bridge/index.js): the run is stopped and the
  * request is a 502.
- *
- *   opencode  OPENCODE_CONFIG names the session's config: one `mcp.local` server whose `timeout`
- *             outlasts toolResultTimeoutMs (opencode's own default, 60 s, gave up on a 75 s wait
- *             in the probe), and an inline agent (`--agent ks-b-<rid>`) whose permission and tools
- *             allow `<server>_*` alone — over the workspace's deny-all opencode.json, which opencode
- *             merges in after it. The model sees `ks<rid6>_<tool>`. opencode reports a tool call
- *             only when it has finished (its `tool_use` line), and runs the calls of one step at
- *             once: those that arrive within `settleMs` of each other go out in one answer.
- *   codex     `codex exec --json` with the profile's tool-less switches and the session's server
- *             on the command line (`-c mcp_servers.<server>.…`): its approval mode `approve` for
- *             that server alone (with approval_policy "never" an MCP call is otherwise refused),
- *             its tool_timeout_sec past toolResultTimeoutMs (codex's default is 60 s), the token
- *             in a file whose path goes in the server's env (`KEYSMITH_BRIDGE_TOKEN_FILE`) — never
- *             in the argv. `--ephemeral` writes no session (and the bridge, which never resumes a
- *             run, needs none). codex shows a call (`item.started`, `mcp__<server>__<tool>`)
- *             before it sends it.
- *   qoder     `qodercli -p -o stream-json --mcp-config <file> --strict-mcp-config` with `--tools ""`,
- *             the server's tools allowed (`--allowed-tools mcp__<server>`), only project settings
- *             read (`--setting-sources project`) and no hooks (`--settings {"disableAllHooks":true}`:
- *             the user's plugin hooks — Qoder Security, qoder-context-hook — ran in a headless run
- *             with project settings alone), no session written, and every inherited QODER_*
- *             variable left out (a nested-agent marker makes stream-json exit 42; QODER_MCP_LAZY
- *             puts the server's tools behind qoder's own `mcp_get`/`mcp_call`). The assistant
- *             message that makes the calls (its `tool_use` blocks) is printed before they run; a
- *             `mcp_call` names the tool it calls (parsers.js), and `mcp_get`, which only reads a
- *             tool's schema, is no foreign tool.
- *   claude    `claude -p --output-format stream-json --mcp-config <file> --strict-mcp-config` with
- *             `--tools ""` (no built-in tool), the server's tools allowed (`--allowedTools
- *             mcp__<server>`), `--permission-prompts none`, `--setting-sources ""` (no settings file
- *             and no CLAUDE.md — `project` still read the workspace's parent directories'), hooks
- *             off, auto-memory off (`autoMemoryEnabled: false` and CLAUDE_CODE_DISABLE_AUTO_MEMORY:
- *             `--setting-sources ""` left it on, and its MEMORY.md and "keep memories with the
- *             Write tool" reached the prompt), skills off, no session written; not `--safe-mode`,
- *             which turns MCP servers off. MCP_TOOL_TIMEOUT outlasts toolResultTimeoutMs (Claude
- *             Code honours it: a 2 s one cancelled a held call at 2 s) and ENABLE_TOOL_SEARCH=false
- *             keeps every tool of the request loaded, with no tool-search tool of Claude Code's to
- *             call. Each tool is listed with `_meta: {"anthropic/maxResultSizeChars":
- *             maxPromptChars}`: without it 2.1.303 wrote a result over ~50,000 chars to
- *             ~/.claude/projects/<workspace>/<session>/tool-results/ — left there when the session
- *             was gone — and showed the model a 2 KB preview and the path to Read. 2.1.303 honours
- *             the _meta up to 500,000 chars (`Math.min(meta, 500000)`), so past that it is
- *             500,000, and a longer result is a 400 before it reaches Claude Code (`resultMax`),
- *             whatever maxPromptChars says. Its assistant message prints each tool_use block
- *             before the call runs.
- *
- * How a step's calls reach the client (`batch`, src/bridge/index.js): codex 0.163 and qoder 1.1.59
- * run them one after another — asked for two at once, each sent its second tools/call only after
- * the first one's result (a held call, 2026-10-20) — so each goes out on its own HTTP turn, as
- * agy's do (`serial`). opencode sends them at once (`gather`): the calls that arrive within
- * `settleMs` of the last one go out in one answer, at the latest STEP_GRACE_MS after the first.
- * claude 2.1.303 runs them one after another too (`serial`): asked for two at once, it sent the
- * second tools/call only after the first one's result.
  */
 
 const DIR = '.keysmith-bridge';
@@ -96,6 +44,8 @@ export function tomlString(s) {
 
 /** claude's bridge argv: the `claude` profile's (src/profiles.js). */
 export const CLAUDE_BRIDGE_ARGS = CLI_PROFILES.claude.bridge.args;
+export const GEMINI_BRIDGE_ARGS = CLI_PROFILES.gemini?.bridge?.args;
+export const KIMI_BRIDGE_ARGS = CLI_PROFILES.kimi?.bridge?.args;
 
 /**
  * The longest MCP tool result Claude Code gives its model whole, whatever the tool's _meta says:
@@ -219,7 +169,7 @@ function opencodeConfig(session, agent, timeout) {
     permission,
     tools,
     mcp: { [session.server]: { type: 'local', command: [process.execPath, SHIM], environment: session.env, enabled: true, timeout } },
-    agent: { [agent]: { description: 'One keysmith MCP bridge session. Its only tools are the request\'s, run by the client.', mode: 'primary', prompt: AGENT_PROMPT, permission, tools } },
+    agent: { [agent]: { description: "One keysmith MCP bridge session. Its only tools are the request's, run by the client.", mode: 'primary', prompt: AGENT_PROMPT, permission, tools } },
     plugin: [],
   };
 }
@@ -299,14 +249,6 @@ export const claudeDriver = fileDriver({
   vars(adapter, session, written) {
     return { mcpConfig: written[0].file };
   },
-  // A keysmith started inside a Claude Code session inherits its markers; one of them
-  // (CLAUDE_AGENT_SDK_MCP_NO_PREFIX) would rename the server's tools. CLAUDE_CONFIG_DIR stays.
-  // Claude Code waits on a call as long as MCP_TOOL_TIMEOUT says: past keysmith's own wait, so
-  // keysmith's clock ends a session first; MCP_TIMEOUT is its readiness wait. ENABLE_TOOL_SEARCH
-  // off: with many tools Claude Code would defer them behind a tool of its own (a placeholder the
-  // model calls to load them), which the tripwire would have to stop. Auto-memory off here as well
-  // as in the profile's `--settings`: an entry's `bridge.args` copied before that are kept as
-  // they are (`keysmith upgrade`), and this reaches every run all the same.
   env(adapter, session) {
     return bridgeEnv(adapter, {
       drop: /^(CLAUDECODE$|CLAUDE_CODE_|CLAUDE_AGENT_SDK_)/,
@@ -318,14 +260,59 @@ export const claudeDriver = fileDriver({
       },
     });
   },
-  // A result as long as the adapter takes one, up to Claude Code's own ceiling (a longer one is a
-  // 400 before it reaches the CLI: index.js _attach), goes to the model whole, never to a file
-  // under ~/.claude/projects/.
   toolMeta(adapter) {
     const max = Math.min(adapter.maxPromptChars, CLAUDE_RESULT_CEILING);
     return Number.isFinite(max) && max > 0 ? { 'anthropic/maxResultSizeChars': max } : null;
   },
   resultMax() {
     return CLAUDE_RESULT_CEILING;
+  },
+});
+
+export const geminiDriver = fileDriver({
+  id: 'gemini',
+  parser: 'harness-json',
+  usageAtEnd: true,
+  prefix: (server) => `mcp__${server}__`,
+  files(adapter, session, base) {
+    const timeout = session.limits.toolResultTimeoutMs + CALL_TIMEOUT_MARGIN_MS;
+    const settings = {
+      mcpServers: {
+        [session.server]: {
+          command: process.execPath,
+          args: [SHIM],
+          env: session.env,
+          timeout,
+          trust: true,
+        },
+      },
+      tools: {
+        core: [],
+      },
+    };
+    return [{ file: `${base}.gemini.json`, content: JSON.stringify(settings, null, 2) + '\n' }];
+  },
+  vars(adapter, session, written) {
+    return { geminiSettings: written[0].file };
+  },
+  env(adapter, session, written) {
+    return bridgeEnv(adapter, {
+      set: {
+        GEMINI_CLI_SYSTEM_SETTINGS_PATH: written[0].file,
+      },
+    });
+  },
+});
+
+export const kimiDriver = fileDriver({
+  id: 'kimi',
+  parser: 'harness-json',
+  usageAtEnd: true,
+  prefix: (server) => `mcp__${server}__`,
+  files(adapter, session, base) {
+    return mcpConfigFile(session, base);
+  },
+  vars(adapter, session, written) {
+    return { mcpConfig: written[0].file };
   },
 });

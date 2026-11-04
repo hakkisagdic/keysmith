@@ -192,7 +192,7 @@ function cmdAdd(flags) {
   if (typeof id !== 'string' || !id || /[/\s]/.test(id) || id.startsWith('-') || FORBIDDEN_FIELDS.has(id)) {
     fail(`"${id}" cannot be an adapter id: it becomes the model prefix, so no "/", no spaces, not starting with "-", and not __proto__, prototype or constructor`);
   }
-  const profile = Object.hasOwn(CLI_PROFILES, name) || Object.hasOwn(HTTP_PROFILES, name) ? getProfile(name) : null;
+  const profile = getProfile(name);
   let entry;
   if (profile) {
     entry = structuredClone(profile);

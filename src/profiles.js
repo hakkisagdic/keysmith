@@ -235,6 +235,28 @@ const claudeBridgeArgs = () => [
 /** Where Warp installs its agent CLI on macOS. `/usr/local/bin/warp-cli` is Cloudflare WARP, a VPN client, not this. */
 const WARP_OZ_BIN = '/Applications/Warp.app/Contents/Resources/bin/oz';
 
+/** Common helper for HarnessRouter-compatible CLI profiles that are not verified tool-less. */
+function harnessCliProfile(id, { bin = id, args, resumeArgs = null, persistSessions = false, parser = 'harness-json', modelsFrom = null, bridge = null, provenance, note }) {
+  return {
+    kind: 'cli',
+    bin,
+    args,
+    ...(resumeArgs ? { resumeArgs } : {}),
+    persistSessions,
+    parser,
+    modelsFrom,
+    cwd: `~/.local/share/keysmith/workspaces/${id}`,
+    ...(bridge ? { bridge } : {}),
+    unsafeTools: true,
+    disabled: true,
+    ...(parser !== 'raw' ? { stopAtToolCall: 'always' } : {}),
+    timeoutMs: 300_000,
+    maxConcurrent: 1,
+    provenance,
+    note,
+  };
+}
+
 export const CLI_PROFILES = {
   cmd: {
     kind: 'cli',
@@ -503,6 +525,10 @@ export const CLI_PROFILES = {
     parser: 'raw',
     modelsFrom: null,
     cwd: '~/.local/share/keysmith/workspaces/gemini',
+    bridge: {
+      driver: 'gemini',
+      args: ['-p', '{prompt}', '--output-format', 'stream-json', ['--model', '{model}']],
+    },
     // Never run from here, and nothing in this argv takes its tools away: print mode keeps at
     // least the read-only ones (its documentation, not checked). Until a tool-less argv is
     // verified against a real install it is treated like a CLI that keeps its tools. The raw
@@ -511,9 +537,211 @@ export const CLI_PROFILES = {
     disabled: true,
     timeoutMs: 300_000,
     maxConcurrent: 2,
-    provenance: 'Gemini CLI one-shot print mode — argv shape from its documented interface, not run against a live install',
+    provenance: 'Gemini CLI one-shot print mode — argv shape from its documented interface, not run against a live install; MCP bridge uses GEMINI_CLI_SYSTEM_SETTINGS_PATH with --output-format stream-json',
     note: 'Not verified tool-less: keysmith has never run this CLI, and nothing in its argv removes the tools Gemini CLI keeps in print mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed. Nothing but the answer reaches stdout in print mode, so `raw` is the parser, there are no token counts and no tool call is seen. Enable it only if you accept that: `keysmith set gemini disabled false --allow-unsafe-tools`.',
   },
+  kilo: harnessCliProfile('kilo', {
+    bin: 'kilo',
+    args: ['run', '--format', 'json', ['--model', '{model}'], '--', '{prompt}'],
+    resumeArgs: ['run', '--format', 'json', '--session', '{session}', ['--model', '{model}'], '--', '{prompt}'],
+    persistSessions: true,
+    parser: 'opencode-ndjson',
+    modelsFrom: { args: ['models'] },
+    provenance: 'Kilo Code CLI (`kilo run --format json`) — OpenCode-derived NDJSON stream (step_start / text / tool_use / step_finish)',
+    note: 'Not verified tool-less: Kilo Code keeps its built-in agent tools unless configured with a deny-all workspace agent. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set kilo disabled false --allow-unsafe-tools`.',
+  }),
+  qwen: harnessCliProfile('qwen', {
+    bin: 'qwen',
+    args: ['-p', '{prompt}', '--output-format', 'json', ['--model', '{model}']],
+    resumeArgs: ['-p', '{prompt}', '--output-format', 'json', '--resume', '{session}', ['--model', '{model}']],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'Qwen Code CLI (`qwen -p --output-format json`) — JSON/stream-json output with session_id and usage',
+    note: 'Not verified tool-less: Qwen Code CLI retains built-in tools in print mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set qwen disabled false --allow-unsafe-tools`.',
+  }),
+  cline: harnessCliProfile('cline', {
+    bin: 'cline',
+    args: ['--json', ['--model', '{model}'], '{prompt}'],
+    resumeArgs: ['--json', '--task-id', '{session}', ['--model', '{model}'], '{prompt}'],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'Cline CLI (`cline --json`) — emits JSON lines (`type: "say"`, `say: "text" | "reasoning"`, `taskId`)',
+    note: 'Not verified tool-less: Cline CLI can run tools in headless tasks. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set cline disabled false --allow-unsafe-tools`.',
+  }),
+  goose: harnessCliProfile('goose', {
+    bin: 'goose',
+    args: ['run', '--output-format', 'stream-json', '--no-session', ['--model', '{model}'], '--text', '{prompt}'],
+    resumeArgs: ['run', '--output-format', 'stream-json', '--resume', '--name', '{session}', ['--model', '{model}'], '--text', '{prompt}'],
+    persistSessions: false,
+    parser: 'harness-json',
+    provenance: 'Goose CLI (`goose run --output-format stream-json --text`) — emits message and total_tokens stream events',
+    note: 'Not verified tool-less: Goose CLI extensions and developer tools can run unless disabled in its profile. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set goose disabled false --allow-unsafe-tools`.',
+  }),
+  kimi: harnessCliProfile('kimi', {
+    bin: 'kimi',
+    args: ['--print', '--output-format', 'stream-json', ['--model', '{model}'], '--prompt', '{prompt}'],
+    resumeArgs: ['--print', '--output-format', 'stream-json', '--session', '{session}', ['--model', '{model}'], '--prompt', '{prompt}'],
+    persistSessions: true,
+    parser: 'harness-json',
+    bridge: {
+      driver: 'kimi',
+      args: ['--print', '--output-format', 'stream-json', '--mcp-config-file', '{mcpConfig}', ['--model', '{model}'], '--prompt', '{prompt}'],
+    },
+    provenance: 'Kimi CLI (`kimi --print --output-format stream-json --prompt`) — emits assistant content parts, thinking blocks, tool_calls and usage; MCP bridge passes `--mcp-config-file`',
+    note: 'Not verified tool-less: Kimi CLI keeps built-in tools in print mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set kimi disabled false --allow-unsafe-tools`.',
+  }),
+  minimax: harnessCliProfile('minimax', {
+    bin: 'mmx',
+    args: ['agent', 'run', '--output', 'json', ['--model', '{model}'], '--task', '{prompt}'],
+    parser: 'harness-json',
+    provenance: 'MiniMax CLI (`mmx agent run --output json --task`) — JSON response envelope',
+    note: 'Not verified tool-less: MiniMax CLI agent mode can invoke built-in tools. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set minimax disabled false --allow-unsafe-tools`.',
+  }),
+  grok: harnessCliProfile('grok', {
+    bin: 'grok',
+    args: ['--max-tool-rounds', '0', ['--model', '{model}'], '--prompt', '{prompt}'],
+    parser: 'harness-json',
+    provenance: 'Grok CLI (`grok --max-tool-rounds 0 --prompt`) — JSON lines with role/content messages',
+    note: 'Not verified tool-less: `--max-tool-rounds 0` caps tool rounds on Grok CLI, but was not verified live against a real install. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set grok disabled false --allow-unsafe-tools`.',
+  }),
+  pi: harnessCliProfile('pi', {
+    bin: 'pi',
+    args: ['--print', '--mode', 'json', '--no-session', '--no-tools', ['--thinking', '{effort}'], ['--model', '{model}'], '{prompt}'],
+    resumeArgs: ['--print', '--mode', 'json', '--no-tools', '--session', '{session}', ['--thinking', '{effort}'], ['--model', '{model}'], '{prompt}'],
+    persistSessions: false,
+    parser: 'harness-json',
+    modelsFrom: { args: ['--list-models'] },
+    provenance: 'Pi Coding Agent (`pi --print --mode json --no-tools`) — emits message_update / text_delta / turn_end events',
+    note: 'Not verified tool-less: `--no-tools` disables Pi built-in tools according to its CLI interface, but has not been verified live here. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set pi disabled false --allow-unsafe-tools`.',
+  }),
+  omp: harnessCliProfile('omp', {
+    bin: 'omp',
+    args: ['--print', '--mode', 'json', '--no-session', '--no-tools', ['--thinking', '{effort}'], ['--model', '{model}'], '{prompt}'],
+    resumeArgs: ['--print', '--mode', 'json', '--no-tools', '--session', '{session}', ['--thinking', '{effort}'], ['--model', '{model}'], '{prompt}'],
+    persistSessions: false,
+    parser: 'harness-json',
+    modelsFrom: { args: ['--list-models'] },
+    provenance: 'Oh My Pi (`omp --print --mode json --no-tools`) — Pi-compatible JSON event stream',
+    note: 'Not verified tool-less: `--no-tools` disables Oh My Pi built-in tools according to its CLI interface, but has not been verified live here. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set omp disabled false --allow-unsafe-tools`.',
+  }),
+  dsh: harnessCliProfile('dsh', {
+    bin: 'dsh',
+    args: [['--model', '{model}'], '-e', '{prompt}'],
+    parser: 'harness-json',
+    provenance: 'dsh CLI (`dsh -e <prompt>`) — one-shot execution mode',
+    note: 'Not verified tool-less: dsh can execute shell commands in one-shot mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set dsh disabled false --allow-unsafe-tools`.',
+  }),
+  aider: harnessCliProfile('aider', {
+    bin: 'aider',
+    args: ['--yes-always', '--no-git', '--no-auto-commits', '--no-detect-urls', '--no-restore-chat-history', ['--thinking-tokens', '{effort}'], ['--model', '{model}'], '--message', '{prompt}'],
+    parser: 'harness-json',
+    modelsFrom: { args: ['--list-models', ''] },
+    provenance: 'Aider CLI (`aider --no-git --no-auto-commits --message`) — one-shot message mode',
+    note: 'Not verified tool-less: Aider is an editing agent and `--yes-always` accepts file edits in its working directory. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set aider disabled false --allow-unsafe-tools`.',
+  }),
+  mimo: harnessCliProfile('mimo', {
+    bin: 'mimo',
+    args: ['-p', '{prompt}', '--output-format', 'stream-json', ['--model', '{model}']],
+    resumeArgs: ['-p', '{prompt}', '--output-format', 'stream-json', '--resume', '{session}', ['--model', '{model}']],
+    persistSessions: true,
+    parser: 'claude-stream-json',
+    provenance: 'MiMo CLI (`mimo -p --output-format stream-json`) — Claude-compatible stream-json output',
+    note: 'Not verified tool-less: MiMo CLI retains built-in tools in print mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set mimo disabled false --allow-unsafe-tools`.',
+  }),
+  jcode: harnessCliProfile('jcode', {
+    bin: 'jcode',
+    args: ['run', '--no-update', ['--model', '{model}'], '{prompt}'],
+    resumeArgs: ['run', '--no-update', '--resume', '{session}', ['--model', '{model}'], '{prompt}'],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'jcode CLI (`jcode run --no-update`) — headless run mode',
+    note: 'Not verified tool-less: jcode can run built-in coding tools during `run`. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set jcode disabled false --allow-unsafe-tools`.',
+  }),
+  vibe: harnessCliProfile('vibe', {
+    bin: 'vibe',
+    args: ['--output', 'streaming', '--max-turns', '1', '--prompt', '{prompt}'],
+    resumeArgs: ['--output', 'streaming', '--max-turns', '1', '--resume', '{session}', '--prompt', '{prompt}'],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'Mistral Vibe CLI (`vibe --output streaming --max-turns 1 --prompt`) — streaming JSON lines',
+    note: 'Not verified tool-less: Mistral Vibe CLI keeps built-in tools in headless mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set vibe disabled false --allow-unsafe-tools`.',
+  }),
+  hermes: harnessCliProfile('hermes', {
+    bin: 'hermes',
+    args: ['chat', '-q', '{prompt}', '-Q', ['--model', '{model}']],
+    resumeArgs: ['chat', '-q', '{prompt}', '-Q', '--resume', '{session}', ['--model', '{model}']],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'Hermes CLI (`hermes chat -q <prompt> -Q`) — quiet single-query mode with `session_id:` footer',
+    note: 'Not verified tool-less: Hermes CLI can invoke agent tools in query mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set hermes disabled false --allow-unsafe-tools`.',
+  }),
+  openhands: harnessCliProfile('openhands', {
+    bin: 'openhands',
+    args: ['--headless', '--json', '--task', '{prompt}'],
+    resumeArgs: ['--headless', '--json', '--resume', '{session}', '--task', '{prompt}'],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'OpenHands CLI (`openhands --headless --json --task`) — JSON event stream (`action: "message"`, `observation`)',
+    note: 'Not verified tool-less: OpenHands is an autonomous agent that executes commands and edits files in headless mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set openhands disabled false --allow-unsafe-tools`.',
+  }),
+  cheetahclaws: harnessCliProfile('cheetahclaws', {
+    bin: 'cheetahclaws',
+    args: ['-p', '{prompt}', ['--model', '{model}']],
+    parser: 'harness-json',
+    provenance: 'CheetahClaws CLI (`cheetahclaws -p`) — headless print mode',
+    note: 'Not verified tool-less: CheetahClaws retains built-in tools in print mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set cheetahclaws disabled false --allow-unsafe-tools`.',
+  }),
+  opensquilla: harnessCliProfile('opensquilla', {
+    bin: 'opensquilla',
+    args: ['agent', '--json', '--message', '{prompt}'],
+    resumeArgs: ['agent', '--json', '--session-id', '{session}', '--message', '{prompt}'],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'OpenSquilla CLI (`opensquilla agent --json --message`) — JSON envelope with payloads and meta.agentMeta.usage',
+    note: 'Not verified tool-less: OpenSquilla agent mode can invoke local tools. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set opensquilla disabled false --allow-unsafe-tools`.',
+  }),
+  nanobot: harnessCliProfile('nanobot', {
+    bin: 'nanobot',
+    args: ['agent', '--no-markdown', '--message', '{prompt}'],
+    resumeArgs: ['agent', '--no-markdown', '--session', '{session}', '--message', '{prompt}'],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'Nanobot CLI (`nanobot agent --no-markdown --message`) — plain/JSON output',
+    note: 'Not verified tool-less: Nanobot agent mode can invoke built-in tools. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set nanobot disabled false --allow-unsafe-tools`.',
+  }),
+  zeroclaw: harnessCliProfile('zeroclaw', {
+    bin: 'zeroclaw',
+    args: ['agent', ['--model', '{model}'], '--message', '{prompt}'],
+    parser: 'harness-json',
+    provenance: 'ZeroClaw CLI (`zeroclaw agent --message`) — single-turn agent output',
+    note: 'Not verified tool-less: ZeroClaw agent mode can invoke built-in tools. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set zeroclaw disabled false --allow-unsafe-tools`.',
+  }),
+  'docker-agent': harnessCliProfile('docker-agent', {
+    bin: 'docker',
+    args: ['agent', 'run', '--exec', '--hide-output', ['--model', '{model}'], 'default', '{prompt}'],
+    parser: 'harness-json',
+    provenance: 'Docker Agent CLI (`docker agent run --exec --hide-output default <prompt>`) — containerized agent execution',
+    note: 'Not verified tool-less: Docker Agent runs tools inside its agent environment. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set docker-agent disabled false --allow-unsafe-tools`.',
+  }),
+  'fast-agent': harnessCliProfile('fast-agent', {
+    bin: 'fast-agent',
+    args: ['go', '--quiet', '--noenv', ['--model', '{model}'], '--message', '{prompt}'],
+    resumeArgs: ['go', '--quiet', '--noenv', '--resume', '{session}', ['--model', '{model}'], '--message', '{prompt}'],
+    persistSessions: true,
+    parser: 'harness-json',
+    provenance: 'Fast-Agent CLI (`fast-agent go --quiet --noenv --message`) — headless message execution',
+    note: 'Not verified tool-less: Fast-Agent can invoke configured MCP or local tools. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set fast-agent disabled false --allow-unsafe-tools`.',
+  }),
+  dcode: harnessCliProfile('dcode', {
+    bin: 'dcode',
+    args: ['run', '--format', 'json', ['--model', '{model}'], '{prompt}'],
+    resumeArgs: ['run', '--format', 'json', '--session', '{session}', ['--model', '{model}'], '{prompt}'],
+    persistSessions: true,
+    parser: 'harness-json',
+    modelsFrom: { args: ['models'] },
+    provenance: 'dcode CLI (`dcode run --format json`) — JSON event stream (`message.delta`, `tool.start`, `run.end`)',
+    note: 'Not verified tool-less: dcode retains built-in tools in `run` mode. Marked `unsafeTools`: added disabled, never an alias leg, never probed, and stopped at the first tool call it reports. Enable it only if you accept that: `keysmith set dcode disabled false --allow-unsafe-tools`.',
+  }),
 };
 
 /**
@@ -576,10 +804,34 @@ export const HTTP_PROFILES = {
     provenance: 'api.githubcopilot.com, OAuth device token (ghu_…) verified against /models and /chat/completions',
     note: 'Copilot answers /chat/completions, but /models lists far more than your plan will actually run — the premium ids reply model_not_supported. `keysmith doctor --probe-models` finds the truth; declare that subset under `models` to keep the picker honest.',
   },
+  harnessrouter: {
+    kind: 'http',
+    wire: 'uhp',
+    baseUrl: 'http://127.0.0.1:8000/api/harness/v1',
+    apiKey: false,
+    apiKeyEnv: 'HARNESSROUTER_API_KEY',
+    defaultModel: 'default',
+    media: ['image', 'pdf'],
+    provenance: 'HarnessRouter Community Edition & Cloud UHP (/v1/responses, /v1/models, /v1/harnesses, /v1/uhp)',
+    note: 'Connects a running HarnessRouter instance (local Community Edition on 127.0.0.1:8000 or Cloud at https://api.harnessrouter.ai/v1) as an upstream adapter over UHP. Set HARNESSROUTER_API_KEY (or --key) when talking to an authenticated instance. Address models as harnessrouter/<model>, harnessrouter/<backend>/<model> (e.g. harnessrouter/claude/claude-sonnet-4-6), or a custom harness as harnessrouter/chrn_<id>.',
+  },
+};
+
+/** Canonical profile aliases matching HarnessRouter backend naming conventions. */
+export const PROFILE_ALIASES = {
+  'claude-code': 'claude',
+  'codex-cli': 'codex',
+  'gemini-cli': 'gemini',
+  'kimi-cli': 'kimi',
+  kilocode: 'kilo',
+  'qwen-code': 'qwen',
 };
 
 export function getProfile(name) {
-  return CLI_PROFILES[name] || HTTP_PROFILES[name] || null;
+  const canonical = Object.hasOwn(PROFILE_ALIASES, name) ? PROFILE_ALIASES[name] : name;
+  if (Object.hasOwn(CLI_PROFILES, canonical)) return CLI_PROFILES[canonical];
+  if (Object.hasOwn(HTTP_PROFILES, canonical)) return HTTP_PROFILES[canonical];
+  return null;
 }
 
 export function profileNames() {

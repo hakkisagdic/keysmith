@@ -154,7 +154,7 @@ adapter takes (`media`, and `vision` for images).
 | `resumeArgs` | — | template used when a session id exists |
 | `persistSessions` | `false` | the CLI keeps its own threads, so `{noSession}` renders empty and `resumeArgs` becomes reachable |
 | `noSessionFlag` | `--no-session` | what `{noSession}` renders as when the run is not resumed. Claude Code and Qoder refuse `--no-session` and take `--no-session-persistence`; their profiles say so |
-| `parser` | `raw` | one of `cmd-ndjson`, `opencode-ndjson`, `claude-stream-json`, `agy-stream-json`, `kiro-stream-json`, `warp-ndjson`, `codex-json`, `codex-json-final`, `raw` |
+| `parser` | `raw` | one of `cmd-ndjson`, `opencode-ndjson`, `claude-stream-json`, `agy-stream-json`, `kiro-stream-json`, `warp-ndjson`, `codex-json`, `codex-json-final`, `harness-json`, `raw` |
 | `modelsFrom` | — | `{ "args": ["--list-models"], "drop": ["preview"], "stdin": "…" }` — run the binary (`stdin` written to it when set), read stdout: one model per line, or JSON (an array, or one under `models`/`data`; the id is `model_id`, `id`, `slug`, `model`, `value` or `name`; `visibility: "hide"` entries are left out), or a stream-json `control_response` (Claude Code's answer to `initialize`). The effort levels a model takes are read from it too: Codex's `supported_reasoning_levels`, Claude Code's `supportedEffortLevels` |
 | `promptVia` | `arg` | `"stdin"` pipes the prompt instead, for CLIs that choke on long argv. A command line cannot carry a NUL character (U+0000): a request with one in its argv (the prompt, a system prompt) is a 400 that quotes none of it, before anything is started — the route goes on to its next leg, which an HTTP upstream can take |
 | `cwd` | process cwd | the agent's workspace: an empty directory keysmith owns (`~/.local/share/keysmith/workspaces/<name>`), created 0700 on first spawn. Every built-in CLI profile sets one, and so does `keysmith add custom`; without it the agent runs in the gateway's own working directory (under launchd, keysmith's source tree). The child's `PWD` is set to it as well: spawn() would leave the gateway's, and opencode takes `PWD` as its project directory |
@@ -253,6 +253,7 @@ yield `done` (a stream with no terminator is a client that hangs forever).
 | `agy-stream-json` | `step_update` text deltas on `agent_response` steps, then `result`; usage summed per step (the `result` total re-counts a resumed thread), an auto-denied tool call with no answer is an error with code `tool_denied`, each `tool` step is reported once as a `tool` event, and a run stopped before its `result` line still reports what its steps spent | Antigravity CLI 1.3.3 |
 | `kiro-stream-json` | `{type,data}` lines: `metadata` carries the sessionId, `sessionUpdate` wraps the ACP update (`agent_message_chunk` text, `agent_thought_chunk` reasoning, `tool_call` reported once), `runFinished.finalText` answers when no chunk did, `runError.message` is an error | Kiro CLI 2.27.1 — runStarted/metadata/runError live; the text events from the binary and the ACP schema |
 | `warp-ndjson` | `agent` lines are the text, `agent_reasoning` reasoning, `tool_call` a `tool` event, `system`/`conversation_started` the session; no usage, no closing line | Oz CLI v0.2026.10.07 (a live run) |
+| `harness-json` | universal JSON/NDJSON/text stream parser for Gemini CLI (`stats.models`), Kilo, Qwen Code, Cline (`say`), Goose (`total_tokens`), Kimi CLI, MiniMax, Pi/OMP (`message_update`), OpenHands (`llm_metrics`), OpenSquilla (`payloads`), Hermes and dcode | HarnessRouter CLI ecosystem |
 | `raw` | stdout *is* the answer; no usage, no session | any `-p`-style CLI |
 
 Usage is normalised across spellings (`inputTokens` / `input_tokens` / `prompt_tokens`,
@@ -732,7 +733,7 @@ right before the prompt — it would take the prompt as a tool name.
 | Field | Default | Meaning |
 |---|---|---|
 | `baseUrl` | required | `…/v1` or `…/v1/` both fine; a route suffix you pasted by accident is trimmed |
-| `wire` | `openai` | `openai` → `POST {base}/chat/completions`; `anthropic` → `POST {base}/messages` with `x-api-key`. Set it explicitly — the other shape is not guessed from a hostname. |
+| `wire` | `openai` | `openai` → `POST {base}/chat/completions`; `anthropic` → `POST {base}/messages` with `x-api-key`; `uhp` → `POST {base}/responses` with `UHP-Version: 2026-10-19` (`harnessrouter` profile). Set it explicitly — the other shape is not guessed from a hostname. |
 | `apiKey` | — | a secret *reference*, see below; `false` for no auth (local servers) |
 | `mediaHeaders` | — | headers sent with a request that carries media up, and with no other: the `copilot` profile's `{"copilot-vision-request": "true"}`, the header Copilot's own clients send with an image (not checked live here). See [Media](#media-images-pdfs-audio-video) |
 | `rawChat` behaviour | automatic | when a request carries `tools`, keysmith forwards the body verbatim to the first HTTP candidate and streams its answer unchanged, so real `tool_calls` survive. When every candidate refuses, the client gets the refusal with the provider's own status (and `retry-after`) — an earlier leg's 429/503 over a later leg's other refusal |

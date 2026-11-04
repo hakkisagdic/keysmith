@@ -387,12 +387,26 @@ export class Gateway {
    * upstream session, so a chat app gets genuine multi-turn (and prompt-cache)
    * behaviour out of a tool that was never meant to answer HTTP.
    */
-  async *complete({ model, messages, session, signal, maxTokens, temperature, includeReasoning = false, exclude = null, scope = null, tools = null, effort = null }) {
+  async *complete({
+    model,
+    messages,
+    session,
+    signal,
+    maxTokens,
+    temperature,
+    includeReasoning = false,
+    exclude = null,
+    scope = null,
+    tools = null,
+    effort = null,
+    harnessId = null,
+    trace = null,
+  }) {
     const chain = this.resolve(model, { exclude, scope });
     const publicId = session || newSessionId();
     const known = session ? this.sessions.get(publicId) : null;
     const run = { publicId, known, reportedSession: false, includeReasoning, signal };
-    const args = { messages, maxTokens, temperature, includeReasoning, signal, effort };
+    const args = { messages, maxTokens, temperature, includeReasoning, signal, effort, harnessId, trace };
     if (tools) return yield* this._toolRoute(model, chain, args, run, tools);
     yield* this._failover(chain, args, run, null);
   }
@@ -414,6 +428,7 @@ export class Gateway {
         // The leg's model and effort: an effort-suffixed id read off, a level checked against the
         // CLI's catalogue (src/effort.js) — a 400 there is this leg refusing, like any other.
         const planned = await effortPlan(leg, args.effort);
+        const legEffort = planned.effort || (adapter.wire === 'uhp' ? args.effort : null);
         const events = adapter.complete({
           model: planned.model,
           messages: args.messages,
@@ -422,7 +437,9 @@ export class Gateway {
           maxTokens: args.maxTokens,
           temperature: args.temperature,
           includeReasoning: args.includeReasoning,
-          ...(planned.effort ? { effort: planned.effort } : {}),
+          ...(legEffort ? { effort: legEffort } : {}),
+          ...(args.harnessId ? { harnessId: args.harnessId } : {}),
+          ...(args.trace ? { trace: args.trace } : {}),
         });
         yield* this._leg({ ...leg, model: planned.model }, withEffort(events, planned), run, state, { canResume, sessions: true });
         return;
@@ -571,9 +588,10 @@ export class Gateway {
       const st = { emitted: false };
       try {
         const planned = await effortPlan(leg, args.effort);
+        const legEffort = planned.effort || (leg.adapter.wire === 'uhp' ? args.effort : null);
         // A bridge session is the model's at an effort, whichever way the request spelled it: an
         // effort-suffixed id and the base id with the same effort are one conversation.
-        const engineLeg = { ...leg, model: planned.model, effort: planned.effort, target: planned.model !== leg.model ? `${leg.adapter.id}/${planned.model}` : leg.target };
+        const engineLeg = { ...leg, model: planned.model, effort: legEffort, target: planned.model !== leg.model ? `${leg.adapter.id}/${planned.model}` : leg.target };
         const events = toolEvents(engineLeg, {
           spec,
           messages: tools.messages,
@@ -586,6 +604,8 @@ export class Gateway {
           log: this.log,
           caller,
           face,
+          harnessId: args.harnessId,
+          trace: args.trace,
         });
         yield* this._leg(engineLeg, withEffort(events, planned), run, st, { sessions: false });
         return;

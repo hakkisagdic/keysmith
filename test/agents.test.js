@@ -189,7 +189,7 @@ test('every CLI profile is tool-less or marked: no auto-approve flag, a keysmith
   }
   assert.deepEqual(
     Object.keys(CLI_PROFILES).filter((n) => !TOOL_LESS.includes(n)).sort(),
-    ['cmd', 'gemini', 'warp'],
+    ['aider', 'cheetahclaws', 'cline', 'cmd', 'dcode', 'docker-agent', 'dsh', 'fast-agent', 'gemini', 'goose', 'grok', 'hermes', 'jcode', 'kilo', 'kimi', 'mimo', 'minimax', 'nanobot', 'omp', 'openhands', 'opensquilla', 'pi', 'qwen', 'vibe', 'warp', 'zeroclaw'],
     'cmd approves its own tool calls in print mode, gemini was never run, warp cannot drop its tools',
   );
 });

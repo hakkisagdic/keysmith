@@ -7,6 +7,8 @@ import { emulate, renderPrompt } from './emulate.js';
  * A route is walked in the order it was declared, as it always is:
  *
  *   an HTTP upstream on the openai wire   the body goes up verbatim (`passthrough`), on the chat face
+ *   an HTTP upstream on the uhp wire      native UHP `/responses` tools, or EMULATE when the upstream
+ *                                         ignores `tools` (e.g. HarnessRouter CE)
  *   a CLI with toolMode other than off    a tool engine answers: EMULATE (emulate.js) or the MCP bridge
  *   anything else                         cannot answer with a tool call: left for the plain completion
  *
@@ -61,12 +63,17 @@ export function checkToolMode(id, cfg) {
 
 /**
  * How `adapter` takes a tool request that came through `face` ('openai': /v1/chat/completions,
- * 'anthropic': /v1/messages): 'passthrough', 'engine' or 'skip'.
+ * 'anthropic': /v1/messages, 'responses': /v1/responses): 'passthrough', 'engine' or 'skip'.
  */
 export function toolPath(adapter, spec, face) {
   if (adapter.kind === 'http') {
-    // Verbatim is the only way an HTTP leg takes tools, and only the chat face has a body an
-    // OpenAI-wire upstream reads as it is.
+    if (adapter.wire === 'uhp') {
+      const mode = adapter.toolMode || 'auto';
+      if (mode === 'off' || spec.unsupported?.length) return 'skip';
+      return 'engine';
+    }
+    // Verbatim is the only way an OpenAI-wire HTTP leg takes tools, and only the chat face has a
+    // body an OpenAI-wire upstream reads as it is.
     return face === 'openai' && (adapter.wire || 'openai') === 'openai' ? 'passthrough' : 'skip';
   }
   const mode = adapter.toolMode || 'off';
@@ -78,7 +85,7 @@ export function toolPath(adapter, spec, face) {
 }
 
 /**
- * Which engine runs a tool request on a CLI leg: `{ engine: 'plain' | 'emulate' | 'mcp',
+ * Which engine runs a tool request on a CLI or UHP leg: `{ engine: 'plain' | 'emulate' | 'mcp' | 'uhp',
  * fallback? }`, or a thrown LlmError when this leg cannot take it (the route moves on).
  * `mcp` is the bridge (src/bridge/index.js; null when no adapter has one): `check(adapter, spec,
  * ctx)` says whether it can take this request now — `{ ok: true }` or `{ ok: false, reason,
@@ -86,6 +93,15 @@ export function toolPath(adapter, spec, face) {
  * continues one of its sessions, which is always the bridge's.
  */
 export function pickEngine(adapter, spec, mcp, ctx = {}) {
+  if (adapter.kind === 'http' && adapter.wire === 'uhp') {
+    const mode = adapter.toolMode || 'auto';
+    const choice = spec.choice?.mode || 'auto';
+    if (choice === 'none') return { engine: 'plain' };
+    if (mode === 'emulate') return { engine: 'emulate' };
+    if (mode === 'uhp') return { engine: 'uhp' };
+    if (adapter._uhpToolsIgnored) return { engine: 'emulate', fallback: 'uhp_tools_ignored' };
+    return { engine: 'uhp' };
+  }
   const mode = adapter.toolMode || 'off';
   const choice = spec.choice?.mode || 'auto';
   if (choice === 'none') return { engine: 'plain' };
@@ -122,13 +138,13 @@ export function pickEngine(adapter, spec, mcp, ctx = {}) {
 }
 
 /**
- * The events of one CLI leg answering a tool request: the engine pickEngine chose, with a
+ * The events of one CLI or UHP leg answering a tool request: the engine pickEngine chose, with a
  * `tool_mode` event (which engine, and why not the one auto picks first) in front of its first
  * answer event. `state.mode` follows the engine as it starts, for a header written before the
- * answer is known. In auto, a bridge that fails before any call or text went out hands the same
- * request to EMULATE — unless the failure is one that must never be retried another way
- * (`noFallback`: the bridge's foreign-tool tripwire is a security event, not a slow engine; a
- * 409 for a result another request is answering).
+ * answer is known. In auto, a bridge (or native UHP tool request) that fails before any call or
+ * text went out hands the same request to EMULATE — unless the failure is one that must never be
+ * retried another way (`noFallback`: the bridge's foreign-tool tripwire is a security event, not
+ * a slow engine; a 409 for a result another request is answering).
  *
  * The bridge is told who asks (`caller`, the gateway key's hash), for which leg (`target`) and
  * on which face (`face`: the ids it hands out are that face's); its `bridge` event (which
@@ -137,7 +153,10 @@ export function pickEngine(adapter, spec, mcp, ctx = {}) {
  * A failure says which engine failed (`toolMode`, and `fallback` when it was not auto's first
  * pick) next to what the engine spent (`usage`, `retries`: emulate.js), for the usage row.
  */
-export async function* toolEvents({ adapter, model, target = null, effort = null }, { spec, messages, plain, signal, includeReasoning = false, maxTokens, state = null, mcp = null, log = () => {}, caller = '', face = 'openai' }) {
+export async function* toolEvents(
+  { adapter, model, target = null, effort = null },
+  { spec, messages, plain, signal, includeReasoning = false, maxTokens, state = null, mcp = null, log = () => {}, caller = '', face = 'openai', harnessId = null, trace = null },
+) {
   const ctx = { messages, caller, target: target || `${adapter.id}/${model}`, effort };
   const pick = pickEngine(adapter, spec, mcp, ctx);
   if (pick.engine === 'plain') {
@@ -145,12 +164,65 @@ export async function* toolEvents({ adapter, model, target = null, effort = null
     // history (earlier calls, fenced results) rendered the EMULATE way, and no session resumed.
     if (state) state.mode = 'emulate';
     const rendered = { system: '', prompt: renderPrompt({ spec, messages }) };
-    const events = adapter.complete({ model, messages: plain, session: null, signal, maxTokens, includeReasoning, effort, rendered });
+    const events = adapter.complete({ model, messages: plain, session: null, signal, maxTokens, includeReasoning, effort, rendered, harnessId, trace });
     yield* withMode(dropSessions(events), 'emulate', null);
     return;
   }
   let fallback = pick.fallback || null;
   let carried = null;
+  if (pick.engine === 'uhp') {
+    if (state) state.mode = 'uhp';
+    const held = [];
+    let started = false;
+    const said = () => ({ type: 'tool_mode', mode: 'uhp' });
+    try {
+      const stream = adapter.complete({
+        model,
+        messages,
+        session: null,
+        signal,
+        maxTokens,
+        includeReasoning,
+        effort,
+        tools: spec.tools,
+        toolChoice: spec.choice,
+        harnessId,
+        trace,
+      });
+      for await (const evt of stream) {
+        if (!started && evt.type === 'error') {
+          throw Object.assign(new LlmError(evt.message, { status: 502, provider: adapter.id }), {
+            fallbackReason: evt.code || null,
+            noFallback: !!evt.noFallback,
+          });
+        }
+        if (!started && evt.type !== 'delta' && evt.type !== 'tool_call') {
+          held.push(evt);
+          continue;
+        }
+        if (!started) {
+          started = true;
+          yield said();
+          yield* held.splice(0);
+        }
+        yield evt;
+      }
+      if (!started) {
+        yield said();
+        yield* held.splice(0);
+      }
+      return;
+    } catch (e) {
+      for (const evt of held) if (evt.type === 'usage') carried = sumUsage(carried, evt.usage);
+      if (e && typeof e === 'object' && e.usage) carried = maxUsage(carried, e.usage);
+      if (started || (adapter.toolMode || 'auto') !== 'auto' || signal?.aborted || e?.noFallback) {
+        if (carried && e && typeof e === 'object') e.usage = carried;
+        throw engineFailed(e, 'uhp', fallback);
+      }
+      fallback = typeof e?.fallbackReason === 'string' && e.fallbackReason ? e.fallbackReason.slice(0, 40) : 'uhp_failed';
+      log(`${adapter.id}/${model}: native UHP tools failed before any call (${fallback}: ${String(e?.message || e).slice(0, 160)}); this request runs as EMULATE`);
+    }
+  }
   if (pick.engine === 'mcp') {
     if (state) state.mode = 'mcp';
     const held = [];

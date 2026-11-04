@@ -3,6 +3,8 @@ import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { redactSecrets } from './redact.js';
 import { checkMedia, hasMedia, upstreamMessages } from './media.js';
 
+const UHP_TOOL_MODES = ['off', 'emulate', 'uhp', 'auto'];
+
 /**
  * Talk to an HTTP upstream that already speaks a chat API and translate its stream
  * into canonical keysmith events.
@@ -10,6 +12,7 @@ import { checkMedia, hasMedia, upstreamMessages } from './media.js';
  * Wires:
  *   openai     POST {base}/chat/completions  — OpenAI, evren, Ollama, OpenRouter, vLLM, GitHub Copilot…
  *   anthropic  POST {base}/messages          — Claude Messages API and clones
+ *   uhp        POST {base}/responses         — Unified Harness Protocol (HarnessRouter CE / Cloud, Keysmith UHP)
  */
 export class HttpAdapter {
   constructor(id, cfg) {
@@ -34,9 +37,23 @@ export class HttpAdapter {
     // Answers only a request that names it: never an alias leg, never probed (Gateway.resolve).
     this.explicitOnly = !!cfg.explicitOnly;
     this.unsafeTools = false;
-    // An HTTP upstream takes tools one way: verbatim (the chat face's relay). toolMode is a CLI's.
-    if (cfg.toolMode != null && cfg.toolMode !== 'off') {
-      throw new Error(`adapter "${id}": toolMode is a CLI adapter's field — an HTTP upstream on the openai wire is handed tool requests verbatim`);
+    this.harnessId = typeof cfg.harnessId === 'string' && cfg.harnessId.trim() ? cfg.harnessId.trim() : null;
+    this.backend = typeof cfg.backend === 'string' && cfg.backend.trim() ? cfg.backend.trim() : null;
+    this.uhpVersion = typeof cfg.uhpVersion === 'string' && cfg.uhpVersion.trim() ? cfg.uhpVersion.trim() : '2026-10-19';
+    if (this.wire === 'uhp') {
+      const mode = cfg.toolMode ?? 'auto';
+      if (!UHP_TOOL_MODES.includes(mode)) {
+        throw new Error(`adapter "${id}": toolMode on the uhp wire must be one of ${UHP_TOOL_MODES.join(', ')} — got ${JSON.stringify(mode)}`);
+      }
+      this.toolMode = mode;
+      this.maxPromptChars = cfg.maxPromptChars ?? 500_000;
+      this._uhpToolsIgnored = false;
+    } else {
+      // An HTTP upstream takes tools one way: verbatim (the chat face's relay). toolMode is a CLI's.
+      if (cfg.toolMode != null && cfg.toolMode !== 'off') {
+        throw new Error(`adapter "${id}": toolMode is a CLI adapter's field — an HTTP upstream on the openai wire is handed tool requests verbatim`);
+      }
+      this.toolMode = 'off';
     }
     // Request fields sent with one upstream model unless the client set them itself:
     // `{ "gemini-4-argon": { "reasoning_effort": "high" } }`, `"*"` for every model.
@@ -49,7 +66,7 @@ export class HttpAdapter {
     // The media this upstream takes (`media`, `vision: true` for images): a user turn that carries
     // some goes up as a content array in the wire's own shapes (src/media.js). Any other upstream
     // is handed the text, each item a label: `[image omitted by keysmith]`.
-    const { kinds, limits } = checkMedia(id, cfg, { wire: this.wire, where: 'on the anthropic wire' });
+    const { kinds, limits } = checkMedia(id, cfg, { wire: this.wire, where: this.wire === 'uhp' ? 'on the uhp wire' : 'on the anthropic wire' });
     this.media = kinds;
     this.vision = kinds.includes('image');
     this.mediaOpts = { adapterId: id, wire: this.wire, kinds, limits, fetchUrls: cfg._fetchMedia !== false };
@@ -59,21 +76,82 @@ export class HttpAdapter {
   }
 
   get resumeArgs() {
-    return null; // HTTP upstreams are stateless; the client always sends full history.
+    return null; // HTTP upstreams are stateless; UHP sessions chain via previous_response_id.
   }
 
   get resumable() {
-    return false;
+    return this.wire === 'uhp';
+  }
+
+  ready() {}
+
+  async acquire() {
+    return () => {};
+  }
+
+  /**
+   * Run one EMULATE tool turn over UHP when the upstream does not execute client tools natively
+   * (e.g. HarnessRouter CE, which reports `ignored_fields: ["tools"]`).
+   */
+  emulateRun({ text, model, effort = null, timeoutMs = this.timeoutMs, signal }) {
+    const ctrl = new AbortController();
+    const onAbort = () => ctrl.abort(new Error('client disconnected'));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    let killed = false;
+    let stopReason = '';
+    const stop = (why = 'stopped') => {
+      killed = true;
+      stopReason = why;
+      ctrl.abort(new Error(why));
+    };
+    let resolveDone;
+    const done = new Promise((r) => {
+      resolveDone = r;
+    });
+    const self = this;
+    const events = (async function* () {
+      try {
+        const stream = self.complete({
+          model,
+          messages: [{ role: 'user', content: text }],
+          signal: ctrl.signal,
+          includeReasoning: true,
+          effort,
+          timeoutMs,
+        });
+        for await (const evt of stream) {
+          yield evt;
+        }
+        resolveDone({ code: 0, killed, stderr: stopReason });
+      } catch (e) {
+        const isTimeout = e instanceof LlmError && e.status === 504;
+        if (killed || isTimeout) {
+          resolveDone({ code: 1, killed: true, stderr: stopReason || e?.message || 'timeout' });
+        } else {
+          yield { type: 'error', message: e?.message || String(e) };
+          resolveDone({ code: 1, killed: false, stderr: e?.message || String(e) });
+        }
+      } finally {
+        signal?.removeEventListener('abort', onAbort);
+      }
+    })();
+    return { events, done, stop };
   }
 
   route(suffix) {
-    const tail = this.wire === 'anthropic' ? '/messages' : '/chat/completions';
+    const tail = this.wire === 'anthropic' ? '/messages' : this.wire === 'uhp' ? '/responses' : '/chat/completions';
     return this.baseUrl.replace(new RegExp(tail + '$'), '') + suffix;
   }
 
-  authHeaders() {
-    if (!this._apiKey) return {};
-    return this.wire === 'anthropic' ? { 'x-api-key': this._apiKey, 'anthropic-version': '2023-06-01' } : { authorization: `Bearer ${this._apiKey}` };
+  authHeaders(extra = {}) {
+    const h = {};
+    if (this.wire === 'uhp') h['uhp-version'] = this.uhpVersion;
+    if (extra?.traceparent) h.traceparent = extra.traceparent;
+    if (extra?.tracestate) h.tracestate = extra.tracestate;
+    if (extra?.idempotencyKey) h['idempotency-key'] = extra.idempotencyKey;
+    if (!this._apiKey) return h;
+    if (this.wire === 'anthropic') return { ...h, 'x-api-key': this._apiKey, 'anthropic-version': '2023-06-01' };
+    return { ...h, authorization: `Bearer ${this._apiKey}` };
   }
 
   /**
@@ -83,6 +161,40 @@ export class HttpAdapter {
    */
   upstreamModel(model) {
     return typeof model === 'string' && Object.hasOwn(this.modelMap, model) ? this.modelMap[model] : model;
+  }
+
+  /**
+   * Decompose a UHP model target into `{ model, backend, harnessId }`:
+   *   - `chrn_<id>` or `chrn_<id>/<model>` -> custom harness id (+ optional model)
+   *   - `<backend>/<model>` (e.g. `claude/claude-sonnet-4-6`) -> backend + model
+   *   - `default` -> adapter defaults
+   *   - `<model>` or `<backend>` -> passed as `model`
+   */
+  parseUhpTarget(raw) {
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    if (!s || s === 'default') {
+      return { model: undefined, backend: this.backend || undefined, harnessId: this.harnessId || undefined };
+    }
+    if (s.startsWith('chrn_')) {
+      const slash = s.indexOf('/');
+      if (slash > 0) {
+        return {
+          harnessId: s.slice(0, slash),
+          model: s.slice(slash + 1) || undefined,
+          backend: this.backend || undefined,
+        };
+      }
+      return { harnessId: s, model: undefined, backend: this.backend || undefined };
+    }
+    const slash = s.indexOf('/');
+    if (slash > 0) {
+      return {
+        backend: s.slice(0, slash),
+        model: s.slice(slash + 1) || undefined,
+        harnessId: this.harnessId || undefined,
+      };
+    }
+    return { model: s, backend: this.backend || undefined, harnessId: this.harnessId || undefined };
   }
 
   /** `modelParams` for one upstream model id: the `"*"` entry, then the model's own on top (own entries only). */
@@ -110,11 +222,67 @@ export class HttpAdapter {
     if (!res.ok) throw new LlmError(`${this.id}: /models returned ${res.status}`, { status: 502, provider: this.id });
     const body = await res.json().catch(() => null);
     if (!body) throw new LlmError(`${this.id}: /models returned no JSON`, { status: 502, provider: this.id });
-    const list = Array.isArray(body) ? body : body.data || body.models || [];
     const strip = (id) => (this.stripModelPrefix && typeof id === 'string' && id.startsWith(this.stripModelPrefix) ? id.slice(this.stripModelPrefix.length) : id);
-    const fetched = list
-      .map((m) => (typeof m === 'string' ? { id: strip(m) } : { id: strip(m.id || m.name), name: m.name, contextWindow: m.context_length || m.context_window || m.limit?.context }))
-      .filter((m) => m.id);
+    const fetched = [];
+    const seen = new Set();
+    const push = (item) => {
+      if (!item?.id || seen.has(item.id)) return;
+      seen.add(item.id);
+      fetched.push(item);
+    };
+    if (body.backends && typeof body.backends === 'object' && !Array.isArray(body.backends)) {
+      for (const m of body.data || body.models || []) {
+        const entry = typeof m === 'string' ? { id: strip(m) } : { id: strip(m.id || m.name), name: m.name };
+        push(entry);
+      }
+      for (const [backend, info] of Object.entries(body.backends)) {
+        if (!info || typeof info !== 'object' || info.installed === false) continue;
+        const rawModels = Array.isArray(info.models) ? info.models : Array.isArray(info.available_models) ? info.available_models : [];
+        const availableModels = rawModels.filter((m) => m && (typeof m === 'string' || m.available !== false));
+        const defModel = info.default || info.default_model;
+        if (availableModels.length || defModel) {
+          push({ id: backend, name: defModel ? `${backend} (${defModel})` : backend });
+        }
+        for (const m of availableModels) {
+          const rawId = typeof m === 'string' ? m : m.id || m.name;
+          const mid = strip(rawId);
+          if (!mid) continue;
+          const mName = typeof m === 'string' ? mid : m.name || mid;
+          const efforts = typeof m === 'object' && Array.isArray(m.reasoning) && m.reasoning.length ? m.reasoning : undefined;
+          push({ id: mid, name: mName, ...(efforts ? { efforts } : {}) });
+          push({ id: `${backend}/${mid}`, name: typeof m === 'object' && m.name ? m.name : `${backend}/${mid}`, ...(efforts ? { efforts } : {}) });
+        }
+      }
+    } else {
+      const list = Array.isArray(body) ? body : body.data || body.models || [];
+      for (const m of list) {
+        const entry =
+          typeof m === 'string'
+            ? { id: strip(m) }
+            : {
+                id: strip(m.id || m.name),
+                name: m.name,
+                contextWindow: m.context_length || m.context_window || m.limit?.context,
+                ...(Array.isArray(m.efforts || m.reasoning) && (m.efforts || m.reasoning).length ? { efforts: m.efforts || m.reasoning } : {}),
+              };
+        push(entry);
+      }
+    }
+    if (this.wire === 'uhp') {
+      try {
+        const hRes = await fetch(this.route('/harnesses'), { headers: { ...this.authHeaders(), ...this.headers }, signal: AbortSignal.timeout(10_000) });
+        if (hRes.ok) {
+          const hBody = await hRes.json().catch(() => null);
+          const hList = hBody?.harnesses || hBody?.data || [];
+          for (const h of hList) {
+            if (h && typeof h.id === 'string' && h.id) {
+              push({ id: h.id, name: h.name || h.id });
+            }
+          }
+        }
+      } catch {}
+      if (!fetched.length && this.defaultModel) push({ id: this.defaultModel, name: this.defaultModel });
+    }
     this._modelCache = { at: Date.now(), list: fetched };
     return fetched;
   }
@@ -172,67 +340,463 @@ export class HttpAdapter {
     return new Response(tapped, { status: res.status, statusText: res.statusText, headers: res.headers });
   }
 
-  async *complete({ model, messages, maxTokens, temperature, signal, includeReasoning }) {
+  async *complete({
+    model,
+    messages,
+    session = null,
+    maxTokens,
+    temperature,
+    signal,
+    includeReasoning,
+    effort = null,
+    rendered = null,
+    timeoutMs = this.timeoutMs,
+    tools = null,
+    toolChoice = null,
+    harnessId = null,
+    trace = null,
+    idempotencyKey = null,
+  }) {
     // Read before anything is sent: a bad image is a 400 and the upstream never sees the request.
     if (this.media.length && hasMedia(messages)) messages = await upstreamMessages(messages, this.mediaOpts, { signal });
     const withMedia = messages.some((m) => Array.isArray(m.content));
     const controller = new AbortController();
     const onAbort = () => controller.abort(new Error('client disconnected'));
     signal?.addEventListener('abort', onAbort, { once: true });
-    const timer = setTimeout(() => controller.abort(new Error(`timeout after ${this.timeoutMs}ms`)), this.timeoutMs);
+    const budgetMs = timeoutMs || this.timeoutMs;
+    const timer = setTimeout(() => controller.abort(new Error(`timeout after ${budgetMs}ms`)), budgetMs);
     const isAnthropic = this.wire === 'anthropic';
+    const isUhp = this.wire === 'uhp';
     const system = messages.find((m) => m.role === 'system');
     // `modelParams` go first, so the fields keysmith builds (model, messages, stream…) win.
     const payload = { ...this.paramsFor(this.upstreamModel(model)) };
-    Object.assign(payload, isAnthropic
-      ? {
-          model: this.upstreamModel(model),
-          // The Messages API requires max_tokens: the client's, else the model's own in `modelParams`, else 4096.
-          // Built after `modelParams`, a bare 4096 here overwrote the model's value every time, and a thinking
-          // model ran out of answer on any long reply.
-          max_tokens: maxTokens || payload.max_tokens || 4096,
-          stream: true,
-          messages: messages.filter((m) => m.role !== 'system'),
-          ...(system?.content ? { system: system.content } : {}),
-        }
-      : {
-          model: this.upstreamModel(model),
+    if (isUhp) {
+      Object.assign(
+        payload,
+        buildUhpPayload(this, payload, {
+          model,
           messages,
-          stream: true,
-          stream_options: { include_usage: true },
-          ...(maxTokens ? { max_tokens: maxTokens } : {}),
-          ...(temperature != null ? { temperature } : {}),
-        });
+          session,
+          maxTokens,
+          effort,
+          rendered,
+          tools,
+          toolChoice,
+          harnessId,
+        }),
+      );
+    } else if (isAnthropic) {
+      Object.assign(payload, {
+        model: this.upstreamModel(model),
+        // The Messages API requires max_tokens: the client's, else the model's own in `modelParams`, else 4096.
+        // Built after `modelParams`, a bare 4096 here overwrote the model's value every time, and a thinking
+        // model ran out of answer on any long reply.
+        max_tokens: maxTokens || payload.max_tokens || 4096,
+        stream: true,
+        messages: messages.filter((m) => m.role !== 'system'),
+        ...(system?.content ? { system: system.content } : {}),
+        ...(effort ? { output_config: { effort } } : {}),
+      });
+    } else {
+      Object.assign(payload, {
+        model: this.upstreamModel(model),
+        messages,
+        stream: true,
+        stream_options: { include_usage: true },
+        ...(maxTokens ? { max_tokens: maxTokens } : {}),
+        ...(temperature != null ? { temperature } : {}),
+        ...(effort && !payload.reasoning_effort && !payload.reasoning ? { reasoning_effort: effort } : {}),
+      });
+    }
 
+    const endpoint = isUhp ? '/responses' : isAnthropic ? '/messages' : '/chat/completions';
     let res;
     try {
-      res = await fetch(this.route(isAnthropic ? '/messages' : '/chat/completions'), {
+      res = await fetch(this.route(endpoint), {
         method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'text/event-stream', ...this.authHeaders(), ...this.headers, ...(withMedia ? this.mediaHeaders : {}) },
+        headers: {
+          'content-type': 'application/json',
+          accept: 'text/event-stream',
+          ...this.authHeaders({ traceparent: trace?.traceparent, tracestate: trace?.tracestate, idempotencyKey }),
+          ...this.headers,
+          ...(withMedia ? this.mediaHeaders : {}),
+        },
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
     } catch (e) {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       const timeout = /abort|timeout/i.test(e.message ?? '');
       throw new LlmError(`${this.id}: ${e.message}`, { status: timeout ? 504 : 502, provider: this.id, retriable: true });
     }
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       throw upstreamError(this.id, res, text);
     }
     try {
-      const events = isAnthropic ? parseAnthropicStream(res.body) : parseOpenaiStream(res.body);
+      const events = isUhp
+        ? parseUhpStream(res, { expectTools: !!(tools && tools.length), adapter: this })
+        : isAnthropic
+          ? parseAnthropicStream(res.body)
+          : parseOpenaiStream(res.body);
       for await (const evt of events) {
         if (evt.type === 'reasoning' && !includeReasoning) continue;
         yield evt;
       }
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       controller.abort(new Error('stream drained'));
     }
   }
+}
+
+/**
+ * Build a UHP `POST /v1/responses` request body from Keysmith's canonical turn inputs.
+ */
+function buildUhpPayload(adapter, baseParams, { model, messages, session, maxTokens, effort, rendered, tools, toolChoice, harnessId }) {
+  const upstream = adapter.upstreamModel(model);
+  const target = adapter.parseUhpTarget(upstream);
+  const out = { stream: true };
+  if (target.model) out.model = target.model;
+  else delete out.model;
+  if (target.backend) out.backend = target.backend;
+  const hid = harnessId || target.harnessId;
+  if (hid) {
+    out.metadata = { ...(baseParams?.metadata || {}), harness_id: hid };
+  }
+  const eff = effort || baseParams?.reasoning?.effort || baseParams?.reasoning_effort;
+  if (eff) {
+    out.reasoning = { ...(baseParams?.reasoning || {}), effort: eff };
+  }
+  if (maxTokens) out.max_output_tokens = maxTokens;
+
+  if (rendered && typeof rendered.prompt === 'string') {
+    if (rendered.system) out.instructions = rendered.system;
+    out.input = [{ role: 'user', content: [{ type: 'input_text', text: rendered.prompt }] }];
+  } else {
+    const sys = messages
+      .filter((m) => m.role === 'system' || m.role === 'developer')
+      .map((m) => (typeof m.content === 'string' ? m.content : ''))
+      .filter(Boolean)
+      .join('\n\n');
+    const conv = messages.filter((m) => m.role !== 'system' && m.role !== 'developer');
+    if (session) {
+      out.previous_response_id = session;
+      const lastAsst = findLastIndex(conv, (m) => m.role === 'assistant');
+      const tail = lastAsst >= 0 ? conv.slice(lastAsst + 1) : conv.slice(-1);
+      out.input = toUhpInputItems(tail.length ? tail : conv.slice(-1));
+    } else {
+      if (sys) out.instructions = sys;
+      out.input = toUhpInputItems(conv);
+    }
+  }
+
+  if (tools?.length) {
+    out.tools = tools.map((t) => ({
+      type: 'function',
+      name: t.name,
+      description: t.description || '',
+      parameters: t.parameters || { type: 'object', properties: {} },
+    }));
+    if (toolChoice) {
+      if (toolChoice.mode === 'required') out.tool_choice = 'required';
+      else if (toolChoice.mode === 'named' && toolChoice.name) out.tool_choice = { type: 'function', name: toolChoice.name };
+      else if (toolChoice.mode === 'none') out.tool_choice = 'none';
+    }
+  }
+  return out;
+}
+
+function findLastIndex(arr, pred) {
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (pred(arr[i], i)) return i;
+  }
+  return -1;
+}
+
+function toUhpInputItems(messages) {
+  const items = [];
+  for (const m of messages || []) {
+    if (m.role === 'user') {
+      if (Array.isArray(m.content)) {
+        const parts = m.content.map((p) => (p.type === 'text' ? { type: 'input_text', text: p.text || '' } : p));
+        items.push({ role: 'user', content: parts });
+      } else {
+        items.push({ role: 'user', content: [{ type: 'input_text', text: String(m.content ?? '') }] });
+      }
+    } else if (m.role === 'assistant') {
+      if (typeof m.content === 'string' && m.content) {
+        items.push({ role: 'assistant', content: [{ type: 'output_text', text: m.content }] });
+      }
+      if (Array.isArray(m.toolCalls)) {
+        for (const tc of m.toolCalls) {
+          items.push({
+            type: 'function_call',
+            call_id: tc.id || 'call_1',
+            name: tc.name,
+            arguments: typeof tc.rawArgs === 'string' ? tc.rawArgs : JSON.stringify(tc.arguments ?? {}),
+          });
+        }
+      }
+    } else if (m.role === 'tool') {
+      items.push({
+        type: 'function_call_output',
+        call_id: m.toolCallId || m.id || 'call_1',
+        output: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
+      });
+    }
+  }
+  return items;
+}
+
+/**
+ * Parse a UHP `/v1/responses` stream (or JSON response on an idempotent replay) into canonical
+ * keysmith events: `session`, `reasoning`, `delta`, `tool_call`, `usage`, `usage_unknown`, `error`, `done`.
+ */
+async function* parseUhpStream(res, { expectTools = false, adapter = null } = {}) {
+  const adapterId = adapter?.id || 'uhp';
+  const ct = res.headers?.get?.('content-type') || '';
+  if (!ct.includes('text/event-stream')) {
+    const body = await res.json().catch(() => null);
+    if (!body) {
+      yield { type: 'error', message: `${adapterId}: empty response` };
+      yield { type: 'done', finishReason: 'stop' };
+      return;
+    }
+    yield* eventsFromUhpResponse(body, { expectTools, adapter });
+    return;
+  }
+
+  let sessionSent = false;
+  let anyDelta = false;
+  let anyReasoning = false;
+  let usageSent = false;
+  const functionCalls = new Map();
+  const resultedCalls = new Set();
+
+  for await (const data of sseEvents(res.body)) {
+    if (data === '[DONE]') break;
+    let d;
+    try {
+      d = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    const type = d.type;
+    if (type === 'response.created' || type === 'response.in_progress') {
+      const resp = d.response;
+      const ignored = resp?.metadata?.ignored_fields;
+      if (Array.isArray(ignored) && ignored.includes('tools')) {
+        if (adapter) adapter._uhpToolsIgnored = true;
+        if (expectTools) {
+          const err = new LlmError(`${adapterId}: upstream ignored tools field`, { status: 502, provider: adapter?.id });
+          err.fallbackReason = 'uhp_tools_ignored';
+          throw err;
+        }
+      }
+      if (resp?.id && !sessionSent) {
+        sessionSent = true;
+        yield { type: 'session', id: resp.id };
+      }
+    } else if (type === 'response.output_text.delta') {
+      if (typeof d.delta === 'string' && d.delta) {
+        anyDelta = true;
+        yield { type: 'delta', text: d.delta };
+      }
+    } else if (
+      type === 'response.reasoning_summary_text.delta' ||
+      type === 'response.reasoning.delta' ||
+      type === 'response.reasoning_text.delta'
+    ) {
+      if (typeof d.delta === 'string' && d.delta) {
+        anyReasoning = true;
+        yield { type: 'reasoning', text: d.delta };
+      }
+    } else if (type === 'response.output_item.added' || type === 'response.output_item.done') {
+      const item = d.item;
+      if (item?.type === 'function_call') {
+        const cid = item.call_id || item.id;
+        if (cid) functionCalls.set(cid, item);
+      } else if (item?.type === 'function_call_output') {
+        if (item.call_id) resultedCalls.add(item.call_id);
+      }
+    } else if (type === 'response.function_call_arguments.done') {
+      if (d.item_id) {
+        for (const [cid, item] of functionCalls.entries()) {
+          if (item.id === d.item_id || cid === d.item_id) {
+            functionCalls.set(cid, { ...item, arguments: d.arguments ?? item.arguments });
+          }
+        }
+      }
+    } else if (type === 'response.completed' || type === 'response.incomplete') {
+      const resp = d.response || {};
+      if (resp.id && !sessionSent) {
+        sessionSent = true;
+        yield { type: 'session', id: resp.id };
+      }
+      for (const item of resp.output || []) {
+        if (item?.type === 'function_call') {
+          const cid = item.call_id || item.id;
+          if (cid) functionCalls.set(cid, item);
+        } else if (item?.type === 'function_call_output' && item.call_id) {
+          resultedCalls.add(item.call_id);
+        } else if (item?.type === 'reasoning' && !anyReasoning) {
+          for (const s of item.summary || []) {
+            if (s?.text) {
+              anyReasoning = true;
+              yield { type: 'reasoning', text: s.text };
+            }
+          }
+        } else if (item?.type === 'message' && !anyDelta) {
+          for (const c of item.content || []) {
+            if ((c?.type === 'output_text' || c?.type === 'text') && c.text) {
+              anyDelta = true;
+              yield { type: 'delta', text: c.text };
+            }
+          }
+        }
+      }
+      const clientCalls = [...functionCalls.entries()].filter(([cid]) => !resultedCalls.has(cid));
+      for (const [cid, fc] of clientCalls) {
+        const rawArgs = typeof fc.arguments === 'string' ? fc.arguments : JSON.stringify(fc.arguments ?? {});
+        let args = {};
+        try {
+          args = rawArgs ? JSON.parse(rawArgs) : {};
+        } catch {}
+        yield { type: 'tool_call', id: cid, name: fc.name, arguments: rawArgs, args };
+      }
+      const uEvt = extractUhpUsage(resp.usage || d.usage, adapterId);
+      if (uEvt) {
+        usageSent = true;
+        yield uEvt;
+      }
+      yield { type: 'done', finishReason: clientCalls.length ? 'tool_calls' : resp.status === 'incomplete' ? 'length' : 'stop' };
+      return;
+    } else if (type === 'response.failed' || type === 'error') {
+      const errObj = d.response?.error || d.error;
+      const msg = typeof errObj === 'string' ? errObj : errObj?.message || 'uhp stream error';
+      yield { type: 'error', message: redactSecrets(msg) };
+      const uEvt = extractUhpUsage(d.response?.usage || d.usage, adapterId);
+      if (uEvt && !usageSent) {
+        usageSent = true;
+        yield uEvt;
+      }
+      yield { type: 'done', finishReason: 'stop' };
+      return;
+    }
+  }
+
+  const clientCalls = [...functionCalls.entries()].filter(([cid]) => !resultedCalls.has(cid));
+  for (const [cid, fc] of clientCalls) {
+    const rawArgs = typeof fc.arguments === 'string' ? fc.arguments : JSON.stringify(fc.arguments ?? {});
+    let args = {};
+    try {
+      args = rawArgs ? JSON.parse(rawArgs) : {};
+    } catch {}
+    yield { type: 'tool_call', id: cid, name: fc.name, arguments: rawArgs, args };
+  }
+  yield { type: 'done', finishReason: clientCalls.length ? 'tool_calls' : 'stop' };
+}
+
+function* eventsFromUhpResponse(resp, { expectTools = false, adapter = null } = {}) {
+  const adapterId = adapter?.id || 'uhp';
+  const ignored = resp?.metadata?.ignored_fields;
+  if (Array.isArray(ignored) && ignored.includes('tools')) {
+    if (adapter) adapter._uhpToolsIgnored = true;
+    if (expectTools) {
+      const err = new LlmError(`${adapterId}: upstream ignored tools field`, { status: 502, provider: adapter?.id });
+      err.fallbackReason = 'uhp_tools_ignored';
+      throw err;
+    }
+  }
+  if (resp.id) yield { type: 'session', id: resp.id };
+  if (resp.status === 'failed' || resp.error) {
+    const errObj = resp.error;
+    const msg = typeof errObj === 'string' ? errObj : errObj?.message || 'uhp response failed';
+    yield { type: 'error', message: redactSecrets(msg) };
+    const uEvt = extractUhpUsage(resp.usage, adapterId);
+    if (uEvt) yield uEvt;
+    yield { type: 'done', finishReason: 'stop' };
+    return;
+  }
+  const functionCalls = new Map();
+  const resultedCalls = new Set();
+  for (const item of resp.output || []) {
+    if (item?.type === 'reasoning') {
+      for (const s of item.summary || []) {
+        if (s?.text) yield { type: 'reasoning', text: s.text };
+      }
+    } else if (item?.type === 'message') {
+      for (const c of item.content || []) {
+        if ((c?.type === 'output_text' || c?.type === 'text') && c.text) {
+          yield { type: 'delta', text: c.text };
+        }
+      }
+    } else if (item?.type === 'function_call') {
+      const cid = item.call_id || item.id;
+      if (cid) functionCalls.set(cid, item);
+    } else if (item?.type === 'function_call_output' && item.call_id) {
+      resultedCalls.add(item.call_id);
+    }
+  }
+  const clientCalls = [...functionCalls.entries()].filter(([cid]) => !resultedCalls.has(cid));
+  for (const [cid, fc] of clientCalls) {
+    const rawArgs = typeof fc.arguments === 'string' ? fc.arguments : JSON.stringify(fc.arguments ?? {});
+    let args = {};
+    try {
+      args = rawArgs ? JSON.parse(rawArgs) : {};
+    } catch {}
+    yield { type: 'tool_call', id: cid, name: fc.name, arguments: rawArgs, args };
+  }
+  const uEvt = extractUhpUsage(resp.usage, adapterId);
+  if (uEvt) yield uEvt;
+  yield { type: 'done', finishReason: clientCalls.length ? 'tool_calls' : resp.status === 'incomplete' ? 'length' : 'stop' };
+}
+
+/**
+ * Extract canonical usage or unknown-usage marker from a UHP `/v1/responses` usage object.
+ * Preserves unknown usage (`keysmith_usage === 'unknown'`, or explicit null token counts)
+ * as `{ type: 'usage_unknown', reason }` so `usage.jsonl` never writes 0 for unknown counts and
+ * downstream faces format unknown counts according to `protocols.js` wire conformance rules.
+ */
+function extractUhpUsage(u, adapterId = 'uhp') {
+  if (!u || typeof u !== 'object') return null;
+  if (u.keysmith_usage === 'unknown') {
+    return {
+      type: 'usage_unknown',
+      reason: typeof u.reason === 'string' && u.reason ? u.reason : `${adapterId} reported unknown token counts`,
+    };
+  }
+  const hasInput = typeof u.input_tokens === 'number' || typeof u.prompt_tokens === 'number';
+  const hasOutput = typeof u.output_tokens === 'number' || typeof u.completion_tokens === 'number';
+  const hasTotal = typeof u.total_tokens === 'number';
+  if (!hasInput && !hasOutput && !hasTotal) {
+    if (u.input_tokens === null || u.output_tokens === null || u.total_tokens === null || typeof u.reason === 'string') {
+      return {
+        type: 'usage_unknown',
+        reason: typeof u.reason === 'string' && u.reason ? u.reason : `${adapterId} reported null token counts`,
+      };
+    }
+    return null;
+  }
+  const cacheRead = u.input_tokens_details?.cached_tokens || u.cache_read_tokens || u.cache_read_input_tokens || 0;
+  const cacheWrite = u.cache_write_tokens || u.cache_creation_input_tokens || 0;
+  const reasoning = u.output_tokens_details?.reasoning_tokens || u.reasoning_tokens || 0;
+  return {
+    type: 'usage',
+    usage: {
+      input: u.input_tokens ?? u.prompt_tokens ?? 0,
+      output: u.output_tokens ?? u.completion_tokens ?? 0,
+      cacheRead,
+      cacheWrite,
+      ...(reasoning ? { reasoning } : {}),
+      ...(hasTotal && !hasInput && !hasOutput ? { total: u.total_tokens } : {}),
+    },
+  };
 }
 
 /**
@@ -303,15 +867,22 @@ async function* parseOpenaiStream(body) {
     if (typeof text === 'string' && text) yield { type: 'delta', text };
     if (choice?.delta?.reasoning_content) yield { type: 'reasoning', text: choice.delta.reasoning_content };
     if (d.usage) {
-      yield {
-        type: 'usage',
-        usage: {
-          input: d.usage.prompt_tokens || 0,
-          output: d.usage.completion_tokens || 0,
-          cacheRead: d.usage.prompt_tokens_details?.cached_tokens || d.usage.cached_tokens || 0,
-          cacheWrite: 0,
-        },
-      };
+      if (d.usage.keysmith_usage === 'unknown') {
+        yield {
+          type: 'usage_unknown',
+          reason: typeof d.usage.reason === 'string' && d.usage.reason ? d.usage.reason : 'upstream reported unknown token counts',
+        };
+      } else {
+        yield {
+          type: 'usage',
+          usage: {
+            input: d.usage.prompt_tokens || 0,
+            output: d.usage.completion_tokens || 0,
+            cacheRead: d.usage.prompt_tokens_details?.cached_tokens || d.usage.cached_tokens || 0,
+            cacheWrite: 0,
+          },
+        };
+      }
     }
     if (choice?.finish_reason) yield { type: 'done', finishReason: choice.finish_reason };
     // Redacted here, at the source: a provider that rejects its key mid-stream quotes it, and
@@ -338,13 +909,22 @@ async function* parseAnthropicStream(body) {
         const u = d.message?.usage;
         // Anthropic's input_tokens is the uncached input alone: `input` is everything charged as
         // input, the cache read and written included (parsers.js, the usage convention).
-        const cacheRead = u?.cache_read_input_tokens || 0;
-        const cacheWrite = u?.cache_creation_input_tokens || 0;
-        if (u) yield { type: 'usage', usage: { input: (u.input_tokens || 0) + cacheRead + cacheWrite, output: u.output_tokens || 0, cacheRead, cacheWrite } };
+        if (u && u.keysmith_usage !== 'unknown') {
+          const cacheRead = u.cache_read_input_tokens || 0;
+          const cacheWrite = u.cache_creation_input_tokens || 0;
+          yield { type: 'usage', usage: { input: (u.input_tokens || 0) + cacheRead + cacheWrite, output: u.output_tokens || 0, cacheRead, cacheWrite } };
+        }
         break;
       }
       case 'message_delta':
-        if (d.usage?.output_tokens) yield { type: 'usage', usage: { input: 0, output: d.usage.output_tokens, cacheRead: 0, cacheWrite: 0 } };
+        if (d.usage?.keysmith_usage === 'unknown') {
+          yield {
+            type: 'usage_unknown',
+            reason: typeof d.usage.reason === 'string' && d.usage.reason ? d.usage.reason : 'upstream reported unknown token counts',
+          };
+        } else if (d.usage?.output_tokens) {
+          yield { type: 'usage', usage: { input: 0, output: d.usage.output_tokens, cacheRead: 0, cacheWrite: 0 } };
+        }
         break;
       case 'error':
         yield { type: 'error', message: redactSecrets(d.error?.message || 'anthropic stream error') };

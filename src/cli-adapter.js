@@ -750,7 +750,7 @@ function checkTemplate(id, field, tpl) {
 }
 
 /** The bridge drivers there are (src/bridge/drivers.js), by the name `bridge.driver` takes. */
-export const BRIDGE_DRIVERS = ['agy', 'opencode', 'codex', 'qoder', 'claude'];
+export const BRIDGE_DRIVERS = ['agy', 'opencode', 'codex', 'qoder', 'claude', 'gemini', 'kimi'];
 
 /**
  * The MCP bridge's settings on a CLI entry (src/bridge): an object; its `driver` one of

@@ -49,12 +49,12 @@ function normaliseUsage(u = {}) {
   };
   const cache = u.cache && typeof u.cache === 'object' ? u.cache : {};
   const usage = {
-    input: pick('inputTokens', 'input_tokens', 'prompt_tokens', 'input'),
-    output: pick('outputTokens', 'output_tokens', 'completion_tokens', 'output'),
-    cacheRead: pick('cacheReadTokens', 'cache_read_input_tokens', 'cache_read_tokens') || cache.read || 0,
-    cacheWrite: pick('cacheWriteTokens', 'cache_creation_input_tokens') || cache.write || 0,
+    input: pick('inputTokens', 'input_tokens', 'prompt_tokens', 'input', 'tokensIn'),
+    output: pick('outputTokens', 'output_tokens', 'completion_tokens', 'output', 'tokensOut'),
+    cacheRead: pick('cacheReadTokens', 'cache_read_input_tokens', 'cache_read_tokens', 'cached_tokens', 'cached', 'cacheReads', 'cacheRead') || cache.read || 0,
+    cacheWrite: pick('cacheWriteTokens', 'cache_creation_input_tokens', 'cache_write_tokens', 'cacheWrites', 'cacheWrite') || cache.write || 0,
   };
-  const reasoning = pick('reasoning_output_tokens', 'reasoningTokens');
+  const reasoning = pick('reasoning_output_tokens', 'reasoningTokens', 'reasoning_tokens', 'thoughts');
   if (reasoning) usage.reasoning = reasoning;
   const total = pick('total', 'total_tokens');
   if (total && !usage.input && !usage.output) usage.total = total;
@@ -203,22 +203,7 @@ export async function* opencodeNdjson(lines) {
 
 /**
  * Claude-Code-shaped stream (`claude -p --output-format stream-json`), which
- * Qoder CLI and other Claude-derived harnesses imitate. Message objects arrive whole,
- * so deltas are computed against what has already been forwarded — per text block of a message
- * (Claude Code prints each content block of a message on a line of its own, under the message's
- * id): a second text block of one message is forwarded whole, never cut by the first one's length,
- * and joined to it with nothing between, as the text of two messages always was. A `tool_use` content block is
- * a `tool` event, once per block id — printed with the assistant message that made the call,
- * before the harness runs it (qodercli 1.1.59: `mcp__<server>__<tool>` for an MCP server's tool;
- * with its lazy MCP, `mcp_call` with the tool's name in `input.toolName`, read as that tool).
- *
- * Usage is Anthropic's (`input_tokens` the uncached input, the cache's counts beside it): `input`
- * here is all three (cacheExclusive). The `result` line's is the run's whole spend (`scope:
- * 'run'`). `perMessageUsage` (the MCP bridge, where one run answers several HTTP turns): each
- * assistant message's own usage as well, as it grows — Claude Code 2.1.303 prints the usage of
- * the message's start on every content block of it (the output count is the stream's first, not
- * its last), so a message's input and cache counts are exact when its call goes out, its output
- * count is not, and the result line at the end of the run says what the run spent in all.
+ * Qoder CLI and other Claude-derived harnesses imitate.
  */
 export async function* claudeStreamJson(lines, { perMessageUsage = false } = {}) {
   const blocks = wholeBlocks(); // per message id
@@ -274,28 +259,6 @@ export async function* claudeStreamJson(lines, { perMessageUsage = false } = {})
 
 /**
  * Antigravity CLI (`agy --output-format stream-json -p …`) — verified against agy 1.3.3.
- *
- *   {"event":"init","conversation_id":"…","init":{"model":…,"tools":[…]}}
- *   {"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"po"}}
- *   {"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":"ng","usage":{…}}}
- *   {"event":"step_update","step_update":{"step_index":2,"step_type":"tool","state":"ACTIVE","tool_name":"manage_task",…}}
- *   {"event":"result","result":{"status":"SUCCESS","response":"pong","usage":{…},"denied_actions":[…]}}
- *
- * Three things the shape gets wrong for a completion API, all handled here:
- *  - `result.usage` is the whole conversation's total, so a resumed thread reports every
- *    earlier turn again. The per-step usage on `agent_response` steps is what this run
- *    actually spent; it is summed and reported once.
- *  - Headless mode cannot ask for tool permission, so a model that reaches for a tool is
- *    auto-denied and the run "succeeds" with an empty response. That is an error, named.
- *  - A run is an agent loop, not one answer: after its text the model may call a tool and
- *    answer again, as often as it likes. Each tool step is reported once as a `tool` event,
- *    so an adapter that wants one answer can end the run there. A run stopped that way has
- *    no `result` line, so the usage counted so far is reported when the stream ends.
- *
- * `perStepUsage` (the MCP bridge, src/bridge/index.js): each agent_response step's usage is its
- * own `usage` event as the step ends, and nothing is summed — one run of the bridge answers
- * several HTTP turns, and each turn reports the steps it ran. The `result` line's total is
- * reported only when no step carried usage. Text runs read the stream as they always did.
  */
 export async function* agyStreamJson(lines, { perStepUsage = false } = {}) {
   let emitted = false;
@@ -338,8 +301,6 @@ export async function* agyStreamJson(lines, { perStepUsage = false } = {}) {
     } else if (d.event === 'result') {
       const r = d.result || {};
       yield* session(r.conversation_id);
-      // A resumed run's stream can carry no text deltas at all on some paths; the final
-      // response is still the answer, so it is the fallback rather than a dropped reply.
       if (!emitted && typeof r.response === 'string' && r.response.trim()) {
         emitted = true;
         yield EV.delta(r.response);
@@ -352,8 +313,6 @@ export async function* agyStreamJson(lines, { perStepUsage = false } = {}) {
         yield EV.error(truncate(`agy: ${r.status}${why ? ' — ' + why : ''}`, 400));
       } else if (!emitted && denied.length) {
         const names = denied.map((a) => a.display_name || a.action).filter(Boolean).join(', ');
-        // `code` is what lets the adapter retry this one failure (see `toolDenialRetry`)
-        // without pattern-matching an English sentence.
         yield EV.error(`agy: the model called ${names || 'a tool'}, which headless mode auto-denies, and answered nothing`, 'tool_denied');
       }
       yield EV.done('stop');
@@ -362,8 +321,6 @@ export async function* agyStreamJson(lines, { perStepUsage = false } = {}) {
       yield EV.error(truncate(`agy: ${typeof d.error === 'string' ? d.error : d.error?.message || d.message || 'error'}`, 400));
     }
   }
-  // No `result` line: the process was stopped or killed. What it spent is still spent (and,
-  // per step, was reported as each step ended).
   if (stepUsage && !perStepUsage && (spent.input || spent.output)) yield EV.usage(spent);
   yield EV.done('stop');
 }
@@ -391,20 +348,6 @@ function acpText(content) {
 
 /**
  * Kiro CLI (`kiro-cli chat --no-interactive --output-format stream-json`) — kiro-cli 2.27.1.
- * One `{type, data}` object per line, the run's ACP events wrapped:
- *
- *   {"type":"runStarted","data":{"payloadSchema":"acp","acpProtocolVersion":1,"engine":"v2"}}
- *   {"type":"metadata","data":{"sessionId":"…","contextUsagePercentage":0.76,…}}
- *   {"type":"sessionUpdate","data":{"sessionId":"…","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"O"}}}}
- *   {"type":"runFinished","data":{"finalText":"OK","finalTextTruncated":false}}
- *   {"type":"runError","data":{"sessionId":"…","stage":"prompt","message":"Internal error (code -32603): …"}}
- *
- * runStarted, metadata and runError were read off a live run, which the account's overage
- * limit refused before it wrote any text. The text events are the ACP `session/update`
- * notification (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`) and runFinished's
- * `finalText`, both named in the binary — so the answer is taken from the chunks, and from
- * `finalText` when no chunk carried any. A `sessionUpdate` whose payload is the update
- * itself (no `update` wrapper) is read the same way.
  */
 export async function* kiroStreamJson(lines) {
   let emitted = false;
@@ -420,8 +363,6 @@ export async function* kiroStreamJson(lines) {
       yield EV.session(data.sessionId);
     }
     if (d.type === 'metadata') {
-      // Token counts, when a metadata event carries them (the turn summary does in Kiro's
-      // telemetry); the last one wins, since each is the turn so far.
       const u = normaliseUsage(data.tokenUsage) || normaliseUsage(data.usage) || normaliseUsage(data);
       if (u) usage = u;
     } else if (d.type === 'sessionUpdate') {
@@ -433,7 +374,6 @@ export async function* kiroStreamJson(lines) {
       } else if (up.sessionUpdate === 'agent_thought_chunk' && text) {
         yield { type: 'reasoning', text };
       } else if (up.sessionUpdate === 'tool_call') {
-        // ACP sends `tool_call` once and `tool_call_update` after it: one call, one event.
         const id = up.toolCallId ?? `${up.title ?? ''}#${toolCalls.size}`;
         if (!toolCalls.has(id)) {
           toolCalls.add(id);
@@ -461,17 +401,7 @@ export async function* kiroStreamJson(lines) {
 const WARP_TOOLS = ['run_command', 'read_files', 'edit_files', 'search_codebase', 'call_mcp_tool', 'read_mcp_resource', 'upload_artifact'];
 
 /**
- * Warp's agent CLI (`oz agent run --output-format ndjson`) — Oz v0.2026.10.07, read off a
- * live run:
- *
- *   {"type":"system","event_type":"run_started","run_id":"…","run_url":"https://oz.warp.dev/runs/…"}
- *   {"type":"system","event_type":"conversation_started","conversation_id":"…"}
- *   {"type":"agent","text":"OK\n"}
- *
- * No usage and no closing line: the process exiting is the end of the answer. The binary
- * names the other message types — agent_reasoning, tool_call, tool_result, tool_error,
- * tool_canceled, update_todos — and a `tool_call` is reported as a `tool` event, which is
- * what lets the adapter stop a run that reached for one (`stopAtToolCall`).
+ * Warp's agent CLI (`oz agent run --output-format ndjson`) — Oz v0.2026.10.07.
  */
 export async function* warpNdjson(lines) {
   for await (const line of lines) {
@@ -498,37 +428,13 @@ export async function* warpNdjson(lines) {
 const CODEX_QUIET_ITEMS = new Set(['agent_message', 'reasoning', 'todo_list', 'context_compaction', 'error']);
 
 /**
- * Codex CLI (`codex exec --json`) — codex 0.163.0, read off the tool-bridge probe's live runs:
- *
- *   {"type":"thread.started","thread_id":"…"}
- *   {"type":"turn.started"}
- *   {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I'm checking …"}}
- *   {"type":"item.started","item":{"id":"item_1","type":"mcp_tool_call","server":"ks3f9a0c","tool":"get_weather","arguments":{…},"status":"in_progress"}}
- *   {"type":"item.completed","item":{"id":"item_1","type":"mcp_tool_call",…,"result":{…},"status":"completed"}}
- *   {"type":"turn.completed","usage":{"input_tokens":20221,"cached_input_tokens":14976,"output_tokens":144,"reasoning_output_tokens":20}}
- *
- * An agent message is a delta when it completes (codex sends it whole); two with no call between
- * them are two paragraphs. Every item that is not text, thinking, its plan (`todo_list`), a compaction or a
- * warning (`error` items: an MCP server that failed to start, say) is a tool: an MCP call is a
- * `tool` event named `mcp__<server>__<tool>` as it starts — before codex sends its tools/call —
- * and anything else (`command_execution`, `file_change`, `web_search`, a sub-agent's call, a type
- * this parser has never seen) a `tool` event named by its type, once per item. That is what the
- * bridge's tripwire reads (src/bridge/clis.js). `turn.completed` carries the run's usage,
- * `turn.failed` its failure.
- *
- * A top-level `error` line is a failure only if the turn does not complete after it. codex prints
- * a stream error it retries that way too — `{"type":"error","message":"Reconnecting... 1/5 (stream
- * disconnected before completion: …)"}`, then the turn goes on to turn.completed and codex exits 0
- * (its JSONL processor turns every error notification into an `error` line; only one it will not
- * retry fails the run). So the line is held: turn.completed drops it, turn.failed says the failure
- * itself (the held message when it gives none), and a stream that ends with neither reports it.
- * Plain `codex exec` printed the same notice on stderr, and its answer stood.
+ * Codex CLI (`codex exec --json`) — codex 0.163.0.
  */
 export async function* codexJson(lines, { finalOnly = false } = {}) {
   const tools = new Set();
-  let afterText = false; // the last item that said anything was an agent message: a next one is a new paragraph
-  let last = null; // finalOnly: the last agent message so far
-  let held = null; // the last top-level `error` line's message, until the turn says how it ended
+  let afterText = false;
+  let last = null;
+  let held = null;
   const flush = function* () {
     if (last !== null) yield EV.delta(last);
     last = null;
@@ -550,8 +456,6 @@ export async function* codexJson(lines, { finalOnly = false } = {}) {
       } else if (kind === 'reasoning') {
         if (d.type === 'item.completed' && typeof it.text === 'string' && it.text) yield { type: 'reasoning', text: it.text };
       } else if (!CODEX_QUIET_ITEMS.has(kind)) {
-        // A call ends the paragraph: what the model says after its result is a new answer (on the
-        // bridge, the next HTTP turn's), not a second paragraph of this one.
         afterText = false;
         const key = typeof it.id === 'string' && it.id ? it.id : `${kind}#${tools.size}`;
         if (!tools.has(key)) {
@@ -560,12 +464,10 @@ export async function* codexJson(lines, { finalOnly = false } = {}) {
         }
       }
     } else if (d.type === 'turn.completed') {
-      held = null; // codex retried and the turn completed: not the run's failure
+      held = null;
       yield* flush();
       const u = d.usage && typeof d.usage === 'object' ? d.usage : null;
       if (u) {
-        // OpenAI's counts: output_tokens holds the reasoning tokens, input_tokens the cached ones —
-        // already what `input` means here. The whole run's, reported once as it ends.
         const usage = normaliseUsage({ input_tokens: u.input_tokens, output_tokens: u.output_tokens, cache_read_input_tokens: u.cached_input_tokens, reasoning_output_tokens: u.reasoning_output_tokens });
         if (usage) yield { type: 'usage', usage, scope: 'run' };
       }
@@ -577,20 +479,361 @@ export async function* codexJson(lines, { finalOnly = false } = {}) {
       held = typeof d.message === 'string' && d.message ? d.message : 'error';
     }
   }
-  // Neither turn.completed nor turn.failed after it (codex stopped before a turn, or mid-turn):
-  // the error line is the run's failure, ahead of a final message left unsent, as it was printed.
   if (held !== null) yield EV.error(truncate(`codex: ${held}`, 400));
   yield* flush();
   yield EV.done('stop');
 }
 
-/**
- * `codex exec --json` read as a text run: what plain `codex exec` prints on stdout — the last agent
- * message — and, unlike it, the run's usage (`turn.completed`). An agent message before the last
- * one (a preamble) is left out, as plain stdout leaves it out.
- */
 export function codexJsonFinal(lines) {
   return codexJson(lines, { finalOnly: true });
+}
+
+/**
+ * Universal JSON/NDJSON/text stream parser (`harness-json`) for the extended CLI harness ecosystem:
+ * Gemini CLI, Kilo, Qwen Code, Cline, Goose, Kimi CLI, MiniMax, Grok, Pi, Oh-My-Pi, DSH, Aider,
+ * Mimo, Jcode, Mistral Vibe, Hermes, OpenHands, CheetahClaws, OpenSquilla, Nanobot, ZeroClaw,
+ * Docker Agent, Fast-Agent, and Dcode.
+ */
+export async function* harnessJson(lines) {
+  const blocks = wholeBlocks();
+  const tools = new Set();
+  const seenSessions = new Set();
+  let emittedText = false;
+  let sawJson = false;
+  const plainLines = [];
+  let lastUsage = null;
+
+  const emitSession = function* (id) {
+    if (typeof id === 'string' && id.trim()) {
+      const s = id.trim();
+      if (!seenSessions.has(s)) {
+        seenSessions.add(s);
+        yield EV.session(s);
+      }
+    }
+  };
+
+  const emitTool = function* (name, id) {
+    const toolName = (typeof name === 'string' && name.trim()) || 'a tool';
+    const key = (typeof id === 'string' && id) || `${toolName}#${tools.size}`;
+    if (!tools.has(key)) {
+      tools.add(key);
+      yield EV.tool(toolName);
+    }
+  };
+
+  for await (const line of lines) {
+    const d = json(line);
+    if (!d) {
+      const hermesMatch = typeof line === 'string' ? line.match(/^session_id:\s*(\S+)/i) : null;
+      if (hermesMatch) {
+        yield* emitSession(hermesMatch[1]);
+        continue;
+      }
+      plainLines.push(line);
+      continue;
+    }
+    sawJson = true;
+
+    // 1. Session ID extraction across CLI conventions
+    const sid =
+      d.session_id ||
+      d.sessionId ||
+      d.sessionID ||
+      d.thread_id ||
+      d.conversation_id ||
+      d.chat_id ||
+      d.session?.id ||
+      d.metadata?.session_id ||
+      d.meta?.agentMeta?.sessionId ||
+      (d.type === 'session' && d.id);
+    if (sid) yield* emitSession(sid);
+
+    // 2. Usage extraction (including Gemini stats.models, OpenHands llm_metrics, OpenSquilla meta, Goose total_tokens, Pi turn_end)
+    const u =
+      normaliseUsage(d.usage) ||
+      normaliseUsage(d.tokens) ||
+      normaliseUsage(d.tokenUsage) ||
+      normaliseUsage(d.metrics) ||
+      normaliseUsage(d.result?.usage) ||
+      normaliseUsage(d.message?.usage) ||
+      normaliseUsage(d.llm_metrics?.accumulated_token_usage) ||
+      normaliseUsage(d.meta?.agentMeta?.usage) ||
+      (d.type === 'complete' && typeof d.total_tokens === 'number'
+        ? { input: 0, output: d.total_tokens, cacheRead: 0, cacheWrite: 0 }
+        : null) ||
+      extractGeminiStatsUsage(d.stats);
+    if (u) lastUsage = u;
+
+    // 3. Cline (`type: "say"`)
+    if (d.type === 'say') {
+      if (d.say === 'reasoning' && typeof d.text === 'string' && d.text) {
+        yield { type: 'reasoning', text: d.text };
+      } else if (d.say === 'tool' && typeof d.text === 'string') {
+        const tj = json(d.text);
+        yield* emitTool(tj?.tool || tj?.name || 'tool', tj?.id);
+      } else if (d.say === 'api_req_started' && typeof d.text === 'string') {
+        const uj = json(d.text);
+        const cu = normaliseUsage(uj);
+        if (cu) lastUsage = cu;
+      } else if ((d.say === 'text' || !d.say) && typeof d.text === 'string' && d.text) {
+        const b = blocks('cline_say', d.text);
+        if (b.text) {
+          emittedText = true;
+          yield EV.delta(b.text);
+        }
+      }
+      continue;
+    }
+
+    // 4. OpenHands (`source: "agent"`, `action: "run" | "message"`)
+    if (d.source === 'agent' && typeof d.action === 'string') {
+      if (typeof d.args?.thought === 'string' && d.args.thought) {
+        yield { type: 'reasoning', text: d.args.thought };
+      }
+      if (d.action === 'message') {
+        const msg = d.args?.content || d.message;
+        if (typeof msg === 'string' && msg) {
+          emittedText = true;
+          yield EV.delta(msg);
+        }
+      } else {
+        yield* emitTool(d.action, d.id ? String(d.id) : undefined);
+      }
+      continue;
+    }
+
+    // 5. OpenSquilla (`payloads: [{ text }]`)
+    if (Array.isArray(d.payloads)) {
+      const joined = d.payloads
+        .map((p) => (typeof p?.text === 'string' ? p.text : ''))
+        .filter(Boolean)
+        .join('\n');
+      if (joined) {
+        emittedText = true;
+        yield EV.delta(joined);
+      }
+      continue;
+    }
+
+    // 6. Pi / Oh-My-Pi `message_update` & `turn_end` events
+    if (d.type === 'message_update' && d.assistantMessageEvent && typeof d.assistantMessageEvent === 'object') {
+      const ev = d.assistantMessageEvent;
+      if (ev.type === 'text_delta' && typeof ev.delta === 'string' && ev.delta) {
+        emittedText = true;
+        yield EV.delta(ev.delta);
+      } else if (ev.type === 'thinking_delta' && typeof ev.delta === 'string' && ev.delta) {
+        yield { type: 'reasoning', text: ev.delta };
+      } else if (ev.type === 'toolcall_start' || ev.type === 'toolcall_end' || ev.type === 'tool_use') {
+        const tc = ev.toolCall || ev;
+        yield* emitTool(tc.toolName || tc.name, tc.id || tc.toolCallId);
+      }
+      continue;
+    }
+    if (d.type === 'turn_end') {
+      continue;
+    }
+
+    // 7. dcode (`message.delta`, `tool.start`, `run.end`, `run.start`)
+    if (d.type === 'message.delta') {
+      if (typeof d.text === 'string' && d.text) {
+        emittedText = true;
+        yield EV.delta(d.text);
+      }
+      continue;
+    }
+    if (d.type === 'tool.start') {
+      yield* emitTool(d.name || d.tool_name, d.id);
+      continue;
+    }
+    if (d.type === 'run.start' || d.type === 'run.end' || d.type === 'complete') {
+      continue;
+    }
+
+    // 8. Tool invocation events
+    if (
+      d.type === 'tool_use' ||
+      d.type === 'tool_call' ||
+      d.type === 'tool_execution_start' ||
+      d.type === 'tool_queued' ||
+      d.type === 'tool_running'
+    ) {
+      const part = d.part && typeof d.part === 'object' ? d.part : d;
+      const tName = part.tool || part.tool_name || part.toolName || part.name || d.tool_call?.name;
+      const tId = part.callID || part.call_id || part.toolCallId || part.id;
+      yield* emitTool(tName, tId);
+      continue;
+    }
+
+    // 9. Claude / Qwen / Kimi / Goose / Mimo `assistant` or `message` with content blocks or `tool_calls`
+    const contentArr = Array.isArray(d.message?.content)
+      ? d.message.content
+      : Array.isArray(d.content)
+        ? d.content
+        : null;
+    if ((d.type === 'assistant' || d.role === 'assistant' || (d.type === 'message' && d.message?.role === 'assistant')) && (contentArr || Array.isArray(d.tool_calls))) {
+      const msgId = d.message?.id || d.id || 'assistant';
+      if (contentArr) {
+        for (const block of contentArr) {
+          if (!block || typeof block !== 'object') continue;
+          if ((block.type === 'text' || block.type === 'output_text') && typeof block.text === 'string') {
+            if (d.type === 'message' && d.message?.role === 'assistant') {
+              // Goose streams incremental text chunks inside message.content
+              emittedText = true;
+              yield EV.delta(block.text);
+            } else {
+              const b = blocks(msgId, block.text);
+              if (b.text) {
+                emittedText = true;
+                yield EV.delta(b.text);
+              }
+            }
+          } else if ((block.type === 'thinking' || block.type === 'reasoning' || block.type === 'think') && (block.thinking || block.text || block.think)) {
+            yield { type: 'reasoning', text: block.thinking || block.text || block.think };
+          } else if (block.type === 'tool_use' || block.type === 'tool_call' || block.type === 'function_call' || block.type === 'toolRequest') {
+            yield* emitTool(block.name || block.tool_name || block.toolCall?.name, block.id || block.call_id);
+          }
+        }
+      }
+      if (Array.isArray(d.tool_calls)) {
+        for (const tc of d.tool_calls) {
+          if (!tc || typeof tc !== 'object') continue;
+          yield* emitTool(tc.function?.name || tc.name, tc.id);
+        }
+      }
+      continue;
+    }
+
+    // 10. Gemini CLI / Qwen / Kilo streaming message (`{ type: "message", role: "assistant", content: "..." }`)
+    if (d.type === 'message') {
+      if (d.role && d.role !== 'assistant') continue;
+      if (typeof d.content === 'string' && d.content) {
+        if (d.delta) {
+          emittedText = true;
+          yield EV.delta(d.content);
+        } else {
+          const b = blocks(d.id || 'message', d.content);
+          if (b.text) {
+            emittedText = true;
+            yield EV.delta(b.text);
+          }
+        }
+      }
+      continue;
+    }
+
+    // 11. Streaming text / reasoning deltas (`text_delta`, `content_block_delta`, `delta`, `text`)
+    if (d.type === 'text_delta' || d.type === 'delta') {
+      const txt = typeof d.delta === 'string' ? d.delta : typeof d.text === 'string' ? d.text : '';
+      if (txt) {
+        emittedText = true;
+        yield EV.delta(txt);
+      }
+      continue;
+    }
+    if (d.type === 'content_block_delta' && d.delta) {
+      if (typeof d.delta.text === 'string' && d.delta.text) {
+        emittedText = true;
+        yield EV.delta(d.delta.text);
+      } else if (typeof d.delta.thinking === 'string' && d.delta.thinking) {
+        yield { type: 'reasoning', text: d.delta.thinking };
+      }
+      continue;
+    }
+    if (d.type === 'thinking' || d.type === 'reasoning' || d.type === 'thinking_delta') {
+      const rText = d.thinking || d.text || d.delta || d.content;
+      if (typeof rText === 'string' && rText) yield { type: 'reasoning', text: rText };
+      continue;
+    }
+    if (d.type === 'text' || d.type === 'agent' || d.type === 'agent_message') {
+      const partText = typeof d.part?.text === 'string' ? d.part.text : typeof d.text === 'string' ? d.text : typeof d.content === 'string' ? d.content : '';
+      if (partText) {
+        const key = d.part?.id || d.id || 'text';
+        const b = blocks(key, partText);
+        if (b.text) {
+          emittedText = true;
+          yield EV.delta(b.text);
+        }
+      }
+      continue;
+    }
+
+    // 12. Result / completion / single-object JSON envelopes (`result`, `response`, `output`)
+    if (d.type === 'result' || d.response != null || d.result != null || d.output != null) {
+      if (d.is_error || d.status === 'error' || d.subtype === 'error') {
+        const why =
+          (typeof d.error === 'string' && d.error) ||
+          d.error?.message ||
+          (typeof d.result === 'string' && d.result) ||
+          (Array.isArray(d.errors) && d.errors.join(' — ')) ||
+          d.message ||
+          'harness error';
+        yield EV.error(truncate(String(why), 400));
+      } else if (!emittedText) {
+        const finalTxt =
+          (typeof d.response === 'string' && d.response) ||
+          (typeof d.result === 'string' && d.result) ||
+          (typeof d.result?.response === 'string' && d.result.response) ||
+          (typeof d.output === 'string' && d.output) ||
+          (typeof d.content === 'string' && d.content) ||
+          (typeof d.text === 'string' && d.text) ||
+          '';
+        if (finalTxt) {
+          emittedText = true;
+          yield EV.delta(finalTxt);
+        }
+      }
+      continue;
+    }
+
+    // 13. Error events
+    if (d.type === 'error' || d.error) {
+      const why =
+        (typeof d.error === 'string' && d.error) ||
+        d.error?.message ||
+        d.error?.data?.message ||
+        d.part?.message ||
+        d.message ||
+        'harness error';
+      yield EV.error(truncate(String(why), 400));
+    }
+  }
+
+  if (!sawJson && plainLines.length) {
+    const text = plainLines.join('\n').replace(/^\n+/, '');
+    if (text.trim()) yield EV.delta(text);
+  }
+  if (lastUsage) yield EV.usage(lastUsage);
+  yield EV.done('stop');
+}
+
+function extractGeminiStatsUsage(stats) {
+  if (!stats || typeof stats !== 'object') return null;
+  if (stats.input_tokens != null || stats.output_tokens != null) {
+    return normaliseUsage(stats);
+  }
+  const models = stats.models;
+  if (!models || typeof models !== 'object') return null;
+  let input = 0;
+  let output = 0;
+  let cacheRead = 0;
+  let reasoning = 0;
+  for (const m of Object.values(models)) {
+    const t = m?.tokens;
+    if (!t || typeof t !== 'object') continue;
+    input += Number(t.prompt || t.input || 0);
+    output += Number(t.candidates || t.output || 0);
+    cacheRead += Number(t.cached || 0);
+    reasoning += Number(t.thoughts || 0);
+  }
+  if (!input && !output) return null;
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite: 0,
+    ...(reasoning ? { reasoning } : {}),
+  };
 }
 
 /** Anything that just prints the answer. */
@@ -611,6 +854,7 @@ export const PARSERS = {
   'warp-ndjson': warpNdjson,
   'codex-json': codexJson,
   'codex-json-final': codexJsonFinal,
+  'harness-json': harnessJson,
   raw: rawText,
 };
 

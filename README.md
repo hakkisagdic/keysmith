@@ -62,7 +62,10 @@ that is the interesting part.
 |---|---|
 | `POST /v1/chat/completions` | OpenAI Chat Completions, streaming and not |
 | `POST /v1/messages` | Anthropic Messages, for Claude Code and friends |
-| `POST /v1/responses` | OpenAI Responses (Codex-style `input` arrays) |
+| `POST /v1/responses` | OpenAI Responses (Codex-style `input` arrays + UHP stateful `previous_response_id`) |
+| `GET /v1/responses/:id` | UHP / Responses API stored response lookup |
+| `GET /v1/uhp` | Universal Harness Protocol (`2026-10-19`) discovery (unauthenticated) |
+| `GET /v1/harnesses` | UHP harness catalogue (`GET /v1/harnesses/:id`, `GET /v1/harnesses/:id/models`) |
 | `POST /v1/embeddings` | forwarded to HTTP adapters only |
 | `GET /v1/models` | the whole catalogue, namespaced; `?refresh` re-queries |
 | `GET /v1/keysmith/routes` | adapters, aliases, limits and any unusable alias leg (`alias_warnings`) as JSON |
@@ -76,6 +79,26 @@ tunnel's request logs, so prefer the header). A key can carry a scope — the ad
 and aliases it may reach — and every route above answers it with that share only; see
 [Keys with a scope](#keys-with-a-scope-what-each-key-may-reach).
 CORS is open, so browser apps can call it directly.
+
+
+## Universal Harness Protocol (UHP) & HarnessRouter Relay
+
+Keysmith natively speaks the **Universal Harness Protocol (UHP `2026-10-19`)** in both directions:
+
+1. **As a UHP Server:** Any UHP client or SDK can discover capabilities at `GET /v1/uhp`, inspect attached harnesses at `GET /v1/harnesses` (filtered by the caller key's scope), route to a specific harness via `metadata.harness_id` or `x-harness-id`, chain stateful multi-turn sessions on `POST /v1/responses` with `previous_response_id` (`GET /v1/responses/:id`), enforce `Idempotency-Key` deduplication (`409 idempotency_conflict` on payload mismatch), and propagate W3C `traceparent` / `tracestate` headers.
+2. **As a UHP Upstream Relay (`harnessrouter` profile):** Connect a running [HarnessRouter](https://github.com/HarnessRouter/harnessrouter) Community Edition (`http://127.0.0.1:8000/api/harness/v1`) or Cloud (`https://api.harnessrouter.ai/v1`) instance as an upstream HTTP adapter:
+
+```bash
+keysmith add harnessrouter                                                # local CE on 127.0.0.1:8000
+keysmith add harnessrouter --base-url https://api.harnessrouter.ai/v1 --key '{env:HARNESSROUTER_API_KEY}'
+```
+
+Address models across any backend or custom harness:
+- `harnessrouter/<model>` (e.g. `harnessrouter/claude-sonnet-4-6`)
+- `harnessrouter/<backend>/<model>` (e.g. `harnessrouter/claude/claude-sonnet-4-6`, `harnessrouter/gemini/gemini-2.5-pro`)
+- `harnessrouter/chrn_<id>` (routes directly to a custom harness with `metadata.harness_id`)
+
+When a request offers client `tools` to a `wire: "uhp"` adapter, Keysmith first forwards them natively over `/v1/responses`; if the upstream CLI backend ignores the tools and replies with plain text, Keysmith automatically falls back to `EMULATE` (`fallback: "uhp_emulate"`).
 
 ## Models are namespaced
 
