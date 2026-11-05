@@ -64,7 +64,7 @@ that is the interesting part.
 | `POST /v1/messages` | Anthropic Messages, for Claude Code and friends |
 | `POST /v1/responses` | OpenAI Responses (Codex-style `input` arrays + UHP stateful `previous_response_id`) |
 | `GET /v1/responses/:id` | UHP / Responses API stored response lookup |
-| `GET /v1/uhp` | Universal Harness Protocol (`2026-10-19`) discovery (unauthenticated) |
+| `GET /.well-known/uhp`, `GET /v1/uhp` | Universal Harness Protocol (`2026-10-19`) discovery (unauthenticated) |
 | `GET /v1/harnesses` | UHP harness catalogue (`GET /v1/harnesses/:id`, `GET /v1/harnesses/:id/models`) |
 | `POST /v1/embeddings` | forwarded to HTTP adapters only |
 | `GET /v1/models` | the whole catalogue, namespaced; `?refresh` re-queries |
@@ -85,7 +85,7 @@ CORS is open, so browser apps can call it directly.
 
 Keysmith natively speaks the **Universal Harness Protocol (UHP `2026-10-19`)** in both directions:
 
-1. **As a UHP Server:** Any UHP client or SDK can discover capabilities at `GET /v1/uhp`, inspect attached harnesses at `GET /v1/harnesses` (filtered by the caller key's scope), route to a specific harness via `metadata.harness_id` or `x-harness-id`, chain stateful multi-turn sessions on `POST /v1/responses` with `previous_response_id` (`GET /v1/responses/:id`), enforce `Idempotency-Key` deduplication (`409 idempotency_conflict` on payload mismatch), and propagate W3C `traceparent` / `tracestate` headers.
+1. **As a UHP Server:** Any UHP client or SDK can discover capabilities at `GET /.well-known/uhp` (or `GET /v1/uhp`), inspect attached harnesses at `GET /v1/harnesses` (filtered by the caller key's scope), route to a specific harness via `metadata.harness_id` or `x-harness-id`, chain stateful multi-turn sessions on `POST /v1/responses` with `previous_response_id` (`GET /v1/responses/:id`), enforce `Idempotency-Key` deduplication (`409 idempotency_conflict` on payload mismatch), and propagate W3C `traceparent` / `tracestate` headers.
 2. **As a UHP Upstream Relay (`harnessrouter` profile):** Connect a running [HarnessRouter](https://github.com/HarnessRouter/harnessrouter) Community Edition (`http://127.0.0.1:8000/api/harness/v1`) or Cloud (`https://api.harnessrouter.ai/v1`) instance as an upstream HTTP adapter:
 
 ```bash
@@ -99,6 +99,13 @@ Address models across any backend or custom harness:
 - `harnessrouter/chrn_<id>` (routes directly to a custom harness with `metadata.harness_id`)
 
 When a request offers client `tools` to a `wire: "uhp"` adapter, Keysmith first forwards them natively over `/v1/responses`; if the upstream CLI backend ignores the tools and replies with plain text, Keysmith automatically falls back to `EMULATE` (`fallback: "uhp_emulate"`).
+3. **Traycer Multi-Provider Gateway (`traycer` HTTP profile):** Attach your Traycer subscription (`~/.traycer/cli/credentials` or `TRAYCER_BEARER_TOKEN`) as an explicit-only multi-provider HTTP adapter:
+
+```bash
+keysmith add traycer
+```
+
+   Keysmith discovers all 32 models from `GET https://server.traycer.ai/api/traycer/models` across five upstream providers (`anthropic`, `openai`, `xai`, `meta`, `openrouter`), sends `x-traycer-account-context: PERSONAL`, and routes each model to its native Traycer inference endpoint (`/inference/anthropic/messages`, `/inference/openai/responses`, or `/inference/{xai,meta,openrouter}/chat/completions`) with reasoning effort and client tool support via `EMULATE` (`tool_mode: "emulate"`).
 
 ## Models are namespaced
 
@@ -1178,6 +1185,9 @@ tools.
 | `google` | http | verified live against Gemini's OpenAI-compatible endpoint: tools, streaming, thought signatures — see [above](#gemini-with-tools-the-google-profile); takes images (read live on `gemini-3.5-flash`) and audio; refuses a PDF `file` part and `video_url` |
 | `ollama`, `lmstudio`, `llamacpp`, `vllm` | http | local servers, no key |
 | `copilot` | http | verified live against `api.githubcopilot.com` with an OAuth device token; takes images with `copilot-vision-request: true` (not checked live) |
+| `traycer` | http | verified live against `https://server.traycer.ai` (`wire: "traycer"`): discovers 32 models across `anthropic`, `openai`, `xai`, `meta` and `openrouter` from `GET /api/traycer/models`, routes each to its native `/inference/…` endpoint with `x-traycer-account-context: PERSONAL`, answers tool requests via `EMULATE`, takes images and PDFs; explicit-only |
+| `harnessrouter` | http | UHP (`2026-10-19`) relay to HarnessRouter CE (`http://127.0.0.1:8000/api/harness/v1`) or Cloud (`https://api.harnessrouter.ai/v1`); native `/v1/responses` tools with automatic `EMULATE` fallback |
+| `traycer-cli`, `droid`, `devin`, `copilot-cli`, `cursor`, `amp`, `reasonix` | cli | Traycer & packaged CLI harness profiles (`traycer --json agent send --expect-reply`, Factory `droid exec`, `devin -p`, GitHub `copilot -p`, `cursor-agent -p`, Sourcegraph `amp -x`, `reasonix -p`); parsed via `harness-json`; `unsafeTools` (ship disabled) |
 
 `keysmith adapters` lists them; `keysmith add <profile>` copies one into your config
 where every field stays yours. Adding an agent nobody has heard of is a config edit:

@@ -140,6 +140,9 @@ reads as a `{json:…#…}` secret reference). Both the standalone CLI and Trayc
 "--model keysmith/cheap"`). A running `opencode serve` keeps the old model list until it
 restarts.
 
+In the reverse direction — exposing your Traycer subscription's 32 cloud models or a live Traycer peer agent *through* Keysmith — attach the built-in `traycer` HTTP profile (`keysmith add traycer`, reads `{json:~/.traycer/cli/credentials#token}`) or the `traycer-cli` CLI profile. Any UHP client can also discover the gateway at `GET /.well-known/uhp` (or `GET /v1/uhp`) and inspect the attached `traycer` harness at `GET /v1/harnesses/traycer`.
+
+
 ## Codex CLI (the Responses face)
 
 ```toml
