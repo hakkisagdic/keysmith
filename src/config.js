@@ -144,7 +144,12 @@ export const DEFAULTS = {
   port: 8787,
   auth: { enabled: true, keys: [] },
   log: { usage: true, body: false },
-  limits: { maxConcurrent: 4, timeoutMs: 300_000 },
+  limits: { maxConcurrent: 4, timeoutMs: 300_000, spend: {} },
+  pricing: {
+    '*/claude-opus-5-5*': { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
+    '*/claude-sonnet-5-5*': { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+    '*/claude-haiku-5-5*': { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
+  },
   tunnel: { provider: 'cloudflared', name: null, hostname: null, configFile: null },
   adapters: {},
   aliases: {},

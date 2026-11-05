@@ -259,6 +259,7 @@ async function* engine(adapter, { model, effort = null, spec, messages, signal, 
       const run = adapter.emulateRun({ text, model, effort, timeoutMs: Math.max(1_000, deadline - Date.now()), signal });
       let reply = '';
       let runUsage = null;
+      let runUsageReason = null;
       let cut = null;
       const errors = [];
       for await (const evt of run.events) {
@@ -266,8 +267,12 @@ async function* engine(adapter, { model, effort = null, spec, messages, signal, 
           if (!cut) reply += evt.text;
         } else if (evt.type === 'reasoning') {
           if (!cut) yield evt;
+        } else if (evt.type === 'upstream') {
+          yield evt;
         } else if (evt.type === 'usage') {
           runUsage = maxUsage(runUsage, evt.usage);
+        } else if (evt.type === 'usage_unknown') {
+          runUsageReason = evt.reason || runUsageReason;
         } else if (evt.type === 'tool') {
           // A call of the CLI's own (agy keeps `manage_task` on every agent) after the reply is the
           // model starting over: the reply is complete, the run ends here (stopAtToolCall).
@@ -290,7 +295,7 @@ async function* engine(adapter, { model, effort = null, spec, messages, signal, 
       if (reply.trim()) {
         const parsed = parseReply(reply, spec);
         if (parsed.ok) {
-          yield* answer(parsed, spent.usage, adapter);
+          yield* answer(parsed, spent.usage, adapter, runUsageReason);
           return;
         }
         reason = parsed.reason;
@@ -317,7 +322,7 @@ async function* engine(adapter, { model, effort = null, spec, messages, signal, 
   }
 }
 
-function* answer(parsed, usage, adapter) {
+function* answer(parsed, usage, adapter, usageReason = null) {
   if (parsed.calls) {
     for (const c of parsed.calls) yield { type: 'tool_call', name: c.name, arguments: JSON.stringify(c.args), args: c.args };
   } else if (parsed.final) {
@@ -325,7 +330,7 @@ function* answer(parsed, usage, adapter) {
   }
   if (usage) yield { type: 'usage', usage };
   // No run said what it spent: said so, never a 0 (cli-adapter.js usageGap).
-  else yield { type: 'usage_unknown', reason: typeof adapter?.usageGap === 'function' ? adapter.usageGap() : `${adapter?.id || 'the CLI'} reported no token counts` };
+  else yield { type: 'usage_unknown', reason: usageReason || (typeof adapter?.usageGap === 'function' ? adapter.usageGap() : `${adapter?.id || 'the CLI'} reported no token counts`) };
   yield { type: 'done', finishReason: parsed.calls ? 'tool_calls' : 'stop' };
 }
 

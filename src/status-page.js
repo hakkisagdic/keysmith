@@ -1,15 +1,27 @@
 import { rel } from './util.js';
 import { configPath } from './config.js';
+import { fmtUsd } from './usage.js';
 
 /**
  * A one-screen status page at `/`. Not a product — a place to see, in a browser,
  * which adapters loaded and what the last requests cost, without opening a terminal.
  */
-export function statusPage({ cfg, models, usage, usageFilter = null, startedAt, loadErrors = {}, aliasIssues = {}, viewer = null, keys = null, keyIssues = [] }) {
+export function statusPage({ cfg, models, usage, usageFilter = null, spend = null, usageErrors = [], startedAt, loadErrors = {}, aliasIssues = {}, viewer = null, keys = null, keyIssues = [] }) {
   const adapters = Object.entries(cfg.adapters || {});
   const failed = Object.entries(loadErrors);
   const aliasList = Object.entries(aliasIssues);
+  const logErrors = usageErrors?.length ? usageErrors : (usage?.readErrors?.() || []);
   const summary = usage?.summarize?.(undefined, usageFilter) || { requests: 0, failures: 0, tokensIn: 0, tokensOut: 0, models: [], keys: [] };
+  const spendCaps = spend ?? (usage?.spendSummary?.(cfg?.limits?.spend, { adapters: cfg?.adapters, filter: usageFilter }) || []);
+  const spendRows = spendCaps
+    .map((s) => {
+      const spentCell = s.error
+        ? `unreadable / ${esc(fmtUsd(s.cap))}`
+        : `${esc(fmtUsd(s.spent))} / ${esc(fmtUsd(s.cap))}`;
+      const statusCell = s.error ? `unreadable (${esc(s.error)})` : s.exceeded ? 'capped' : 'ok';
+      return `<tr><td>${esc(s.target)}</td><td class="muted">${esc(s.kind)}</td><td class="n ${s.exceeded ? 'bad' : ''}">${spentCell}</td><td class="${s.exceeded ? 'bad' : 'ok'}">${statusCell}</td><td class="muted">${esc(s.resetAt)}</td></tr>`;
+    })
+    .join('');
   // Per key: the fingerprint, never the key. Shown to an unscoped key only; a scoped one sees
   // its own line at the top instead.
   const perKey = new Map((summary.keys || []).map((k) => [k.key, k]));
@@ -23,7 +35,7 @@ export function statusPage({ cfg, models, usage, usageFilter = null, startedAt, 
     .join('');
   const rows = (summary.models || [])
     .slice(0, 12)
-    .map((m) => `<tr><td>${esc(m.model)}</td><td class="n">${m.requests}</td><td class="n ${m.failures ? 'bad' : ''}">${m.failures}</td><td class="n">${fmt(m.input)}</td><td class="n">${fmt(m.output)}</td><td class="n">${Math.round(m.msTotal / m.requests)} ms</td></tr>`)
+    .map((m) => `<tr><td>${esc(m.model)}</td><td class="n">${m.requests}</td><td class="n ${m.failures ? 'bad' : ''}">${m.failures}</td><td class="n">${fmt(m.input)}</td><td class="n">${fmt(m.output)}</td><td class="n">${m.p50Ms ?? 0} / ${m.p95Ms ?? 0} ms</td><td class="n">${m.requests ? Math.round(m.msTotal / m.requests) : 0} ms</td></tr>`)
     .join('');
   return `${HEAD}
 <body>
@@ -31,8 +43,9 @@ export function statusPage({ cfg, models, usage, usageFilter = null, startedAt, 
 <div class="sub">OpenAI-compatible front for the agents already on this machine · up ${humanUptime(Date.now() - startedAt)} · config <code>${esc(rel(configPath()))}</code></div>
 ${viewer && viewer.scope && !/^unscoped/.test(viewer.scope) ? `<div class="sub">viewing as key fp:${esc(viewer.fp)}${viewer.label ? ` (${esc(viewer.label)})` : ''} — its scope: ${esc(viewer.scope)}. This page shows what that key can reach.</div>` : ''}
 ${viewer && viewer.perDay != null ? `<div class="sub">this key today: <b class="${(viewer.today?.requests || 0) >= viewer.perDay ? 'bad' : 'ok'}">${viewer.today?.requests || 0} of ${viewer.perDay}</b> requests${viewer.today?.refused ? `, ${viewer.today.refused} refused over the cap` : ''} — the count starts again at local midnight.</div>` : ''}
+${logErrors.length ? `<p class="bad">${logErrors.map((e) => `usage log unreadable: ${esc(e)}`).join('<br>')}</p>` : ''}
 <div class="grid">
-  <div class="card"><small>requests 24h</small><b>${summary.requests}</b></div>
+  <div class="card"><small>requests 24h (UTC hour)</small><b>${summary.requests}</b></div>
   <div class="card"><small>failures</small><b class="${summary.failures ? 'bad' : 'ok'}">${summary.failures}</b></div>
   <div class="card"><small>tokens in / out</small><b>${fmt(summary.tokensIn)} / ${fmt(summary.tokensOut)}</b></div>
   <div class="card"><small>models exposed</small><b>${models.length}</b></div>
@@ -51,8 +64,9 @@ ${aliasList.length ? `<h2>Alias legs that can never work</h2><table><thead><tr><
 <table><thead><tr><th>id</th><th>adapter</th><th>upstream</th><th>context</th></tr></thead><tbody>
 ${models.map((m) => `<tr><td${m.keysmith?.kind === 'alias' && aliasIssues[m.id] ? ' class="bad"' : ''}>${esc(m.id)}</td><td class="muted">${esc(m.keysmith?.adapter || '')}</td><td class="muted">${esc(m.keysmith?.upstream || '')}</td><td class="n">${m.keysmith?.contextWindow || ''}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">no models listed — check <code>keysmith doctor</code></td></tr>'}
 </tbody></table>
-${keys ? `<h2>Keys</h2><table><thead><tr><th>key</th><th>label</th><th>scope</th><th class="n">today / cap</th><th class="n">req 24h</th><th class="n">denied</th></tr></thead><tbody>${keyRows}</tbody></table>${keyIssues.length ? `<p class="bad">${keyIssues.map(esc).join('<br>')}</p>` : ''}<p class="muted">A key is named by its fingerprint. <code>keysmith key scope fp:&lt;hex&gt; --deny &lt;adapter&gt;</code> narrows one, <code>--per-day N</code> caps its requests per local day; <code>keysmith key who-can &lt;adapter&gt;</code> lists the keys that reach an adapter.</p>` : ''}
-${rows ? `<h2>Last 24h by model</h2><table><thead><tr><th>model</th><th class="n">req</th><th class="n">err</th><th class="n">in</th><th class="n">out</th><th class="n">avg</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
+${keys ? `<h2>Keys</h2><table><thead><tr><th>key</th><th>label</th><th>scope</th><th class="n">today / cap</th><th class="n">req 24h (UTC hour)</th><th class="n">denied</th></tr></thead><tbody>${keyRows}</tbody></table>${keyIssues.length ? `<p class="bad">${keyIssues.map(esc).join('<br>')}</p>` : ''}<p class="muted">A key is named by its fingerprint. <code>keysmith key scope fp:&lt;hex&gt; --deny &lt;adapter&gt;</code> narrows one, <code>--per-day N</code> caps its requests per local day; <code>keysmith key who-can &lt;adapter&gt;</code> lists the keys that reach an adapter.</p>` : ''}
+${spendRows ? `<h2>Spend caps (${esc(spendCaps[0].month)})</h2><table><thead><tr><th>target</th><th>kind</th><th class="n">spent / cap</th><th>status</th><th>resets</th></tr></thead><tbody>${spendRows}</tbody></table>` : ''}
+${rows ? `<h2>Last 24h by model (rounded to the UTC hour)</h2><table><thead><tr><th>model</th><th class="n">req</th><th class="n">err</th><th class="n">in</th><th class="n">out</th><th class="n">p50 / p95</th><th class="n">avg</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
 <p class="muted">Keys never leave this machine's config. <code>Authorization: Bearer &lt;key&gt;</code> is required on /v1. This page takes the key once, through its form, and keeps a cookie that opens this page alone for an hour.</p>
 </body></html>`;
 }
@@ -105,6 +119,7 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 }
 function fmt(n) {
+  if (n == null) return '—';
   n = n || 0;
   return n > 1e6 ? (n / 1e6).toFixed(1) + 'M' : n > 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n);
 }

@@ -5,7 +5,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { loadConfig, saveConfig, configPath, dataDir, newApiKey, newUniqueApiKey, configExists, expand, resolveSecret } from './config.js';
 import { Gateway, checkAdapter, kindOf, own } from './gateway.js';
 import { createServer } from './server.js';
-import { UsageLog } from './usage.js';
+import { UsageLog, formatUsageCsv, formatUsageTable } from './usage.js';
 import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
 import { autoApproveFlag, which } from './cli-adapter.js';
 import * as tunnel from './tunnel.js';
@@ -45,7 +45,8 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith chat <model> <prompt>     one-shot request against your own gateway
   keysmith doctor [--probe-models]   is each adapter actually alive, and at what cost
   keysmith tunnel <status|setup|run> cloudflared: named tunnel first, quick as fallback
-  keysmith usage [--hours N]         who spent what
+  keysmith usage [--by d1[,d2]] [--since t] [--until t] [--format table|csv|json]
+                                     who spent what (by key, label, adapter, model, account, tag, day, client)
   keysmith key <add|list> [--reveal] client-facing API keys; --reveal prints them in full, to a terminal only
   keysmith key add <label> [--allow p,…] [--deny p,…] [--out <file>]
                                      a labelled key with a scope; --out writes the key to a new 0600 file
@@ -489,7 +490,7 @@ function showValue(field, v) {
 /** Fields worth knowing about that an entry may not have yet, by kind (docs/adapters.md has them all). */
 const SETTABLE = {
   cli: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'models', 'defaultModel', 'toolMode', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'stopAtToolCall', 'stripSystemPrompt', 'systemFlag', 'promptVia', 'env'],
-  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
+  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'streamUsage', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
 };
 
 /**
@@ -795,11 +796,11 @@ function maskRef(ref) {
 /* ------------------------------------------------------------------------ models */
 
 function buildGateway(cfg) {
-  const usage = new UsageLog();
+  const usage = new UsageLog(undefined, { pricing: cfg?.pricing });
   // Under launchd this stderr is a log file. Adapter errors quote whatever a CLI printed,
   // which can be a prompt that held the key, so every line is redacted on the way out.
   const log = process.env.KEYSMITH_VERBOSE ? (m) => process.stderr.write(`[keysmith] ${redactSecrets(m)}\n`) : () => {};
-  return { gateway: new Gateway(cfg, { log }), usage, log };
+  return { gateway: new Gateway(cfg, { log, usage }), usage, log };
 }
 
 async function cmdModels(flags) {
@@ -1045,6 +1046,9 @@ async function cmdStatus() {
   lines.push(`config  : ${rel(configPath())}${cfg ? '' : ' (missing — keysmith init)'}`);
   if (cfg) {
     lines.push(`adapters: ${Object.keys(cfg.adapters || {}).join(', ') || 'none'}`);
+    for (const err of new UsageLog(undefined, { pricing: cfg?.pricing }).checkReadable()) {
+      lines.push(`usage   : UNREADABLE (${err})`);
+    }
     const t = tunnel.tunnelStatus(cfg);
     lines.push(`tunnel  : cloudflared ${t.installed ? 'installed' : 'MISSING'}${t.logged_in ? ', cloudflare login ok' : ', not logged in'}${t.configured ? `, named "${t.configured.name}" → ${t.configured.hostname}` : ', no named tunnel'}`);
     if (rec && alive(rec.pid)) {
@@ -1194,8 +1198,11 @@ async function cmdDoctor(flags) {
   for (const [alias, problems] of Object.entries(gateway.aliasIssues)) {
     for (const p of problems) rows.push([alias, 'alias warning', truncate(p, 70)]);
   }
+  for (const err of new UsageLog(undefined, { pricing: cfg?.pricing }).checkReadable()) {
+    rows.push(['usage log', 'unreadable', truncate(err, 70)]);
+  }
 
-  const w = Math.max(...rows.map((r) => r[0].length), 8);
+  const w = maxLen(rows, (r) => r[0].length, 8);
   for (const [id, state, detail] of rows) {
     // '!' rather than '✗': the route still answers, because the next leg in the chain picks it
     // up. What is broken is the ordering you asked for, and the money you think you are saving.
@@ -1285,10 +1292,39 @@ async function cmdTunnel(flags) {
 /* ------------------------------------------------------------------------- usage */
 
 function cmdUsage(flags) {
-  const usage = new UsageLog();
-  const s = usage.summarize((flags.hours || 24) * 3600_000);
-  out(`last ${s.window}: ${s.requests} requests, ${s.failures} failed, ${s.tokensIn} in / ${s.tokensOut} out`);
-  for (const m of s.models) out(`  ${m.model.padEnd(44)} ${String(m.requests).padStart(4)} req  ${String(m.failures).padStart(3)} err  ${m.input} in  ${m.output} out`);
+  const cfg = configExists() ? loadConfig({ mint: false }) : { limits: {}, pricing: {}, adapters: {} };
+  const usage = new UsageLog(undefined, { pricing: cfg?.pricing });
+  const format = String(flags.format || 'table').toLowerCase();
+  if (!['table', 'csv', 'json'].includes(format)) {
+    fail(`unknown --format "${flags.format}" — table | csv | json`);
+  }
+  const byFlags = flags[ALL]?.by ? [...flags[ALL].by, ...flags._] : ['model'];
+  let stats;
+  try {
+    stats = usage.query({
+      by: byFlags,
+      since: flags.since,
+      until: flags.until,
+      hours: flags.hours !== undefined ? Number(flags.hours) : null,
+    });
+  } catch (e) {
+    fail(e.message);
+  }
+  const spend = usage.spendSummary(cfg?.limits?.spend, { adapters: cfg?.adapters });
+  const daily = authEnabled(cfg) ? usage.dailySummary(parseKeys(cfg?.auth?.keys || []).entries) : [];
+  if (format === 'json') {
+    const payload = {
+      ...stats,
+      ...(spend.length ? { spend } : {}),
+      ...(daily.length ? { daily } : {}),
+      ...(flags.tail ? { entries: usage.tail(Number(flags.tail)) } : {}),
+    };
+    return out(JSON.stringify(payload, null, 2));
+  }
+  if (format === 'csv') {
+    return out(formatUsageCsv(stats));
+  }
+  out(formatUsageTable(stats, { spend, daily }));
   if (flags.tail) {
     out('\nrecent:');
     for (const e of usage.tail(Number(flags.tail))) {
@@ -1342,7 +1378,7 @@ function cmdKey(flags) {
 function keyList(cfg, flags) {
   if (!cfg.auth.keys.length) return out('(none)');
   const { entries, issues } = parseKeys(cfg.auth.keys);
-  const w = Math.max(1, ...entries.map((e) => (e.label || '-').length));
+  const w = maxLen(entries, (e) => (e.label || '-').length, 1);
   if (entries.length) showKeys(entries, { reveal: flags.reveal, describe: (e) => `  ${(e.label || '-').padEnd(w)}  ${describeKey(e)}` });
   for (const issue of issues) warn(`! ${issue}`);
   for (const w of scopeWarnings(cfg, entries)) warn(`! ${w.message}`);
@@ -1511,7 +1547,7 @@ function keyWhoCan(cfg, flags) {
   const rows = entries.map((e) => ({ e, ...decide(e.scope) }));
   const can = rows.filter((r) => r.reach !== 'none');
   const cannot = rows.filter((r) => r.reach === 'none');
-  const w = Math.max(1, ...entries.map((e) => (e.label || '-').length));
+  const w = maxLen(entries, (e) => (e.label || '-').length, 1);
   const line = (r) => `  fp:${r.e.fp}  ${(r.e.label || '-').padEnd(w)}  ${r.reach === 'some' ? `part of it (${r.how || 'some models'}) — ` : ''}${describeKey(r.e)}`;
   out(`${target}: reachable by ${can.length} of ${entries.length} key(s)`);
   for (const r of can) out(line(r));
@@ -1687,6 +1723,15 @@ function parseFlags(args) {
  * Everything keysmith prints goes through redaction: the configured keys, and anything
  * shaped like a minted one, come out as `ks_Q…35 fp:…`. Only `showKeys`, to a terminal, gets past it.
  */
+function maxLen(list, fn, min = 0) {
+  let max = min;
+  for (const item of list) {
+    const n = fn(item);
+    if (n > max) max = n;
+  }
+  return max;
+}
+
 function out(s) {
   process.stdout.write(redactSecrets(s) + '\n');
 }

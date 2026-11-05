@@ -17,23 +17,28 @@ import { MAX_TOOLS, anthropicToolMessages, anthropicToolSpec, openaiLegacy, open
 import { addUsage } from './tools/emulate.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
-import { upstreamError } from './http-adapter.js';
-import { failureOf, scopeError } from './gateway.js';
+import { upstreamError, upstreamIdFromHeaders } from './http-adapter.js';
+import { failureOf, legMetaOf, scopeError } from './gateway.js';
 import { authEnabled, describeScope, parseKeys, scopeWarnings, targetDecision } from './keys.js';
 import { DailyQuota, overCapMessage } from './quota.js';
 import { requestEffort } from './effort.js';
+import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
 
 const MAX_BODY = 32 * 1024 * 1024;
 const STREAM_HOLD_MS = 10_000;
 const UHP_DEFAULT_VERSION = '2026-10-19';
 const UHP_VERSIONS = ['2026-10-19', '2026-09-28', '2026-09-12', '2026-08-11'];
 /**
- * The routes that ask a model something: a request to one of them is what a key's daily cap
- * counts (quota.js). Listing models, routes or usage, and the status page, are not.
+ * The routes that ask a model something, plus `/v1/keysmith/usage`: a request to one of them is
+ * what a key's daily cap counts (quota.js). Listing models or routes, and the status page, are not.
  */
 const METERED = new Set(['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/embeddings']);
 
-export function createServer(gateway, cfg, { usage, log: write = () => {}, now = () => Date.now() } = {}) {
+export function createServer(gateway, cfg, { usage, log: write = () => {}, now: customNow = null } = {}) {
+  const now = customNow || (usage?.now ? () => {
+    const v = usage.now();
+    return v instanceof Date ? v.getTime() : Number(v);
+  } : () => Date.now());
   // Every line this server logs can quote an upstream error; it leaves here redacted.
   const log = (m) => write(redactSecrets(m));
   // Each key, with what it may reach (keys.js): a bare key is unscoped, as it always was.
@@ -49,6 +54,12 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now =
   // The usage log redacts these from every line it writes; register them even when the
   // config did not come through loadConfig (an embedded server, a test).
   registerSecrets(cfg.auth?.keys);
+  if (usage) {
+    if (!gateway.usage) gateway.usage = usage;
+    if (!usage.pricing && cfg?.pricing) usage.pricing = cfg.pricing;
+    if (!usage.log) usage.log = log;
+    if (customNow) usage.now = customNow;
+  }
   // Today's requests per key, rebuilt from today's usage rows: a restart does not hand a capped
   // key a fresh day (quota.js).
   const quota = new DailyQuota({ now });
@@ -76,6 +87,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now =
   });
 
   async function handle(req, res) {
+    wrapBytesOut(res);
+    req._bytesIn = 0;
     let url;
     try {
       url = new URL(req.url, 'http://internal');
@@ -87,7 +100,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now =
     const route = url.pathname.replace(/\/+$/, '') || '/';
 
     res.setHeader('access-control-allow-origin', '*');
-    res.setHeader('access-control-allow-headers', 'authorization,content-type,x-keysmith-session,x-api-key,anthropic-version,uhp-version,idempotency-key,x-harness-id,traceparent,tracestate');
+    res.setHeader('access-control-allow-headers', 'authorization,content-type,x-keysmith-session,x-keysmith-tag,x-api-key,anthropic-version,uhp-version,idempotency-key,x-harness-id,traceparent,tracestate');
     res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
 
     // UHP-Version header negotiation (UHP 2026-10-19).
@@ -146,11 +159,14 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now =
         if (!viewer) return send(res, 401, PAGE_HEADERS, loginPage({ action: route }));
         const scope = viewer.entry?.scope || null;
         const { models } = await safeList(gateway, scope);
+        const uFilter = usageFilterFor(gateway, viewer.entry);
         return send(res, 200, PAGE_HEADERS, statusPage({
           cfg: scope ? { ...cfg, adapters: visibleEntries(cfg.adapters, (id) => gateway.adapterVisible(id, scope)) } : cfg,
           models,
           usage,
-          usageFilter: usageFilterFor(gateway, viewer.entry),
+          usageFilter: uFilter,
+          spend: visibleSpend(usage, cfg, gateway, scope, viewer.entry),
+          usageErrors: usage?.readErrors?.() || [],
           startedAt,
           loadErrors: visibleEntries(gateway.loadErrors, (id) => gateway.adapterVisible(id, scope)),
           aliasIssues: gateway.aliasIssuesFor(scope),
@@ -167,12 +183,16 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now =
     }
     const { caller, scope } = who;
     // Every usage row this request writes says which key it came with and what its scope did.
-    const stamped = usage ? { record: (entry) => usage.record(stamp(entry, who, res)) } : null;
+    const stamped = usage ? { record: (entry) => usage.record(stamp({ ts: new Date(now()).toISOString(), ...entry }, { who, req, res, route, gateway, cfg })) } : null;
 
+    let meteredRequest = false;
     try {
-      // A request that asks a model counts against its key's daily cap before anything is read:
-      // one per client request, whatever alias, failover or retry happens under it.
-      if (req.method === 'POST' && METERED.has(route)) meter(who, route, stamped);
+      // A request that asks a model (or queries /v1/keysmith/usage) counts against its key's daily
+      // cap before anything is read: one per client request, whatever alias, failover or retry happens under it.
+      if ((req.method === 'POST' && METERED.has(route)) || (req.method === 'GET' && route === '/v1/keysmith/usage')) {
+        meter(who, route, stamped, req);
+        meteredRequest = true;
+      }
       if (route === '/v1/models' || route === '/models') {
         const { models, errors } = await gateway.listModels({ refresh: url.searchParams.has('refresh'), scope });
         return json(res, 200, { object: 'list', data: models, ...(errors.length ? { keysmith: { errors } } : {}) });
@@ -218,15 +238,49 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now =
           failed_to_load: visibleEntries(gateway.loadErrors, (id) => gateway.adapterVisible(id, scope)),
           aliases: gateway.aliasesFor(scope),
           alias_warnings: gateway.aliasIssuesFor(scope),
-          limits: cfg.limits,
+          limits: visibleLimits(cfg, gateway, scope),
         });
       }
       if (route === '/v1/keysmith/usage' && req.method === 'GET') {
-        const n = Number(url.searchParams.get('tail') || 0);
+        const rawTail = url.searchParams.get('tail');
+        let n = 0;
+        if (rawTail !== null && rawTail !== '') {
+          const parsedTail = Number(rawTail);
+          if (!Number.isInteger(parsedTail) || parsedTail < 0 || parsedTail > TAIL_RING_MAX) {
+            throw new LlmError(`tail must be an integer between 0 and ${TAIL_RING_MAX}`, { status: 400, type: 'invalid_request_error' });
+          }
+          n = parsedTail;
+        }
         // A scoped key reads its own rows only (usageFilterFor): its summary counts its requests,
         // and its `keys` holds its own fingerprint and no other.
         const filter = usageFilterFor(gateway, who);
-        return json(res, 200, { summary: usage?.summarize(Number(url.searchParams.get('hours') || 24) * 3600_000, filter), ...(n ? { entries: usage.tail(n, filter) } : {}) });
+        const byParam = url.searchParams.getAll('by');
+        const sinceParam = url.searchParams.get('since');
+        const untilParam = url.searchParams.get('until');
+        const hoursParam = url.searchParams.has('hours') ? Number(url.searchParams.get('hours')) : null;
+        let stats = null;
+        try {
+          stats = usage?.query({
+            by: byParam.length ? byParam : ['model'],
+            since: sinceParam,
+            until: untilParam,
+            hours: hoursParam,
+            filter,
+            now: now(),
+            fromDays: true,
+          });
+        } catch (err) {
+          throw new LlmError(err.message, { status: 400, type: 'invalid_request_error' });
+        }
+        const spend = visibleSpend(usage, cfg, gateway, scope, who);
+        const daily = authOn ? (usage?.dailySummary?.(keys, { who, quota, now: now() }) || []) : [];
+        return json(res, 200, {
+          ...(stats || {}),
+          summary: stats,
+          ...(spend.length ? { spend } : {}),
+          ...(daily.length ? { daily } : {}),
+          ...(n ? { entries: usage.tail(n, filter) } : {}),
+        });
       }
       if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope });
       if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope });
@@ -240,27 +294,54 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now =
       // a provider key, and a client of this gateway was never given that key.
       const message = redactSecrets(e.message || String(e));
       const meta = res._keysmith;
-      if (meta && !meta.done) {
-        // A tool engine that failed still spent its runs: the error says what, and which engine.
-        record(stamped, { model: meta.model, status: e?.scopeDenied ? 'denied' : 'error', ms: Date.now() - meta.t0, stream: meta.stream, error: message, client: req.headers['user-agent'], ...(meta.via ? { via: meta.via } : {}), ...errorMarks(e) });
-      }
+      const faceName = faceFromRoute(route);
+      let pendingErrBody = null;
       if (res.headersSent) {
         // A stream that already started must be closed politely, in its face's own error frame
         // (an OpenAI error chunk and [DONE]; an Anthropic `error` event), or clients hang waiting
         // for a terminator that never comes — or take what came so far for the whole answer.
         if (meta?.face && !res.writableEnded) {
           meta.face.fail(message, e.type || 'upstream_error');
-          return;
+        } else {
+          if ((res.getHeader('content-type') || '').includes('text/event-stream')) {
+            res.write(`data: ${JSON.stringify({ error: { message: `keysmith: ${message}`, type: e.type || 'upstream_error' } })}\n\n`);
+            res.write('data: [DONE]\n\n');
+          }
+          res.end();
         }
-        if ((res.getHeader('content-type') || '').includes('text/event-stream')) {
-          res.write(`data: ${JSON.stringify({ error: { message: `keysmith: ${message}`, type: e.type || 'upstream_error' } })}\n\n`);
-          res.write('data: [DONE]\n\n');
-        }
-        return res.end();
+      } else {
+        // A provider's "retry after N s" is for the client's backoff: pass it on.
+        if (e?.retryAfter) res.setHeader('retry-after', String(e.retryAfter));
+        pendingErrBody = JSON.stringify(errorBody(message, e instanceof LlmError ? e.type : 'internal_error', status, e?.provider || null, faceName));
       }
-      // A provider's "retry after N s" is for the client's backoff: pass it on.
-      if (e?.retryAfter) res.setHeader('retry-after', String(e.retryAfter));
-      return json(res, status, errorBody(message, e instanceof LlmError ? e.type : 'internal_error', status, e?.provider || null));
+      if (meta && !meta.done) {
+        // A tool engine that failed still spent its runs: the error says what, and which engine.
+        record(stamped, {
+          model: meta.model,
+          status: e?.scopeDenied ? 'denied' : 'error',
+          ms: Date.now() - meta.t0,
+          stream: meta.stream,
+          error: message,
+          client: req.headers['user-agent'],
+          ...(pendingErrBody !== null ? { bytesOut: (res._bytesOut || 0) + Buffer.byteLength(pendingErrBody, 'utf8') } : {}),
+          ...(meta.via ? { via: meta.via } : {}),
+          ...(e?.leg ? { _leg: e.leg } : {}),
+          ...(e?.upstreamId ? { upstreamId: e.upstreamId } : {}),
+          ...errorMarks(e),
+        });
+      } else if (meteredRequest && !meta && who?.fp) {
+        usage?.noteUnloggedFailure?.(who.fp, now(), {
+          label: who.label,
+          route,
+          face: faceFromRoute(route),
+          client: req.headers['user-agent'],
+          tag: parseTag(req.headers['x-keysmith-tag']),
+        });
+      }
+      if (pendingErrBody !== null) {
+        send(res, status, { 'content-type': 'application/json; charset=utf-8' }, pendingErrBody);
+      }
+      return;
     }
   }
 
@@ -271,15 +352,36 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now =
    * and a log line; the ones after it are counted (the status page shows them) but write
    * nothing, so a client that keeps asking cannot fill the disk.
    */
-  function meter(who, route, stamped) {
+  function meter(who, route, stamped, req = null) {
     if (!who.fp) return; // auth off: there is no key to count against
     const d = quota.admit(who.fp, who.perDay ?? null);
-    if (d.ok) return;
+    if (d.ok) {
+      usage?.noteDaily?.(who.fp, quota.today(who.fp), now(), { label: who.label, route });
+      return;
+    }
     const message = overCapMessage(d);
     if (d.first) {
       log(`key fp:${who.fp}${who.label ? ` (${who.label})` : ''} reached its daily cap of ${d.perDay} requests: refused until local midnight`);
-      record(stamped, { model: null, status: 'limited', ms: 0, stream: false, via: route, error: message });
+      const errJson = JSON.stringify(errorBody(message, 'rate_limit_error', 429, null, faceFromRoute(route)));
+      record(stamped, {
+        model: null,
+        status: 'limited',
+        ms: 0,
+        stream: false,
+        via: route,
+        error: message,
+        client: req?.headers?.['user-agent'],
+        bytesOut: Buffer.byteLength(errJson, 'utf8'),
+      });
     }
+    usage?.noteDaily?.(who.fp, quota.today(who.fp), now(), {
+      label: who.label,
+      route,
+      face: faceFromRoute(route),
+      client: req?.headers?.['user-agent'],
+      tag: parseTag(req?.headers?.['x-keysmith-tag']),
+      extraRefusal: !d.first,
+    });
     const e = new LlmError(message, { status: 429, type: 'rate_limit_error' });
     e.retryAfter = d.retryAfter;
     throw e;
@@ -357,13 +459,96 @@ function usageFilterFor(gateway, who) {
   const scope = who?.scope;
   if (!scope) return null;
   const mine = `fp:${who.fp}`;
-  // A refusal over the daily cap names no model: it is the key's own row all the same.
-  return (e) => e?.key === mine && (e.status === 'limited' || gateway.mayName(e.model, scope));
+  // A refusal over the daily cap (or a model-less failure before routing) names no model: it is the key's own row all the same.
+  const fn = (e) => e?.key === mine && (e.status === 'limited' || !e.model || gateway.mayName(e.model, scope));
+  fn._cacheKey = mine;
+  return fn;
 }
 
 /** `obj` with only the own entries whose key `keep` accepts. */
 function visibleEntries(obj, keep) {
   return Object.fromEntries(Object.entries(obj || {}).filter(([id]) => keep(id)));
+}
+
+function reachableAdapters(cfg, gateway, scope) {
+  const out = new Set();
+  for (const a of gateway.publicAdapters || []) {
+    if (gateway.adapterVisible(a.id, scope)) out.add(a.id);
+  }
+  for (const [id, raw] of Object.entries(cfg?.adapters || {})) {
+    if (!raw || typeof raw !== 'object' || raw.disabled) continue;
+    if (gateway.adapterVisible(id, scope)) out.add(id);
+  }
+  return out;
+}
+
+function reachableAccounts(cfg, gateway, scope) {
+  const out = new Set();
+  for (const a of gateway.publicAdapters || []) {
+    if (gateway.adapterVisible(a.id, scope) && a.account) out.add(a.account);
+  }
+  for (const [id, raw] of Object.entries(cfg?.adapters || {})) {
+    if (!raw || typeof raw !== 'object' || raw.disabled) continue;
+    if (!gateway.adapterVisible(id, scope)) continue;
+    const acct = credentialAccount(raw);
+    if (acct) out.add(acct);
+  }
+  return out;
+}
+
+/**
+ * Limits visible to a caller on /v1/keysmith/routes: a scoped key sees only the spend caps on
+ * adapters and accounts it can reach, normalised across every accepted spend-key form (`adapters`,
+ * `accounts`, `adapter:<id>`, `account:<name>`, and flat adapter or account keys); non-spend
+ * limits (`streamHoldMs`, `keepaliveMs`, etc.) stay.
+ */
+function visibleLimits(cfg, gateway, scope) {
+  const raw = cfg?.limits || {};
+  if (!scope || !raw.spend || typeof raw.spend !== 'object' || Array.isArray(raw.spend)) return raw;
+  const adapters = reachableAdapters(cfg, gateway, scope);
+  const accounts = reachableAccounts(cfg, gateway, scope);
+  const knownAdapters = new Set([
+    ...Object.keys(cfg?.adapters || {}),
+    ...(gateway.adapters ? gateway.adapters.keys() : []),
+  ]);
+  const spend = {};
+  for (const [k, v] of Object.entries(raw.spend)) {
+    if ((k === 'adapters' || k === 'adapter' || k === 'byAdapter') && v && typeof v === 'object' && !Array.isArray(v)) {
+      const sub = {};
+      for (const [id, cap] of Object.entries(v)) {
+        if (adapters.has(id.trim())) sub[id] = cap;
+      }
+      if (Object.keys(sub).length) spend[k] = sub;
+    } else if ((k === 'accounts' || k === 'account' || k === 'byAccount') && v && typeof v === 'object' && !Array.isArray(v)) {
+      const sub = {};
+      for (const [acct, cap] of Object.entries(v)) {
+        if (accounts.has(acct.trim())) sub[acct] = cap;
+      }
+      if (Object.keys(sub).length) spend[k] = sub;
+    } else if (k.startsWith('adapter:')) {
+      const id = k.slice('adapter:'.length).trim();
+      if (adapters.has(id)) spend[k] = v;
+    } else if (k.startsWith('account:')) {
+      const acct = k.slice('account:'.length).trim();
+      if (accounts.has(acct)) spend[k] = v;
+    } else {
+      const target = k.trim();
+      if (knownAdapters.has(target) ? adapters.has(target) : accounts.has(target)) {
+        spend[k] = v;
+      }
+    }
+  }
+  return { ...raw, spend };
+}
+
+/** Monthly spend caps visible to a caller (`scope` null: all; scoped: only adapters/accounts it can reach). */
+function visibleSpend(usage, cfg, gateway, scope, who = null) {
+  const callerKey = scope && who?.fp ? `fp:${who.fp}` : null;
+  const raw = usage?.spendSummary?.(cfg?.limits?.spend, { adapters: cfg?.adapters, callerKey }) || [];
+  if (!scope) return raw;
+  const visibleAdapters = reachableAdapters(cfg, gateway, scope);
+  const visibleAccounts = reachableAccounts(cfg, gateway, scope);
+  return raw.filter((s) => (s.kind === 'adapter' ? visibleAdapters.has(s.target) : visibleAccounts.has(s.target)));
 }
 
 function cookieFrom(req, name) {
@@ -456,21 +641,31 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   // A client that offered the older `functions` reads a call back as message.function_call.
   const legacy = openaiLegacy(body);
 
-  // A request that offers tools walks its route for a leg that takes them, in declared order
-  // (gateway._toolRoute, tools/router.js): an HTTP upstream gets the body verbatim (the relay
-  // below writes its answer), a CLI with a toolMode answers through a tool engine. `out` is what
-  // the relay and the stream share: which engine is running, and the stream's face once it opened.
+  // A request that offers tools — or whose history holds tool calls — walks its route for a leg
+  // that takes them, in declared order (gateway._toolRoute, tools/router.js): an HTTP upstream on
+  // the openai wire gets the body verbatim (the relay below writes its answer), a CLI with a
+  // toolMode answers a request that offers tools through a tool engine. `out` is what the relay and
+  // the stream share: which engine is running, and the stream's face once it opened.
   const out = { mode: null, face: null };
-  const tools = offered
-    ? { spec: openaiToolSpec(body), messages: openaiToolMessages(body), face: 'openai', state: out, caller, relay: (leg) => relayLeg(leg, { body, req, res, out, usage, log, t0, caller, requested }) }
-    : null;
+  const hasToolHistory = !offered && hasOpenaiToolHistory(body);
+  const tools =
+    offered || hasToolHistory
+      ? {
+          spec: offered ? openaiToolSpec(body) : { tools: [], choice: { mode: 'auto' }, parallel: true, unsupported: [], historyOnly: true },
+          messages: offered ? openaiToolMessages(body) : [],
+          face: 'openai',
+          state: out,
+          caller,
+          relay: (leg) => relayLeg(leg, { body, req, res, out, usage, log, t0, caller, requested }),
+        }
+      : null;
 
   const chain = gateway.resolve(requested, { scope });
   const publicId = session || null;
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
   if (!stream) {
-    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace });
+    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace });
     if (relayed) {
       // An HTTP leg's answer went out verbatim, with its own usage row.
       meta.done = true;
@@ -479,16 +674,28 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     const calls = toolCalls.map((c) => faceCall(c, 'openai'));
     // Written before the row: an answer the face cannot write is the error row, not an `ok` one.
     const payload = openaiCompletion({ id, model: requested, created, text, usage: faceUsage(u, usageReason), reasoning: body.include_reasoning ? reasoning || null : null, toolCalls: calls, legacy });
-    meta.done = true;
-    record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, usageReason), stream: false, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }), ...effortMarks(ran) });
     // The header carries the session for clients that read headers; the body carries it
     // for the ones that do not (curl, `keysmith chat`), and OpenAI SDKs ignore extras.
     if (sid) payload.keysmith = { session: sid, resumed: !!publicId };
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
-    return json(res, 200, payload, sid);
+    meta.done = true;
+    json(res, 200, payload, sid);
+    record(usage, {
+      model: requested,
+      status: 'ok',
+      ms: Date.now() - t0,
+      ...usageMarks(out.failed, u, usageReason),
+      stream: false,
+      client: req.headers['user-agent'],
+      ...(leg ? { _leg: leg } : {}),
+      ...(upstreamId ? { upstreamId } : {}),
+      ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }),
+      ...effortMarks(ran),
+    });
+    return;
   }
 
-  const events = await held(gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace }), holdMs);
+  const events = await held(gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace }), holdMs);
   if (res.headersSent) {
     // An HTTP leg is answering verbatim — its status, its headers, its bytes — and writes its
     // own usage row: what is left here is waiting for it to finish.
@@ -512,11 +719,17 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   let toolMode = null;
   let fallback = null;
   let bridge = null;
+  let leg = null;
+  let upstreamId = null;
   for await (const evt of events) {
     if (evt.type === 'relayed') {
       // An HTTP leg took the open stream over (relayLeg) and finished it, row and all.
       meta.done = true;
       return;
+    } else if (evt.type === 'leg') {
+      leg = evt.leg;
+    } else if (evt.type === 'upstream' && evt.upstreamId) {
+      upstreamId = evt.upstreamId;
     } else if (evt.type === 'retry') {
       retries++;
     } else if (evt.type === 'cut') {
@@ -549,7 +762,19 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   // engine reported after the answer began replaces that chunk with the error frame.
   face.finish({ usage: faceUsage(u, uReason), keysmith: sid ? { session: sid, resumed: !!publicId } : null, error: errMessage });
   meta.done = true;
-  record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, uReason), stream: true, error: errMessage, client: req.headers['user-agent'], ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }), ...effortMarks(ran) });
+  record(usage, {
+    model: requested,
+    status: errMessage ? 'error' : 'ok',
+    ms: Date.now() - t0,
+    ...usageMarks(out.failed, u, uReason),
+    stream: true,
+    error: errMessage,
+    client: req.headers['user-agent'],
+    ...(leg ? { _leg: leg } : {}),
+    ...(upstreamId ? { upstreamId } : {}),
+    ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }),
+    ...effortMarks(ran),
+  });
 }
 
 async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null }) {
@@ -577,13 +802,26 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   const tools = offered ? { spec: anthropicToolSpec(body), messages: anthropicToolMessages(body), face: 'anthropic', state: out, caller, relay: null } : null;
   // The Messages API defaults to a single JSON reply; SSE only when asked.
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge } = await gateway.collect({ model: requested, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId } = await gateway.collect({ model: requested, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace });
     const calls = toolCalls.map((c) => faceCall(c, 'anthropic'));
-    meta.done = true;
-    record(usage, { model: requested, status: 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, usageReason), stream: false, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }), ...effortMarks(ran) });
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
+    meta.done = true;
     // Session goes out as a header only: Anthropic clients schema-check the body.
-    return json(res, 200, anthropicMessage({ id, model: requested, text, usage: faceUsage(u, usageReason), toolCalls: calls }), sid);
+    json(res, 200, anthropicMessage({ id, model: requested, text, usage: faceUsage(u, usageReason), toolCalls: calls }), sid);
+    record(usage, {
+      model: requested,
+      status: 'ok',
+      ms: Date.now() - t0,
+      ...usageMarks(out.failed, u, usageReason),
+      stream: false,
+      client: req.headers['user-agent'] || 'anthropic',
+      via: '/v1/messages',
+      ...(leg ? { _leg: leg } : {}),
+      ...(upstreamId ? { upstreamId } : {}),
+      ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }),
+      ...effortMarks(ran),
+    });
+    return;
   }
   const events = await held(gateway.complete({ model: requested, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace }), holdMs);
   startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
@@ -601,8 +839,12 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   let toolMode = null;
   let fallback = null;
   let bridge = null;
+  let leg = null;
+  let upstreamId = null;
   for await (const evt of events) {
-    if (evt.type === 'retry') retries++;
+    if (evt.type === 'leg') leg = evt.leg;
+    else if (evt.type === 'upstream' && evt.upstreamId) upstreamId = evt.upstreamId;
+    else if (evt.type === 'retry') retries++;
     else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'usage_unknown') uReason ||= evt.reason;
     else if (evt.type === 'effort') ran = evt;
@@ -615,7 +857,20 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   }
   face.finish({ usage: faceUsage(u, uReason), error: errMessage });
   meta.done = true;
-  record(usage, { model: requested, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, uReason), stream: true, error: errMessage, client: 'anthropic', via: '/v1/messages', ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }), ...effortMarks(ran) });
+  record(usage, {
+    model: requested,
+    status: errMessage ? 'error' : 'ok',
+    ms: Date.now() - t0,
+    ...usageMarks(out.failed, u, uReason),
+    stream: true,
+    error: errMessage,
+    client: req.headers['user-agent'] || 'anthropic',
+    via: '/v1/messages',
+    ...(leg ? { _leg: leg } : {}),
+    ...(upstreamId ? { upstreamId } : {}),
+    ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }),
+    ...effortMarks(ran),
+  });
   void log;
 }
 
@@ -720,15 +975,28 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     });
   }
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls } = await gateway.collect({ model: requestedModel, messages, session, signal: abortSignal(req, res), scope, effort, harnessId, trace });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, leg, upstreamId } = await gateway.collect({ model: requestedModel, messages, session, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace });
     if (toolCalls.length) throw noResponsesToolCalls();
     meta.done = true;
-    record(usage, { model: requestedModel, status: 'ok', ms: Date.now() - t0, ...usageMarks(null, u, usageReason), stream: false, via: '/v1/responses', ...marks({ retries, cutAt }), ...effortMarks(ran) });
     const payload = responsesResult({ id, model: requestedModel, text, usage: faceUsage(u, usageReason), created });
     onStore(payload, sid);
-    return json(res, 200, payload, sid);
+    json(res, 200, payload, sid);
+    record(usage, {
+      model: requestedModel,
+      status: 'ok',
+      ms: Date.now() - t0,
+      ...usageMarks(null, u, usageReason),
+      stream: false,
+      client: req.headers['user-agent'],
+      via: '/v1/responses',
+      ...(leg ? { _leg: leg } : {}),
+      ...(upstreamId ? { upstreamId } : {}),
+      ...marks({ retries, cutAt }),
+      ...effortMarks(ran),
+    });
+    return;
   }
-  const events = await held(gateway.complete({ model: requestedModel, messages, session, signal: abortSignal(req, res), scope, effort, harnessId, trace }), holdMs);
+  const events = await held(gateway.complete({ model: requestedModel, messages, session, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace }), holdMs);
   startSse(res, 'text/event-stream');
   for (const e of responsesStreamEventsHead({ id, model: requestedModel })) sseEvent(res, e.event, e.data);
   let full = '';
@@ -739,8 +1007,12 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
   let errMessage = null;
   let retries = 0;
   let cutAt = null;
+  let leg = null;
+  let upstreamId = null;
   for await (const evt of events) {
-    if (evt.type === 'retry') retries++;
+    if (evt.type === 'leg') leg = evt.leg;
+    else if (evt.type === 'upstream' && evt.upstreamId) upstreamId = evt.upstreamId;
+    else if (evt.type === 'retry') retries++;
     else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'usage_unknown') uReason ||= evt.reason;
     else if (evt.type === 'effort') ran = evt;
@@ -760,7 +1032,20 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
   sseEvent(res, 'response.completed', { type: 'response.completed', response: { id: `resp_${id}`, object: 'response', model: requestedModel, status: errMessage ? 'failed' : 'completed', output: completedPayload.output, usage: responsesUsage(faceUsage(u, uReason)) } });
   res.end();
   meta.done = true;
-  record(usage, { model: requestedModel, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(null, u, uReason), stream: true, error: errMessage, via: '/v1/responses', ...marks({ retries, cutAt }), ...effortMarks(ran) });
+  record(usage, {
+    model: requestedModel,
+    status: errMessage ? 'error' : 'ok',
+    ms: Date.now() - t0,
+    ...usageMarks(null, u, uReason),
+    stream: true,
+    error: errMessage,
+    client: req.headers['user-agent'],
+    via: '/v1/responses',
+    ...(leg ? { _leg: leg } : {}),
+    ...(upstreamId ? { upstreamId } : {}),
+    ...marks({ retries, cutAt }),
+    ...effortMarks(ran),
+  });
   void log;
 }
 
@@ -776,16 +1061,29 @@ async function responsesWithTools(req, res, gateway, body, { usage, caller, hold
   const messages = responsesMessages(body);
   const request = { tools: body.tools, tool_choice: body.tool_choice, parallel_tool_calls: body.parallel_tool_calls };
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), scope, tools, effort, harnessId, trace });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace });
     const calls = toolCalls.map((c) => faceCall(c, 'responses'));
     const payload = responsesBody({ id, model: body.model, created, text, usage: faceUsage(u, usageReason), toolCalls: calls, request });
-    meta.done = true;
-    record(usage, { model: body.model, status: 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, usageReason), stream: false, via: '/v1/responses', ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }), ...effortMarks(ran) });
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
     onStore?.(payload, sid);
-    return json(res, 200, payload, sid);
+    meta.done = true;
+    json(res, 200, payload, sid);
+    record(usage, {
+      model: body.model,
+      status: 'ok',
+      ms: Date.now() - t0,
+      ...usageMarks(out.failed, u, usageReason),
+      stream: false,
+      client: req.headers['user-agent'],
+      via: '/v1/responses',
+      ...(leg ? { _leg: leg } : {}),
+      ...(upstreamId ? { upstreamId } : {}),
+      ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }),
+      ...effortMarks(ran),
+    });
+    return;
   }
-  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), scope, tools, effort, harnessId, trace }), holdMs);
+  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace }), holdMs);
   startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
   const face = new ResponsesStream(res, { id, model: body.model, created, request, keepaliveMs });
   meta.face = face;
@@ -800,8 +1098,12 @@ async function responsesWithTools(req, res, gateway, body, { usage, caller, hold
   let toolMode = null;
   let fallback = null;
   let bridge = null;
+  let leg = null;
+  let upstreamId = null;
   for await (const evt of events) {
-    if (evt.type === 'retry') retries++;
+    if (evt.type === 'leg') leg = evt.leg;
+    else if (evt.type === 'upstream' && evt.upstreamId) upstreamId = evt.upstreamId;
+    else if (evt.type === 'retry') retries++;
     else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'usage_unknown') uReason ||= evt.reason;
     else if (evt.type === 'effort') ran = evt;
@@ -818,7 +1120,20 @@ async function responsesWithTools(req, res, gateway, body, { usage, caller, hold
     onStore(face._response('completed', { output: face.output, usage: faceUsage(u, uReason) }), sid);
   }
   meta.done = true;
-  record(usage, { model: body.model, status: errMessage ? 'error' : 'ok', ms: Date.now() - t0, ...usageMarks(out.failed, u, uReason), stream: true, error: errMessage, via: '/v1/responses', ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }), ...effortMarks(ran) });
+  record(usage, {
+    model: body.model,
+    status: errMessage ? 'error' : 'ok',
+    ms: Date.now() - t0,
+    ...usageMarks(out.failed, u, uReason),
+    stream: true,
+    error: errMessage,
+    client: req.headers['user-agent'],
+    via: '/v1/responses',
+    ...(leg ? { _leg: leg } : {}),
+    ...(upstreamId ? { upstreamId } : {}),
+    ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }),
+    ...effortMarks(ran),
+  });
 }
 
 /**
@@ -847,6 +1162,7 @@ async function handleEmbeddings(req, res, gateway, { usage, scope = null } = {})
   }
   const adapter = gateway.adapters.get(adapterId);
   if (!adapter || adapter.kind !== 'http') throw new LlmError('embeddings need an HTTP adapter', { status: 400 });
+  gateway.checkSpend(adapter, upstreamModel, scope);
   const r = await fetch(`${adapter.baseUrl}/embeddings`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...adapter.authHeaders(), ...adapter.headers },
@@ -854,12 +1170,65 @@ async function handleEmbeddings(req, res, gateway, { usage, scope = null } = {})
     signal: AbortSignal.timeout(adapter.timeoutMs),
   });
   const text = await r.text();
+  const upstreamId = upstreamIdFromHeaders(r.headers);
+  const embUsage = r.ok ? extractEmbeddingsUsage(text) : undefined;
   meta.done = true;
-  record(usage, { model: body.model, status: r.ok ? 'ok' : 'error', ms: Date.now() - t0, stream: false, via: '/v1/embeddings', ...(r.ok ? {} : { error: `${adapterId} ${r.status}` }) });
   res.writeHead(r.status, { 'content-type': 'application/json' });
   // A refusal is the provider's error body, which can quote the key it refused; vectors are
   // passed on as they came.
   res.end(r.ok ? text : redactSecrets(text));
+  record(usage, {
+    model: body.model,
+    status: r.ok ? 'ok' : 'error',
+    ms: Date.now() - t0,
+    ...(embUsage?.unknown ? { usage: null, usageReason: embUsage.unknown } : embUsage ? { usage: embUsage } : {}),
+    stream: false,
+    client: req.headers['user-agent'],
+    via: '/v1/embeddings',
+    _leg: legMetaOf(adapter, upstreamModel),
+    ...(upstreamId ? { upstreamId } : {}),
+    ...(r.ok ? {} : { error: `${adapterId} ${r.status}` }),
+  });
+}
+
+function hasOpenaiToolHistory(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  return messages.some((m) => (Array.isArray(m?.tool_calls) && m.tool_calls.length > 0) || m?.role === 'tool');
+}
+
+function extractEmbeddingsUsage(rawText) {
+  if (!rawText) return undefined;
+  try {
+    const parsed = JSON.parse(rawText);
+    const raw = parsed?.usage;
+    if (!raw || typeof raw !== 'object') return undefined;
+    if (raw.keysmith_usage === 'unknown') {
+      return { unknown: typeof raw.reason === 'string' && raw.reason ? raw.reason : 'upstream reported unknown token counts' };
+    }
+    const rawInput = raw.prompt_tokens ?? raw.input_tokens ?? raw.input ?? raw.total_tokens;
+    const cacheRead = raw.prompt_tokens_details?.cached_tokens || raw.cached_tokens || raw.cache_read_input_tokens || raw.cacheRead || 0;
+    const cacheWrite = raw.prompt_tokens_details?.cache_creation_tokens || raw.cache_creation_input_tokens || raw.cacheWrite || 0;
+    const output = raw.completion_tokens ?? raw.output_tokens ?? raw.output ?? 0;
+    if (![rawInput, cacheRead, cacheWrite, output].some((v) => typeof v === 'number' && Number.isFinite(v))) {
+      return undefined;
+    }
+    const input =
+      raw.prompt_tokens != null
+        ? Math.max(0, Number(raw.prompt_tokens) || 0)
+        : Math.max(
+            0,
+            (Number(rawInput) || 0) +
+              (raw.cache_read_input_tokens != null || raw.cache_creation_input_tokens != null ? (Number(cacheRead) || 0) + (Number(cacheWrite) || 0) : 0),
+          );
+    return {
+      input,
+      output: Number(output) || 0,
+      cacheRead: Number(cacheRead) || 0,
+      cacheWrite: Number(cacheWrite) || 0,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -880,15 +1249,28 @@ async function relayLeg({ adapter, model }, { body, req, res, out, usage, log, t
   // and its answer carries on in it. After a refusal the next leg names its own engine, and a
   // plain completion none (gateway._toolRoute).
   out.mode = 'passthrough';
-  const upstream = await adapter.rawChat({ ...body, model }, { caller });
+  const clientAskedUsage = !!body?.stream_options?.include_usage;
+  const streamUsageAllowed = adapter.streamUsage !== false;
+  const addedIncludeUsage = !!body?.stream && !clientAskedUsage && streamUsageAllowed;
+  const upstreamBody = addedIncludeUsage
+    ? {
+        ...body,
+        model,
+        stream_options: {
+          ...(body.stream_options && typeof body.stream_options === 'object' ? body.stream_options : {}),
+          include_usage: true,
+        },
+      }
+    : { ...body, model };
+  const upstream = await adapter.rawChat(upstreamBody, { caller });
   if (!upstream.ok) {
     const t = await upstream.text().catch(() => '');
     throw upstreamError(adapter.id, upstream, t, { keepStatus: true });
   }
+  const sse = /text\/event-stream/i.test(upstream.headers.get('content-type') || '');
   if (res.headersSent) {
     // The hold ended while the upstream was asked: its answer carries on in the open stream,
     // when it is SSE (and the face, lazy, still wrote nothing but comments).
-    const sse = /text\/event-stream/i.test(upstream.headers.get('content-type') || '');
     if (!sse || !out.face || out.face.wroteData) {
       await upstream.body?.cancel?.().catch(() => {});
       throw cannotRelay(adapter.id, sse ? 'with another leg\'s frames in it' : 'and the upstream answered without SSE');
@@ -899,19 +1281,205 @@ async function relayLeg({ adapter, model }, { body, req, res, out, usage, log, t
   }
   // This row is the request's only one: the retries of a tool leg that failed before it are counted here.
   const retries = (out.failed || []).reduce((n, f) => n + (f.retries || 0), 0);
-  const row = { model: requested, ms: 0, stream: !!body.stream, via: 'passthrough', client: req.headers['user-agent'], toolMode: 'passthrough', ...failedMarks(out.failed, undefined), ...marks({ retries }) };
+  const upstreamId = upstreamIdFromHeaders(upstream.headers);
+  const leg = legMetaOf(adapter, model);
+  const decoder = new TextDecoder();
+  let rawText = '';
+  let sseBuf = '';
+  const flushSseEvents = (final = false) => {
+    while (true) {
+      const m = sseBuf.match(/\r?\n\r?\n/);
+      if (!m) break;
+      const boundary = m.index + m[0].length;
+      const eventBlock = sseBuf.slice(0, boundary);
+      sseBuf = sseBuf.slice(boundary);
+      const outBlock = stripInjectedUsageSseEvent(eventBlock);
+      if (outBlock !== null) {
+        res.write(outBlock);
+      }
+    }
+    if (final && sseBuf) {
+      const outBlock = stripInjectedUsageSseEvent(sseBuf);
+      if (outBlock !== null) {
+        res.write(outBlock);
+      }
+      sseBuf = '';
+    }
+  };
+  const uReason = body?.stream && !streamUsageAllowed ? `${adapter.id} has streamUsage false: streamed relay requests no usage from the upstream` : null;
   try {
-    for await (const chunk of upstream.body) res.write(chunk);
+    for await (const chunk of upstream.body) {
+      const str = decoder.decode(chunk, { stream: true });
+      rawText += str;
+      if (addedIncludeUsage && sse) {
+        sseBuf += str;
+        flushSseEvents(false);
+      } else {
+        res.write(chunk);
+      }
+    }
+    const tailStr = decoder.decode();
+    rawText += tailStr;
+    if (addedIncludeUsage && sse) {
+      sseBuf += tailStr;
+      flushSseEvents(true);
+    }
   } catch (e) {
     // Part of the answer is out: it is the answer, broken, and no other leg is asked.
     log(`passthrough via ${adapter.id} failed after it had started answering: ${e.message}`);
+    if (addedIncludeUsage && sse && sseBuf) {
+      try { flushSseEvents(true); } catch {}
+    }
     res.end();
-    record(usage, { ...row, status: 'error', ms: Date.now() - t0, error: redactSecrets(e.message || String(e)) });
+    const u = extractRelayedUsage(rawText);
+    const relayedReason = u?.unknown || uReason;
+    const effectiveU = u?.unknown ? null : u;
+    const row = {
+      model: requested,
+      ms: Date.now() - t0,
+      stream: !!body.stream,
+      via: 'passthrough',
+      client: req.headers['user-agent'],
+      toolMode: 'passthrough',
+      _leg: leg,
+      ...(upstreamId ? { upstreamId } : {}),
+      ...usageMarks(out.failed, effectiveU ?? (relayedReason ? null : undefined), relayedReason),
+      ...marks({ retries }),
+    };
+    record(usage, { ...row, status: 'error', error: redactSecrets(e.message || String(e)) });
     return true;
   }
   res.end();
-  record(usage, { ...row, status: 'ok', ms: Date.now() - t0 });
+  const u = extractRelayedUsage(rawText);
+  const relayedReason = u?.unknown || uReason;
+  const effectiveU = u?.unknown ? null : u;
+  const row = {
+    model: requested,
+    ms: Date.now() - t0,
+    stream: !!body.stream,
+    via: 'passthrough',
+    client: req.headers['user-agent'],
+    toolMode: 'passthrough',
+    _leg: leg,
+    ...(upstreamId ? { upstreamId } : {}),
+    ...usageMarks(out.failed, effectiveU ?? (relayedReason ? null : undefined), relayedReason),
+    ...marks({ retries }),
+  };
+  record(usage, { ...row, status: 'ok' });
   return true;
+}
+
+/**
+ * Strip an injected `usage` field from an SSE event block when the client did not ask for
+ * `stream_options.include_usage`: drops the chunk completely when nothing else is left in it
+ * (empty `choices`), or removes the `usage` member and keeps the chunk when it carries content,
+ * tool calls, or `finish_reason`.
+ */
+const CHUNK_ENVELOPE_KEYS = new Set(['id', 'object', 'created', 'model', 'system_fingerprint', 'service_tier', 'choices']);
+const CHUNK_PADDING_KEYS = new Set(['obfuscation']);
+
+/**
+ * Strip `usage` injected by keysmith's own `stream_options.include_usage` from an SSE event block
+ * before forwarding to a client that did not ask for it: removes the `usage` member (`null`
+ * included) from every chunk, and drops the chunk when, after removing `usage`, nothing is left
+ * but envelope keys (`CHUNK_ENVELOPE_KEYS`, with empty `choices`) and allowed padding keys
+ * (`CHUNK_PADDING_KEYS`: `obfuscation`). A `choices: []` chunk carrying any other payload field
+ * (such as `prompt_filter_results`) is kept without `usage`.
+ */
+function stripInjectedUsageSseEvent(eventBlock) {
+  const trailingMatch = eventBlock.match(/(\r?\n\r?\n|\r?\n)$/);
+  const trailing = trailingMatch ? trailingMatch[1] : '';
+  const bodyPart = trailing ? eventBlock.slice(0, -trailing.length) : eventBlock;
+  const lineSep = eventBlock.includes('\r\n') ? '\r\n' : '\n';
+  const lines = bodyPart.split(/\r?\n/);
+  const dataIndices = [];
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    if (!rawLine || rawLine.startsWith(':')) continue;
+    if (rawLine.startsWith('data:')) {
+      dataIndices.push(i);
+    } else {
+      return eventBlock;
+    }
+  }
+  if (dataIndices.length !== 1) return eventBlock;
+  const dataIdx = dataIndices[0];
+  const data = lines[dataIdx].slice(5).trim();
+  if (!data || data === '[DONE]') return eventBlock;
+  try {
+    const parsed = JSON.parse(data);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return eventBlock;
+    if (parsed.error) return eventBlock;
+    if (!Object.hasOwn(parsed, 'usage')) return eventBlock;
+    delete parsed.usage;
+    const hasChoices = Array.isArray(parsed.choices) && parsed.choices.length > 0;
+    const hasExtraFields = Object.keys(parsed).some((k) => !CHUNK_ENVELOPE_KEYS.has(k) && !CHUNK_PADDING_KEYS.has(k));
+    if (!hasChoices && !hasExtraFields) {
+      return null;
+    }
+    lines[dataIdx] = `data: ${JSON.stringify(parsed)}`;
+    return lines.join(lineSep) + trailing;
+  } catch {
+    return eventBlock;
+  }
+}
+
+function extractRelayedUsage(rawText) {
+  if (!rawText) return undefined;
+  let u = null;
+  let unknownReason = null;
+  const pull = (obj) => {
+    const raw = obj?.usage || obj?.message?.usage;
+    if (!raw || typeof raw !== 'object') return;
+    if (raw.keysmith_usage === 'unknown') {
+      unknownReason ||= typeof raw.reason === 'string' && raw.reason ? raw.reason : 'upstream reported unknown token counts';
+      return;
+    }
+    const hasTokenNumber = [
+      raw.prompt_tokens,
+      raw.input_tokens,
+      raw.input,
+      raw.completion_tokens,
+      raw.output_tokens,
+      raw.output,
+      raw.prompt_tokens_details?.cached_tokens,
+      raw.cached_tokens,
+      raw.cache_read_input_tokens,
+      raw.cacheRead,
+      raw.prompt_tokens_details?.cache_creation_tokens,
+      raw.cache_creation_input_tokens,
+      raw.cacheWrite,
+    ].some((v) => typeof v === 'number' && Number.isFinite(v));
+    if (!hasTokenNumber) return;
+    const cacheRead = raw.prompt_tokens_details?.cached_tokens || raw.cached_tokens || raw.cache_read_input_tokens || raw.cacheRead || 0;
+    const cacheWrite = raw.prompt_tokens_details?.cache_creation_tokens || raw.cache_creation_input_tokens || raw.cacheWrite || 0;
+    const rawInput =
+      raw.prompt_tokens != null
+        ? Math.max(0, Number(raw.prompt_tokens) || 0)
+        : Math.max(
+            0,
+            (Number(raw.input_tokens ?? raw.input ?? 0) || 0) +
+              (raw.cache_read_input_tokens != null || raw.cache_creation_input_tokens != null ? cacheRead + cacheWrite : 0),
+          );
+    u = mergeUsage(u, {
+      input: rawInput,
+      output: raw.completion_tokens ?? raw.output_tokens ?? raw.output ?? 0,
+      cacheRead,
+      cacheWrite,
+    });
+  };
+  const trimmed = rawText.trim();
+  if (trimmed.startsWith('{')) {
+    try { pull(JSON.parse(trimmed)); } catch {}
+    return u || (unknownReason ? { unknown: unknownReason } : undefined);
+  }
+  for (const line of rawText.split('\n')) {
+    if (!line.startsWith('data:')) continue;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') continue;
+    try { pull(JSON.parse(data)); } catch {}
+  }
+  return u || (unknownReason ? { unknown: unknownReason } : undefined);
 }
 
 function cannotRelay(id, why) {
@@ -1068,8 +1636,12 @@ function extractW3cTrace(req, res) {
  * mergeUsage keeps the larger of two reports of one run, and these are other runs.
  */
 function failedMarks(failed, usage) {
-  if (!failed?.length) return { usage };
-  return { usage: failed.reduce((u, f) => addUsage(u, f.usage), usage ?? null) ?? usage, failedLegs: failed.map((f) => ({ ...f })) };
+  if (!failed?.length) return usage === undefined ? {} : { usage, _ownUsage: usage };
+  return {
+    usage: failed.reduce((u, f) => addUsage(u, f.usage), usage ?? null) ?? usage,
+    _ownUsage: usage ?? null,
+    failedLegs: failed.map((f) => ({ ...f })),
+  };
 }
 
 /**
@@ -1081,10 +1653,13 @@ function faceUsage(u, reason) {
   return u || (reason ? { unknown: reason } : null);
 }
 
-/** A row's `usage` (failedMarks), and `usageReason` beside a null one when the CLI said why it has none. */
+/** A row's `usage` (failedMarks), and `usageReason` when the answering leg reported none and said why. */
 function usageMarks(failed, u, reason) {
   const m = failedMarks(failed, u);
-  return m.usage == null && reason ? { ...m, usage: null, usageReason: reason } : m;
+  if (u == null && reason) {
+    return { ...m, ...(m.usage == null ? { usage: null } : {}), usageReason: reason };
+  }
+  return m;
 }
 
 /** What an error that ends a request says it spent (emulate.js, gateway._toolRoute), for its row. */
@@ -1093,6 +1668,7 @@ function errorMarks(e) {
   const failure = failureOf(e);
   return {
     ...(e.usage ? { usage: e.usage } : {}),
+    ...(e._ownUsage !== undefined ? { _ownUsage: e._ownUsage } : {}),
     ...marks({ retries: e.retries || 0, toolMode: e.toolMode || null, fallback: e.fallback || null }),
     // Why the engine failed, as a code (the bridge's: `foreign_tool` for the tripwire): the
     // security event is in the row, not in the gateway log only.
@@ -1103,8 +1679,13 @@ function errorMarks(e) {
 
 function mergeUsage(a, b) {
   if (!b) return a;
-  if (!a) return { ...b };
-  return {
+  if (!a) {
+    const out = { ...b };
+    if (b.cacheInclusive) Object.defineProperty(out, 'cacheInclusive', { value: true, enumerable: false });
+    if (b.total != null) Object.defineProperty(out, 'total', { value: b.total, enumerable: false });
+    return out;
+  }
+  const out = {
     input: Math.max(a.input || 0, b.input || 0),
     output: Math.max(a.output || 0, b.output || 0),
     cacheRead: Math.max(a.cacheRead || 0, b.cacheRead || 0),
@@ -1112,6 +1693,10 @@ function mergeUsage(a, b) {
     ...(a.reasoning || b.reasoning ? { reasoning: Math.max(a.reasoning || 0, b.reasoning || 0) } : {}),
     ...(a.total || b.total ? { total: Math.max(a.total || 0, b.total || 0) } : {}),
   };
+  if (a.cacheInclusive || b.cacheInclusive) {
+    Object.defineProperty(out, 'cacheInclusive', { value: true, enumerable: false });
+  }
+  return out;
 }
 
 function record(usage, entry) {
@@ -1119,15 +1704,170 @@ function record(usage, entry) {
 }
 
 /**
- * What a usage row says about the key a request came with: its fingerprint (never the key)
- * and its scope's decision — `unscoped`, `allowed` (with `skipped`: the alias legs it left
- * out) or `denied`. With auth off there is no key, and the row is as it always was.
+ * What a usage row says about the request, the key it came with, the adapter and credential
+ * that served it, the face and byte counts, the client's tag and the request's cost.
+ * With auth off there is no key or label, and the row omits them as it always did.
  */
-function stamp(entry, who, res) {
-  if (!who?.fp) return entry;
-  const skipped = res._keysmith?.skipped;
-  const scope = entry.status === 'denied' ? 'denied' : who.scope ? 'allowed' : 'unscoped';
-  return { ...entry, key: `fp:${who.fp}`, scope, ...(skipped?.length && scope !== 'denied' ? { skipped } : {}) };
+function stamp(entry, { who, req, res, route, gateway, cfg } = {}) {
+  const { _leg, _ownUsage, ...rest } = entry;
+  const leg = _leg || gateway?.resolveLegMeta?.(rest.model) || null;
+  const adapter = rest.adapter !== undefined ? rest.adapter : (leg?.adapter ?? null);
+  const kind = rest.kind !== undefined ? rest.kind : (leg?.kind ?? null);
+  const host = rest.host !== undefined ? rest.host : (kind === 'http' ? (leg?.host ?? null) : undefined);
+  const account = rest.account !== undefined ? rest.account : (leg ? (leg.account ?? null) : null);
+  const upstreamModel = leg?.upstreamModel || leg?.model || null;
+  const face = rest.face !== undefined ? rest.face : faceFromRoute(route, rest.via);
+  const bytesIn = rest.bytesIn !== undefined ? rest.bytesIn : (req?._bytesIn ?? 0);
+  const bytesOut = rest.bytesOut !== undefined ? rest.bytesOut : (res?._bytesOut ?? 0);
+  const tag = rest.tag !== undefined ? rest.tag : parseTag(req?.headers?.['x-keysmith-tag']);
+  const ownUsage = _ownUsage !== undefined ? _ownUsage : rest.usage;
+  const costBasis = leg?.costBasis || null;
+  const cost = rest.cost || stampCost(rest, ownUsage, {
+    adapter,
+    upstreamModel,
+    kind,
+    costBasis,
+    pricing: cfg?.pricing,
+    gateway,
+  });
+
+  const base = {
+    ...rest,
+    adapter,
+    kind,
+    ...(kind === 'http' && host ? { host } : {}),
+    account,
+    ...(face ? { face } : {}),
+    bytesIn,
+    bytesOut,
+    ...(tag ? { tag } : {}),
+    cost,
+  };
+
+  if (!who?.fp) return base;
+  const skipped = res?._keysmith?.skipped;
+  const scope = rest.status === 'denied' ? 'denied' : who.scope ? 'allowed' : 'unscoped';
+  return {
+    ...base,
+    key: `fp:${who.fp}`,
+    ...(who.label ? { label: who.label } : {}),
+    scope,
+    ...(skipped?.length && scope !== 'denied' ? { skipped } : {}),
+  };
+}
+
+/**
+ * Price a row's tokens by the leg that spent them: the answering (or failing) leg's own tokens
+ * (`ownUsage`) at its own adapter and basis, and each failed tool leg in `failedLegs` at its own
+ * adapter's basis (resolved via `gateway.resolveLegMeta`: `metered` for an HTTP leg that bills per
+ * token such as `harnessrouter`, `subscription` with `listUsd` for a CLI or a subscription wire
+ * such as `traycer`). When the answering leg's count is unknown (`ownCost.usd === null`), the
+ * row's cost stays `{usd: null, basis: 'unpriced', reason}` while failed legs are priced on their
+ * own.
+ */
+function stampCost(rest, ownUsage, { adapter, upstreamModel, kind, costBasis = null, pricing, gateway = null }) {
+  const isUnknown =
+    Boolean(rest.usageReason) ||
+    Boolean(ownUsage?.reason) ||
+    ('usage' in rest && rest.usage === null) ||
+    (rest.status === 'ok' && 'usage' in rest && ownUsage === null) ||
+    Boolean(ownUsage && typeof ownUsage === 'object' && (ownUsage.input === null || ownUsage.output === null));
+  const ownCost = computeCost({
+    usage: isUnknown ? null : (ownUsage ?? { input: 0, output: 0 }),
+    usageReason: rest.usageReason || ownUsage?.reason || null,
+    adapter,
+    model: rest.model,
+    upstreamModel,
+    kind,
+    costBasis,
+    pricing,
+  });
+  if (!rest.failedLegs?.length) return ownCost;
+  const round = (n) => Math.round(n * 1e8) / 1e8;
+  let meteredUsd = ownCost.basis === 'metered' ? (ownCost.usd || 0) : 0;
+  let hasMeteredFailed = false;
+  let listUsd = ownCost.listUsd;
+  for (const f of rest.failedLegs) {
+    if (!f?.usage) continue;
+    const fLeg = gateway?.resolveLegMeta?.(f.target) || null;
+    const slash = String(f.target || '').indexOf('/');
+    const fAdapter = fLeg?.adapter || (slash < 0 ? f.target : f.target.slice(0, slash)) || adapter;
+    const fModel = fLeg?.model || (slash < 0 ? '' : f.target.slice(slash + 1)) || null;
+    const fKind = fLeg?.kind || 'cli';
+    const fCostBasis = fLeg?.costBasis || null;
+    const fAccount = fLeg?.account ?? null;
+    const fc = computeCost({
+      usage: f.usage,
+      adapter: fAdapter,
+      model: f.target || rest.model,
+      upstreamModel: fModel,
+      kind: fKind,
+      costBasis: fCostBasis,
+      pricing,
+    });
+    if (fc.basis === 'metered' || fc.listUsd > 0) {
+      f.cost = fc;
+      if (fAccount) f.account = fAccount;
+    }
+    if (fc.basis === 'metered') {
+      hasMeteredFailed = true;
+      meteredUsd = round(meteredUsd + (fc.usd || 0));
+    }
+    if (fc.listUsd !== undefined) {
+      listUsd = round((listUsd || 0) + fc.listUsd);
+    }
+  }
+  if (ownCost.usd === null) return ownCost;
+  if (ownCost.basis === 'metered' || (hasMeteredFailed && meteredUsd > 0)) {
+    return {
+      usd: meteredUsd,
+      basis: 'metered',
+      ...(listUsd > 0 ? { listUsd } : {}),
+    };
+  }
+  if (ownCost.basis === 'subscription') {
+    return listUsd !== undefined ? { usd: 0, basis: 'subscription', listUsd } : ownCost;
+  }
+  if (listUsd !== undefined) {
+    return { ...ownCost, listUsd };
+  }
+  return ownCost;
+}
+
+function faceFromRoute(route, via = null) {
+  const r = route || via || '';
+  if (r === '/v1/chat/completions') return 'chat';
+  if (r === '/v1/messages') return 'messages';
+  if (r === '/v1/responses') return 'responses';
+  if (r === '/v1/embeddings') return 'embeddings';
+  return null;
+}
+
+function byteLengthOf(chunk, encoding) {
+  if (!chunk || typeof chunk === 'function') return 0;
+  if (typeof chunk === 'string') return Buffer.byteLength(chunk, typeof encoding === 'string' ? encoding : 'utf8');
+  if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) return chunk.byteLength;
+  return 0;
+}
+
+function wrapBytesOut(res) {
+  res._bytesOut = 0;
+  const origWrite = res.write;
+  const origEnd = res.end;
+  let inWrite = false;
+  res.write = function (chunk, encoding, cb) {
+    if (!inWrite) res._bytesOut += byteLengthOf(chunk, encoding);
+    return origWrite.call(this, chunk, encoding, cb);
+  };
+  res.end = function (chunk, encoding, cb) {
+    res._bytesOut += byteLengthOf(chunk, encoding);
+    inWrite = true;
+    try {
+      return origEnd.call(this, chunk, encoding, cb);
+    } finally {
+      inWrite = false;
+    }
+  };
 }
 
 /**
@@ -1198,7 +1938,7 @@ function sseEvent(res, name, data) {
  * run ended at a tool call (`cut`), which engine runs (`tool_mode`), a session id, a usage
  * report or the reason there is none. None of them is an answer, so none of them opens a held stream.
  */
-const QUIET_EVENTS = new Set(['retry', 'cut', 'tool_mode', 'session', 'usage', 'usage_unknown', 'effort']);
+const QUIET_EVENTS = new Set(['retry', 'cut', 'tool_mode', 'session', 'usage', 'usage_unknown', 'effort', 'leg', 'upstream']);
 const HOLD_EXPIRED = Symbol('hold expired');
 
 /**
@@ -1259,10 +1999,12 @@ async function readJson(req) {
   let size = 0;
   for await (const c of req) {
     size += c.length;
+    req._bytesIn = size;
     if (size > MAX_BODY) throw new LlmError('request body too large', { status: 413 });
     chunks.push(c);
     if (req.method === 'HEAD') break;
   }
+  req._bytesIn = size;
   if (!chunks.length) return {};
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));

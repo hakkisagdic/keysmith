@@ -880,6 +880,7 @@ export const HTTP_PROFILES = {
     baseUrl: 'https://server.traycer.ai',
     apiKey: '{json:~/.traycer/cli/credentials#token}',
     apiKeyEnv: 'TRAYCER_BEARER_TOKEN',
+    costBasis: 'subscription',
     headers: { 'x-traycer-account-context': 'PERSONAL' },
     media: ['image', 'pdf'],
     explicitOnly: true,

@@ -2,6 +2,7 @@ import { LlmError } from './util.js';
 import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { redactSecrets } from './redact.js';
 import { checkMedia, hasMedia, upstreamMessages } from './media.js';
+import { credentialAccount, hostOf } from './usage.js';
 
 const UHP_TOOL_MODES = ['off', 'emulate', 'uhp', 'auto'];
 
@@ -22,6 +23,8 @@ export class HttpAdapter {
     this.wire = cfg.wire || 'openai';
     this.baseUrl = (cfg.baseUrl || '').replace(/\/+$/, '');
     if (!this.baseUrl) throw new Error(`adapter "${id}": baseUrl is required`);
+    this.host = hostOf(this.baseUrl);
+    this.account = credentialAccount(cfg);
     this.headers = cfg.headers || {};
     this.timeoutMs = cfg.timeoutMs ?? 120_000;
     this.priority = cfg.priority ?? 100;
@@ -36,6 +39,7 @@ export class HttpAdapter {
     this._traycerModels = null; // Map<modelId, { provider, upstreamModelId, efforts, defaultEffort }>
     this.defaultModel = cfg.defaultModel || null;
     this.note = cfg.note || null;
+    this.costBasis = cfg.costBasis || (this.wire === 'traycer' ? 'subscription' : 'metered');
     // Answers only a request that names it: never an alias leg, never probed (Gateway.resolve).
     this.explicitOnly = !!cfg.explicitOnly;
     this.unsafeTools = false;
@@ -75,6 +79,10 @@ export class HttpAdapter {
     // Headers sent only with a request that carries media up: Copilot's clients send
     // `copilot-vision-request: true` with an image.
     this.mediaHeaders = checkHeaders(id, 'mediaHeaders', cfg.mediaHeaders);
+    if (cfg.streamUsage != null && typeof cfg.streamUsage !== 'boolean') {
+      throw new Error(`adapter "${id}": streamUsage must be true or false`);
+    }
+    this.streamUsage = cfg.streamUsage !== false;
   }
 
   get resumeArgs() {
@@ -403,6 +411,8 @@ export class HttpAdapter {
     messages,
     session = null,
     maxTokens,
+    maxCompletionTokens,
+    maxOutputTokens,
     temperature,
     signal,
     includeReasoning,
@@ -433,21 +443,28 @@ export class HttpAdapter {
       ];
     }
 
-    // Read before anything is sent: a bad image is a 400 and the upstream never sees the request.
+    // Read before anything is sent: a bad image or malformed tool_calls history is a 400 and the upstream never sees the request.
     if (this.media.length && hasMedia(messages)) {
       messages = await upstreamMessages(messages, { ...this.mediaOpts, wire: effectiveWire }, { signal });
     }
     const withMedia = messages.some((m) => Array.isArray(m.content));
+    const isAnthropic = effectiveWire === 'anthropic';
+    const isUhp = effectiveWire === 'uhp';
+    const system = messages.find((m) => m.role === 'system');
+    const anthropicMessages = isAnthropic ? anthropicWireMessages(messages.filter((m) => m.role !== 'system'), this.id) : null;
     const controller = new AbortController();
     const onAbort = () => controller.abort(new Error('client disconnected'));
     signal?.addEventListener('abort', onAbort, { once: true });
     const budgetMs = timeoutMs || this.timeoutMs;
     const timer = setTimeout(() => controller.abort(new Error(`timeout after ${budgetMs}ms`)), budgetMs);
-    const isAnthropic = effectiveWire === 'anthropic';
-    const isUhp = effectiveWire === 'uhp';
-    const system = messages.find((m) => m.role === 'system');
-    // `modelParams` go first, so the fields keysmith builds (model, messages, stream…) win.
-    const payload = { ...this.paramsFor(this.upstreamModel(model)) };
+    // `modelParams` go first, so the fields keysmith builds (model, messages, stream…) win;
+    // on the Anthropic wire `max_tokens` is the client's (`max_tokens`, `max_completion_tokens`
+    // or `max_output_tokens`), else `modelParams`, else 4096; on the OpenAI wire the client's
+    // own token-limit field is sent under its own name (`max_completion_tokens` stays
+    // `max_completion_tokens`, `max_tokens` stays `max_tokens`) and `temperature` only when
+    // the client sent one, never translating one into another.
+    const payload = { ...this.paramsFor(effectiveModel) };
+    const anthropicMaxTokens = maxTokens || maxCompletionTokens || maxOutputTokens || payload.max_tokens || 4096;
     if (isUhp) {
       Object.assign(
         payload,
@@ -455,7 +472,7 @@ export class HttpAdapter {
           model: effectiveModel,
           messages,
           session: isTraycer ? null : session,
-          maxTokens,
+          maxTokens: maxTokens || maxCompletionTokens || maxOutputTokens,
           effort,
           rendered,
           tools,
@@ -470,19 +487,22 @@ export class HttpAdapter {
         // The Messages API requires max_tokens: the client's, else the model's own in `modelParams`, else 4096.
         // Built after `modelParams`, a bare 4096 here overwrote the model's value every time, and a thinking
         // model ran out of answer on any long reply.
-        max_tokens: maxTokens || payload.max_tokens || 4096,
+        max_tokens: anthropicMaxTokens,
         stream: true,
-        messages: messages.filter((m) => m.role !== 'system'),
+        messages: anthropicMessages,
         ...(system?.content ? { system: system.content } : {}),
         ...(effort ? { output_config: { effort } } : {}),
       });
     } else {
+      if (maxCompletionTokens && !maxTokens) delete payload.max_tokens;
+      if (maxTokens && !maxCompletionTokens) delete payload.max_completion_tokens;
       Object.assign(payload, {
         model: effectiveModel,
         messages,
         stream: true,
-        stream_options: { include_usage: true },
+        ...(this.streamUsage ? { stream_options: { include_usage: true } } : {}),
         ...(maxTokens ? { max_tokens: maxTokens } : {}),
+        ...(maxCompletionTokens ? { max_completion_tokens: maxCompletionTokens } : {}),
         ...(temperature != null ? { temperature } : {}),
         ...(effort && !payload.reasoning_effort && !payload.reasoning ? { reasoning_effort: effort } : {}),
       });
@@ -527,14 +547,26 @@ export class HttpAdapter {
       signal?.removeEventListener('abort', onAbort);
       throw upstreamError(this.id, res, text);
     }
+    let upstreamId = upstreamIdFromHeaders(res.headers);
+    if (upstreamId) yield { type: 'upstream', upstreamId };
     try {
       const events = isUhp
         ? parseUhpStream(res, { expectTools: !!(tools && tools.length), adapter: this })
         : isAnthropic
           ? parseAnthropicStream(res.body)
           : parseOpenaiStream(res.body);
+      let sawUsage = false;
       for await (const evt of events) {
+        if (!upstreamId && isUhp && evt.type === 'session' && evt.id) {
+          upstreamId = evt.id;
+          yield { type: 'upstream', upstreamId };
+        }
+        if (evt.type === 'usage' || evt.type === 'usage_unknown') sawUsage = true;
         if (evt.type === 'reasoning' && !includeReasoning) continue;
+        if (evt.type === 'done' && !this.streamUsage && !isUhp && !isAnthropic && !sawUsage) {
+          sawUsage = true;
+          yield { type: 'usage_unknown', reason: `${this.id} has streamUsage false: the streamed answer carries no token counts` };
+        }
         yield evt;
       }
     } finally {
@@ -701,8 +733,10 @@ async function* parseUhpStream(res, { expectTools = false, adapter = null } = {}
       if (Array.isArray(ignored) && ignored.includes('tools')) {
         if (adapter) adapter._uhpToolsIgnored = true;
         if (expectTools) {
+          const uEvt = extractUhpUsage(resp?.usage || d.usage, adapterId);
           const err = new LlmError(`${adapterId}: upstream ignored tools field`, { status: 502, provider: adapter?.id });
           err.fallbackReason = 'uhp_tools_ignored';
+          if (uEvt?.usage) err.usage = uEvt.usage;
           throw err;
         }
       }
@@ -787,12 +821,12 @@ async function* parseUhpStream(res, { expectTools = false, adapter = null } = {}
     } else if (type === 'response.failed' || type === 'error') {
       const errObj = d.response?.error || d.error;
       const msg = typeof errObj === 'string' ? errObj : errObj?.message || 'uhp stream error';
-      yield { type: 'error', message: redactSecrets(msg) };
       const uEvt = extractUhpUsage(d.response?.usage || d.usage, adapterId);
       if (uEvt && !usageSent) {
         usageSent = true;
         yield uEvt;
       }
+      yield { type: 'error', message: redactSecrets(msg) };
       yield { type: 'done', finishReason: 'stop' };
       return;
     }
@@ -816,8 +850,10 @@ function* eventsFromUhpResponse(resp, { expectTools = false, adapter = null } = 
   if (Array.isArray(ignored) && ignored.includes('tools')) {
     if (adapter) adapter._uhpToolsIgnored = true;
     if (expectTools) {
+      const uEvt = extractUhpUsage(resp?.usage, adapterId);
       const err = new LlmError(`${adapterId}: upstream ignored tools field`, { status: 502, provider: adapter?.id });
       err.fallbackReason = 'uhp_tools_ignored';
+      if (uEvt?.usage) err.usage = uEvt.usage;
       throw err;
     }
   }
@@ -825,9 +861,9 @@ function* eventsFromUhpResponse(resp, { expectTools = false, adapter = null } = 
   if (resp.status === 'failed' || resp.error) {
     const errObj = resp.error;
     const msg = typeof errObj === 'string' ? errObj : errObj?.message || 'uhp response failed';
-    yield { type: 'error', message: redactSecrets(msg) };
     const uEvt = extractUhpUsage(resp.usage, adapterId);
     if (uEvt) yield uEvt;
+    yield { type: 'error', message: redactSecrets(msg) };
     yield { type: 'done', finishReason: 'stop' };
     return;
   }
@@ -891,19 +927,42 @@ function extractUhpUsage(u, adapterId = 'uhp') {
     }
     return null;
   }
-  const cacheRead = u.input_tokens_details?.cached_tokens || u.cache_read_tokens || u.cache_read_input_tokens || 0;
-  const cacheWrite = u.cache_write_tokens || u.cache_creation_input_tokens || 0;
+  const cacheRead =
+    u.input_tokens_details?.cached_tokens ||
+    u.prompt_tokens_details?.cached_tokens ||
+    u.cached_tokens ||
+    u.cache_read_tokens ||
+    u.cache_read_input_tokens ||
+    u.cacheRead ||
+    0;
+  const cacheWrite =
+    u.input_tokens_details?.cache_write_tokens ||
+    u.prompt_tokens_details?.cache_creation_tokens ||
+    u.cache_write_tokens ||
+    u.cache_creation_input_tokens ||
+    u.cacheWrite ||
+    0;
   const reasoning = u.output_tokens_details?.reasoning_tokens || u.reasoning_tokens || 0;
+  const rawInput = u.input_tokens ?? u.prompt_tokens ?? 0;
+  const hasDetailsCache =
+    u.input_tokens_details?.cached_tokens != null ||
+    u.prompt_tokens_details?.cached_tokens != null ||
+    u.cached_tokens != null ||
+    u.cache_read_tokens != null ||
+    u.cacheRead != null;
+  const addAnthropicCache = !hasDetailsCache && (u.cache_read_input_tokens != null || u.cache_creation_input_tokens != null);
+  const usage = {
+    input: rawInput + (addAnthropicCache ? cacheRead + cacheWrite : 0),
+    output: u.output_tokens ?? u.completion_tokens ?? 0,
+    cacheRead,
+    cacheWrite,
+    ...(reasoning ? { reasoning } : {}),
+    ...(hasTotal && !hasInput && !hasOutput ? { total: u.total_tokens } : {}),
+  };
+  if (hasInput) Object.defineProperty(usage, 'cacheInclusive', { value: true, enumerable: false });
   return {
     type: 'usage',
-    usage: {
-      input: u.input_tokens ?? u.prompt_tokens ?? 0,
-      output: u.output_tokens ?? u.completion_tokens ?? 0,
-      cacheRead,
-      cacheWrite,
-      ...(reasoning ? { reasoning } : {}),
-      ...(hasTotal && !hasInput && !hasOutput ? { total: u.total_tokens } : {}),
-    },
+    usage,
   };
 }
 
@@ -961,9 +1020,78 @@ function checkModelParams(id, params) {
   return params;
 }
 
+function anthropicWireMessages(messages, adapterId) {
+  const out = [];
+  for (let i = 0; i < messages.length; ) {
+    const m = messages[i];
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const blocks = [];
+      if (Array.isArray(m.content)) {
+        for (const b of m.content) blocks.push(b);
+      } else if (typeof m.content === 'string' && m.content.length > 0) {
+        blocks.push({ type: 'text', text: m.content });
+      }
+      for (const tc of m.tool_calls) {
+        const fn = tc?.function || {};
+        const name = typeof fn.name === 'string' ? fn.name : (typeof tc?.name === 'string' ? tc.name : '');
+        const id = typeof tc?.id === 'string' && tc.id ? tc.id : '';
+        const rawArgs = fn.arguments !== undefined ? fn.arguments : tc?.arguments;
+        let input = null;
+        if (typeof rawArgs === 'string') {
+          try {
+            input = JSON.parse(rawArgs);
+          } catch {
+            input = null;
+          }
+        } else if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+          input = rawArgs;
+        }
+        if (!input || typeof input !== 'object' || Array.isArray(input)) {
+          const err = new LlmError(`tool_calls arguments for "${name || id || 'tool'}" must be a JSON object`, {
+            status: 400,
+            type: 'invalid_request_error',
+            provider: adapterId,
+          });
+          err.clientError = true;
+          throw err;
+        }
+        blocks.push({ type: 'tool_use', id, name, input });
+      }
+      out.push({ role: 'assistant', content: blocks });
+      i++;
+      continue;
+    }
+    if (m.role === 'tool') {
+      const blocks = [];
+      while (i < messages.length && messages[i].role === 'tool') {
+        const tm = messages[i++];
+        blocks.push({
+          type: 'tool_result',
+          tool_use_id: typeof tm.tool_call_id === 'string' ? tm.tool_call_id : '',
+          content: typeof tm.content === 'string' ? tm.content : Array.isArray(tm.content) ? tm.content : String(tm.content ?? ''),
+        });
+      }
+      if (i < messages.length && messages[i].role === 'user') {
+        const um = messages[i++];
+        if (Array.isArray(um.content)) {
+          blocks.push(...um.content);
+        } else if (typeof um.content === 'string' && um.content.length > 0) {
+          blocks.push({ type: 'text', text: um.content });
+        }
+      }
+      out.push({ role: 'user', content: blocks });
+      continue;
+    }
+    out.push(m);
+    i++;
+  }
+  return out;
+}
+
 async function* parseOpenaiStream(body) {
+  let finishReason = 'stop';
   for await (const data of sseEvents(body)) {
-    if (data === '[DONE]') return void (yield { type: 'done', finishReason: 'stop' });
+    if (data === '[DONE]') return void (yield { type: 'done', finishReason });
     let d;
     try {
       d = JSON.parse(data);
@@ -981,23 +1109,42 @@ async function* parseOpenaiStream(body) {
           reason: typeof d.usage.reason === 'string' && d.usage.reason ? d.usage.reason : 'upstream reported unknown token counts',
         };
       } else {
-        yield {
-          type: 'usage',
-          usage: {
-            input: d.usage.prompt_tokens || 0,
-            output: d.usage.completion_tokens || 0,
-            cacheRead: d.usage.prompt_tokens_details?.cached_tokens || d.usage.cached_tokens || 0,
-            cacheWrite: 0,
-          },
+        const cacheRead =
+          d.usage.prompt_tokens_details?.cached_tokens ||
+          d.usage.cached_tokens ||
+          d.usage.cache_read_input_tokens ||
+          d.usage.cacheRead ||
+          0;
+        const cacheWrite =
+          d.usage.prompt_tokens_details?.cache_creation_tokens ||
+          d.usage.cache_creation_input_tokens ||
+          d.usage.cacheWrite ||
+          0;
+        const hasPromptTokens = d.usage.prompt_tokens != null;
+        const promptTokens = hasPromptTokens ? Number(d.usage.prompt_tokens) || 0 : null;
+        const input = hasPromptTokens
+          ? promptTokens
+          : (Number(d.usage.input_tokens ?? d.usage.input ?? 0) || 0) +
+            (d.usage.cache_read_input_tokens != null || d.usage.cache_creation_input_tokens != null ? cacheRead + cacheWrite : 0);
+        const u = {
+          input,
+          output: d.usage.completion_tokens ?? d.usage.output_tokens ?? d.usage.output ?? 0,
+          cacheRead,
+          cacheWrite,
         };
+        if (hasPromptTokens) Object.defineProperty(u, 'cacheInclusive', { value: true, enumerable: false });
+        if (d.usage.total_tokens != null) {
+          Object.defineProperty(u, 'total', { value: Number(d.usage.total_tokens) || 0, enumerable: false });
+        }
+        yield { type: 'usage', usage: u };
       }
     }
-    if (choice?.finish_reason) yield { type: 'done', finishReason: choice.finish_reason };
+    if (choice?.finish_reason) finishReason = choice.finish_reason;
     // Redacted here, at the source: a provider that rejects its key mid-stream quotes it, and
     // this message is written to clients, logs and the usage log further on.
     if (d.error) yield { type: 'error', message: redactSecrets(typeof d.error === 'string' ? d.error : d.error.message || JSON.stringify(d.error)) };
   }
-  yield { type: 'done', finishReason: 'stop' };
+  yield { type: 'done', finishReason };
 }
 
 async function* parseAnthropicStream(body) {
@@ -1017,7 +1164,12 @@ async function* parseAnthropicStream(body) {
         const u = d.message?.usage;
         // Anthropic's input_tokens is the uncached input alone: `input` is everything charged as
         // input, the cache read and written included (parsers.js, the usage convention).
-        if (u && u.keysmith_usage !== 'unknown') {
+        if (u?.keysmith_usage === 'unknown') {
+          yield {
+            type: 'usage_unknown',
+            reason: typeof u.reason === 'string' && u.reason ? u.reason : 'upstream reported unknown token counts',
+          };
+        } else if (u) {
           const cacheRead = u.cache_read_input_tokens || 0;
           const cacheWrite = u.cache_creation_input_tokens || 0;
           yield { type: 'usage', usage: { input: (u.input_tokens || 0) + cacheRead + cacheWrite, output: u.output_tokens || 0, cacheRead, cacheWrite } };
@@ -1030,10 +1182,30 @@ async function* parseAnthropicStream(body) {
             type: 'usage_unknown',
             reason: typeof d.usage.reason === 'string' && d.usage.reason ? d.usage.reason : 'upstream reported unknown token counts',
           };
-        } else if (d.usage?.output_tokens) {
-          yield { type: 'usage', usage: { input: 0, output: d.usage.output_tokens, cacheRead: 0, cacheWrite: 0 } };
+        } else if (d.usage) {
+          const cacheRead = d.usage.cache_read_input_tokens || 0;
+          const cacheWrite = d.usage.cache_creation_input_tokens || 0;
+          yield { type: 'usage', usage: { input: (d.usage.input_tokens || 0) + cacheRead + cacheWrite, output: d.usage.output_tokens || 0, cacheRead, cacheWrite } };
         }
         break;
+      case 'message': {
+        for (const b of d.content || []) {
+          if (b?.type === 'text' && b.text) yield { type: 'delta', text: b.text };
+        }
+        const u = d.usage;
+        if (u?.keysmith_usage === 'unknown') {
+          yield {
+            type: 'usage_unknown',
+            reason: typeof u.reason === 'string' && u.reason ? u.reason : 'upstream reported unknown token counts',
+          };
+        } else if (u) {
+          const cacheRead = u.cache_read_input_tokens || 0;
+          const cacheWrite = u.cache_creation_input_tokens || 0;
+          yield { type: 'usage', usage: { input: (u.input_tokens || 0) + cacheRead + cacheWrite, output: u.output_tokens || 0, cacheRead, cacheWrite } };
+        }
+        yield { type: 'done', finishReason: 'stop' };
+        return;
+      }
       case 'error':
         yield { type: 'error', message: redactSecrets(d.error?.message || 'anthropic stream error') };
         break;
@@ -1047,11 +1219,12 @@ async function* parseAnthropicStream(body) {
   yield { type: 'done', finishReason: 'stop' };
 }
 
-/** Server-Sent Events -> the `data:` payload of each event. */
+/** Server-Sent Events -> the `data:` payload of each event (or a single JSON body when a stub answers without SSE). */
 export async function* sseEvents(body) {
   if (!body) return;
   const decoder = new TextDecoder();
   let buf = '';
+  let yielded = false;
   for await (const chunk of iterate(body)) {
     buf += decoder.decode(chunk, { stream: true });
     let i;
@@ -1063,9 +1236,24 @@ export async function* sseEvents(body) {
         .filter((l) => l.startsWith('data:'))
         .map((l) => l.slice(5).replace(/^ /, ''))
         .join('\n');
-      if (data.trim()) yield data;
+      if (data.trim()) {
+        yielded = true;
+        yield data;
+      }
     }
   }
+  buf += decoder.decode();
+  const tail = buf.trim();
+  if (!yielded && tail.startsWith('{')) yield tail;
+}
+
+export function upstreamIdFromHeaders(headers) {
+  if (!headers || typeof headers.get !== 'function') return null;
+  for (const h of ['request-id', 'x-request-id', 'anthropic-request-id', 'openai-request-id']) {
+    const v = headers.get(h);
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return null;
 }
 
 async function* iterate(body) {
@@ -1099,6 +1287,8 @@ export function upstreamError(id, res, text, { keepStatus = false } = {}) {
   });
   const retryAfter = res.headers?.get?.('retry-after');
   if (retryAfter) err.retryAfter = retryAfter;
+  const upstreamId = upstreamIdFromHeaders(res.headers);
+  if (upstreamId) err.upstreamId = upstreamId;
   return err;
 }
 

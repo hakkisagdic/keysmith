@@ -69,7 +69,7 @@ that is the interesting part.
 | `POST /v1/embeddings` | forwarded to HTTP adapters only |
 | `GET /v1/models` | the whole catalogue, namespaced; `?refresh` re-queries |
 | `GET /v1/keysmith/routes` | adapters, aliases, limits and any unusable alias leg (`alias_warnings`) as JSON |
-| `GET /v1/keysmith/usage?hours=24&tail=50` | request counts per model, latest entries |
+| `GET /v1/keysmith/usage` | whole-log audit statistics (`?by=…&since=…&until=…`), spend caps, and `?tail=N` recent entries |
 | `GET /` | status page in a browser: post the key once through its form, a cookie opens it for an hour |
 | `GET /healthz` | keyless liveness probe for a supervisor |
 
@@ -743,7 +743,9 @@ An agent gets a key of its own instead, written to a file only it reads:
 |---|---|---|
 | `launchd-gateway.log` | launchd: `serve`'s stdout + stderr | start banner (address, adapters, the key redacted, tunnel URL); with `KEYSMITH_VERBOSE=1`, adapter failures, retries and skipped alias legs |
 | `keysmith.log` | `keysmith start`: the same stream | the same, for a gateway started without launchd |
-| `usage.jsonl` | the gateway, one line per request | time, model, status, duration, token counts (`input` every input token charged, the cache's included; or `usage: null` with a `usageReason` when the CLI reported none), stream flag, user agent, error message, `retries`/`cutAt`; for a tool request `toolMode`, `toolCalls`, `fallback`, `failure` and `failedLegs` (see [Tool calls](#tool-calls-thinking)); the key's fingerprint (`key: "fp:…"`) and its scope's decision (`scope`, `skipped`) |
+| `usage.jsonl` | the gateway, one line per request (active UTC month) | time, `key` (`"fp:…"`), `label`, `scope`/`skipped`, `adapter`, `kind` (`http`/`cli`), `host` (HTTP upstream host alone), `account` (credential name, never its value), `model`, `face` (`chat`/`messages`/`responses`/`embeddings`), `status`, `ms`, `bytesIn`/`bytesOut`, `upstreamId`, `tag` (`x-keysmith-tag`), token counts (`input` every input token charged, the cache's included, with `cacheRead` and `cacheWrite` beside it; or `usage: null` with a `usageReason` when the CLI or upstream reported none), `cost` (`{usd, basis, listUsd?, reason?}`), `stream`, `client`, `error`, `retries`/`cutAt`, and for tool requests `toolMode`, `toolCalls`, `fallback`, `failure`, `failedLegs` (see [Tool calls](#tool-calls-thinking)) |
+| `usage.jsonl.YYYY-MM` | the gateway, on UTC month rollover | closed calendar months of the audit log: the current UTC month always lives at `usage.jsonl` so `tail -F ~/.local/share/keysmith/usage.jsonl` keeps working, and when a new UTC month begins the finished file moves to `usage.jsonl.YYYY-MM`; nothing is ever deleted |
+| `.usage.jsonl.daily` | the gateway, on each metered request | today's live per-key request and daily-cap refusal counts (`0600`, by fingerprint, never a key), so `keysmith usage` and `/status` see refusals that write no JSONL line |
 | `launchd-tunnel.log` | launchd: cloudflared | cloudflared's own output |
 
 keysmith does not log prompts, answers, request headers or request URLs, and a request
@@ -881,21 +883,23 @@ keysmith key list                              # … deny: claude-api · 300 req
 
 - A request is counted once, when it comes in — before its body is read and before any adapter
   or alias leg is picked: one per request to `/v1/chat/completions`, `/v1/messages`,
-  `/v1/responses` or `/v1/embeddings`, streamed or not, whatever it asks for. An alias that fails
-  over to its second leg, a CLI asked again, a tool request that walks three legs: one request.
-  A request that fails — upstream, or refused by the key's scope — is one too. Listing models,
-  routes or usage, and the status page, are not counted.
+  `/v1/responses`, `/v1/embeddings` or `/v1/keysmith/usage`, streamed or not, whatever it asks
+  for. An alias that fails over to its second leg, a CLI asked again, a tool request that walks
+  three legs: one request. A request that fails — upstream, or refused by the key's scope — is
+  one too. Listing models or routes, and the status page, are not counted.
 - Over the cap, every face answers **429** (`rate_limit_error`) with a `retry-after` in seconds
   up to the next local midnight, when the count starts again at 0. The message names the cap and
   when it resets, never the key. The day's first refusal writes one usage row
   (`"status": "limited"`) and a gateway log line; the refusals after it are counted on the status
   page and write nothing, so a client that keeps asking does not fill the disk.
-- The count survives a restart: at start it is rebuilt from today's rows in `usage.jsonl` (a
+- The count survives a restart: at start it is rebuilt from today's rows in `usage.jsonl` (and
+  the previous month's `usage.jsonl.YYYY-MM` when local midnight crosses a UTC month boundary; a
   request writes one row, stamped with its key's fingerprint). A request refused before its body
   was read — not JSON, no messages — costs nothing upstream and leaves no row, so it is not in
   the count a restart rebuilds.
-- Every key is counted, capped or not: the status page (to an unscoped key) shows each key's
-  requests today next to its cap, and a capped key sees its own count at the top of its page.
+- Every key is counted, capped or not: `keysmith usage` lists each capped key's requests today
+  beside its `perDay` cap, the status page (to an unscoped key) shows each key's requests today
+  next to its cap, and a capped key sees its own count at the top of its page.
 - It fails closed like a scope: a `perDay` that is not a whole number (`"300"`, `-1`) leaves the
   key reaching nothing, and one key listed twice with two different caps reaches nothing —
   otherwise an uncapped copy above a capped entry would quietly lift the cap. `perDay: 0` refuses
@@ -928,6 +932,138 @@ adapter added later stays out until you add it to the list:
 ```bash
 keysmith key add ada --allow agy,alias:argon --out ~/.config/ada/keysmith.key
 ```
+
+## Usage audit, pricing and spend caps
+
+Every request writes one JSON line to `usage.jsonl` (`0600` in a `0700` directory; every string
+redacted before encoding, and never a key, a prompt, an answer, a header or a request URL).
+Alongside `ts`, `model`, `status`, `ms`, `usage` (`input` — every input token the upstream
+charged, cache reads and writes included, on HTTP and CLI rows alike — with `output`, `cacheRead`
+and `cacheWrite` beside it), `stream`, `client`, `error`, `key` (`"fp:…"`) and `scope`, each line
+records:
+
+- **`label`** — the gateway key's label from `auth.keys`, beside its fingerprint (`key`).
+- **`adapter`**, **`kind`** (`"http"` or `"cli"`) and, for an HTTP adapter, **`host`** — the
+  upstream `hostname[:port]` alone, with no path and no query.
+- **`account`** — which credential the adapter spent, named and never valued: an explicit
+  `account` on the adapter config, else for `{exec:security find-generic-password … -s NAME …}`
+  the keychain service `NAME`; for `{env:NAME}` the variable name `NAME`; for `{file:PATH}`
+  `path.basename(PATH)`; for any other `{…}` reference `"exec"` (with no text from it); and `null`
+  for an unreferenced literal key or no key (never read from a CLI's stdout).
+- **`face`** — `"chat"`, `"messages"`, `"responses"` or `"embeddings"` (`/v1/chat/completions`,
+  `/v1/messages`, `/v1/responses` — including the UHP server and relay — and `/v1/embeddings`).
+- **`bytesIn`** / **`bytesOut`** — the request and response body sizes in bytes.
+- **`upstreamId`** — the provider's request id when it returns one (such as Anthropic's
+  `request-id`, OpenAI's `x-request-id`, or a UHP upstream's `resp_…` response id), to reconcile a
+  line with the provider's console.
+- **`tag`** — the client's `x-keysmith-tag` request header (e.g. `ao-review`), kept when it is
+  1–40 characters of letters, digits, `-`, `_` and `.`, dropped otherwise, and absent when not
+  sent.
+- **`cost`** — `{usd, basis}` (pricing derives uncached input as `input - cacheRead - cacheWrite`
+  at the `input` rate and prices `cacheRead` and `cacheWrite` at their own rates, uniformly across
+  every adapter and parser):
+  - `"metered"` for a per-token HTTP adapter matched by `pricing` (`harnessrouter` included),
+    computed from `input - cacheRead - cacheWrite`, `output`, `cacheRead` and `cacheWrite` tokens;
+  - `"subscription"` for a CLI adapter or a subscription-backed HTTP profile (`traycer`, `usd: 0`),
+    with `listUsd` holding what those tokens would cost at the list rate `pricing` names for that
+    model, when it names one;
+  - `"unpriced"` with `usd: null` and `reason` when the row's token counts are unknown (`usage: null`
+    with `usageReason`), or `usd: 0` when no price entry matches.
+
+**One file per UTC calendar month.** The active month is always written to
+`~/.local/share/keysmith/usage.jsonl`, so `tail -F ~/.local/share/keysmith/usage.jsonl` keeps
+working across requests, rollovers and restarts. When the first line of a new UTC month is
+written, the closed month's `usage.jsonl` is atomically renamed to `usage.jsonl.YYYY-MM` and a
+fresh `usage.jsonl` starts the new month (and an entry dated in an older month goes straight to
+its `usage.jsonl.YYYY-MM`). Nothing is ever deleted.
+
+**Price table (`pricing`).** Keyed by `adapter/model` glob in `config.json`, in USD per million
+tokens for `input`, `output`, `cacheRead` and `cacheWrite`. keysmith ships defaults for the
+Anthropic models (Anthropic's pricing page, read 2026-10-20; cache writes at the 5-minute TTL
+price):
+
+| Glob | `input` | `output` | `cacheRead` | `cacheWrite` | Notes |
+|---|---:|---:|---:|---:|---|
+| `*/claude-opus-5-5*` | `$4.00` | `$20.00` | `$0.20` | `$5.00` | per 1M tokens |
+| `*/claude-sonnet-5-5*` | `$2.00` | `$10.00` | `$0.10` | `$2.50` | per 1M tokens |
+| `*/claude-haiku-5-5*` | `$0.10` | `$0.50` | `$0.01` | `$0.125` | Anthropic's rate for prompts up to 100K tokens (an approximation: each row is priced from its token totals without tiered prompt-length breakpoints) |
+
+A config entry overrides any default that matches the same target; a price never comes from the
+client:
+
+```json
+"pricing": {
+  "claude-api/claude-sonnet-5-5*": { "input": 2, "output": 10, "cacheRead": 0.1, "cacheWrite": 2.5 },
+  "openai/gpt-5*":                 { "input": 1.25, "output": 10, "cacheRead": 0.125, "cacheWrite": 0 }
+}
+```
+
+**Statistics (`keysmith usage` and `GET /v1/keysmith/usage`).** Reads every monthly log file in
+full — not the last 5,000 lines — and groups by one or two dimensions (`key`, `label`,
+`adapter`, `model`, `account`, `tag`, `day`, `client`), filtered by inclusive `--since` and
+`--until` bounds (an ISO date/timestamp such as `2026-10-01` — where `--until YYYY-MM-DD`
+includes that entire UTC day through `23:59:59.999Z` — or a relative duration such as `7d`,
+`24h`), in `table`, `csv` or `json` format. Monthly log files, `--by day` and `limits.spend`
+use UTC calendar days and months, while per-key `perDay` request caps reset at local midnight:
+
+```bash
+keysmith usage                                             # whole log, grouped by model
+keysmith usage --by adapter,model --since 7d               # two dimensions, last 7 days
+keysmith usage --by label,tag --since 2026-10-01 --until 2026-10-31 --format csv
+keysmith usage --by account --format json
+```
+
+Each group and the grand total report: `requests`, `failures`, `refused`, `unknownUsage` (rows
+whose token counts were unknown, counted apart so no token or USD total treats an unknown count as
+zero — a bucket with only unknown-usage rows reports `null` for token counts and USD), token counts
+(`input` — every input token charged, cache reads and writes included, on HTTP and CLI rows alike so
+`keysmith usage` totals add like with like — `output`, `cacheRead`, `cacheWrite`), `meteredUsd`,
+`listUsd` (kept apart from metered spend),
+and `p50Ms` / `p95Ms` latency. Percentiles are computed from a fixed log-spaced latency histogram
+(exact 1 ms resolution up to 100 ms, then 50 log-spaced buckets per decade up to 1,000,000 ms,
+~4.7% bucket width, merged by adding bucket counts across cells and read identically by the
+endpoint, the status page and `keysmith usage` so their numbers agree within one bucket).
+`GET /v1/keysmith/usage?by=adapter,model&since=7d` takes the same parameters and answers JSON
+from bounded in-memory aggregates under the key's scope: windows of 48 hours or less (`?hours=N`
+for `N <= 48`, and the status page's 24h figures) answer from hourly cells rounded to the UTC
+hour (`granularity: "hour"`, `roundedToWholeHours: true`), and wider windows answer from daily
+cells rounded to whole UTC days (`granularity: "day"`, `roundedToWholeDays: true`, with `since`
+naming the earliest kept day when older days have aged out). `?tail=N` returns recent rows from an
+in-memory ring bounded by both count (at most 2,000 rows, `TAIL_RING_MAX`) and byte size (at most
+2 MiB, `TAIL_RING_MAX_BYTES`; `tail` above 2,000 is refused with HTTP 400). On a verbatim
+OpenAI-wire relay, keysmith reads `usage` from a non-streamed body or asks the upstream for
+`stream_options: {"include_usage": true}` on a stream (stripping any `usage` member, `null`
+included, that the client did not request and dropping a chunk only when nothing else is left
+before forwarding); an HTTP adapter entry may set
+`"streamUsage": false` for an upstream that refuses `stream_options`, in which case a streamed
+relay records `usage: null` with a `usageReason`.
+
+**Spend caps (`limits.spend`).** Caps monthly metered USD (per UTC calendar month) by adapter id
+or by credential `account` (two adapters that reference the same credential share that account's
+cap):
+
+```json
+"limits": {
+  "spend": {
+    "claude-api": 25.00,
+    "anthropic-prod": 50.00
+  }
+}
+```
+
+Each cap's month-to-date `metered` spend is kept in memory — seeded lazily once from the current
+UTC month's file on first use and again when the UTC month turns, and incremented as each
+new row is written, with `adaptersSeen` bounded to 200 characters per name (cut with
+`…[truncated]`, as in the aggregates) and at most 1,000 distinct adapter names
+(`MAX_ADAPTERS_SEEN`) — so checking a cap reads no file on the request path. Once the recorded spend
+has reached or passed the cap, keysmith refuses the request with HTTP `429` (`rate_limit_error`)
+and a `retry-after` header in seconds until the UTC month turns, naming the cap, the current
+spend (for an unscoped key; a scoped key sees the cap and reset time without totals across keys),
+and when the month resets (`YYYY-MM-01T00:00:00Z`), in each face's error shape
+(`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), and records the refusal as a line of
+its own. A request already in flight when the cap is crossed finishes. An unreadable month file is
+logged and surfaced on the status page, `keysmith doctor` and `keysmith status`, and makes its
+caps fail closed; `keysmith usage` and the status page show each cap beside its current spend.
 
 ## Publishing it safely
 

@@ -19,15 +19,18 @@ export function chatId(prefix = 'chatcmpl') {
 
 export function openaiMessages(body) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  return messages.map((m) =>
-    keepMediaParts(
+  return messages.map((m) => {
+    const out = keepMediaParts(
       {
         role: m.role === 'developer' ? 'system' : m.role || 'user',
         content: typeof m.content === 'string' ? m.content : contentToText(m.content),
       },
       m.content,
-    ),
-  );
+    );
+    if (Array.isArray(m.tool_calls)) Object.defineProperty(out, 'tool_calls', { value: m.tool_calls, enumerable: false });
+    if (typeof m.tool_call_id === 'string') Object.defineProperty(out, 'tool_call_id', { value: m.tool_call_id, enumerable: false });
+    return out;
+  });
 }
 
 export function openaiChunk(id, model, created, delta, finish = null) {
@@ -121,7 +124,8 @@ export function anthropicUsage(u) {
   if (unknown) return { input_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null, output_tokens: 0, ...unknownMarks(unknown) };
   const cacheRead = u?.cacheRead || 0;
   const cacheWrite = u?.cacheWrite || 0;
-  return { input_tokens: Math.max(0, (u?.input || 0) - cacheRead - cacheWrite), cache_creation_input_tokens: cacheWrite, cache_read_input_tokens: cacheRead, output_tokens: u?.output || 0 };
+  const inputTokens = u?.cacheInclusive ? (u?.input || 0) : Math.max(0, (u?.input || 0) - cacheRead - cacheWrite);
+  return { input_tokens: inputTokens, cache_creation_input_tokens: cacheWrite, cache_read_input_tokens: cacheRead, output_tokens: u?.output || 0 };
 }
 
 /**
@@ -230,6 +234,8 @@ export function responsesResult({ id, model, text, usage, created }) {
   };
 }
 
-export function errorBody(message, type = 'invalid_request_error', status = 400, provider = null) {
-  return { error: { message: `keysmith: ${message}`, type, param: null, code: null, ...(provider ? { provider } : {}) }, status };
+export function errorBody(message, type = 'invalid_request_error', status = 400, provider = null, face = null) {
+  const err = { message: `keysmith: ${message}`, type, param: null, code: null, ...(provider ? { provider } : {}) };
+  if (face === 'messages') return { type: 'error', error: err, status };
+  return { error: err, status };
 }

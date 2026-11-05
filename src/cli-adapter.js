@@ -8,6 +8,7 @@ import { checkToolMode } from './tools/router.js';
 import { checkMedia, hasMedia, mediaPrompt } from './media.js';
 import { takesEffort } from './effort.js';
 import { CLI_PROFILES, FORMER_PARSERS } from './profiles.js';
+import { credentialAccount } from './usage.js';
 
 /**
  * Run a coding CLI once per request and turn its stdout into a chat completion.
@@ -118,6 +119,8 @@ export class CliAdapter {
     this.declaredModels = cfg.models || null;
     this.defaultModel = cfg.defaultModel || null;
     this.note = cfg.note || null;
+    this.account = credentialAccount(cfg);
+    this.costBasis = cfg.costBasis || 'subscription';
     this._sem = new Semaphore(cfg.maxConcurrent ?? 1);
     this._modelCache = null;
   }

@@ -192,9 +192,9 @@ test('the cap counts client requests: an alias that fails over is one, a request
   assert.equal((await gw.call(KEY, '/v1/chat/completions', { model: 'up/m', stream: true, ...say('hi') })).status, 200);
   const over = await gw.call(KEY, '/v1/chat/completions', { model: 'up/m', ...say('hi') });
   assertOverCap(over, { perDay: 4, retryAfter: 12 * 3600, keys: [KEY] }, 'the fifth');
-  // Listing models, routes or usage is not a request to a model: neither counted nor refused.
+  // Listing models is not a request to a model: neither counted nor refused; /v1/keysmith/usage is metered.
   assert.equal((await gw.call(KEY, '/v1/models')).status, 200);
-  assert.equal((await gw.call(KEY, '/v1/keysmith/usage')).status, 200);
+  assertOverCap(await gw.call(KEY, '/v1/keysmith/usage'), { perDay: 4, retryAfter: 12 * 3600, keys: [KEY] }, '/v1/keysmith/usage');
 });
 
 test('a restart does not hand a capped key a fresh day: the count is rebuilt from usage.jsonl', async (t) => {

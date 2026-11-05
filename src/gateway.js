@@ -11,6 +11,7 @@ import { addUsage } from './tools/emulate.js';
 import { McpBridge } from './bridge/index.js';
 import { DRIVERS } from './bridge/drivers.js';
 import { resolveEffort, suffixedIds } from './effort.js';
+import { credentialAccount, fmtUsd, hostOf } from './usage.js';
 
 /**
  * The gateway: config in, one model catalogue + one streaming `complete()` out.
@@ -21,11 +22,13 @@ import { resolveEffort, suffixedIds } from './effort.js';
  * slash-free by construction.
  */
 export class Gateway {
-  constructor(cfg, { log = () => {} } = {}) {
+  constructor(cfg, { log = () => {}, usage = null } = {}) {
     this.cfg = cfg;
+    this.usage = usage;
     // Redacted here as well as by the CLI's writer: an embedding's own log function is
     // handed provider errors, and those can quote a key.
     this.log = (m) => log(redactSecrets(m));
+    if (this.usage && !this.usage.log) this.usage.log = this.log;
     this.adapters = new Map();
     this.loadErrors = {}; // adapter id -> why it never constructed; doctor and /status must say so
     this.sessions = new Map(); // x-keysmith-session id -> {adapter, upstream session}
@@ -66,6 +69,75 @@ export class Gateway {
   /** Stop what the gateway runs on its own: the MCP bridge's sessions (each CLI stopped) and its socket. */
   async close() {
     await this.toolEngines.mcp?.close?.();
+  }
+
+  /**
+   * Throw a 429 rate_limit_error when `adapter` (or its credential account) has reached its
+   * recorded metered spend cap for the current UTC calendar month (`limits.spend`).
+   */
+  checkSpend(adapter, upstreamModel = '', scope = null) {
+    const err = this._spendCapError(adapter, upstreamModel, scope);
+    if (err) throw err;
+  }
+
+  _spendCapError(adapter, upstreamModel = '', scope = null) {
+    const spendCfg = this.cfg?.limits?.spend;
+    if (!spendCfg || !this.usage || !adapter) return null;
+    const capped = this.usage.checkSpendCap(spendCfg, adapter, { adaptersCfg: this.cfg?.adapters });
+    if (!capped) return null;
+    const msg = capped.error
+      ? `spend cap for ${capped.kind} "${capped.target}" (${fmtUsd(capped.cap)} monthly cap in ${capped.month}, resets ${capped.resetAt}): refusing request because the usage log is unreadable (${capped.error})`
+      : scope
+        ? `spend cap reached for ${capped.kind} "${capped.target}" (${fmtUsd(capped.cap)} monthly cap in ${capped.month}, resets ${capped.resetAt})`
+        : `spend cap reached for ${capped.kind} "${capped.target}": spent ${fmtUsd(capped.spent)} of ${fmtUsd(capped.cap)} monthly cap in ${capped.month} (resets ${capped.resetAt})`;
+    const err = new LlmError(msg, {
+      status: 429,
+      type: 'rate_limit_error',
+      provider: adapter.id,
+    });
+    if (capped.error) {
+      err.retryAfter = capped.retryAfter || 5;
+    } else {
+      const nowMs = this.usage?._nowDate ? this.usage._nowDate().getTime() : Date.now();
+      const resetMs = Date.parse(capped.resetAt);
+      err.retryAfter = Number.isFinite(resetMs) ? Math.max(1, Math.ceil((resetMs - nowMs) / 1000)) : 3600;
+    }
+    err.spendCap = capped;
+    err.leg = legMetaOf(adapter, upstreamModel);
+    return err;
+  }
+
+  /**
+   * Audit metadata for `requested` when a request fails before any leg starts.
+   */
+  resolveLegMeta(requested) {
+    if (!requested || typeof requested !== 'string') return null;
+    const aliases = this.cfg?.aliases || {};
+    let target = requested;
+    if (own(aliases, requested) && Array.isArray(aliases[requested]) && aliases[requested].length) {
+      target = String(aliases[requested][0] || '');
+    }
+    const slash = target.indexOf('/');
+    const adapterId = slash < 0 ? target : target.slice(0, slash);
+    const modelName = slash < 0 ? '' : target.slice(slash + 1);
+    const adapter = this.adapters.get(adapterId);
+    if (adapter) return legMetaOf(adapter, modelName || adapter.defaultModel || '');
+    if (own(this.cfg?.adapters, adapterId)) {
+      const raw = this.cfg.adapters[adapterId];
+      if (raw && typeof raw === 'object') {
+        const k = kindOf(raw);
+        return {
+          adapter: adapterId,
+          kind: k,
+          ...(k === 'http' && raw.baseUrl ? { host: hostOf(raw.baseUrl) } : {}),
+          ...(k === 'cli' && raw.parser ? { parser: raw.parser } : {}),
+          ...(raw.costBasis ? { costBasis: raw.costBasis } : {}),
+          account: credentialAccount(raw),
+          model: modelName || raw.defaultModel || '',
+        };
+      }
+    }
+    return null;
   }
 
   /**
@@ -393,6 +465,8 @@ export class Gateway {
     session,
     signal,
     maxTokens,
+    maxCompletionTokens,
+    maxOutputTokens,
     temperature,
     includeReasoning = false,
     exclude = null,
@@ -405,8 +479,8 @@ export class Gateway {
     const chain = this.resolve(model, { exclude, scope });
     const publicId = session || newSessionId();
     const known = session ? this.sessions.get(publicId) : null;
-    const run = { publicId, known, reportedSession: false, includeReasoning, signal };
-    const args = { messages, maxTokens, temperature, includeReasoning, signal, effort, harnessId, trace };
+    const run = { publicId, known, reportedSession: false, includeReasoning, signal, scope };
+    const args = { messages, maxTokens, maxCompletionTokens, maxOutputTokens, temperature, includeReasoning, signal, effort, harnessId, trace };
     if (tools) return yield* this._toolRoute(model, chain, args, run, tools);
     yield* this._failover(chain, args, run, null);
   }
@@ -429,12 +503,15 @@ export class Gateway {
         // CLI's catalogue (src/effort.js) — a 400 there is this leg refusing, like any other.
         const planned = await effortPlan(leg, args.effort);
         const legEffort = planned.effort || (adapter.wire === 'uhp' || adapter.wire === 'traycer' ? args.effort : null);
+        this.checkSpend(adapter, planned.model, run.scope);
         const events = adapter.complete({
           model: planned.model,
           messages: args.messages,
           session: canResume ? run.known.upstreamSession : null,
           signal: args.signal,
-          maxTokens: args.maxTokens,
+          maxTokens: adapter.kind === 'cli' ? (args.maxTokens || args.maxCompletionTokens || args.maxOutputTokens) : args.maxTokens,
+          maxCompletionTokens: args.maxCompletionTokens,
+          maxOutputTokens: args.maxOutputTokens,
           temperature: args.temperature,
           includeReasoning: args.includeReasoning,
           ...(legEffort ? { effort: legEffort } : {}),
@@ -444,6 +521,10 @@ export class Gateway {
         yield* this._leg({ ...leg, model: planned.model }, withEffort(events, planned), run, state, { canResume, sessions: true });
         return;
       } catch (e) {
+        if (e?.clientError) {
+          e.leg = e.leg || legMetaOf(adapter, upstreamModel);
+          throw e;
+        }
         const err = this._legFailed(leg, e, state, args.signal, chain.length > 1 ? 'trying next candidate' : 'giving up');
         if (chain.length === 1) throw lastError ? routeError(lastError, err) : err;
         lastError = routeError(lastError, err);
@@ -461,6 +542,7 @@ export class Gateway {
     // Which effort the leg ran at is said once its answer is: a leg that fails before answering
     // takes its `effort` event with it.
     let effort = null;
+    yield { type: 'leg', leg: legMetaOf(adapter, upstreamModel) };
     for await (const evt of events) {
       if (evt.type === 'effort') {
         effort = evt;
@@ -469,6 +551,9 @@ export class Gateway {
       if (effort && (evt.type === 'delta' || evt.type === 'tool_call' || evt.type === 'done')) {
         yield effort;
         effort = null;
+      }
+      if (evt.type === 'done') {
+        yield { type: 'leg', leg: legMetaOf(adapter, upstreamModel) };
       }
       // One rule for both adapter kinds: chain-of-thought is only ever forwarded to
       // a client that asked for it. Providers and CLIs emit it freely; a UI that
@@ -526,6 +611,8 @@ export class Gateway {
   _legFailed({ adapter, model: upstreamModel }, e, state, signal, next) {
     // Wrapped, a failure keeps what a tool engine marked it with: which engine, and what it spent.
     const err = e instanceof LlmError ? e : Object.assign(new LlmError(e.message, { status: 502, provider: adapter.id }), engineMarks(e));
+    err.leg = e?.leg || legMetaOf(adapter, upstreamModel);
+    if (e?.upstreamId && !err.upstreamId) err.upstreamId = e.upstreamId;
     if (signal?.aborted) throw err;
     if (state.emitted) {
       this.log(`${adapter.id}/${truncate(upstreamModel, 60)} failed after it had started answering, so no other leg is tried: ${truncate(e.message, 160)}`);
@@ -566,18 +653,75 @@ export class Gateway {
     const refused = [];
     for (let i = 0; i < chain.length; i++) {
       const leg = chain[i];
+      if (spec?.historyOnly) {
+        tried.add(i);
+        if (leg.adapter.kind === 'http' && (leg.adapter.wire || 'openai') === 'openai' && relay) {
+          try {
+            this.checkSpend(leg.adapter, leg.model, run.scope);
+            if (await relay(leg)) {
+              yield { type: 'relayed', target: leg.target };
+              return;
+            }
+          } catch (e) {
+            const err = e instanceof LlmError ? e : new LlmError(`${leg.adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: leg.adapter.id });
+            err.leg = e?.leg || legMetaOf(leg.adapter, leg.model);
+            if (e?.upstreamId && !err.upstreamId) err.upstreamId = e.upstreamId;
+            if (args.signal?.aborted) throw err;
+            lastError = routeError(lastError, err);
+            refused.push({ target: leg.target, status: err.status });
+            this.log(`passthrough via ${leg.adapter.id} failed: ${truncate(e.message, 300)}`);
+          }
+          continue;
+        }
+        if (state) state.mode = null;
+        const canResume = !!run.known && run.known.upstreamSession && adapterOf(run.known.target) === leg.adapter.id && !!leg.adapter.resumable;
+        const st = { emitted: false };
+        try {
+          const planned = await effortPlan(leg, args.effort);
+          const legEffort = planned.effort || (leg.adapter.wire === 'uhp' || leg.adapter.wire === 'traycer' ? args.effort : null);
+          this.checkSpend(leg.adapter, planned.model, run.scope);
+          const events = leg.adapter.complete({
+            model: planned.model,
+            messages: args.messages,
+            session: canResume ? run.known.upstreamSession : null,
+            signal: args.signal,
+            maxTokens: leg.adapter.kind === 'cli' ? (args.maxTokens || args.maxCompletionTokens || args.maxOutputTokens) : args.maxTokens,
+            maxCompletionTokens: args.maxCompletionTokens,
+            maxOutputTokens: args.maxOutputTokens,
+            temperature: args.temperature,
+            includeReasoning: args.includeReasoning,
+            ...(legEffort ? { effort: legEffort } : {}),
+            ...(args.harnessId ? { harnessId: args.harnessId } : {}),
+            ...(args.trace ? { trace: args.trace } : {}),
+          });
+          yield* this._leg({ ...leg, model: planned.model }, withEffort(events, planned), run, st, { canResume, sessions: true });
+          return;
+        } catch (e) {
+          if (e?.clientError) {
+            e.leg = e.leg || legMetaOf(leg.adapter, leg.model);
+            throw e;
+          }
+          const err = this._legFailed(leg, e, st, args.signal, i + 1 < chain.length ? 'trying next candidate' : 'giving up');
+          lastError = routeError(lastError, err);
+          refused.push({ target: leg.target, status: err.status });
+        }
+        continue;
+      }
       const path = toolPath(leg.adapter, spec, face);
       if (path === 'skip' || (path === 'passthrough' && !relay)) continue;
       tried.add(i);
       const more = chain.slice(i + 1).some((l) => toolPath(l.adapter, spec, face) !== 'skip') ? 'trying the next leg that takes tools' : 'no other leg takes tools';
       if (path === 'passthrough') {
         try {
+          this.checkSpend(leg.adapter, leg.model, run.scope);
           if (await relay(leg)) {
             yield { type: 'relayed', target: leg.target };
             return;
           }
         } catch (e) {
           const err = e instanceof LlmError ? e : new LlmError(`${leg.adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: leg.adapter.id });
+          err.leg = e?.leg || legMetaOf(leg.adapter, leg.model);
+          if (e?.upstreamId && !err.upstreamId) err.upstreamId = e.upstreamId;
           if (args.signal?.aborted) throw err;
           lastError = routeError(lastError, err);
           refused.push({ target: leg.target, status: err.status });
@@ -589,6 +733,7 @@ export class Gateway {
       try {
         const planned = await effortPlan(leg, args.effort);
         const legEffort = planned.effort || (leg.adapter.wire === 'uhp' || leg.adapter.wire === 'traycer' ? args.effort : null);
+        this.checkSpend(leg.adapter, planned.model, run.scope);
         // A bridge session is the model's at an effort, whichever way the request spelled it: an
         // effort-suffixed id and the base id with the same effort are one conversation.
         const engineLeg = { ...leg, model: planned.model, effort: legEffort, target: planned.model !== leg.model ? `${leg.adapter.id}/${planned.model}` : leg.target };
@@ -598,7 +743,7 @@ export class Gateway {
           plain: args.messages,
           signal: args.signal,
           includeReasoning: args.includeReasoning,
-          maxTokens: args.maxTokens,
+          maxTokens: args.maxTokens || args.maxCompletionTokens || args.maxOutputTokens,
           state,
           mcp: this.toolEngines.mcp,
           log: this.log,
@@ -638,12 +783,14 @@ export class Gateway {
     // completion would ask the same upstream a second time, drop the tools without a word and turn
     // a 429 into a 502: answer with what the leg said instead.
     if (!rest.length) throw lastError || new LlmError(`every leg of "${requested}" has already refused this request`, { status: 502 });
-    if (refused.length) {
-      // Those legs already said no to this very request: asking them again without the tools
-      // spends their quota twice and can turn their refusal into a tool-less answer.
-      this.log(`tools requested; ${refused.map((r) => `${r.target} refused (${r.status})`).join(', ')} — the rest of "${requested}" runs as a plain completion, without tools`);
-    } else {
-      this.log(`tools requested but no leg of "${requested}" takes them (an HTTP upstream on the openai wire, or a CLI with a toolMode) — running as a plain completion`);
+    if (!spec.historyOnly) {
+      if (refused.length) {
+        // Those legs already said no to this very request: asking them again without the tools
+        // spends their quota twice and can turn their refusal into a tool-less answer.
+        this.log(`tools requested; ${refused.map((r) => `${r.target} refused (${r.status})`).join(', ')} — the rest of "${requested}" runs as a plain completion, without tools`);
+      } else {
+        this.log(`tools requested but no leg of "${requested}" takes them (an HTTP upstream on the openai wire, or a CLI with a toolMode) — running as a plain completion`);
+      }
     }
     // No tool engine answers from here: a stream that opens now names none.
     if (state) state.mode = null;
@@ -674,8 +821,12 @@ export class Gateway {
     let fallback = null;
     let bridge = null;
     let relayed = false;
+    let leg = null;
+    let upstreamId = null;
     for await (const evt of this.complete(opts)) {
       if (evt.type === 'relayed') relayed = true;
+      else if (evt.type === 'leg') leg = evt.leg;
+      else if (evt.type === 'upstream' && evt.upstreamId) upstreamId = evt.upstreamId;
       else if (evt.type === 'retry') retries++;
       else if (evt.type === 'cut') cutAt = evt.tool;
       else if (evt.type === 'delta') text += evt.text;
@@ -688,8 +839,13 @@ export class Gateway {
       else if (evt.type === 'session') sessionId = sessionId || evt.id;
       else if (evt.type === 'error') err = evt.message;
     }
-    if (err && !text && !toolCalls.length) throw new LlmError(err, { status: 502 });
-    return { text, reasoning, usage, usageReason, effort, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed };
+    if (err && !text && !toolCalls.length) {
+      const e = new LlmError(err, { status: 502, provider: leg?.adapter || null });
+      if (leg) e.leg = leg;
+      if (upstreamId) e.upstreamId = upstreamId;
+      throw e;
+    }
+    return { text, reasoning, usage, usageReason, effort, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId };
   }
 }
 
@@ -709,11 +865,29 @@ async function* withEffort(events, planned) {
   yield* events;
 }
 
+export function legMetaOf(adapter, upstreamModel = '') {
+  if (!adapter) return null;
+  const mapped = typeof adapter.upstreamModel === 'function' ? adapter.upstreamModel(upstreamModel) : upstreamModel;
+  return {
+    adapter: adapter.id,
+    kind: adapter.kind,
+    ...(adapter.kind === 'http' && adapter.host ? { host: adapter.host } : {}),
+    account: adapter.account ?? null,
+    ...(adapter.costBasis ? { costBasis: adapter.costBasis } : {}),
+    model: mapped || '',
+  };
+}
+
 function mergeUsage(a, b) {
   if (!b) return a;
-  if (!a) return { ...b };
+  if (!a) {
+    const out = { ...b };
+    if (b.cacheInclusive) Object.defineProperty(out, 'cacheInclusive', { value: true, enumerable: false });
+    if (b.total != null) Object.defineProperty(out, 'total', { value: b.total, enumerable: false });
+    return out;
+  }
   // Upstreams sometimes report per-request-usage and cumulative totals; keep the max.
-  return {
+  const out = {
     input: Math.max(a.input || 0, b.input || 0),
     output: Math.max(a.output || 0, b.output || 0),
     cacheRead: Math.max(a.cacheRead || 0, b.cacheRead || 0),
@@ -721,6 +895,10 @@ function mergeUsage(a, b) {
     ...(a.reasoning || b.reasoning ? { reasoning: Math.max(a.reasoning || 0, b.reasoning || 0) } : {}),
     ...(a.total || b.total ? { total: Math.max(a.total || 0, b.total || 0) } : {}),
   };
+  if (a.cacheInclusive || b.cacheInclusive) {
+    Object.defineProperty(out, 'cacheInclusive', { value: true, enumerable: false });
+  }
+  return out;
 }
 
 /**
@@ -768,6 +946,7 @@ function withFailedLegs(e, failed) {
   if (!e || typeof e !== 'object') return e;
   const others = failed.filter((f) => f.error !== e);
   if (!others.length) return e;
+  e._ownUsage = e.usage ?? null;
   e.failedLegs = others.map((f) => ({ ...f }));
   const usage = others.reduce((u, f) => addUsage(u, f.usage), e.usage ?? null);
   if (usage) e.usage = usage;
@@ -852,11 +1031,12 @@ function newSessionId() {
 export function prepareAdapter(id, raw) {
   const cfg = { ...raw };
   const ref = cfg.apiKey ?? cfg.key ?? null;
+  cfg._rawKeyRef = ref;
   delete cfg.key;
   if (ref == null || ref === false) {
     cfg._apiKey = null;
   } else if (cfg._apiKeyResolved) {
-    cfg._apiKey = ref;
+    cfg._apiKey = cfg._apiKey ?? ref;
   } else {
     let resolved = null;
     try {
