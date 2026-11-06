@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import http from 'node:http';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { LlmError } from './util.js';
@@ -17,12 +18,24 @@ import { MAX_TOOLS, anthropicToolMessages, anthropicToolSpec, openaiLegacy, open
 import { addUsage } from './tools/emulate.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
-import { upstreamError, upstreamIdFromHeaders } from './http-adapter.js';
+import { pickChatRelayFields, upstreamError, upstreamIdFromHeaders } from './http-adapter.js';
 import { failureOf, legMetaOf, scopeError } from './gateway.js';
-import { authEnabled, describeScope, parseKeys, scopeWarnings, targetDecision } from './keys.js';
+import { authEnabled, describeScope, hashKey, parseKeys, scopeWarnings, targetDecision } from './keys.js';
 import { DailyQuota, overCapMessage } from './quota.js';
 import { requestEffort } from './effort.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
+
+export function isLoopbackHost(host) {
+  if (!host) return true;
+  const h = String(host).trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '::ffff:127.0.0.1';
+}
+
+export function hasTunnelConfigured(cfg) {
+  const t = cfg?.tunnel;
+  if (!t || typeof t !== 'object') return false;
+  return Boolean(t.name || t.hostname || t.configFile);
+}
 
 const MAX_BODY = 32 * 1024 * 1024;
 const STREAM_HOLD_MS = 10_000;
@@ -34,26 +47,117 @@ const UHP_VERSIONS = ['2026-10-19', '2026-09-28', '2026-09-12', '2026-08-11'];
  */
 const METERED = new Set(['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/embeddings']);
 
-export function createServer(gateway, cfg, { usage, log: write = () => {}, now: customNow = null } = {}) {
+export const LEGACY_MAX_CONCURRENT_WARNING =
+  'limits.maxConcurrent is 4 (the legacy value written by older keysmith init and examples/config.json): treating it as 32; set any other integer in config.json (e.g. 5 or 32) to enforce an explicit limit';
+
+export function createServer(gateway, cfg, { usage, log: write = () => {}, now: customNow = null, tunnelActive = false } = {}) {
+  if (!authEnabled(cfg)) {
+    if (tunnelActive || hasTunnelConfigured(cfg)) {
+      throw new Error('refusing to start with auth.enabled=false while a tunnel is configured');
+    }
+    if (cfg?.host && !isLoopbackHost(cfg.host)) {
+      throw new Error(`refusing to start with auth.enabled=false on non-loopback host "${cfg.host}"`);
+    }
+  }
   const now = customNow || (usage?.now ? () => {
     const v = usage.now();
     return v instanceof Date ? v.getTime() : Number(v);
   } : () => Date.now());
   // Every line this server logs can quote an upstream error; it leaves here redacted.
   const log = (m) => write(redactSecrets(m));
+  if (Number(cfg?.limits?.maxConcurrent) === 4) {
+    log(LEGACY_MAX_CONCURRENT_WARNING);
+  }
   // Each key, with what it may reach (keys.js): a bare key is unscoped, as it always was.
   // `authOn` is the list being there, not any entry in it parsing: a list of broken entries
   // opens nothing — it never turns into a keyless gateway.
-  const authOn = authEnabled(cfg);
-  const { entries: keys, issues: keyIssues } = authOn ? parseKeys(cfg.auth.keys) : { entries: [], issues: [] };
+  let authOn = authEnabled(cfg);
+  let { entries: keys, issues: keyIssues } = authOn ? parseKeys(cfg.auth?.keys) : { entries: [], issues: [] };
   for (const issue of keyIssues) log(`auth.keys: ${issue}`);
   // A hand-edited pattern that names nothing (`deny: ["Claude-API"]`) keeps nothing out: said at
   // start and on the status page, never refused — it may name an adapter that is added later.
-  const keyWarnings = authOn ? scopeWarnings(cfg, keys) : [];
+  let keyWarnings = authOn ? scopeWarnings(cfg, keys) : [];
   for (const w of keyWarnings) log(`auth.keys: ${w.message}`);
   // The usage log redacts these from every line it writes; register them even when the
   // config did not come through loadConfig (an embedded server, a test).
   registerSecrets(cfg.auth?.keys);
+
+  const cfgFile = typeof cfg?._path === 'string' && cfg._path ? cfg._path : null;
+  let lastMtimeMs = 0;
+  let lastSize = 0;
+  let lastIno = 0;
+  let lastFailedMtimeMs = 0;
+  let lastFailedSize = 0;
+  let lastFailedIno = 0;
+  if (cfgFile) {
+    try {
+      const st = fs.statSync(cfgFile);
+      lastMtimeMs = st.mtimeMs;
+      lastSize = st.size;
+      lastIno = st.ino;
+    } catch {}
+  }
+
+  function reloadKeys(force = false) {
+    let st = null;
+    try {
+      if (cfgFile) {
+        st = fs.statSync(cfgFile);
+        if (!force && st.mtimeMs === lastMtimeMs && st.size === lastSize && st.ino === lastIno) {
+          return false;
+        }
+        const disk = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
+        lastMtimeMs = st.mtimeMs;
+        lastSize = st.size;
+        lastIno = st.ino;
+        lastFailedMtimeMs = 0;
+        lastFailedSize = 0;
+        lastFailedIno = 0;
+        if (disk && typeof disk === 'object' && !Array.isArray(disk)) {
+          const nextAuth = disk.auth && typeof disk.auth === 'object' && !Array.isArray(disk.auth)
+            ? { ...disk.auth, enabled: disk.auth.enabled === false ? false : true }
+            : { enabled: true, keys: [] };
+          const unsafeOff =
+            nextAuth.enabled === false &&
+            (tunnelActive ||
+              hasTunnelConfigured(disk) ||
+              hasTunnelConfigured(cfg) ||
+              (disk.host && !isLoopbackHost(disk.host)) ||
+              (cfg?.host && !isLoopbackHost(cfg.host)));
+          if (unsafeOff) {
+            log('! auth.keys reload refused: auth.enabled cannot be false when a tunnel is configured or host is not loopback; keeping previous keys');
+            return false;
+          }
+          cfg.auth = nextAuth;
+        }
+      } else if (!force) {
+        return false;
+      }
+      registerSecrets(cfg.auth?.keys);
+      authOn = authEnabled(cfg);
+      const parsed = authOn ? parseKeys(cfg.auth?.keys) : { entries: [], issues: [] };
+      keys = parsed.entries;
+      keyIssues = parsed.issues;
+      keyWarnings = authOn ? scopeWarnings(cfg, keys) : [];
+      return true;
+    } catch (e) {
+      const sameFailedStamp =
+        st &&
+        st.mtimeMs === lastFailedMtimeMs &&
+        st.size === lastFailedSize &&
+        st.ino === lastFailedIno;
+      if (!sameFailedStamp) {
+        if (st) {
+          lastFailedMtimeMs = st.mtimeMs;
+          lastFailedSize = st.size;
+          lastFailedIno = st.ino;
+        }
+        log(`auth.keys reload failed: ${e.message || e}`);
+      }
+      return false;
+    }
+  }
+
   if (usage) {
     if (!gateway.usage) gateway.usage = usage;
     if (!usage.pricing && cfg?.pricing) usage.pricing = cfg.pricing;
@@ -68,6 +172,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const pages = pageSessions();
   const responseStore = createResponseStore({ now });
   const idempotencyStore = createIdempotencyStore({ now });
+  let inFlight = 0;
   // How long a streamed answer's headers wait for its first event (see `held`).
   const holdMs = Number.isFinite(cfg.limits?.streamHoldMs) && cfg.limits.streamHoldMs >= 0 ? cfg.limits.streamHoldMs : STREAM_HOLD_MS;
   // How long an open stream may go without a byte before it gets a keepalive (faces.js); 0: never.
@@ -85,8 +190,18 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       } catch {}
     });
   });
+  const onHup = () => reloadKeys(true);
+  server.on('listening', () => process.on('SIGHUP', onHup));
+  server.on('close', () => process.off('SIGHUP', onHup));
+  const origClose = server.close.bind(server);
+  server.close = (...args) => {
+    process.off('SIGHUP', onHup);
+    return origClose(...args);
+  };
+  server.reloadKeys = () => reloadKeys(true);
 
   async function handle(req, res) {
+    reloadKeys(false);
     wrapBytesOut(res);
     req._bytesIn = 0;
     let url;
@@ -99,7 +214,6 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     }
     const route = url.pathname.replace(/\/+$/, '') || '/';
 
-    res.setHeader('access-control-allow-origin', '*');
     res.setHeader('access-control-allow-headers', 'authorization,content-type,x-keysmith-session,x-keysmith-tag,x-api-key,anthropic-version,uhp-version,idempotency-key,x-harness-id,traceparent,tracestate');
     res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
 
@@ -114,7 +228,12 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
 
     if (req.method === 'OPTIONS') return send(res, 204, {}, '');
 
-    if (route === '/healthz') return send(res, 200, { 'content-type': 'application/json' }, JSON.stringify({ ok: true, uptime_s: Math.round((Date.now() - startedAt) / 1000), adapters: gateway.publicAdapters.length, failed_to_load: Object.keys(gateway.loadErrors).length, alias_warnings: Object.keys(gateway.aliasIssues).length }));
+    if (route === '/healthz') {
+      if (req.headers['cf-connecting-ip']) {
+        return send(res, 200, { 'content-type': 'application/json' }, JSON.stringify({ ok: true }));
+      }
+      return send(res, 200, { 'content-type': 'application/json' }, JSON.stringify({ ok: true, uptime_s: Math.round((Date.now() - startedAt) / 1000), adapters: gateway.publicAdapters.length, failed_to_load: Object.keys(gateway.loadErrors).length, alias_warnings: Object.keys(gateway.aliasIssues).length }));
+    }
     // Unauthenticated UHP protocol discovery endpoint (UHP 2026-10-19).
     if ((route === '/v1/uhp' || route === '/uhp' || route === '/.well-known/uhp') && req.method === 'GET') {
       return json(res, 200, {
@@ -155,7 +274,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       if (req.method === 'POST') return pageLogin(req, res, route);
       if (req.method === 'GET') {
         const byHeader = authOn ? headerEntry(req, keys) : null;
-        const viewer = !authOn ? { entry: null } : byHeader ? { entry: byHeader } : pages.session(cookieFrom(req, PAGE_COOKIE));
+        const viewer = !authOn ? { entry: null } : byHeader ? { entry: byHeader } : pages.session(cookieFrom(req, PAGE_COOKIE), keys);
         if (!viewer) return send(res, 401, PAGE_HEADERS, loginPage({ action: route }));
         const scope = viewer.entry?.scope || null;
         const { models } = await safeList(gateway, scope);
@@ -177,16 +296,52 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       }
     }
 
-    const who = identify(req, keys, url, authOn);
+    const who = identify(req, keys, url, authOn, cfg);
     if (who === null) {
       return json(res, 401, errorBody('missing or invalid API key — send `Authorization: Bearer <key>`', 'authentication_error', 401));
     }
     const { caller, scope } = who;
+    const heldSpend = [];
+    const holdSpend = (fn) => {
+      if (typeof fn === 'function') heldSpend.push(fn);
+    };
+    const releaseHeldSpend = () => {
+      for (const fn of heldSpend.splice(0)) {
+        try { fn(); } catch {}
+      }
+    };
     // Every usage row this request writes says which key it came with and what its scope did.
-    const stamped = usage ? { record: (entry) => usage.record(stamp({ ts: new Date(now()).toISOString(), ...entry }, { who, req, res, route, gateway, cfg })) } : null;
+    const stamped = {
+      record: (entry) => {
+        try {
+          if (usage) {
+            usage.record(stamp({ ts: new Date(now()).toISOString(), ...entry }, { who, req, res, route, gateway, cfg }));
+          }
+        } finally {
+          releaseHeldSpend();
+        }
+      },
+    };
 
     let meteredRequest = false;
+    let countedInFlight = false;
     try {
+      if (req.method === 'POST' && METERED.has(route)) {
+        const rawMax = cfg?.limits?.maxConcurrent;
+        const numMax = rawMax === undefined ? 32 : Number(rawMax);
+        const maxConcurrent = numMax === 4 ? 32 : numMax;
+        if (Number.isFinite(maxConcurrent) && maxConcurrent > 0 && inFlight >= maxConcurrent) {
+          const err = new LlmError(`too many concurrent requests (maxConcurrent=${maxConcurrent})`, {
+            status: 429,
+            type: 'rate_limit_error',
+          });
+          err.retryAfter = 1;
+          throw err;
+        }
+        inFlight++;
+        if (typeof gateway.inFlight === 'number') gateway.inFlight++;
+        countedInFlight = true;
+      }
       // A request that asks a model (or queries /v1/keysmith/usage) counts against its key's daily
       // cap before anything is read: one per client request, whatever alias, failover or retry happens under it.
       if ((req.method === 'POST' && METERED.has(route)) || (req.method === 'GET' && route === '/v1/keysmith/usage')) {
@@ -234,7 +389,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       }
       if (route === '/v1/keysmith/routes' && req.method === 'GET') {
         return json(res, 200, {
-          adapters: describeAdapters(gateway).filter((a) => gateway.adapterVisible(a.id, scope)),
+          adapters: describeAdapters(gateway, scope).filter((a) => gateway.adapterVisible(a.id, scope)),
           failed_to_load: visibleEntries(gateway.loadErrors, (id) => gateway.adapterVisible(id, scope)),
           aliases: gateway.aliasesFor(scope),
           alias_warnings: gateway.aliasIssuesFor(scope),
@@ -282,11 +437,11 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           ...(n ? { entries: usage.tail(n, filter) } : {}),
         });
       }
-      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope });
-      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope });
-      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore });
-      if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope });
-      return json(res, 404, errorBody(`no route ${req.method} ${route}`, 'invalid_request_error', 404));
+      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend });
+      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend });
+      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend });
+      if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend });
+      return json(res, 404, errorBody(`no route for ${req.method}`, 'invalid_request_error', 404));
     } catch (e) {
       const status = e instanceof LlmError ? e.status : 500;
       if (status >= 500) log(`${route} crashed: ${e.stack || e.message}`);
@@ -295,6 +450,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       const message = redactSecrets(e.message || String(e));
       const meta = res._keysmith;
       const faceName = faceFromRoute(route);
+      const errProvider = status === 403 || status === 404 ? null : (e?.provider || null);
       let pendingErrBody = null;
       if (res.headersSent) {
         // A stream that already started must be closed politely, in its face's own error frame
@@ -312,7 +468,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       } else {
         // A provider's "retry after N s" is for the client's backoff: pass it on.
         if (e?.retryAfter) res.setHeader('retry-after', String(e.retryAfter));
-        pendingErrBody = JSON.stringify(errorBody(message, e instanceof LlmError ? e.type : 'internal_error', status, e?.provider || null, faceName));
+        pendingErrBody = JSON.stringify(errorBody(message, e instanceof LlmError ? e.type : 'internal_error', status, errProvider, faceName));
       }
       if (meta && !meta.done) {
         // A tool engine that failed still spent its runs: the error says what, and which engine.
@@ -342,6 +498,12 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
         send(res, status, { 'content-type': 'application/json; charset=utf-8' }, pendingErrBody);
       }
       return;
+    } finally {
+      releaseHeldSpend();
+      if (countedInFlight) {
+        inFlight = Math.max(0, inFlight - 1);
+        if (typeof gateway.inFlight === 'number') gateway.inFlight = Math.max(0, gateway.inFlight - 1);
+      }
     }
   }
 
@@ -438,12 +600,22 @@ function pageSessions() {
       return token;
     },
     /** `{ entry }` for a live token, null otherwise. */
-    session(token) {
+    session(token, currentKeys = null) {
       const s = token ? live.get(token) : null;
       if (!s) return null;
-      if (s.exp > Date.now()) return { entry: s.entry };
-      live.delete(token);
-      return null;
+      if (s.exp <= Date.now()) {
+        live.delete(token);
+        return null;
+      }
+      if (s.entry && Array.isArray(currentKeys)) {
+        const fresh = currentKeys.find((e) => e.fp === s.entry.fp);
+        if (!fresh) {
+          live.delete(token);
+          return null;
+        }
+        return { entry: fresh };
+      }
+      return { entry: s.entry };
     },
   };
 }
@@ -567,13 +739,12 @@ async function safeList(gateway, scope = null) {
   }
 }
 
-function describeAdapters(gateway) {
+function describeAdapters(gateway, scope = null) {
   return gateway.publicAdapters.map((a) => ({
     id: a.id,
     kind: a.kind,
     wire: a.wire || null,
-    bin: a.bin || null,
-    baseUrl: a.baseUrl || null,
+    ...(scope ? {} : { bin: a.bin || null, baseUrl: a.baseUrl || null }),
     priority: a.priority,
     parser: a.parser || null,
     resumable: !!a.resumable,
@@ -616,7 +787,7 @@ function describeHarness(a) {
 
 /* ---------------------------------------------------------------------- handlers */
 
-async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null }) {
+async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null }) {
   const body = await readJson(req);
   const messages = openaiMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -665,7 +836,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
   if (!stream) {
-    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId } = await gateway.collect({ model: requested, messages, session: publicId, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace });
+    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId } = await gateway.collect({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace, holdSpend });
     if (relayed) {
       // An HTTP leg's answer went out verbatim, with its own usage row.
       meta.done = true;
@@ -695,7 +866,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     return;
   }
 
-  const events = await held(gateway.complete({ model: requested, messages, session: publicId, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace }), holdMs);
+  const events = await held(gateway.complete({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace, holdSpend }), holdMs);
   if (res.headersSent) {
     // An HTTP leg is answering verbatim — its status, its headers, its bytes — and writes its
     // own usage row: what is left here is waiting for it to finish.
@@ -777,7 +948,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   });
 }
 
-async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null }) {
+async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null }) {
   const body = await readJson(req);
   const messages = anthropicMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -802,7 +973,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   const tools = offered ? { spec: anthropicToolSpec(body), messages: anthropicToolMessages(body), face: 'anthropic', state: out, caller, relay: null } : null;
   // The Messages API defaults to a single JSON reply; SSE only when asked.
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId } = await gateway.collect({ model: requested, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId } = await gateway.collect({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend });
     const calls = toolCalls.map((c) => faceCall(c, 'anthropic'));
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
     meta.done = true;
@@ -823,7 +994,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
     });
     return;
   }
-  const events = await held(gateway.complete({ model: requested, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace }), holdMs);
+  const events = await held(gateway.complete({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend }), holdMs);
   startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
   const face = new AnthropicStream(res, { id, model: requested, keepaliveMs });
   meta.face = face;
@@ -874,7 +1045,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   void log;
 }
 
-async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null }) {
+async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null, holdSpend = null }) {
   const body = await readJson(req);
   const trace = extractW3cTrace(req, res);
 
@@ -972,10 +1143,11 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
       harnessId,
       trace,
       onStore,
+      holdSpend,
     });
   }
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, leg, upstreamId } = await gateway.collect({ model: requestedModel, messages, session, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, leg, upstreamId } = await gateway.collect({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace, holdSpend });
     if (toolCalls.length) throw noResponsesToolCalls();
     meta.done = true;
     const payload = responsesResult({ id, model: requestedModel, text, usage: faceUsage(u, usageReason), created });
@@ -996,7 +1168,7 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     });
     return;
   }
-  const events = await held(gateway.complete({ model: requestedModel, messages, session, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace }), holdMs);
+  const events = await held(gateway.complete({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace, holdSpend }), holdMs);
   startSse(res, 'text/event-stream');
   for (const e of responsesStreamEventsHead({ id, model: requestedModel })) sseEvent(res, e.event, e.data);
   let full = '';
@@ -1055,13 +1227,13 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
  * text — streamed or not, with the usage row of the other faces (toolMode, toolCalls, fallback,
  * the bridge's session).
  */
-async function responsesWithTools(req, res, gateway, body, { usage, caller, holdMs, keepaliveMs, scope, id, created, stream, session, meta, t0, effort = null, harnessId = null, trace = null, onStore = null }) {
+async function responsesWithTools(req, res, gateway, body, { usage, caller, holdMs, keepaliveMs, scope, id, created, stream, session, meta, t0, effort = null, harnessId = null, trace = null, onStore = null, holdSpend = null }) {
   const out = { mode: null };
   const tools = { spec: responsesToolSpec(body), messages: responsesToolMessages(body), face: 'responses', state: out, caller, relay: null };
   const messages = responsesMessages(body);
   const request = { tools: body.tools, tool_choice: body.tool_choice, parallel_tool_calls: body.parallel_tool_calls };
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId } = await gateway.collect({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId } = await gateway.collect({ model: body.model, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace, holdSpend });
     const calls = toolCalls.map((c) => faceCall(c, 'responses'));
     const payload = responsesBody({ id, model: body.model, created, text, usage: faceUsage(u, usageReason), toolCalls: calls, request });
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
@@ -1083,7 +1255,7 @@ async function responsesWithTools(req, res, gateway, body, { usage, caller, hold
     });
     return;
   }
-  const events = await held(gateway.complete({ model: body.model, messages, session, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace }), holdMs);
+  const events = await held(gateway.complete({ model: body.model, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace, holdSpend }), holdMs);
   startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
   const face = new ResponsesStream(res, { id, model: body.model, created, request, keepaliveMs });
   meta.face = face;
@@ -1145,7 +1317,7 @@ function noResponsesToolCalls() {
   return new LlmError('this answer is a tool call, and the request offered no tools', { status: 502 });
 }
 
-async function handleEmbeddings(req, res, gateway, { usage, scope = null } = {}) {
+async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSpend = null } = {}) {
   const body = await readJson(req);
   const t0 = Date.now();
   const meta = track(res, body.model, false, t0, '/v1/embeddings');
@@ -1162,14 +1334,25 @@ async function handleEmbeddings(req, res, gateway, { usage, scope = null } = {})
   }
   const adapter = gateway.adapters.get(adapterId);
   if (!adapter || adapter.kind !== 'http') throw new LlmError('embeddings need an HTTP adapter', { status: 400 });
-  gateway.checkSpend(adapter, upstreamModel, scope);
-  const r = await fetch(`${adapter.baseUrl}/embeddings`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...adapter.authHeaders(), ...adapter.headers },
-    body: JSON.stringify({ ...body, model: upstreamModel }),
-    signal: AbortSignal.timeout(adapter.timeoutMs),
-  });
-  const text = await r.text();
+  const tokens = typeof gateway.estimateTokens === 'function'
+    ? gateway.estimateTokens(adapter, upstreamModel, { input: body.input, maxTokens: 0 })
+    : { inputTokens: 16, outputTokens: 0 };
+  const releaseSpend = gateway.reserveSpend(adapter, upstreamModel, scope, tokens);
+  if (typeof holdSpend === 'function') holdSpend(releaseSpend);
+  let r;
+  let text;
+  try {
+    r = await fetch(`${adapter.baseUrl}/embeddings`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...adapter.authHeaders(), ...adapter.headers },
+      body: JSON.stringify({ ...body, model: upstreamModel }),
+      signal: AbortSignal.timeout(adapter.timeoutMs),
+    });
+    text = await r.text();
+  } catch (e) {
+    releaseSpend();
+    throw e;
+  }
   const upstreamId = upstreamIdFromHeaders(r.headers);
   const embUsage = r.ok ? extractEmbeddingsUsage(text) : undefined;
   meta.done = true;
@@ -1177,18 +1360,22 @@ async function handleEmbeddings(req, res, gateway, { usage, scope = null } = {})
   // A refusal is the provider's error body, which can quote the key it refused; vectors are
   // passed on as they came.
   res.end(r.ok ? text : redactSecrets(text));
-  record(usage, {
-    model: body.model,
-    status: r.ok ? 'ok' : 'error',
-    ms: Date.now() - t0,
-    ...(embUsage?.unknown ? { usage: null, usageReason: embUsage.unknown } : embUsage ? { usage: embUsage } : {}),
-    stream: false,
-    client: req.headers['user-agent'],
-    via: '/v1/embeddings',
-    _leg: legMetaOf(adapter, upstreamModel),
-    ...(upstreamId ? { upstreamId } : {}),
-    ...(r.ok ? {} : { error: `${adapterId} ${r.status}` }),
-  });
+  try {
+    record(usage, {
+      model: body.model,
+      status: r.ok ? 'ok' : 'error',
+      ms: Date.now() - t0,
+      ...(embUsage?.unknown ? { usage: null, usageReason: embUsage.unknown } : embUsage ? { usage: embUsage } : {}),
+      stream: false,
+      client: req.headers['user-agent'],
+      via: '/v1/embeddings',
+      _leg: legMetaOf(adapter, upstreamModel),
+      ...(upstreamId ? { upstreamId } : {}),
+      ...(r.ok ? {} : { error: `${adapterId} ${r.status}` }),
+    });
+  } finally {
+    releaseSpend();
+  }
 }
 
 function hasOpenaiToolHistory(body) {
@@ -1249,19 +1436,20 @@ async function relayLeg({ adapter, model }, { body, req, res, out, usage, log, t
   // and its answer carries on in it. After a refusal the next leg names its own engine, and a
   // plain completion none (gateway._toolRoute).
   out.mode = 'passthrough';
-  const clientAskedUsage = !!body?.stream_options?.include_usage;
+  const safeBody = pickChatRelayFields(body);
+  const clientAskedUsage = !!safeBody?.stream_options?.include_usage;
   const streamUsageAllowed = adapter.streamUsage !== false;
-  const addedIncludeUsage = !!body?.stream && !clientAskedUsage && streamUsageAllowed;
+  const addedIncludeUsage = !!safeBody?.stream && !clientAskedUsage && streamUsageAllowed;
   const upstreamBody = addedIncludeUsage
     ? {
-        ...body,
+        ...safeBody,
         model,
         stream_options: {
-          ...(body.stream_options && typeof body.stream_options === 'object' ? body.stream_options : {}),
+          ...(safeBody.stream_options && typeof safeBody.stream_options === 'object' ? safeBody.stream_options : {}),
           include_usage: true,
         },
       }
-    : { ...body, model };
+    : { ...safeBody, model };
   const upstream = await adapter.rawChat(upstreamBody, { caller });
   if (!upstream.ok) {
     const t = await upstream.text().catch(() => '');
@@ -2027,28 +2215,57 @@ function send(res, status, headers, body) {
 /** The configured key entry `candidate` is, or null. */
 function matchKey(entries, candidate) {
   if (!candidate) return null;
-  return entries.find((e) => safeEqual(e.key, String(candidate))) ?? null;
+  const raw = String(candidate);
+  let candidateHash = null;
+  for (const e of entries) {
+    if (e.key && safeEqual(e.key, raw)) return e;
+    if (e.keyHash) {
+      candidateHash ??= hashKey(raw);
+      if (safeEqual(e.keyHash, candidateHash)) return e;
+    }
+  }
+  return null;
 }
 
 /** The configured key entry a header presents (`Authorization: Bearer` or `x-api-key`), or null. */
 function headerEntry(req, entries) {
-  const header = req.headers.authorization || '';
-  const candidate = header.startsWith('Bearer ') ? header.slice(7) : req.headers['x-api-key'] || '';
-  return matchKey(entries, candidate);
+  const header = req.headers.authorization;
+  if (header !== undefined) {
+    return typeof header === 'string' && header.startsWith('Bearer ') ? matchKey(entries, header.slice(7)) : null;
+  }
+  const xKey = req.headers['x-api-key'];
+  return typeof xKey === 'string' && xKey ? matchKey(entries, xKey) : null;
+}
+
+function isDirectLoopback(req) {
+  if (req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']) return false;
+  const addr = req.socket?.remoteAddress || '';
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 }
 
 /**
- * Who is asking — by header, or by `?api_key=` for clients that cannot set one: null when no
- * key fits; with auth off, `{ caller: '' }` and no scope. Otherwise `{ caller, fp, label,
- * scope }`: `caller` is a hash of the key (what one caller's requests leave behind, Gemini's
- * thought signatures, goes back up on that caller's requests only), `fp` its fingerprint for
- * the usage log, `scope` what it may reach (null: everything), `perDay` its daily cap (null: none).
+ * Who is asking — by header, or by `?api_key=` when explicitly enabled for direct loopback
+ * clients: null when no key fits; with auth off, `{ caller: '' }` and no scope. Otherwise
+ * `{ caller, fp, label, scope }`: `caller` is a hash of the key (what one caller's requests
+ * leave behind, Gemini's thought signatures, goes back up on that caller's requests only),
+ * `fp` its fingerprint for the usage log, `scope` what it may reach (null: everything),
+ * `perDay` its daily cap (null: none).
  */
-function identify(req, entries, url, authOn) {
+function identify(req, entries, url, authOn, cfg = null) {
   if (!authOn) return { caller: '', fp: null, label: null, scope: null, perDay: null };
-  const entry = headerEntry(req, entries) ?? matchKey(entries, url.searchParams.get('api_key') || '');
+  let entry = headerEntry(req, entries);
+  if (!entry && req.headers.authorization === undefined && req.headers['x-api-key'] === undefined) {
+    const queryAllowed = cfg?.auth?.allowQueryApiKey === true || cfg?.auth?.queryKey === true;
+    if (queryAllowed && isDirectLoopback(req)) {
+      entry = matchKey(entries, url.searchParams.get('api_key') || '');
+    }
+  }
   if (!entry) return null;
-  return { caller: createHash('sha256').update(entry.key).digest('base64url').slice(0, 22), fp: entry.fp, label: entry.label, scope: entry.scope, perDay: entry.perDay ?? null };
+  const hex = entry.keyHash || (entry.key ? hashKey(entry.key) : null);
+  const caller = hex
+    ? Buffer.from(hex, 'hex').toString('base64url').slice(0, 22)
+    : createHash('sha256').update(String(entry.fp || '')).digest('base64url').slice(0, 22);
+  return { caller, fp: entry.fp, label: entry.label, scope: entry.scope, perDay: entry.perDay ?? null };
 }
 
 function safeEqual(a, b) {

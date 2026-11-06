@@ -73,12 +73,11 @@ that is the interesting part.
 | `GET /` | status page in a browser: post the key once through its form, a cookie opens it for an hour |
 | `GET /healthz` | keyless liveness probe for a supervisor |
 
-Everything under `/v1` needs `Authorization: Bearer <key>`, `x-api-key`, or `?api_key=` (the
-last for clients that cannot set a header; a URL is kept by shell history, browsers and a
-tunnel's request logs, so prefer the header). A key can carry a scope — the adapters, models
+Everything under `/v1` needs `Authorization: Bearer <key>` or `x-api-key` (`?api_key=` is off by
+default; when enabled via `auth.allowQueryApiKey: true`, it is accepted only from direct loopback
+clients with no `cf-connecting-ip` or `x-forwarded-for` header). A key can carry a scope — the adapters, models
 and aliases it may reach — and every route above answers it with that share only; see
 [Keys with a scope](#keys-with-a-scope-what-each-key-may-reach).
-CORS is open, so browser apps can call it directly.
 
 
 ## Universal Harness Protocol (UHP) & HarnessRouter Relay
@@ -761,7 +760,11 @@ not take `?api_key=` at all: it asks for the key in a form, and keeps a cookie t
 that page alone, for an hour. Error messages can quote anything a CLI printed, so every log
 line and every usage row goes through the same redaction: the configured keys — as written,
 as JSON escapes them, and any run of 12 or more of their characters a cut left behind — and
-anything shaped like a minted key, whole or cut, come out as above. Messages are redacted
+anything shaped like a minted key, whole or cut, come out as above. (Note: hashed keys stored
+as `keyHash` via `keysmith key add --hash` do not keep their plaintext secret in `config.json`, so
+`registerSecrets` cannot register their exact string; if a client echoes a custom hashed key into a
+prompt or upstream error message, exact-string redaction cannot redact it from logs, though
+standard `ks_…`-shaped tokens are still redacted by pattern.) Messages are redacted
 before they are shortened, streamed text (`keysmith chat --stream`, cloudflared's output)
 is redacted across the pieces it arrives in, and an error nothing caught is reported
 redacted too. The files are `0600` in a `0700` directory; `serve`, `start` and
@@ -866,9 +869,11 @@ cannot be written no key is added. A pattern that names no configured adapter or
 refused, because a deny-list typo keeps nothing out; `--allow-unknown` saves it anyway (for an
 adapter you are about to add). `--force` does not: a script that rotates an agent's key into
 the same file passes `--force` every time. Quote a glob, or the shell expands it.
-`key add` with neither a label nor a scope still writes a bare key. Like every key change, a
-scope takes effect when the gateway restarts, and `who-can` warns when the running gateway is
-older than the config.
+`key add` with neither a label nor a scope still writes a bare key. Passing `--hash` stores only
+the SHA-256 `keyHash` in `config.json` (`{ "keyHash": "<sha256-hex>", … }`) and shows the full key
+once at creation (`key list` marks hashed entries with `hashed (sha256)`). Key changes (`key add`,
+`key scope`, `key revoke`) signal a running `keysmith serve` instance with `SIGHUP` and are also
+reloaded automatically when `config.json` changes on disk.
 
 `explicitOnly` and a scope answer different questions: `explicitOnly` keeps an adapter out of
 aliases for every key; a scope keeps one key away from an adapter however it asks for it.

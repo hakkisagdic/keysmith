@@ -5,7 +5,7 @@ import { LlmError, routeError, truncate } from './util.js';
 import { resolveSecret } from './config.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
-import { adapterReach, aliasDecision, requestDecision } from './keys.js';
+import { adapterReach, aliasDecision, requestDecision, scopeText } from './keys.js';
 import { describeUnsupported, toolEvents, toolPath } from './tools/router.js';
 import { addUsage } from './tools/emulate.js';
 import { McpBridge } from './bridge/index.js';
@@ -78,6 +78,60 @@ export class Gateway {
   checkSpend(adapter, upstreamModel = '', scope = null) {
     const err = this._spendCapError(adapter, upstreamModel, scope);
     if (err) throw err;
+  }
+
+  reserveSpend(adapter, upstreamModel = '', scope = null, { inputTokens = 1, outputTokens = 256 } = {}) {
+    this.checkSpend(adapter, upstreamModel, scope);
+    const spendCfg = this.cfg?.limits?.spend;
+    if (!spendCfg || !this.usage || !adapter || typeof this.usage.reserveSpend !== 'function') return () => {};
+    return this.usage.reserveSpend(spendCfg, adapter, {
+      adaptersCfg: this.cfg?.adapters,
+      model: upstreamModel,
+      upstreamModel: typeof adapter.upstreamModel === 'function' ? adapter.upstreamModel(upstreamModel) : upstreamModel,
+      inputTokens,
+      outputTokens,
+    });
+  }
+
+  /**
+   * Realistic token estimate for in-flight spend reservation:
+   * - inputTokens: prompt characters / 4 (across messages, tool messages, tool definitions, or input)
+   * - outputTokens: requested max output tokens, or the adapter's max output tokens when absent
+   */
+  estimateTokens(adapter, model = '', args = {}, tools = null) {
+    const msgChars = Math.max(countPromptChars(args?.messages), countPromptChars(tools?.messages));
+    const toolChars = countPromptChars(tools?.spec?.tools);
+    const inputChars = countPromptChars(args?.input);
+    const totalChars = msgChars + toolChars + inputChars;
+    const inputTokens = Math.max(1, Math.ceil(totalChars / 4));
+
+    if (args?.maxTokens === 0) {
+      return { inputTokens, outputTokens: 0 };
+    }
+    const reqMax = Number(args?.maxTokens ?? args?.maxCompletionTokens ?? args?.maxOutputTokens);
+    if (Number.isFinite(reqMax) && reqMax > 0) {
+      return { inputTokens, outputTokens: reqMax };
+    }
+    const upModel = typeof adapter?.upstreamModel === 'function' ? adapter.upstreamModel(model) : model;
+    const mp = typeof adapter?._paramsFor === 'function'
+      ? adapter._paramsFor(upModel)
+      : (adapter?.modelParams?.[upModel] || adapter?.modelParams?.[model] || null);
+    const rawAdapterCfg = adapter?.id ? this.cfg?.adapters?.[adapter.id] : null;
+    const adapterMax = Number(
+      mp?.max_tokens ??
+      mp?.max_completion_tokens ??
+      mp?.max_output_tokens ??
+      mp?.maxTokens ??
+      mp?.maxOutputTokens ??
+      adapter?.maxOutputTokens ??
+      adapter?.maxTokens ??
+      adapter?.max_tokens ??
+      rawAdapterCfg?.maxOutputTokens ??
+      rawAdapterCfg?.maxTokens ??
+      rawAdapterCfg?.max_tokens,
+    );
+    const outputTokens = Number.isFinite(adapterMax) && adapterMax > 0 ? adapterMax : 4096;
+    return { inputTokens, outputTokens };
   }
 
   _spendCapError(adapter, upstreamModel = '', scope = null) {
@@ -318,11 +372,12 @@ export class Gateway {
           });
           for (const m of list) {
             if (!m?.id) continue;
-            if (!scope || this.checkTarget(a.id, m.id, scope).ok) models.push(entry(m.id, m));
+            const baseOk = !scope || this.checkTarget(a.id, m.id, scope).ok;
+            if (baseOk) models.push(entry(m.id, m));
             // A client that cannot send an effort (OpenBot) names one in the model id: one id per
             // level the catalogue lists for the model, on a CLI whose argv takes an effort. A scope
-            // decides it as written: `codex/gpt-6-astra*` reaches `codex/gpt-6-astra-xhigh`.
-            if (!a.takesEffort) continue;
+            // decides both the base model and the suffixed id as written.
+            if (!a.takesEffort || !baseOk) continue;
             for (const { id, level } of suffixedIds(list, m)) {
               if (scope && !this.checkTarget(a.id, id, scope).ok) continue;
               models.push(entry(id, m, { effort: level, name: m.name ? `${m.name} (effort ${level})` : null }));
@@ -416,13 +471,13 @@ export class Gateway {
       if (!adapter) {
         const why = this.loadError(adapterId);
         const live = [...this.adapters.keys()].filter((id) => this.adapterVisible(id, scope));
-        err = new LlmError(why ? `adapter "${adapterId}" is configured but did not load: ${why}` : `no adapter named "${adapterId}" — try one of: ${live.join(', ')}`, { status: why ? 503 : 404, provider: adapterId });
+        err = new LlmError(why ? `adapter "${adapterId}" is configured but did not load: ${why}` : `no adapter named "${adapterId}" — try one of: ${live.join(', ')}`, { status: why ? 503 : 404, provider: why ? adapterId : null });
       } else if (adapter.disabled) {
         err = new LlmError(`adapter "${adapterId}" is disabled`, { status: 503, provider: adapterId });
       } else if (isAlias && adapter.explicitOnly) {
         // An alias is a route the gateway picks legs from on its own; this adapter is only
         // ever run by a request that names it. A hand-edited leg is a dead leg, not a route.
-        err = new LlmError(`alias "${requested}": ${keptOutOfAliases(adapterId, adapter)}`, { status: 403, provider: adapterId });
+        err = new LlmError(`alias "${requested}": ${keptOutOfAliases(adapterId, adapter)}`, { status: 403, provider: null });
       }
       if (err) {
         firstError ??= err;
@@ -471,18 +526,30 @@ export class Gateway {
     includeReasoning = false,
     exclude = null,
     scope = null,
+    caller = null,
     tools = null,
     effort = null,
     harnessId = null,
     trace = null,
+    holdSpend = null,
   }) {
     const chain = this.resolve(model, { exclude, scope });
+    const callerKey = caller || tools?.caller || (scope ? (scope._fp || JSON.stringify(scopeText(scope))) : '');
     const publicId = session || newSessionId();
-    const known = session ? this.sessions.get(publicId) : null;
-    const run = { publicId, known, reportedSession: false, includeReasoning, signal, scope };
+    const sessionKey = `${callerKey}:${publicId}`;
+    const known = session ? this.sessions.get(sessionKey) : null;
+    const localHeld = [];
+    const hold = typeof holdSpend === 'function' ? holdSpend : (fn) => { if (typeof fn === 'function') localHeld.push(fn); };
+    const run = { publicId, sessionKey, known, reportedSession: false, includeReasoning, signal, scope, holdSpend: hold };
     const args = { messages, maxTokens, maxCompletionTokens, maxOutputTokens, temperature, includeReasoning, signal, effort, harnessId, trace };
-    if (tools) return yield* this._toolRoute(model, chain, args, run, tools);
-    yield* this._failover(chain, args, run, null);
+    try {
+      if (tools) return yield* this._toolRoute(model, chain, args, run, tools);
+      yield* this._failover(chain, args, run, null);
+    } finally {
+      for (const fn of localHeld.splice(0)) {
+        try { fn(); } catch {}
+      }
+    }
   }
 
   /**
@@ -498,12 +565,18 @@ export class Gateway {
       // Outside the try: a leg that throws after part of its answer went out (text, or a tool
       // call the client may already be running) is not restarted on the next leg either.
       const state = { emitted: false };
+      let releaseSpend = () => {};
       try {
         // The leg's model and effort: an effort-suffixed id read off, a level checked against the
         // CLI's catalogue (src/effort.js) — a 400 there is this leg refusing, like any other.
         const planned = await effortPlan(leg, args.effort);
+        if (run.scope && planned.model !== leg.model) {
+          const d = this.checkTarget(adapter.id, planned.model, run.scope);
+          if (!d.ok) throw scopeError(d.reason, adapter.id);
+        }
         const legEffort = planned.effort || (adapter.wire === 'uhp' || adapter.wire === 'traycer' ? args.effort : null);
-        this.checkSpend(adapter, planned.model, run.scope);
+        releaseSpend = this.reserveSpend(adapter, planned.model, run.scope, this.estimateTokens(adapter, planned.model, args, null));
+        run.holdSpend(releaseSpend);
         const events = adapter.complete({
           model: planned.model,
           messages: args.messages,
@@ -521,6 +594,12 @@ export class Gateway {
         yield* this._leg({ ...leg, model: planned.model }, withEffort(events, planned), run, state, { canResume, sessions: true });
         return;
       } catch (e) {
+        releaseSpend();
+        if (e?.scopeDenied) {
+          if (chain.length === 1) throw e;
+          lastError = lastError || e;
+          continue;
+        }
         if (e?.clientError) {
           e.leg = e.leg || legMetaOf(adapter, upstreamModel);
           throw e;
@@ -590,7 +669,7 @@ export class Gateway {
       if (evt.type === 'session') {
         if (!sessions) continue;
         if (evt.id) {
-          this._remember(run.publicId, { target: `${adapter.id}/${upstreamModel}`, upstreamSession: evt.id });
+          this._remember(run.sessionKey || run.publicId, { target: `${adapter.id}/${upstreamModel}`, upstreamSession: evt.id });
           if (!run.reportedSession) {
             run.reportedSession = true;
             yield { type: 'session', id: run.publicId, resumed: canResume };
@@ -656,13 +735,17 @@ export class Gateway {
       if (spec?.historyOnly) {
         tried.add(i);
         if (leg.adapter.kind === 'http' && (leg.adapter.wire || 'openai') === 'openai' && relay) {
+          let releaseSpend = () => {};
           try {
-            this.checkSpend(leg.adapter, leg.model, run.scope);
+            releaseSpend = this.reserveSpend(leg.adapter, leg.model, run.scope, this.estimateTokens(leg.adapter, leg.model, args, tools));
+            run.holdSpend(releaseSpend);
             if (await relay(leg)) {
               yield { type: 'relayed', target: leg.target };
               return;
             }
+            releaseSpend();
           } catch (e) {
+            releaseSpend();
             const err = e instanceof LlmError ? e : new LlmError(`${leg.adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: leg.adapter.id });
             err.leg = e?.leg || legMetaOf(leg.adapter, leg.model);
             if (e?.upstreamId && !err.upstreamId) err.upstreamId = e.upstreamId;
@@ -676,10 +759,16 @@ export class Gateway {
         if (state) state.mode = null;
         const canResume = !!run.known && run.known.upstreamSession && adapterOf(run.known.target) === leg.adapter.id && !!leg.adapter.resumable;
         const st = { emitted: false };
+        let releaseSpend = () => {};
         try {
           const planned = await effortPlan(leg, args.effort);
+          if (run.scope && planned.model !== leg.model) {
+            const d = this.checkTarget(leg.adapter.id, planned.model, run.scope);
+            if (!d.ok) throw scopeError(d.reason, leg.adapter.id);
+          }
           const legEffort = planned.effort || (leg.adapter.wire === 'uhp' || leg.adapter.wire === 'traycer' ? args.effort : null);
-          this.checkSpend(leg.adapter, planned.model, run.scope);
+          releaseSpend = this.reserveSpend(leg.adapter, planned.model, run.scope, this.estimateTokens(leg.adapter, planned.model, args, tools));
+          run.holdSpend(releaseSpend);
           const events = leg.adapter.complete({
             model: planned.model,
             messages: args.messages,
@@ -697,6 +786,13 @@ export class Gateway {
           yield* this._leg({ ...leg, model: planned.model }, withEffort(events, planned), run, st, { canResume, sessions: true });
           return;
         } catch (e) {
+          releaseSpend();
+          if (e?.scopeDenied) {
+            if (chain.length === 1) throw e;
+            lastError = lastError || e;
+            refused.push({ target: leg.target, status: e.status });
+            continue;
+          }
           if (e?.clientError) {
             e.leg = e.leg || legMetaOf(leg.adapter, leg.model);
             throw e;
@@ -712,13 +808,17 @@ export class Gateway {
       tried.add(i);
       const more = chain.slice(i + 1).some((l) => toolPath(l.adapter, spec, face) !== 'skip') ? 'trying the next leg that takes tools' : 'no other leg takes tools';
       if (path === 'passthrough') {
+        let releaseSpend = () => {};
         try {
-          this.checkSpend(leg.adapter, leg.model, run.scope);
+          releaseSpend = this.reserveSpend(leg.adapter, leg.model, run.scope, this.estimateTokens(leg.adapter, leg.model, args, tools));
+          run.holdSpend(releaseSpend);
           if (await relay(leg)) {
             yield { type: 'relayed', target: leg.target };
             return;
           }
+          releaseSpend();
         } catch (e) {
+          releaseSpend();
           const err = e instanceof LlmError ? e : new LlmError(`${leg.adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: leg.adapter.id });
           err.leg = e?.leg || legMetaOf(leg.adapter, leg.model);
           if (e?.upstreamId && !err.upstreamId) err.upstreamId = e.upstreamId;
@@ -730,10 +830,16 @@ export class Gateway {
         continue;
       }
       const st = { emitted: false };
+      let releaseSpend = () => {};
       try {
         const planned = await effortPlan(leg, args.effort);
+        if (run.scope && planned.model !== leg.model) {
+          const d = this.checkTarget(leg.adapter.id, planned.model, run.scope);
+          if (!d.ok) throw scopeError(d.reason, leg.adapter.id);
+        }
         const legEffort = planned.effort || (leg.adapter.wire === 'uhp' || leg.adapter.wire === 'traycer' ? args.effort : null);
-        this.checkSpend(leg.adapter, planned.model, run.scope);
+        releaseSpend = this.reserveSpend(leg.adapter, planned.model, run.scope, this.estimateTokens(leg.adapter, planned.model, args, tools));
+        run.holdSpend(releaseSpend);
         // A bridge session is the model's at an effort, whichever way the request spelled it: an
         // effort-suffixed id and the base id with the same effort are one conversation.
         const engineLeg = { ...leg, model: planned.model, effort: legEffort, target: planned.model !== leg.model ? `${leg.adapter.id}/${planned.model}` : leg.target };
@@ -755,6 +861,13 @@ export class Gateway {
         yield* this._leg(engineLeg, withEffort(events, planned), run, st, { sessions: false });
         return;
       } catch (e) {
+        releaseSpend();
+        if (e?.scopeDenied) {
+          if (chain.length === 1) throw e;
+          lastError = lastError || e;
+          refused.push({ target: leg.target, status: e.status });
+          continue;
+        }
         const err = this._legFailed(leg, e, st, args.signal, more);
         // A failure that ends the route: a 409 from the bridge (another request is answering this
         // very tool result: no other leg makes a second answer to it), and the bridge's tripwire
@@ -956,8 +1069,8 @@ function withFailedLegs(e, failed) {
 }
 
 /** A request the key's scope does not cover: 403, marked so the usage log says `denied`. */
-export function scopeError(reason, adapterId) {
-  const e = new LlmError(reason, { status: 403, type: 'permission_error', provider: adapterId || null });
+export function scopeError(reason, _adapterId) {
+  const e = new LlmError(reason, { status: 403, type: 'permission_error', provider: null });
   e.scopeDenied = true;
   return e;
 }
@@ -1060,4 +1173,27 @@ export function prepareAdapter(id, raw) {
 
 export function kindOf(cfg) {
   return cfg.kind === 'cli' || cfg.bin ? 'cli' : 'http';
+}
+
+function countPromptChars(val) {
+  if (val == null) return 0;
+  if (typeof val === 'string') return val.length;
+  if (typeof val === 'number' || typeof val === 'boolean') return String(val).length;
+  if (Array.isArray(val)) {
+    let n = 0;
+    for (const item of val) n += countPromptChars(item);
+    return n;
+  }
+  if (typeof val === 'object') {
+    let n = 0;
+    for (const [k, v] of Object.entries(val)) {
+      if (k === 'data' && typeof v === 'string' && v.length > 4096) {
+        n += Math.min(v.length, 4096);
+      } else {
+        n += countPromptChars(v);
+      }
+    }
+    return n;
+  }
+  return 0;
 }

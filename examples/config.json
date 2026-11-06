@@ -6,7 +6,7 @@
     "keys": ["ks_replace_me_with_keysmith_key_add"]
   },
   "log": { "usage": true, "body": false },
-  "limits": { "maxConcurrent": 4, "timeoutMs": 300000 },
+  "limits": { "maxConcurrent": 32, "timeoutMs": 300000 },
 
   "tunnel": {
     "provider": "cloudflared",

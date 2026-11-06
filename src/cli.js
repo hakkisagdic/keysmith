@@ -4,7 +4,7 @@ import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { loadConfig, saveConfig, configPath, dataDir, newApiKey, newUniqueApiKey, configExists, expand, resolveSecret } from './config.js';
 import { Gateway, checkAdapter, kindOf, own } from './gateway.js';
-import { createServer } from './server.js';
+import { createServer, hasTunnelConfigured, isLoopbackHost, LEGACY_MAX_CONCURRENT_WARNING } from './server.js';
 import { UsageLog, formatUsageCsv, formatUsageTable } from './usage.js';
 import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
 import { autoApproveFlag, which } from './cli-adapter.js';
@@ -13,7 +13,7 @@ import * as service from './service.js';
 import { rel, truncate } from './util.js';
 import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets, streamRedactor } from './redact.js';
 import { ensurePrivateDir, logFiles, openPrivateLog, rotatedLogFiles, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
-import { adapterReach, aliasDecision, authEnabled, describePerDay, describeScope, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
+import { adapterReach, aliasDecision, authEnabled, describePerDay, describeScope, entryFp, hashKey, keyHashOf, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
 
 const PKG = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
@@ -169,18 +169,18 @@ function DEFAULT_CONFIG() {
     port: 8787,
     auth: { enabled: true, keys: [newApiKey()] },
     log: { usage: true, body: false },
-    limits: { maxConcurrent: 4, timeoutMs: 300_000 },
+    limits: { maxConcurrent: 32, timeoutMs: 300_000 },
     tunnel: { provider: 'cloudflared', name: null, hostname: null, configFile: null },
     adapters: {},
     aliases: {},
   };
 }
 
-function loadOrFail() {
+function loadOrFail(opts = {}) {
   if (!configExists()) {
     fail(`no config at ${rel(configPath())} — run \`keysmith init\`, or \`keysmith add <profile>\``);
   }
-  return loadConfig();
+  return loadConfig(opts);
 }
 
 function cmdAdd(flags) {
@@ -822,11 +822,14 @@ async function cmdServe(flags) {
   const cfg = loadOrFail();
   if (flags.port) cfg.port = Number(flags.port);
   if (flags.host) cfg.host = flags.host;
+  if (!authEnabled(cfg) && (flags.tunnel || hasTunnelConfigured(cfg) || (cfg.host && !isLoopbackHost(cfg.host)))) {
+    fail('refusing to start with auth.enabled === false when a tunnel is configured or host is not loopback');
+  }
   // launchd opened its log before this process started, with the default umask: tighten
   // that, and anything an older keysmith left behind, before the first line is written.
   const secured = secureLogFiles();
   const { gateway, usage, log } = buildGateway(cfg);
-  const server = createServer(gateway, cfg, { usage, log });
+  const server = createServer(gateway, cfg, { usage, log, tunnelActive: !!flags.tunnel });
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -839,6 +842,7 @@ async function cmdServe(flags) {
   out(`  key     : ${keyBanner(cfg)}`);
   // A key whose scope cannot be read reaches nothing: said at start, where the owner looks.
   for (const issue of keyProblems(cfg)) warn(`! auth.keys: ${issue}`);
+  if (Number(cfg?.limits?.maxConcurrent) === 4) warn(`! ${LEGACY_MAX_CONCURRENT_WARNING}`);
   if (secured.changed.length) out(`  logs    : tightened ${secured.changed.length} file(s)/dir(s) to 0600/0700`);
   for (const f of secured.failed) warn(`! could not tighten ${f}`);
   // The MCP bridge (agy's toolMode auto/mcp): its socket, and what a gateway killed before it
@@ -890,11 +894,13 @@ function pidFile() {
   return path.join(dataDir(), 'keysmith.pid');
 }
 function keyBanner(cfg) {
-  const keys = keyStrings(cfg.auth?.keys);
-  if (!cfg.auth?.enabled) return 'none — auth is disabled';
-  if (!keys.length) return 'none';
-  const scoped = parseKeys(cfg.auth.keys).entries.filter((e) => e.scope).length;
-  return `${redactKey(keys[0])}${keys.length > 1 ? ` (+${keys.length - 1} more${scoped ? `, ${scoped} with a scope` : ''})` : ''} — full key: \`keysmith key list --reveal\`, in a terminal`;
+  if (!authEnabled(cfg)) return 'none — auth is disabled';
+  const parsed = parseKeys(Array.isArray(cfg.auth?.keys) ? cfg.auth.keys : []);
+  if (!parsed.entries.length) return 'none';
+  const scoped = parsed.entries.filter((e) => e.scope).length;
+  const first = parsed.entries[0];
+  const firstDisp = first.key ? redactKey(first.key) : `fp:${first.fp} [hashed]`;
+  return `${firstDisp}${parsed.entries.length > 1 ? ` (+${parsed.entries.length - 1} more${scoped ? `, ${scoped} with a scope` : ''})` : ''} — full key: \`keysmith key list --reveal\`, in a terminal`;
 }
 
 /** What `serve` says about `auth.keys` at start: entries it cannot read, and patterns that name nothing. */
@@ -905,7 +911,7 @@ function keyProblems(cfg) {
 
 function writePid(port, pid) {
   ensurePrivateDir(dataDir());
-  fs.writeFileSync(pidFile(), JSON.stringify({ pid, port, at: new Date().toISOString() }), { mode: FILE_MODE });
+  fs.writeFileSync(pidFile(), JSON.stringify({ pid, port, config: path.resolve(configPath()), at: new Date().toISOString() }), { mode: FILE_MODE });
 }
 function removePid() {
   try { fs.unlinkSync(pidFile()); } catch {}
@@ -915,6 +921,32 @@ function readPid() {
     return JSON.parse(fs.readFileSync(pidFile(), 'utf8'));
   } catch {
     return null;
+  }
+}
+
+function isKeysmithServeProcess(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    const cmd = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return /\b(?:keysmith|cli\.js)\b.*\bserve\b/.test(cmd);
+  } catch {
+    return false;
+  }
+}
+
+function signalRunningGateway() {
+  const rec = readPid();
+  if (!rec || !alive(rec.pid)) return false;
+  if (!rec.config || path.resolve(rec.config) !== path.resolve(configPath())) return false;
+  if (!isKeysmithServeProcess(rec.pid)) return false;
+  try {
+    process.kill(rec.pid, 'SIGHUP');
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -1087,7 +1119,7 @@ function staleCode(rec) {
     return null;
   }
   if (newest <= started) return null;
-  return `${rel(path.join(src, newestFile))} changed ${new Date(newest).toISOString()}, after this gateway started (${rec.at}): it still runs the old code — restart it (${restartCommand()})`;
+  return `${rel(path.join(src, newestFile))} changed ${new Date(newest).toISOString()}, after this gateway started (${rec.at}): it still runs the old code — restart it (${restartCommand(rec)})`;
 }
 
 /**
@@ -1104,10 +1136,20 @@ function staleConfig(rec) {
     return null;
   }
   if (changed <= started) return null;
-  return `${rel(configPath())} changed ${new Date(changed).toISOString()}, after this gateway started (${rec.at}): it still serves the old config — restart it (${restartCommand()})`;
+  return `${rel(configPath())} changed ${new Date(changed).toISOString()}, after this gateway started (${rec.at}): it still serves the old config — restart it (${restartCommand(rec)})`;
 }
 
-function restartCommand() {
+function restartCommand(rec = readPid()) {
+  const lpid = service.launchdPid(service.labels.gateway);
+  if (rec?.pid && alive(rec.pid)) {
+    if (lpid && rec.pid === lpid) {
+      return `launchd (pid ${rec.pid}): launchctl kickstart -k gui/${process.getuid?.() ?? '$UID'}/${service.labels.gateway}`;
+    }
+    return `pid ${rec.pid}${rec.port ? ` (port ${rec.port})` : ''}: keysmith stop && keysmith start`;
+  }
+  if (lpid) {
+    return `launchd (pid ${lpid}): launchctl kickstart -k gui/${process.getuid?.() ?? '$UID'}/${service.labels.gateway}`;
+  }
   return `launchd: launchctl kickstart -k gui/${process.getuid?.() ?? '$UID'}/${service.labels.gateway}; otherwise keysmith stop && keysmith start`;
 }
 
@@ -1119,7 +1161,7 @@ function restartCommand() {
 function noteRestart(what) {
   const rec = readPid();
   if (!rec || !alive(rec.pid)) return;
-  out(`! the running gateway (pid ${rec.pid}) still serves the config it started with — ${what} takes effect when it restarts: ${restartCommand()}`);
+  out(`! the running gateway (pid ${rec.pid}) still serves the config it started with — ${what} takes effect when it restarts: ${restartCommand(rec)}`);
 }
 
 /* -------------------------------------------------------------------------- chat */
@@ -1218,6 +1260,7 @@ async function cmdDoctor(flags) {
   out(`  keys       ${cfg.auth.keys?.length || 0} client key(s)${scoped ? `, ${scoped} with a scope (keysmith key list)` : ''} — ${cfg.host}:${cfg.port}`);
   for (const issue of keyIssues) out(`             ✗ ${issue}`);
   for (const w of scopeWarnings(cfg, keyEntries)) out(`             ! ${w.message}`);
+  if (Number(cfg?.limits?.maxConcurrent) === 4) out(`  limits     ! ${LEGACY_MAX_CONCURRENT_WARNING}`);
 
   if (flags.probeModels) {
     out('\nprobing every model with a 1-token request (this spends real quota):');
@@ -1337,7 +1380,7 @@ function cmdUsage(flags) {
 
 const KEY_USAGE = [
   'usage: keysmith key list [--reveal]',
-  '       keysmith key add [<label>] [--allow <patterns>] [--deny <patterns>] [--out <file> [--force]] [--allow-unknown] [--reveal]',
+  '       keysmith key add [<label>] [--allow <patterns>] [--deny <patterns>] [--hash] [--out <file> [--force]] [--allow-unknown] [--reveal]',
   '       keysmith key scope fp:<8 hex> [--allow <patterns>] [--deny <patterns>] [--no-allow] [--no-deny] [--clear] [--label <name>] [--allow-unknown] [--per-day <N> | --no-per-day]',
   '       keysmith key who-can <adapter> | <adapter/model> | alias:<name>',
   '       keysmith key revoke fp:<8 hex>',
@@ -1347,8 +1390,8 @@ const KEY_USAGE = [
 
 function cmdKey(flags) {
   const sub = flags._[0] || 'list';
-  // Reading commands never write the config: no key is minted for them (loadConfig would).
-  const cfg = sub === 'list' || sub === 'who-can' ? (configExists() ? loadConfig({ mint: false }) : fail(`no config at ${rel(configPath())} — run \`keysmith init\``)) : loadOrFail();
+  // Key subcommands never auto-mint a hidden unscoped key when auth.keys is empty (L5).
+  const cfg = loadOrFail({ mint: false });
   cfg.auth = cfg.auth || { enabled: true, keys: [] };
   if (cfg.auth.keys == null) cfg.auth.keys = [];
   if (!Array.isArray(cfg.auth.keys)) fail(`auth.keys in ${rel(configPath())} is not a list — fix it by hand first`);
@@ -1364,12 +1407,15 @@ function cmdKey(flags) {
     if (!m) fail('usage: keysmith key revoke fp:<8 hex>\n  the fingerprint `keysmith key list` prints next to each key; the key itself is never taken on the command line');
     const fp = m[1].toLowerCase();
     const before = cfg.auth.keys.length;
-    const revoked = cfg.auth.keys.filter((x) => keyOf(x) && fingerprint(keyOf(x)) === fp);
+    const revoked = cfg.auth.keys.filter((x) => entryFp(x) === fp);
     cfg.auth.keys = cfg.auth.keys.filter((x) => !revoked.includes(x));
     if (!revoked.length) return out(`no key matched fp:${fp} — this would have removed nothing`);
     saveConfig(cfg);
-    out(`revoked ${before - cfg.auth.keys.length} key(s): ${revoked.map((x) => `${redactKey(keyOf(x))}${x?.label ? ` (${x.label})` : ''}`).join(', ')}; ${cfg.auth.keys.length} left`);
-    return noteRestart('the revocation (the revoked key works until then)');
+    const signalled = signalRunningGateway();
+    const dispRevoked = (x) => (keyOf(x) ? redactKey(keyOf(x)) : `fp:${entryFp(x)} [hashed]`);
+    out(`revoked ${before - cfg.auth.keys.length} key(s): ${revoked.map((x) => `${dispRevoked(x)}${x?.label ? ` (${x.label})` : ''}`).join(', ')}; ${cfg.auth.keys.length} left`);
+    if (!signalled) return noteRestart('the revocation (the revoked key works until then)');
+    return;
   }
   fail(KEY_USAGE);
 }
@@ -1382,22 +1428,23 @@ function keyList(cfg, flags) {
   if (entries.length) showKeys(entries, { reveal: flags.reveal, describe: (e) => `  ${(e.label || '-').padEnd(w)}  ${describeKey(e)}` });
   for (const issue of issues) warn(`! ${issue}`);
   for (const w of scopeWarnings(cfg, entries)) warn(`! ${w.message}`);
-  if (!cfg.auth.enabled) warn(AUTH_OFF);
+  if (!authEnabled(cfg)) warn(AUTH_OFF);
 }
 
 /** A key entry's scope, and its daily cap when it has one: `deny: claude-api · 300 requests/day`. */
 function describeKey(e) {
-  return `${describeScope(e.scope)}${e.perDay != null ? ` · ${describePerDay(e.perDay)}` : ''}`;
+  return `${describeScope(e.scope)}${e.perDay != null ? ` · ${describePerDay(e.perDay)}` : ''}${e.hashed ? ' · hashed (sha256)' : ''}`;
 }
 
 /** Said wherever a key or a scope is written or listed while auth is off: none of it applies. */
 const AUTH_OFF = '! auth is disabled (auth.enabled is false): no key is asked for, so no scope applies — every client that can reach the gateway reaches every adapter';
 
 /**
- * `keysmith key add [<label>] [--allow …] [--deny …] [--out <file>]`. With no label and no
- * scope the key is written the way it always was, a bare string. The new key goes to an
- * interactive terminal only when asked for (--reveal), and to `--out` — a new file, 0600 —
- * for an agent to read; anywhere else it is printed redacted.
+ * `keysmith key add [<label>] [--allow …] [--deny …] [--hash] [--out <file>]`. With no label and no
+ * scope the key is written the way it always was, a bare string. With `--hash`, only the SHA-256
+ * `keyHash` is stored in `config.json`. The new key goes to an interactive terminal only when
+ * asked for (--reveal), and to `--out` — a new file, 0600 — for an agent to read; anywhere else
+ * it is printed redacted.
  */
 function keyAdd(cfg, flags) {
   if (flags._[1] !== undefined && flags.label !== undefined) fail('the label once: keysmith key add <label>, or --label <label>');
@@ -1410,8 +1457,13 @@ function keyAdd(cfg, flags) {
   if (allow) checkScopePatterns(cfg, allow, 'allow', flags);
   if (deny) checkScopePatterns(cfg, deny, 'deny', flags);
   if (flags.out === true || flags.out === '') fail('--out takes a file path, e.g. --out ~/.config/<agent>/keysmith.key');
-  const key = newUniqueApiKey(keyStrings(cfg.auth.keys).map(fingerprint));
-  const entry = label !== undefined || allow || deny ? { key, ...(label !== undefined ? { label } : {}), ...(allow ? { allow } : {}), ...(deny ? { deny } : {}) } : key;
+  const key = newUniqueApiKey(cfg.auth.keys.map(entryFp).filter(Boolean));
+  const useHash = !!flags.hash;
+  const entry = useHash
+    ? { keyHash: hashKey(key), ...(label !== undefined ? { label } : {}), ...(allow ? { allow } : {}), ...(deny ? { deny } : {}) }
+    : label !== undefined || allow || deny
+      ? { key, ...(label !== undefined ? { label } : {}), ...(allow ? { allow } : {}), ...(deny ? { deny } : {}) }
+      : key;
   const parsed = parseKeys([entry]);
   if (parsed.issues.length) fail(`not added: ${parsed.issues[0]}`);
   // The file first: a key that could not be handed over is not added either.
@@ -1429,13 +1481,14 @@ function keyAdd(cfg, flags) {
     }
     throw e;
   }
-  showKeys([key], { reveal: flags.reveal, quiet: !!outFile });
-  if (typeof entry === 'object') out(`  ${entry.label ? `label ${entry.label} · ` : ''}${describeScope(parsed.entries[0].scope)}`);
+  const signalled = signalRunningGateway();
+  showKeys([key], { reveal: flags.reveal, quiet: !!outFile, note: useHash ? 'shown once — only its SHA-256 keyHash is stored in config.json' : '' });
+  if (typeof entry === 'object') out(`  ${entry.label ? `label ${entry.label} · ` : ''}${describeKey(parsed.entries[0])}`);
   if (outFile) out(`  written to ${rel(outFile)} (0600) — point the agent at that file ({file:${rel(outFile)}}, or KEY=$(cat ${rel(outFile)})); nothing printed the key`);
   if (allow && !allow.length) out('! an empty --allow: this key reaches nothing');
   // The key and its scope are saved, and apply once auth is on; until then they keep nobody out.
-  if (!cfg.auth.enabled) warn(AUTH_OFF);
-  return noteRestart('the new key');
+  if (!authEnabled(cfg)) warn(AUTH_OFF);
+  if (!signalled) return noteRestart('the new key');
 }
 
 /**
@@ -1449,7 +1502,7 @@ function keyScope(cfg, flags) {
   const m = String(flags._[1] ?? '').match(/^(?:fp:)?([0-9a-fA-F]{8})$/);
   if (!m || flags._.length > 2) fail(`${KEY_USAGE}\n  the fingerprint is what \`keysmith key list\` prints; the key itself is never taken on the command line`);
   const fp = m[1].toLowerCase();
-  const at = cfg.auth.keys.map((x, i) => (keyOf(x) && fingerprint(keyOf(x)) === fp ? i : -1)).filter((i) => i >= 0);
+  const at = cfg.auth.keys.map((x, i) => (entryFp(x) === fp ? i : -1)).filter((i) => i >= 0);
   if (!at.length) fail(`no key matched fp:${fp} — \`keysmith key list\` shows each key's fingerprint`);
   if (at.length > 1) fail(`fp:${fp} matches ${at.length} entries — \`keysmith key list\` says which; leave one`);
   const i = at[0];
@@ -1487,6 +1540,7 @@ function keyScope(cfg, flags) {
   if (parsed.issues.length) fail(`not saved: ${parsed.issues[0]}`);
   cfg.auth.keys[i] = entry;
   saveConfig(cfg);
+  const signalled = signalRunningGateway();
   const e = parsed.entries[0];
   out(`fp:${fp}${e.label ? ` (${e.label})` : ''}: ${describeKey(e)}`);
   if (allow && !allow.length) out('! an empty --allow: this key reaches nothing');
@@ -1495,8 +1549,8 @@ function keyScope(cfg, flags) {
   if (i === 0 && typeof entry === 'object' && typeof cur === 'string') {
     out("  auth.keys[0] is an object now: a script that reads the key with jq takes .auth.keys[0] | .key? // .");
   }
-  if (!cfg.auth.enabled) warn(AUTH_OFF);
-  return noteRestart(`the scope of fp:${fp}`);
+  if (!authEnabled(cfg)) warn(AUTH_OFF);
+  if (!signalled) return noteRestart(`the scope of fp:${fp}`);
 }
 
 /** `--per-day N` as a whole number of requests; undefined when the flag is absent. */
@@ -1539,11 +1593,16 @@ function keyWhoCan(cfg, flags) {
     decide = model === null ? (scope) => ({ reach: adapterReach(scope, id) }) : (scope) => ({ reach: requestDecision(scope, id, a, model).ok ? 'all' : 'none' });
   }
   if (!authEnabled(cfg)) {
-    out(`${target}: auth is ${cfg.auth.enabled ? 'on, but no key is configured' : 'disabled'} — no key is asked for, so every client that can reach this gateway reaches it`);
+    out(`${target}: auth is disabled — no key is asked for, so every client that can reach this gateway reaches it`);
     for (const n of notes) warn(n);
     return;
   }
   const { entries, issues } = parseKeys(cfg.auth.keys);
+  if (!entries.length && !issues.length) {
+    out(`${target}: no key is configured — auth is on, so no client reaches this gateway until a key is added`);
+    for (const n of notes) warn(n);
+    return;
+  }
   const rows = entries.map((e) => ({ e, ...decide(e.scope) }));
   const can = rows.filter((r) => r.reach !== 'none');
   const cannot = rows.filter((r) => r.reach === 'none');
@@ -1593,21 +1652,30 @@ function checkLabel(cfg, label, ownFp) {
  * passes it every time — it must not switch this check off along the way.
  */
 function checkScopePatterns(cfg, patterns, field, flags) {
+  const parsed = [];
   for (const raw of patterns) {
     try {
-      parsePattern(raw);
+      parsed.push({ raw, pattern: parsePattern(raw) });
     } catch (e) {
       fail(`--${field}: ${e.message}`);
     }
   }
   const problems = unnamedPatterns(cfg, patterns);
-  if (!problems.length) return;
-  if (!flags.allowUnknown) {
-    fail(
-      `not saved: --${field} ${problems.join('; ')}.\n  adapters: ${Object.keys(cfg.adapters || {}).join(', ') || 'none'}\n  aliases : ${Object.keys(cfg.aliases || {}).join(', ') || 'none'}\n  A ${field === 'deny' ? 'deny pattern that names nothing keeps nothing out' : 'pattern that names nothing lets nothing in'}; --allow-unknown saves it anyway${flags.force ? ' (--force only replaces the --out file)' : ''}.`,
-    );
+  if (problems.length) {
+    if (!flags.allowUnknown) {
+      fail(
+        `not saved: --${field} ${problems.join('; ')}.\n  adapters: ${Object.keys(cfg.adapters || {}).join(', ') || 'none'}\n  aliases : ${Object.keys(cfg.aliases || {}).join(', ') || 'none'}\n  A ${field === 'deny' ? 'deny pattern that names nothing keeps nothing out' : 'pattern that names nothing lets nothing in'}; --allow-unknown saves it anyway${flags.force ? ' (--force only replaces the --out file)' : ''}.`,
+      );
+    }
+    for (const p of problems) warn(`! --${field} ${p} — saved anyway (--allow-unknown)`);
   }
-  for (const p of problems) warn(`! --${field} ${p} — saved anyway (--allow-unknown)`);
+  if (field === 'deny') {
+    for (const { raw, pattern } of parsed) {
+      if (pattern.kind === 'glob' && pattern.glob.includes('/') && !pattern.glob.includes('*')) {
+        warn(`! --deny "${raw}" is an exact-model deny: dated snapshots, effort suffixes or model variants may not match it — consider a wildcard such as "${raw}*" or denying the whole adapter`);
+      }
+    }
+  }
 }
 
 /** The key, alone on one line, in a new file only its owner can read. Never over a file that is there, unless --force. */
@@ -1760,13 +1828,20 @@ function showKeys(keys, { label = '', note = '', reveal = false, describe = null
   // rest of its line (label and scope: never secret).
   const items = keys.map((k) => (typeof k === 'string' ? { key: k } : k));
   const rest = (e) => (describe ? describe(e) : '');
+  const disp = (e, full = false) => {
+    if (e.hashed || (!e.key && e.keyHash)) {
+      const fp = e.fp || e.keyHash.slice(0, 8);
+      return `fp:${fp} [hashed]`;
+    }
+    return full ? `${e.key} fp:${fingerprint(e.key)}` : redactKey(e.key);
+  };
   if (canReveal(reveal)) {
     // The fingerprint too, as the redacted form has it: `key scope fp:` and `key revoke fp:` take it.
-    process.stdout.write(items.map((e) => `${label}${e.key} fp:${fingerprint(e.key)}${rest(e)}`).join('\n') + '\n');
+    process.stdout.write(items.map((e) => `${label}${disp(e, true)}${rest(e)}`).join('\n') + '\n');
     if (note) out(`(${note})`);
     return;
   }
-  out(items.map((e) => `${label}${redactKey(e.key)}${rest(e)}`).join('\n'));
+  out(items.map((e) => `${label}${disp(e, false)}${rest(e)}`).join('\n'));
   if (quiet) return;
   const s = keys.length > 1 ? 's' : '';
   const why = !process.stdout.isTTY || !process.stdin.isTTY ? 'stdout is not an interactive terminal' : 'no --reveal';

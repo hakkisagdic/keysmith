@@ -144,7 +144,7 @@ export const DEFAULTS = {
   port: 8787,
   auth: { enabled: true, keys: [] },
   log: { usage: true, body: false },
-  limits: { maxConcurrent: 4, timeoutMs: 300_000, spend: {} },
+  limits: { maxConcurrent: 32, timeoutMs: 300_000, spend: {} },
   pricing: {
     '*/claude-opus-5-5*': { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
     '*/claude-sonnet-5-5*': { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
@@ -176,8 +176,8 @@ export function configExists() {
  * `mint: false` is for commands that only read (`key list`, `key who-can`): they say there
  * is no key rather than writing one into the config.
  */
-export function loadConfig({ mint = true } = {}) {
-  const p = configPath();
+export function loadConfig({ path: customPath = null, mint = true } = {}) {
+  const p = customPath || configPath();
   if (!fs.existsSync(p)) return structuredClone(DEFAULTS);
   let raw;
   try {
@@ -186,11 +186,13 @@ export function loadConfig({ mint = true } = {}) {
     throw new Error(`${p}: ${jsonErrorWithoutText(e)}`);
   }
   const cfg = deepMerge(structuredClone(DEFAULTS), raw);
+  if (!isObj(cfg.auth)) cfg.auth = { enabled: true, keys: [] };
+  cfg.auth.enabled = cfg.auth.enabled === false ? false : true;
   cfg._path = p;
   // A key with a scope is an object ({ key, label, allow, deny }); registerSecrets takes both forms.
   registerSecrets(cfg.auth?.keys);
   // A gateway that listens on a tunnel must not be keyless; refuse silently-defaulting.
-  if (mint && cfg.auth.enabled && (!cfg.auth.keys || cfg.auth.keys.length === 0)) {
+  if (mint && cfg.auth.enabled !== false && (!Array.isArray(cfg.auth.keys) || cfg.auth.keys.length === 0)) {
     cfg.auth.keys = [newApiKey()];
     registerSecrets(cfg.auth.keys);
     saveConfig(cfg);
@@ -211,10 +213,20 @@ export function jsonErrorWithoutText(e) {
 
 export function saveConfig(cfg) {
   const p = cfg._path || configPath();
-  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
+  cfg._path = p;
+  const dir = path.dirname(p);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const out = { ...cfg };
   delete out._path;
-  fs.writeFileSync(p, JSON.stringify(out, null, 2) + '\n', { mode: 0o600 });
-  try { fs.chmodSync(p, 0o600); } catch {}
+  const tmp = path.join(dir, `.${path.basename(p)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n', { mode: 0o600 });
+    try { fs.chmodSync(tmp, 0o600); } catch {}
+    fs.renameSync(tmp, p);
+    try { fs.chmodSync(p, 0o600); } catch {}
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
   return p;
 }

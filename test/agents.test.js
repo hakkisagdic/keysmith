@@ -944,7 +944,7 @@ test('a change saved while a gateway runs says it needs a restart, and keysmith 
   const pid = path.join(dataDir, 'keysmith.pid');
   // This test process stands in for the running gateway: alive, started a minute ago.
   fs.writeFileSync(pid, JSON.stringify({ pid: process.pid, port: 9, at: new Date(Date.now() - 60_000).toISOString() }), { mode: 0o600 });
-  const restart = /still serves the config it started with — .* takes effect when it restarts: launchd: launchctl kickstart -k gui\/\d+\/dev\.keysmith\.gateway/;
+  const restart = /still serves the config it started with — .* takes effect when it restarts: (?:pid \d+ \(port 9\): keysmith stop && keysmith start|launchd.*kickstart)/;
   for (const args of [['add', 'agy'], ['alias', 'argon', 'agy/gemini-4-argon-high'], ['set', 'agy', 'disabled', 'true'], ['alias', 'argon', '--delete'], ['key', 'add'], ['remove', 'agy']]) {
     const r = run(...args);
     assert.equal(r.status, 0, r.all);
@@ -955,5 +955,5 @@ test('a change saved while a gateway runs says it needs a restart, and keysmith 
   fs.rmSync(pid);
   const quiet = run('add', 'agy');
   assert.equal(quiet.status, 0);
-  assert.doesNotMatch(quiet.all, /kickstart/, 'no gateway running, nothing to restart');
+  assert.doesNotMatch(quiet.all, /still serves the config/, 'no gateway running, nothing to restart');
 });

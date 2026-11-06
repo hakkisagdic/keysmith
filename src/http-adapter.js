@@ -374,7 +374,8 @@ export class HttpAdapter {
     if (this.wire !== 'openai') {
       throw new LlmError(`adapter "${this.id}" cannot relay tool calls on the ${this.wire} wire`, { status: 400, provider: this.id });
     }
-    const outgoing = this.thoughtSignatures ? this.thoughtSignatures.attach(body, { caller }).body : body;
+    const allowed = pickChatRelayFields(body);
+    const outgoing = this.thoughtSignatures ? this.thoughtSignatures.attach(allowed, { caller }).body : allowed;
     const upstream = this.upstreamModel(body.model);
     const res = await fetch(this.route('/chat/completions'), {
       method: 'POST',
@@ -1314,4 +1315,63 @@ export function describeErrorBody(text) {
     if (m) return `${kind}${m}`.slice(0, 600);
   } catch {}
   return t.slice(0, 600);
+}
+
+/**
+ * Known allow-list of OpenAI chat completion request fields forwarded upstream on the tool-call
+ * relay (`rawChat`). Router/aggregator fields (`models`, `provider`, `route`, `transforms`,
+ * `fallbacks`, `api_key`, etc.) are stripped so a scoped client cannot override upstream routing.
+ */
+export const OPENAI_CHAT_RELAY_FIELDS = new Set([
+  'model',
+  'messages',
+  'tools',
+  'tool_choice',
+  'parallel_tool_calls',
+  'functions',
+  'function_call',
+  'stream',
+  'stream_options',
+  'temperature',
+  'top_p',
+  'n',
+  'stop',
+  'max_tokens',
+  'max_completion_tokens',
+  'presence_penalty',
+  'frequency_penalty',
+  'logit_bias',
+  'logprobs',
+  'top_logprobs',
+  'user',
+  'response_format',
+  'seed',
+  'reasoning_effort',
+  'reasoning',
+  'modalities',
+  'audio',
+  'prediction',
+  'web_search_options',
+  'prompt_cache_key',
+  'verbosity',
+  'google',
+  'thinking',
+]);
+
+export function pickChatRelayFields(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return {};
+  const out = {};
+  for (const k of Object.keys(body)) {
+    if (OPENAI_CHAT_RELAY_FIELDS.has(k)) out[k] = body[k];
+  }
+  if (
+    body.extra_body &&
+    typeof body.extra_body === 'object' &&
+    !Array.isArray(body.extra_body) &&
+    Object.hasOwn(body.extra_body, 'google') &&
+    body.extra_body.google !== undefined
+  ) {
+    out.extra_body = { google: body.extra_body.google };
+  }
+  return out;
 }

@@ -277,9 +277,9 @@ test('/v1/models lists only what the key may reach, and an alias with only the l
   assert.deepEqual(ada.data.find((m) => m.id === 'smart').keysmith.routes, ['google/gemini-3.8-flash']);
   assert.ok(adaIds.includes('google/gemini-4-argon') && adaIds.includes('agy/gemini-4-argon-high') && adaIds.includes('argon'));
 
-  // A key sent as ?api_key= (for clients that cannot set a header) carries its scope too.
-  const byQuery = await (await fetch(`${base}/v1/models?api_key=${encodeURIComponent(ADA)}`)).json();
-  assert.ok(byQuery.data.length && !byQuery.data.some((m) => m.id.startsWith('claude-api/')));
+  // ?api_key= is off by default on API routes (refused with 401 even when the key is valid).
+  const byQuery = await fetch(`${base}/v1/models?api_key=${encodeURIComponent(ADA)}`);
+  assert.equal(byQuery.status, 401);
   const embedded = await call(MAIN, '/v1/embeddings', { model: 'google/text-embedding-4', input: 'hi' });
   assert.equal(embedded.status, 200, 'an unscoped key still gets its embeddings');
 

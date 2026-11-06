@@ -311,6 +311,7 @@ curl -s http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"cmd/gpt-5","messages":[{"role":"user","content":"and now in Turkish"}]}'
 ```
 
-`?api_key=$KEY` works on `/v1` too, for clients that cannot set a header — but it puts the
-key in shell history, browser history and a tunnel's request logs, so prefer the header.
+`?api_key=$KEY` is disabled by default on `/v1` so keys do not leak into URLs, browser history or
+tunnel logs; when explicitly enabled (`"allowQueryApiKey": true` under `auth`), it is accepted only
+from direct loopback clients with no `cf-connecting-ip` or `x-forwarded-for` header.
 The status page at `/` does not take it at all: open it and post the key through its form.

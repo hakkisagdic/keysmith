@@ -20,8 +20,9 @@ function startMockHarnessRouter(handler) {
 }
 
 function startKeysmith(cfg, opts = {}) {
-  const gateway = new Gateway(cfg);
-  const server = createServer(gateway, cfg, { log: () => {}, ...opts });
+  const full = { auth: { enabled: false }, ...cfg };
+  const gateway = new Gateway(full);
+  const server = createServer(gateway, full, { log: () => {}, ...opts });
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address();

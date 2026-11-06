@@ -70,7 +70,7 @@ function upstream(req, res) {
 /** A gateway over `keys`, its usage log in `dir`, on the clock `clock.t`. */
 async function gateway(t, { keys, dir, clock, upRoot }) {
   const cfg = {
-    auth: { enabled: true, keys },
+    auth: { enabled: true, allowQueryApiKey: true, keys },
     limits: { streamHoldMs: 250 },
     adapters: {
       up: { kind: 'http', wire: 'openai', baseUrl: `${upRoot}/up/v1`, apiKey: false, models: ['m', 'e'] },

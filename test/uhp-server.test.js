@@ -22,7 +22,7 @@ function startMockUhpUpstream(handler) {
 }
 
 function startKeysmith(cfg) {
-  const full = { adapters: {}, aliases: {}, limits: { maxRetries: 0, maxConcurrentCli: 2 }, ...cfg };
+  const full = { auth: { enabled: false }, adapters: {}, aliases: {}, limits: { maxRetries: 0, maxConcurrentCli: 2 }, ...cfg };
   const gateway = new Gateway(full);
   const srv = createServer(gateway, full, { log: () => {} });
   return new Promise((resolve) => {

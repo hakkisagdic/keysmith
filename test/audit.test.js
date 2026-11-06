@@ -725,12 +725,12 @@ test('limits.spend caps monthly metered USD per adapter and per account, refuses
     const inFlightA = fetch(`${base1}/v1/chat/completions`, {
       method: 'POST',
       headers: authAda,
-      body: JSON.stringify({ model: 'claude-api/claude-sonnet-5-5', messages: [{ role: 'user', content: 'two-a' }] }),
+      body: JSON.stringify({ model: 'claude-api/claude-sonnet-5-5', max_tokens: 100, messages: [{ role: 'user', content: 'two-a' }] }),
     });
     const inFlightB = fetch(`${base1}/v1/chat/completions`, {
       method: 'POST',
       headers: authAda,
-      body: JSON.stringify({ model: 'claude-api/claude-sonnet-5-5', messages: [{ role: 'user', content: 'two-b' }] }),
+      body: JSON.stringify({ model: 'claude-api/claude-sonnet-5-5', max_tokens: 100, messages: [{ role: 'user', content: 'two-b' }] }),
     });
     await new Promise((r) => setTimeout(r, 40));
     slowGate = null;

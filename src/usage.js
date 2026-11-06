@@ -803,6 +803,8 @@ export class UsageLog {
       byAccount: new Map(),
       byKeyAdapter: new Map(),
       byKeyAccount: new Map(),
+      reservedByAdapter: new Map(),
+      reservedByAccount: new Map(),
       adaptersSeen: new Set(),
       readError: null,
       retryAt: 0,
@@ -1591,11 +1593,63 @@ export class UsageLog {
           : kind === 'account'
             ? state.byAccount.get(c.target) || 0
             : roundUsd((state.byAdapter.get(c.target) || 0) + (state.byAccount.get(c.target) || 0));
-      if (Math.round(spent * 1e9) >= Math.round(c.cap * 1e9)) {
-        return { kind, target: c.target, cap: c.cap, spent, month: m, resetAt };
+      const reserved =
+        kind === 'adapter'
+          ? state.reservedByAdapter.get(c.target) || 0
+          : kind === 'account'
+            ? state.reservedByAccount.get(c.target) || 0
+            : roundUsd((state.reservedByAdapter.get(c.target) || 0) + (state.reservedByAccount.get(c.target) || 0));
+      const effective = roundUsd(spent + reserved);
+      if (Math.round(effective * 1e9) >= Math.round(c.cap * 1e9)) {
+        return { kind, target: c.target, cap: c.cap, spent: effective, month: m, resetAt };
       }
     }
     return null;
+  }
+
+  /**
+   * Reserve estimated in-flight metered spend for `adapter` (`{ id, account, kind, costBasis }`)
+   * while a request is executing so concurrent requests cannot overshoot `limits.spend`.
+   * Returns an idempotent `release()` function to call in `finally`.
+   */
+  reserveSpend(spendCfg, adapter, { adaptersCfg = null, model = null, upstreamModel = null, inputTokens = 1, outputTokens = 256, month = null } = {}) {
+    if (!spendCfg || !adapter) return () => {};
+    if (adapter.costBasis === 'subscription') return () => {};
+    const caps = parseSpendCaps(spendCfg, adaptersCfg);
+    if (!caps.length) return () => {};
+    const m = month || utcMonth(this._nowDate());
+    const state = this._ensureSpendMonth(m);
+    if (state.readError) return () => {};
+    const adapterId = adapter.id || adapter.adapter || null;
+    const account = adapter.account || null;
+    const rates = matchPrice(this.pricing, adapterId, model, { upstreamModel, anyAdapter: false });
+    const estIn = Number.isFinite(Number(inputTokens)) && Number(inputTokens) >= 0 ? Math.max(1, Number(inputTokens)) : 1;
+    const estOut = Number.isFinite(Number(outputTokens)) && Number(outputTokens) >= 0 ? Number(outputTokens) : 256;
+    const est = rates
+      ? Math.max(tokensToUsd({ input: estIn, output: estOut }, rates), 1e-6)
+      : 0;
+    if (!(est > 0)) return () => {};
+    if (adapterId) {
+      state.reservedByAdapter.set(adapterId, roundUsd((state.reservedByAdapter.get(adapterId) || 0) + est));
+    }
+    if (account) {
+      state.reservedByAccount.set(account, roundUsd((state.reservedByAccount.get(account) || 0) + est));
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (adapterId) {
+        const next = roundUsd((state.reservedByAdapter.get(adapterId) || 0) - est);
+        if (next > 0) state.reservedByAdapter.set(adapterId, next);
+        else state.reservedByAdapter.delete(adapterId);
+      }
+      if (account) {
+        const next = roundUsd((state.reservedByAccount.get(account) || 0) - est);
+        if (next > 0) state.reservedByAccount.set(account, next);
+        else state.reservedByAccount.delete(account);
+      }
+    };
   }
 
   /**

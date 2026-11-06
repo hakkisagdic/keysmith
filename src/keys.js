@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { fingerprint } from './redact.js';
 
 /**
@@ -33,12 +34,35 @@ import { fingerprint } from './redact.js';
  * fingerprint.
  */
 
-const ENTRY_FIELDS = new Set(['key', 'label', 'allow', 'deny', 'perDay']);
+const ENTRY_FIELDS = new Set(['key', 'keyHash', 'label', 'allow', 'deny', 'perDay']);
 
 /** A key string out of an `auth.keys` entry, or null. */
 export function keyOf(entry) {
   if (typeof entry === 'string') return entry || null;
   if (entry && typeof entry === 'object' && !Array.isArray(entry) && typeof entry.key === 'string' && entry.key) return entry.key;
+  return null;
+}
+
+/** SHA-256 hex digest of a key string. */
+export function hashKey(key) {
+  return crypto.createHash('sha256').update(String(key || '')).digest('hex');
+}
+
+/** A SHA-256 hex digest out of an `auth.keys` entry (`{ keyHash }`), or null. */
+export function keyHashOf(entry) {
+  if (entry && typeof entry === 'object' && !Array.isArray(entry) && typeof entry.keyHash === 'string') {
+    const h = entry.keyHash.trim().toLowerCase();
+    if (/^[0-9a-f]{64}$/.test(h)) return h;
+  }
+  return null;
+}
+
+/** Fingerprint of an `auth.keys` entry (plaintext or hashed), or null. */
+export function entryFp(entry) {
+  const k = keyOf(entry);
+  if (k) return fingerprint(k);
+  const h = keyHashOf(entry);
+  if (h) return h.slice(0, 8);
   return null;
 }
 
@@ -48,12 +72,21 @@ export function keyStrings(list) {
 }
 
 /**
- * Whether a config's auth is on: enabled, and something is listed. A list whose entries are
- * all malformed is still "on" — it opens nothing; it never turns into a keyless gateway.
+ * Whether a config's auth is on: only literal `false` disables auth.
+ * Any other value (`true`, `undefined`, `0`, `null`, `""`), or an empty/malformed key list,
+ * keeps auth on (failing closed rather than opening a keyless gateway).
  */
 export function authEnabled(cfg) {
-  const keys = cfg?.auth?.keys;
-  return !!cfg?.auth?.enabled && (Array.isArray(keys) ? keys.length > 0 : !!keys);
+  return cfg?.auth?.enabled !== false;
+}
+
+function normaliseModelPart(m) {
+  return String(m ?? '')
+    .trim()
+    .split('/')
+    .filter((seg) => seg && seg !== '.')
+    .join('/')
+    .toLowerCase();
 }
 
 export function parsePattern(raw) {
@@ -63,7 +96,13 @@ export function parsePattern(raw) {
     if (!glob) throw new Error('"alias:" names an alias, e.g. alias:argon');
     return { text: raw, kind: 'alias', glob, re: globRe(glob) };
   }
-  if (raw.includes('/') || raw.includes('*')) return { text: raw, kind: 'glob', glob: raw, re: globRe(raw) };
+  if (raw.includes('/') || raw.includes('*')) {
+    const slash = raw.indexOf('/');
+    const normGlob = slash >= 0
+      ? `${raw.slice(0, slash)}/${normaliseModelPart(raw.slice(slash + 1))}`
+      : raw.toLowerCase();
+    return { text: raw, kind: 'glob', glob: raw, re: globRe(raw), normRe: globRe(normGlob) };
+  }
   return { text: raw, kind: 'adapter', id: raw };
 }
 
@@ -143,28 +182,40 @@ export function parseKeys(list) {
   }
   for (const [i, item] of (list || []).entries()) {
     const key = keyOf(item);
-    if (!key) {
+    const keyHash = key ? null : keyHashOf(item);
+    if (!key && !keyHash) {
       issues.push(`auth.keys[${i}] holds no key — ignored`);
       continue;
     }
-    const fp = fingerprint(key);
+    const fp = key ? fingerprint(key) : keyHash.slice(0, 8);
+    const hashed = !key && !!keyHash;
     const label = item && typeof item === 'object' && typeof item.label === 'string' ? item.label : null;
     let scope;
     let perDay = null;
     try {
+      if (item && typeof item === 'object' && item.key != null && item.keyHash != null) {
+        const h = keyHashOf(item);
+        if (!h || hashKey(key) !== h) throw new Error('"key" and "keyHash" do not match');
+      }
       scope = compileScope(item);
       perDay = perDayOf(item);
     } catch (e) {
       scope = NOTHING(e.message);
       issues.push(`key fp:${fp}${label ? ` (${label})` : ''}: ${e.message} — it reaches nothing until that is fixed`);
     }
-    entries.push({ key, label, fp, scope, perDay });
+    if (scope && typeof scope === 'object') {
+      Object.defineProperty(scope, '_fp', { value: fp, enumerable: false, configurable: true });
+    }
+    entries.push({ key: key || null, keyHash: keyHash || null, hashed, label, fp, scope, perDay });
   }
   // The same key twice: the gateway would match the first entry, and a hand edit that adds an
   // unscoped (or uncapped) copy above a scoped (or capped) one would quietly widen it. Two
   // different scopes, or two different caps, is an error.
   const byKey = new Map();
-  for (const e of entries) byKey.set(e.key, [...(byKey.get(e.key) || []), e]);
+  for (const e of entries) {
+    const id = e.key ? hashKey(e.key) : e.keyHash;
+    byKey.set(id, [...(byKey.get(id) || []), e]);
+  }
   for (const [, same] of byKey) {
     if (same.length < 2) continue;
     const scopes = new Set(same.map((e) => JSON.stringify(scopeText(e.scope))));
@@ -202,10 +253,15 @@ export function targetDecision(scope, adapterId, models = [''], { spellings = []
   if (!scope) return OK;
   if (scope.invalid) return no(invalidReason(scope));
   const forms = [...new Set(models.map((m) => `${adapterId}/${m ?? ''}`))];
-  const denyForms = [...new Set([...forms, ...spellings.map((m) => `${adapterId}/${m}`)])];
+  const allModels = [...models, ...spellings];
+  const denyForms = [...new Set([
+    ...allModels.map((m) => `${adapterId}/${m ?? ''}`),
+    ...allModels.map((m) => `${adapterId}/${normaliseModelPart(m)}`),
+  ])];
   const hits = (p, form) => (p.kind === 'adapter' ? p.id === adapterId : p.kind === 'glob' ? p.re.test(form) : false);
+  const hitsDeny = (p, form) => (p.kind === 'adapter' ? p.id === adapterId : p.kind === 'glob' ? (p.re.test(form) || (p.normRe ? p.normRe.test(form) : false)) : false);
   for (const p of scope.deny) {
-    if (denyForms.some((f) => hits(p, f))) return no(`this key may not reach adapter "${adapterId}": its scope denies ${p.text}`);
+    if (denyForms.some((f) => hitsDeny(p, f))) return no(`this key may not reach adapter "${adapterId}": its scope denies ${p.text}`);
   }
   if (scope.allow && !forms.every((f) => scope.allow.some((p) => hits(p, f)))) {
     return no(`this key may not reach adapter "${adapterId}": ${forms[0]} is not in its allow-list`);
