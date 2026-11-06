@@ -5,7 +5,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { loadConfig, saveConfig, configPath, dataDir, newApiKey, newUniqueApiKey, configExists, expand, resolveSecret } from './config.js';
 import { Gateway, checkAdapter, kindOf, own } from './gateway.js';
 import { createServer, hasTunnelConfigured, isLoopbackHost, LEGACY_MAX_CONCURRENT_WARNING } from './server.js';
-import { UsageLog, formatUsageCsv, formatUsageTable } from './usage.js';
+import { UsageLog, accountHmacKey, execAccountMigrationWarnings, formatUsageCsv, formatUsageTable } from './usage.js';
 import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
 import { autoApproveFlag, which } from './cli-adapter.js';
 import * as tunnel from './tunnel.js';
@@ -828,6 +828,11 @@ async function cmdServe(flags) {
   // launchd opened its log before this process started, with the default umask: tighten
   // that, and anything an older keysmith left behind, before the first line is written.
   const secured = secureLogFiles();
+  try {
+    accountHmacKey();
+  } catch (e) {
+    fail(e.message);
+  }
   const { gateway, usage, log } = buildGateway(cfg);
   const server = createServer(gateway, cfg, { usage, log, tunnelActive: !!flags.tunnel });
 
@@ -843,6 +848,9 @@ async function cmdServe(flags) {
   // A key whose scope cannot be read reaches nothing: said at start, where the owner looks.
   for (const issue of keyProblems(cfg)) warn(`! auth.keys: ${issue}`);
   if (Number(cfg?.limits?.maxConcurrent) === 4) warn(`! ${LEGACY_MAX_CONCURRENT_WARNING}`);
+  if (!process.env.KEYSMITH_VERBOSE || !gateway._warnedExecMigration) {
+    for (const w of execAccountMigrationWarnings(cfg, usage, { checkDisk: true })) warn(`! ${w}`);
+  }
   if (secured.changed.length) out(`  logs    : tightened ${secured.changed.length} file(s)/dir(s) to 0600/0700`);
   for (const f of secured.failed) warn(`! could not tighten ${f}`);
   // The MCP bridge (agy's toolMode auto/mcp): its socket, and what a gateway killed before it
@@ -1195,7 +1203,7 @@ async function cmdChat(flags) {
 
 async function cmdDoctor(flags) {
   const cfg = loadOrFail();
-  const { gateway, log } = buildGateway(cfg);
+  const { gateway, usage, log } = buildGateway(cfg);
   const rows = [];
   out(`keysmith ${PKG.version} — config ${rel(configPath())}\n`);
 
@@ -1243,6 +1251,11 @@ async function cmdDoctor(flags) {
   for (const err of new UsageLog(undefined, { pricing: cfg?.pricing }).checkReadable()) {
     rows.push(['usage log', 'unreadable', truncate(err, 70)]);
   }
+  try {
+    accountHmacKey();
+  } catch (e) {
+    rows.push(['account key', 'unreadable', e.message]);
+  }
 
   const w = maxLen(rows, (r) => r[0].length, 8);
   for (const [id, state, detail] of rows) {
@@ -1261,6 +1274,7 @@ async function cmdDoctor(flags) {
   for (const issue of keyIssues) out(`             ✗ ${issue}`);
   for (const w of scopeWarnings(cfg, keyEntries)) out(`             ! ${w.message}`);
   if (Number(cfg?.limits?.maxConcurrent) === 4) out(`  limits     ! ${LEGACY_MAX_CONCURRENT_WARNING}`);
+  for (const w of execAccountMigrationWarnings(cfg, usage, { checkDisk: true })) out(`             ! ${w}`);
 
   if (flags.probeModels) {
     out('\nprobing every model with a 1-token request (this spends real quota):');

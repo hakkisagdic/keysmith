@@ -1,8 +1,9 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { dataDir } from './config.js';
-import { openPrivateLog } from './logfiles.js';
+import { FILE_MODE, ensurePrivateDir, openPrivateLog } from './logfiles.js';
 import { fingerprint, redactSecrets } from './redact.js';
 import { dayOf, nextMidnight, startOfDay } from './quota.js';
 
@@ -43,6 +44,7 @@ export const MAX_ADAPTERS_SEEN = 1000;
 const TAG_RE = /^[A-Za-z0-9._-]{1,40}$/;
 const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 const SAFE_SERVICE_RE = /^[A-Za-z0-9._@-]{1,128}$/;
+const EXEC_HMAC_ACCOUNT_RE = /^[\w.+-]+:[0-9a-f]{12}$/;
 const CHUNK_BYTES = 64 * 1024;
 const MAX_DISTINCT_MODELS = 1000;
 const MAX_DISTINCT_GROUPS = 5000;
@@ -118,19 +120,41 @@ export function hostOf(baseUrl) {
 }
 
 /**
- * Which credential an adapter spent — named from config only, never from CLI output or free
- * command text, and never valued:
+ * Which credential an adapter spent — named from config only, never from CLI output or secret
+ * command arguments, never by running the command, and never valued:
  *  - explicit `cfg.account` -> that name
- *  - `{exec:security find-generic-password ... -s NAME ...}` -> `NAME`
+ *  - `{exec:/usr/bin/security find-generic-password ... -s NAME ...}` (string or argv) -> `NAME`
+ *  - other `{exec:...}`     -> `<program basename>:<first 12 hex of HMAC-SHA256 of normalized argv>`
+ *                              (or `exec:<hmac12>` when a wrapper has an unknown flag)
  *  - `{env:NAME}`           -> `NAME`
  *  - `{file:PATH}`          -> `path.basename(PATH)`
  *  - any other `{...}` ref  -> `"exec"` with no text from it
  *  - literal key / none     -> `null`
+ *
+ * Note:
+ *  - Object/argv `{exec: [...]}` forms are supported here for callers that resolve the key
+ *    themselves (`resolveSecret` in `config.js` accepts string references only).
+ *  - The HMAC key is stored in `dataDir()` (`<dataDir>/account-hmac.key`); because the launchd
+ *    service runs without `$KEYSMITH_DATA`/`$XDG_DATA_HOME`, setting those variables in a shell
+ *    selects a different data directory and key from the launchd agent.
  */
-export function credentialAccount(cfg) {
+export function credentialAccount(cfg, opts = null) {
+  const normOpts =
+    Buffer.isBuffer(opts) || typeof opts === 'string'
+      ? { hmacKey: opts }
+      : opts && typeof opts === 'object'
+        ? { hmacKey: opts.hmacKey ?? null, dataDir: opts.dataDir ?? null }
+        : {};
+  if (typeof cfg === 'string') return credentialAccount({ apiKey: cfg }, normOpts);
+  if (Array.isArray(cfg)) return execServiceName(cfg, normOpts);
   if (!cfg || typeof cfg !== 'object') return null;
   if (typeof cfg.account === 'string' && cfg.account.trim()) return cfg.account.trim();
-  const ref = cfg._rawKeyRef ?? cfg.apiKey ?? cfg.key ?? null;
+  const ref = cfg._rawKeyRef ?? cfg.apiKey ?? cfg.key ?? (Object.hasOwn(cfg, 'exec') ? { exec: cfg.exec } : null);
+  if (ref && typeof ref === 'object') {
+    if (Array.isArray(ref)) return execServiceName(ref, normOpts);
+    if (Object.hasOwn(ref, 'exec')) return execServiceName(ref.exec, normOpts);
+    return null;
+  }
   if (typeof ref === 'string') {
     const m = ref.match(/^\{(\w+):([\s\S]*)\}$/);
     if (m) {
@@ -138,7 +162,7 @@ export function credentialAccount(cfg) {
       const arg = rawArg.trim();
       if (kind === 'env') return arg || null;
       if (kind === 'file') return path.basename(arg) || null;
-      if (kind === 'exec') return execServiceName(arg);
+      if (kind === 'exec') return execServiceName(arg, normOpts);
       return 'exec';
     }
   }
@@ -146,16 +170,518 @@ export function credentialAccount(cfg) {
   return null;
 }
 
-function execServiceName(cmd) {
-  const trimmed = String(cmd || '').trim();
-  const parts = trimmed.split(/\s+/);
-  const bin = path.basename(parts[0] || '');
-  if (bin === 'security' && parts[1] === 'find-generic-password') {
-    const s = trimmed.match(/(?:^|\s)(?:-s|--service)(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))/);
-    const name = s ? (s[1] || s[2] || s[3] || '').trim() : '';
-    if (name && SAFE_SERVICE_RE.test(name)) return name;
+export const ACCOUNT_HMAC_KEY_FILE = 'account-hmac.key';
+const _hmacKeyCache = new Map();
+const _execUsageScanCache = new Map();
+
+function formatHmacKeyError(keyFile, err) {
+  if (err && err._isHmacKeyError) return err;
+  const code = err?.code || 'EINVAL';
+  const detail = err?.message ? err.message : String(code);
+  const msg = detail.includes(keyFile)
+    ? `${detail}${detail.includes(code) ? '' : ` (${code})`}`
+    : `account HMAC key ${keyFile}: ${code} (${detail})`;
+  const wrapped = new Error(msg);
+  wrapped.code = code;
+  wrapped.keyFile = keyFile;
+  wrapped._isHmacKeyError = true;
+  return wrapped;
+}
+
+function readExistingHmacKey(keyFile) {
+  let fd = null;
+  try {
+    fd = fs.openSync(keyFile, 'r');
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) {
+      const err = new Error(`account HMAC key ${keyFile} is not a regular file`);
+      err.code = st.isDirectory() ? 'EISDIR' : 'EINVAL';
+      throw err;
+    }
+    if (st.size < 32) {
+      const err = new Error(`account HMAC key ${keyFile}: EINVAL (file is ${st.size} bytes, expected at least 32)`);
+      err.code = 'EINVAL';
+      throw err;
+    }
+    if ((st.mode & 0o077) !== 0) {
+      try { fs.fchmodSync(fd, FILE_MODE); } catch {}
+    }
+    const buf = Buffer.alloc(32);
+    const bytesRead = fs.readSync(fd, buf, 0, 32, 0);
+    if (bytesRead < 32) {
+      const err = new Error(`account HMAC key ${keyFile}: EINVAL (read ${bytesRead} bytes, expected 32)`);
+      err.code = 'EINVAL';
+      throw err;
+    }
+    return buf;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
   }
-  return 'exec';
+}
+
+/**
+ * Return the per-install 32-byte HMAC key stored at `<dataDir>/account-hmac.key` (mode 0600,
+ * created atomically on first use when missing, loaded once per process and cached in memory,
+ * never overwritten if invalid/truncated, and never failing open silently).
+ */
+export function accountHmacKey(dir = null) {
+  const targetDir = path.resolve(dir || dataDir());
+  const keyFile = path.join(targetDir, ACCOUNT_HMAC_KEY_FILE);
+  const cached = _hmacKeyCache.get(keyFile);
+  if (cached) return cached;
+
+  try {
+    const existing = readExistingHmacKey(keyFile);
+    _hmacKeyCache.set(keyFile, existing);
+    return existing;
+  } catch (err) {
+    if (!err || err.code !== 'ENOENT') {
+      throw formatHmacKeyError(keyFile, err);
+    }
+  }
+
+  try {
+    ensurePrivateDir(targetDir);
+    const fresh = crypto.randomBytes(32);
+    const tmp = path.join(targetDir, `.${ACCOUNT_HMAC_KEY_FILE}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`);
+    let created = false;
+    try {
+      fs.writeFileSync(tmp, fresh, { mode: FILE_MODE });
+      try { fs.chmodSync(tmp, FILE_MODE); } catch {}
+      try {
+        fs.linkSync(tmp, keyFile);
+        created = true;
+      } catch (linkErr) {
+        if (linkErr && linkErr.code === 'EEXIST') {
+          created = false;
+        } else if (
+          linkErr &&
+          (linkErr.code === 'ENOTSUP' ||
+            linkErr.code === 'EOPNOTSUPP' ||
+            linkErr.code === 'EPERM' ||
+            linkErr.code === 'EXDEV' ||
+            linkErr.code === 'ENOSYS' ||
+            linkErr.code === 'EINVAL')
+        ) {
+          let cfd = null;
+          try {
+            cfd = fs.openSync(keyFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, FILE_MODE);
+            try { fs.fchmodSync(cfd, FILE_MODE); } catch {}
+            const written = fs.writeSync(cfd, fresh, 0, 32, 0);
+            if (written < 32) {
+              const wErr = new Error(`short write (${written} of 32 bytes)`);
+              wErr.code = 'EIO';
+              throw wErr;
+            }
+            created = true;
+          } catch (exclErr) {
+            if (!exclErr || exclErr.code !== 'EEXIST') throw exclErr;
+            created = false;
+          } finally {
+            if (cfd !== null) {
+              try { fs.closeSync(cfd); } catch {}
+            }
+          }
+        } else {
+          throw linkErr;
+        }
+      }
+    } finally {
+      try { fs.unlinkSync(tmp); } catch {}
+    }
+
+    const finalKey = created ? fresh : readExistingHmacKey(keyFile);
+    _hmacKeyCache.set(keyFile, finalKey);
+    return finalKey;
+  } catch (err) {
+    throw formatHmacKeyError(keyFile, err);
+  }
+}
+
+function resolveHmacKey(hmacKey = null, dir = null) {
+  if (Buffer.isBuffer(hmacKey) && hmacKey.length > 0) return hmacKey;
+  if (typeof hmacKey === 'string' && hmacKey.length > 0) {
+    return /^[0-9a-fA-F]{64}$/.test(hmacKey) ? Buffer.from(hmacKey, 'hex') : Buffer.from(hmacKey, 'utf8');
+  }
+  return accountHmacKey(dir);
+}
+
+const SECURITY_VALUE_FLAGS = new Set([
+  '-a', '-c', '-C', '-D', '-G', '-j', '-l', '-p', '-k',
+  '--account', '--label', '--kind', '--creator', '--type',
+]);
+
+function execServiceName(cmd, opts = {}) {
+  const segments = tokenizeExecSegments(cmd);
+  if (!segments.length) return 'exec';
+
+  // 1) macOS keychain (`security find-generic-password` / `find-internet-password`):
+  // extract `-s <service>` only (regardless of argument order or presence of `-a` / `-w`),
+  // provided no wrapper with unknown flag arity preceded the command.
+  // With no `-s`, fall back to rule 2 (never `-l` or `-a`).
+  if (!segments.some((s) => s.unknownWrapper)) {
+    for (const seg of segments) {
+      const tokens = seg.cmdTokens;
+      if (tokens[0] === 'security' && (tokens.includes('find-generic-password') || tokens.includes('find-internet-password'))) {
+        const svc = extractSecurityFlag(tokens, '-s', '--service');
+        if (svc && SAFE_SERVICE_RE.test(svc)) return svc;
+      }
+    }
+  }
+
+  // 2) Every other exec reference: `<program basename>:<first 12 hex of HMAC-SHA256 of normalized argv>`
+  // (or `exec:<hmac12>` if an unknown wrapper flag stopped program derivation) — no argument text at all.
+  const normalized = segments.map((s) => s.hmacTokens.join('\x00')).join('\x1e');
+  const key = resolveHmacKey(opts?.hmacKey, opts?.dataDir);
+  const digest = crypto.createHmac('sha256', key).update(normalized).digest('hex').slice(0, 12);
+  if (segments.some((s) => s.unknownWrapper)) return `exec:${digest}`;
+  const rawProg = segments[0].cmdTokens[0] || '';
+  const prog = rawProg.replace(/[^A-Za-z0-9._+-]/g, '');
+  if (!prog) return `exec:${digest}`;
+  return `${prog}:${digest}`;
+}
+
+function extractSecurityFlag(tokens, shortFlag, longFlag) {
+  const shortChar = shortFlag.slice(1);
+  const combinedRe = new RegExp(`^-[wgqvi]*${shortChar}[wgqvi]*$`);
+  const attachedRe = new RegExp(`^-[wgqvi]*${shortChar}(.+)$`);
+  for (let i = 1; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (!tok || tok === 'find-generic-password' || tok === 'find-internet-password') continue;
+    if (tok === shortFlag || tok === longFlag || combinedRe.test(tok)) {
+      const next = tokens[i + 1];
+      if (next && !next.startsWith('-')) return next.trim();
+      continue;
+    }
+    if (tok.startsWith(`${longFlag}=`)) {
+      return tok.slice(longFlag.length + 1).trim();
+    }
+    if (tok.startsWith(`${shortFlag}=`)) {
+      return tok.slice(shortFlag.length + 1).trim();
+    }
+    const attached = tok.match(attachedRe);
+    if (attached && !tok.startsWith('--')) {
+      return attached[1].trim();
+    }
+    if ((SECURITY_VALUE_FLAGS.has(tok) || SECURITY_VALUE_FLAGS.has(tok.toLowerCase())) && tokens[i + 1] && !tokens[i + 1].startsWith('-')) {
+      i++;
+    }
+  }
+  return '';
+}
+
+export function isExecCredentialAdapter(raw) {
+  if (!raw || typeof raw !== 'object') return false;
+  if (typeof raw.account === 'string' && raw.account.trim()) return false;
+  const ref = raw._rawKeyRef ?? raw.apiKey ?? raw.key ?? (Object.hasOwn(raw, 'exec') ? { exec: raw.exec } : null);
+  if (ref && typeof ref === 'object') {
+    return Array.isArray(ref) || Object.hasOwn(ref, 'exec');
+  }
+  if (typeof ref === 'string') {
+    return /^\{exec:[\s\S]*\}$/.test(ref);
+  }
+  return false;
+}
+
+/**
+ * Warnings emitted by `keysmith doctor` and once at startup when:
+ * - `limits.spend` or recent usage rows are keyed on `"exec"`, or
+ * - `limits.spend` has a `<program>:<hmac12>` target that no configured adapter derives
+ *   (e.g. `account-hmac.key` was replaced or `dataDir` moved).
+ */
+export function execAccountMigrationWarnings(cfg, usage = null, { checkDisk = false, hmacKey = null, dataDir: dir = null } = {}) {
+  const caps = parseSpendCaps(cfg?.limits?.spend, cfg?.adapters);
+  const hasExecCap = caps.some((c) => c.target === 'exec' && c.kind !== 'adapter');
+  const hasExecUsage = !!usage?.hasExecAccountUsage?.({ checkDisk });
+
+  const named = [];
+  const allAccounts = new Set();
+  for (const [id, raw] of Object.entries(cfg?.adapters || {})) {
+    if (!raw || typeof raw !== 'object') continue;
+    let acct = '';
+    try {
+      acct = credentialAccount(raw, { hmacKey, dataDir: dir });
+    } catch {
+      continue;
+    }
+    if (acct) allAccounts.add(acct);
+    if (isExecCredentialAdapter(raw) && acct && acct !== 'exec') {
+      named.push(`${acct} (adapter ${id})`);
+    }
+  }
+
+  const out = [];
+  if (hasExecCap || hasExecUsage) {
+    const what =
+      hasExecCap && hasExecUsage
+        ? 'limits.spend cap and recent usage rows are keyed on account "exec"'
+        : hasExecCap
+          ? 'limits.spend cap is keyed on account "exec"'
+          : 'recent usage rows are keyed on account "exec"';
+    const targetHint = named.length
+      ? `use ${named.join(', ')} instead`
+      : 'use the keychain service (-s <service>) or <program>:<hmac12> account names instead';
+    out.push(`exec account migration: ${what}, which no longer matches {exec:...} credentials — ${targetHint}`);
+  }
+
+  const staleHmacTargets = [];
+  for (const c of caps) {
+    if (c.kind === 'adapter' || !c.target) continue;
+    if (EXEC_HMAC_ACCOUNT_RE.test(c.target) && !allAccounts.has(c.target) && !staleHmacTargets.includes(c.target)) {
+      staleHmacTargets.push(c.target);
+    }
+  }
+  if (staleHmacTargets.length) {
+    const targetHint = named.length
+      ? `current exec account(s): ${named.join(', ')}`
+      : 'no configured adapter derives that account name';
+    out.push(
+      `limits.spend cap target ${staleHmacTargets.map((t) => `"${t}"`).join(', ')} looks like an exec HMAC account (<program>:<hmac12>) that no configured adapter derives (HMAC key changed or adapter removed) — ${targetHint}`
+    );
+  }
+  return out;
+}
+
+const WRAPPER_ZERO_ARG_FLAGS = {
+  env: new Set(['-i', '--ignore-environment', '-0', '--null']),
+  sudo: new Set(['-A', '-b', '-E', '-e', '-H', '-i', '-K', '-k', '-N', '-n', '-P', '-S', '-s']),
+  command: new Set(['-p']),
+  exec: new Set(['-c', '-l']),
+  nohup: new Set(),
+  nice: new Set(),
+};
+
+const WRAPPER_ONE_ARG_FLAGS = {
+  env: new Set(['-u', '--unset', '-C', '--chdir']),
+  sudo: new Set(['-u', '--user']),
+  command: new Set(),
+  exec: new Set(['-a']),
+  nohup: new Set(),
+  nice: new Set(['-n', '--adjustment']),
+};
+
+const WRAPPER_EQ_PREFIXES = {
+  env: ['--unset=', '--chdir='],
+  sudo: ['--user='],
+  command: [],
+  exec: [],
+  nohup: [],
+  nice: ['--adjustment='],
+};
+
+function tokenizeExecSegments(cmd, depth = 0) {
+  if (depth > 3 || cmd == null) return [];
+  let rawSegments = [];
+  if (Array.isArray(cmd)) {
+    const toks = cmd.map((x) => String(x ?? '').trim()).filter(Boolean);
+    if (toks.length) rawSegments.push(toks);
+  } else if (typeof cmd === 'string') {
+    const trimmed = cmd.trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return tokenizeExecSegments(parsed, depth + 1);
+      } catch {}
+    }
+    rawSegments = splitShellSegments(trimmed);
+  } else {
+    return [];
+  }
+
+  const out = [];
+  for (const seg of rawSegments) {
+    out.push(...unwrapExecSegment(seg, depth));
+  }
+  return out;
+}
+
+function unwrapExecSegment(tokens, depth = 0) {
+  if (!tokens.length) return [];
+  const envVars = [];
+  let i = 0;
+
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+      envVars.push(t);
+      i++;
+      continue;
+    }
+    const base = path.basename(t);
+    if (Object.hasOwn(WRAPPER_ZERO_ARG_FLAGS, base)) {
+      const wrapperIdx = i;
+      i++;
+      const zeroFlags = WRAPPER_ZERO_ARG_FLAGS[base];
+      const oneFlags = WRAPPER_ONE_ARG_FLAGS[base];
+      const eqPrefixes = WRAPPER_EQ_PREFIXES[base];
+      let unknownFlag = false;
+      while (i < tokens.length && tokens[i].startsWith('-') && tokens[i] !== '-') {
+        const flag = tokens[i];
+        if (flag === '--') {
+          i++;
+          break;
+        }
+        if (zeroFlags.has(flag) || eqPrefixes.some((p) => flag.startsWith(p))) {
+          i++;
+          continue;
+        }
+        if (oneFlags.has(flag)) {
+          if (i + 1 < tokens.length) {
+            i += 2;
+            continue;
+          }
+          unknownFlag = true;
+          break;
+        }
+        unknownFlag = true;
+        break;
+      }
+      if (unknownFlag || i >= tokens.length) {
+        const rem = tokens.slice(wrapperIdx);
+        if (rem.length) rem[0] = path.basename(rem[0]);
+        return [
+          {
+            unknownWrapper: true,
+            envVars,
+            cmdTokens: [],
+            hmacTokens: [...envVars, ...rem],
+          },
+        ];
+      }
+      continue;
+    }
+    break;
+  }
+
+  if (i >= tokens.length) {
+    return [
+      {
+        unknownWrapper: true,
+        envVars,
+        cmdTokens: [],
+        hmacTokens: [...envVars],
+      },
+    ];
+  }
+
+  const rest = tokens.slice(i);
+  rest[0] = path.basename(rest[0]);
+  const bin = rest[0];
+
+  if (bin === 'sh' || bin === 'bash' || bin === 'zsh' || bin === 'dash' || bin === 'ksh') {
+    if (rest.length >= 3 && /^-[a-z]*c$/i.test(rest[1]) && typeof rest[2] === 'string' && depth < 3) {
+      const inner = tokenizeExecSegments(rest[2], depth + 1);
+      if (inner.length) {
+        if (envVars.length) {
+          inner[0] = {
+            ...inner[0],
+            envVars: [...envVars, ...inner[0].envVars],
+            hmacTokens: [...envVars, ...inner[0].hmacTokens],
+          };
+        }
+        if (rest.length > 3) {
+          const lastIdx = inner.length - 1;
+          inner[lastIdx] = {
+            ...inner[lastIdx],
+            hmacTokens: [...inner[lastIdx].hmacTokens, ...rest.slice(3)],
+          };
+        }
+        return inner;
+      }
+    }
+    if (rest.length >= 2 && rest[1].startsWith('-') && !/^-[a-z]*c$/i.test(rest[1])) {
+      return [
+        {
+          unknownWrapper: true,
+          envVars,
+          cmdTokens: [],
+          hmacTokens: [...envVars, ...rest],
+        },
+      ];
+    }
+  }
+
+  return [
+    {
+      unknownWrapper: false,
+      envVars,
+      cmdTokens: rest,
+      hmacTokens: [...envVars, ...rest],
+    },
+  ];
+}
+
+function splitShellSegments(str) {
+  const segments = [];
+  let curTokens = [];
+  let cur = '';
+  let quote = null;
+  let tokenStarted = false;
+
+  const pushToken = () => {
+    if (tokenStarted || cur.length > 0) {
+      curTokens.push(cur);
+      cur = '';
+      tokenStarted = false;
+    }
+  };
+  const pushSegment = () => {
+    pushToken();
+    if (curTokens.length) {
+      segments.push(curTokens);
+      curTokens = [];
+    }
+  };
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = null;
+      } else if (ch === '\\' && i + 1 < str.length) {
+        cur += str[++i];
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      tokenStarted = true;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < str.length) {
+      cur += str[++i];
+      tokenStarted = true;
+      continue;
+    }
+    if (ch === '|' || ch === ';' || ch === '\n') {
+      if (ch === '|' && str[i + 1] === '|') i++;
+      pushSegment();
+      continue;
+    }
+    if (ch === '&' && str[i + 1] === '&') {
+      i++;
+      pushSegment();
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      pushToken();
+      continue;
+    }
+    cur += ch;
+    tokenStarted = true;
+  }
+  pushSegment();
+  return segments;
 }
 
 function globToRegExp(glob) {
@@ -806,9 +1332,90 @@ export class UsageLog {
       reservedByAdapter: new Map(),
       reservedByAccount: new Map(),
       adaptersSeen: new Set(),
+      accountsSeen: new Set(),
       readError: null,
       retryAt: 0,
     };
+  }
+
+  hasExecAccountUsage({ checkDisk = false } = {}) {
+    if (this._spendState?.byAccount?.has('exec') || this._spendState?.accountsSeen?.has('exec')) return true;
+    if (this._tailRing?.some((r) => r?.account === 'exec')) return true;
+    if (!checkDisk) return false;
+    if (this._hasExecUsageDisk !== undefined) return this._hasExecUsageDisk;
+    const m = utcMonth(this._nowDate().getTime());
+    if (this._spendState && this._spendState.month === m && !this._spendState.readError) {
+      this._hasExecUsageDisk = false;
+      return false;
+    }
+    const candidates = [...new Set([this.monthFile(m), this.file].filter(Boolean))];
+    const cachePath = this.file ? path.join(path.dirname(this.file), '.usage-exec-scan.json') : null;
+    let diskCache = null;
+    let diskDirty = false;
+    const loadDiskCache = () => {
+      if (diskCache !== null) return diskCache;
+      diskCache = {};
+      if (!cachePath) return diskCache;
+      try {
+        const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+        if (parsed && typeof parsed === 'object') diskCache = parsed;
+      } catch {}
+      return diskCache;
+    };
+
+    let found = false;
+    for (const f of candidates) {
+      try {
+        let st;
+        try {
+          st = fs.statSync(f);
+        } catch {
+          continue;
+        }
+        if (!st.isFile()) continue;
+        const mem = _execUsageScanCache.get(f);
+        if (mem && mem.size === st.size && mem.mtimeMs === st.mtimeMs && mem.hasExec === false) {
+          continue;
+        }
+        const dc = loadDiskCache()[f];
+        if (dc && dc.size === st.size && dc.mtimeMs === st.mtimeMs && dc.hasExec === false) {
+          _execUsageScanCache.set(f, { size: st.size, mtimeMs: st.mtimeMs, hasExec: false });
+          continue;
+        }
+        let fileFound = false;
+        forEachLine(f, (line) => {
+          if (!line.includes('"exec"')) return true;
+          try {
+            const e = JSON.parse(line);
+            if (e?.account === 'exec' || (Array.isArray(e?.failedLegs) && e.failedLegs.some((fl) => fl?.account === 'exec'))) {
+              fileFound = true;
+              return false;
+            }
+          } catch {}
+          return true;
+        });
+        if (fileFound) {
+          found = true;
+          _execUsageScanCache.delete(f);
+          if (diskCache && Object.hasOwn(diskCache, f)) {
+            delete diskCache[f];
+            diskDirty = true;
+          }
+          break;
+        }
+        const entry = { size: st.size, mtimeMs: st.mtimeMs, hasExec: false };
+        _execUsageScanCache.set(f, entry);
+        loadDiskCache()[f] = entry;
+        diskDirty = true;
+      } catch {}
+    }
+    if (diskDirty && cachePath && diskCache) {
+      try {
+        fs.writeFileSync(cachePath, JSON.stringify(diskCache), { mode: FILE_MODE });
+      } catch {}
+    }
+    this._hasExecUsageDisk = found;
+    return found;
   }
 
   _addMeteredSpend(state, { adapter, account, key, usd }) {
@@ -844,9 +1451,15 @@ export class UsageLog {
     if (seenAdapter && (state.adaptersSeen.has(seenAdapter) || state.adaptersSeen.size < MAX_ADAPTERS_SEEN)) {
       state.adaptersSeen.add(seenAdapter);
     }
+    if (typeof e.account === 'string' && e.account && (state.accountsSeen.has(e.account) || state.accountsSeen.size < MAX_ADAPTERS_SEEN)) {
+      state.accountsSeen.add(capDim(e.account));
+    }
     let failedMeteredUsd = 0;
     if (Array.isArray(e.failedLegs)) {
       for (const f of e.failedLegs) {
+        if (typeof f?.account === 'string' && f.account && (state.accountsSeen.has(f.account) || state.accountsSeen.size < MAX_ADAPTERS_SEEN)) {
+          state.accountsSeen.add(capDim(f.account));
+        }
         const fAdapter = f?.adapter ?? splitTargetModel(f?.target).adapter;
         if (f?.cost?.basis === 'metered' && f.cost.usd > 0) {
           const fUsd = Number(f.cost.usd) || 0;

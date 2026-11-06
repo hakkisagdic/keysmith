@@ -23,6 +23,9 @@ export function configPath() {
 }
 
 export function dataDir() {
+  // Note: the launchd plist (`src/service.js`) only sets PATH and writes to `~/.local/share/keysmith`.
+  // Running CLI commands with a custom $KEYSMITH_DATA or $XDG_DATA_HOME reads both `usage.jsonl`
+  // and `account-hmac.key` from that custom directory rather than the launchd agent's directory.
   return process.env.KEYSMITH_DATA || path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'keysmith');
 }
 

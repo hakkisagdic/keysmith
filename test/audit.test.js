@@ -12,7 +12,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { Gateway } from '../src/gateway.js';
+import { Gateway, prepareAdapter } from '../src/gateway.js';
+import { resolveSecret } from '../src/config.js';
 import { HttpAdapter } from '../src/http-adapter.js';
 import { DailyQuota } from '../src/quota.js';
 import { createServer } from '../src/server.js';
@@ -24,6 +25,7 @@ import {
   UsageLog,
   computeCost,
   credentialAccount,
+  execAccountMigrationWarnings,
   formatUsageCsv,
   formatUsageTable,
   hostOf,
@@ -43,6 +45,11 @@ const SECRET_EXEC_VAL = 'sk-ant-api03-exec-secret-' + crypto.randomBytes(12).toS
 const SECRET_FILE_VAL = 'sk-openai-file-secret-' + crypto.randomBytes(12).toString('hex');
 const SECRET_ENV_VAL = 'sk-env-secret-' + crypto.randomBytes(12).toString('hex');
 const SECRET_LITERAL_VAL = 'sk-literal-secret-' + crypto.randomBytes(12).toString('hex');
+const TEST_HMAC_KEY = crypto.randomBytes(32);
+
+function expectedExecHmac(normalizedInput, key = TEST_HMAC_KEY) {
+  return crypto.createHmac('sha256', key).update(normalizedInput).digest('hex').slice(0, 12);
+}
 
 const CLI_STUB = `#!/usr/bin/env node
 const argv = process.argv.slice(2);
@@ -61,6 +68,7 @@ line({
 `;
 
 let tmpDir;
+let prevKeysmithData;
 let upstreamServer;
 let upstreamPort;
 let upstreamHits = [];
@@ -68,6 +76,8 @@ let slowGate = null;
 
 before(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-audit-'));
+  prevKeysmithData = process.env.KEYSMITH_DATA;
+  process.env.KEYSMITH_DATA = tmpDir;
   process.env.KEYSMITH_AUDIT_TEST_KEY = SECRET_ENV_VAL;
 
   upstreamServer = http.createServer(async (req, res) => {
@@ -133,6 +143,8 @@ before(async () => {
 
 after(async () => {
   delete process.env.KEYSMITH_AUDIT_TEST_KEY;
+  if (prevKeysmithData === undefined) delete process.env.KEYSMITH_DATA;
+  else process.env.KEYSMITH_DATA = prevKeysmithData;
   if (upstreamServer) {
     upstreamServer.closeAllConnections?.();
     await new Promise((r) => upstreamServer.close(r));
@@ -157,14 +169,17 @@ test('account names the credential source and never holds a secret value', () =>
     credentialAccount({ apiKey: '{exec:security find-generic-password --service=openai-work -w}' }),
     'openai-work',
   );
-  // Any other {exec:...} reference (including curl -s with a URL/token) returns 'exec' with no text from it
+  // Other {exec:...} references derive `<program basename>:<first 12 hex of HMAC-SHA256>`
+  // with no argument text at all (op:// paths and URLs/tokens included)
+  const expectedOp = `op:${expectedExecHmac('op\0read\0op://vault/item/credential')}`;
+  const expectedCurl = `curl:${expectedExecHmac('curl\0-s\0https://vault.internal/v1/kv?token=hvs.SECRET_TOKEN_99')}`;
   assert.equal(
-    credentialAccount({ apiKey: '{exec:op read op://vault/item/credential}' }),
-    'exec',
+    credentialAccount({ apiKey: '{exec:op read op://vault/item/credential}' }, { hmacKey: TEST_HMAC_KEY }),
+    expectedOp,
   );
   assert.equal(
-    credentialAccount({ apiKey: '{exec:curl -s "https://vault.internal/v1/kv?token=hvs.SECRET_TOKEN_99"}' }),
-    'exec',
+    credentialAccount({ apiKey: '{exec:curl -s "https://vault.internal/v1/kv?token=hvs.SECRET_TOKEN_99"}' }, { hmacKey: TEST_HMAC_KEY }),
+    expectedCurl,
   );
   // {env:...} extracts the environment variable name
   assert.equal(credentialAccount({ apiKey: '{env:ANTHROPIC_API_KEY}' }), 'ANTHROPIC_API_KEY');
@@ -307,7 +322,7 @@ test('each new audit field is written on HTTP and CLI requests across faces, and
   fs.writeFileSync(keyFile, SECRET_FILE_VAL, { mode: 0o600 });
 
   // {exec:...} reference that prints SECRET_EXEC_VAL while carrying `-s "https://vault.internal/..."`
-  // must resolve to account "exec" (never leaking the argument to -s when the binary is not `security`).
+  // must resolve to a stable program name ("node"), never leaking the inline script or the URL argument to -s.
   const execRef = `{exec:node -e "process.stdout.write('${SECRET_EXEC_VAL}')" -- -s "https://vault.internal/v1/kv?token=hvs.VAULT_TOKEN_123"}`;
 
   const cfg = {
@@ -446,7 +461,7 @@ test('each new audit field is written on HTTP and CLI requests across faces, and
     assert.equal(r1.adapter, 'claude-api');
     assert.equal(r1.kind, 'http');
     assert.equal(r1.host, `127.0.0.1:${upstreamPort}`);
-    assert.equal(r1.account, 'exec');
+    assert.match(r1.account, /^node:[0-9a-f]{12}$/);
     assert.equal(r1.face, 'messages');
     assert.equal(r1.bytesIn, Buffer.byteLength(reqBody1));
     assert.equal(r1.bytesOut, Buffer.byteLength(text1));
@@ -4595,4 +4610,878 @@ process.stdout.write(reply + '\\n');
     await new Promise((r) => srv.close(r));
     await new Promise((r) => upstream.close(r));
   }
+});
+
+/* ---------------- 15. {exec:...} credential account derivation & per-account spend caps */
+
+test('exec credential references derive stable non-secret account names for security (string and argv forms, any flag order) and non-security commands without running the command', () => {
+  // 1) Real /usr/bin/security find-generic-password form: any argument order, -s with or without -a, -w
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:/usr/bin/security find-generic-password -s claude-api-oai -w}' }),
+    'claude-api-oai',
+  );
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:/usr/bin/security find-generic-password -w -s claude-api-oai}' }),
+    'claude-api-oai',
+  );
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:/usr/bin/security find-generic-password -a hakki -s claude-api-oai -w}' }),
+    'claude-api-oai',
+  );
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:/usr/bin/security find-generic-password -w -s claude-api-oai -a hakki}' }),
+    'claude-api-oai',
+  );
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:/usr/bin/security find-generic-password -s claude-api-oai}' }),
+    'claude-api-oai',
+  );
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:/usr/bin/security find-generic-password -a hakki -s claude-api-oai}' }),
+    'claude-api-oai',
+  );
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:/usr/bin/security -q find-generic-password -ws claude-api-oai}' }),
+    'claude-api-oai',
+  );
+  // Object and argv-array forms ({ exec: "..." }, { exec: [...] }, and JSON argv inside {exec:[...]})
+  assert.equal(
+    credentialAccount({ apiKey: { exec: '/usr/bin/security find-generic-password -s claude-api-oai -w' } }),
+    'claude-api-oai',
+  );
+  assert.equal(
+    credentialAccount({
+      apiKey: { exec: ['/usr/bin/security', 'find-generic-password', '-w', '-a', 'hakki', '-s', 'claude-api-oai'] },
+    }),
+    'claude-api-oai',
+  );
+  assert.equal(
+    credentialAccount({
+      apiKey: { exec: ['/usr/bin/security', 'find-generic-password', '-s', 'claude-api-oai'] },
+    }),
+    'claude-api-oai',
+  );
+  assert.equal(
+    credentialAccount({
+      apiKey: '{exec:["/usr/bin/security","find-generic-password","-s","claude-api-oai","-w"]}',
+    }),
+    'claude-api-oai',
+  );
+
+  // 2) Two different keychain services give two distinct accounts
+  const acctPersonal = credentialAccount({
+    apiKey: '{exec:/usr/bin/security find-generic-password -a hakki -s claude-personal -w}',
+  });
+  const acctWork = credentialAccount({
+    apiKey: { exec: ['/usr/bin/security', 'find-generic-password', '-s', 'claude-work', '-w'] },
+  });
+  assert.equal(acctPersonal, 'claude-personal');
+  assert.equal(acctWork, 'claude-work');
+  assert.notEqual(acctPersonal, acctWork);
+
+  // 3) Non-security commands derive `<program basename>:<first 12 hex of HMAC-SHA256 of normalized argv>`
+  // with no argument text at all (including op:// paths, passphrases, or positional arguments)
+  const acctOp1 = credentialAccount({ apiKey: '{exec:op read op://Work/anthropic/credential}' }, { hmacKey: TEST_HMAC_KEY });
+  const acctOp2 = credentialAccount({ apiKey: '{exec:op read op://Personal/anthropic/credential}' }, { hmacKey: TEST_HMAC_KEY });
+  const expectedOp1 = `op:${expectedExecHmac('op\0read\0op://Work/anthropic/credential')}`;
+  const expectedOp2 = `op:${expectedExecHmac('op\0read\0op://Personal/anthropic/credential')}`;
+  assert.equal(acctOp1, expectedOp1);
+  assert.equal(acctOp2, expectedOp2);
+  assert.notEqual(acctOp1, acctOp2);
+  assert.ok(!acctOp1.includes('Work') && !acctOp1.includes('anthropic') && !acctOp1.includes('op://'));
+
+  const expectedPass = `pass:${expectedExecHmac('pass\0show\0anthropic/team-key')}`;
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:pass show anthropic/team-key}' }, { hmacKey: TEST_HMAC_KEY }),
+    expectedPass,
+  );
+  assert.equal(
+    credentialAccount({ apiKey: { exec: ['pass', 'show', 'anthropic/team-key'] } }, { hmacKey: TEST_HMAC_KEY }),
+    expectedPass,
+  );
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:sudo /bin/sh -c "/usr/bin/pass show anthropic/team-key"}' }, { hmacKey: TEST_HMAC_KEY }),
+    expectedPass,
+  );
+
+  // Never include any argument text (passphrases, PINs, plain words) and never run the command
+  for (const [cmd, forbidden] of [
+    ['gpg -d --passphrase hunter2 key.gpg', ['hunter2', 'key.gpg']],
+    ['openssl enc -d -k MyPassw0rd -in k.enc', ['MyPassw0rd', 'k.enc', 'enc']],
+    ['echo correcthorsebattery', ['correcthorsebattery']],
+    ['getkey 482913', ['482913']],
+  ]) {
+    const acct = credentialAccount({ apiKey: `{exec:${cmd}}` }, { hmacKey: TEST_HMAC_KEY });
+    const toks = cmd.split(' ');
+    const prog = toks[0];
+    const hmac12 = expectedExecHmac(toks.join('\0'));
+    assert.equal(acct, `${prog}:${hmac12}`);
+    // Must not match unkeyed sha256 either
+    const plainSha = crypto.createHash('sha256').update(cmd).digest('hex').slice(0, 8);
+    assert.ok(!acct.endsWith(plainSha));
+    for (const word of forbidden) {
+      assert.ok(!acct.includes(word), `account "${acct}" must not contain "${word}"`);
+    }
+  }
+
+  const sentinelPath = path.join(tmpDir, 'must-never-be-created-by-credentialAccount');
+  const dangerousAccount = credentialAccount({
+    apiKey: `{exec:/bin/sh -c "touch ${sentinelPath}" sk-ant-api03-SUPERSECRET9999999999}`,
+  }, { hmacKey: TEST_HMAC_KEY });
+  assert.equal(fs.existsSync(sentinelPath), false, 'credentialAccount must never execute the command');
+  assert.match(dangerousAccount, /^touch:[0-9a-f]{12}$/);
+  assert.ok(!String(dangerousAccount).includes('SUPERSECRET'), 'credentialAccount must never include secret-looking args');
+
+  // env, file, and plain literal references remain unchanged
+  assert.equal(credentialAccount({ apiKey: '{env:ANTHROPIC_API_KEY}' }), 'ANTHROPIC_API_KEY');
+  assert.equal(credentialAccount({ apiKey: '{file:~/.config/keys/claude.key}' }), 'claude.key');
+  assert.equal(credentialAccount({ apiKey: SECRET_LITERAL_VAL }), null);
+});
+
+test('exec account HMAC key is generated once per install in dataDir (32 bytes, mode 0600, atomic, never logged) and produces <program>:<hmac12> under an injected or per-install key', () => {
+  const dirA = fs.mkdtempSync(path.join(tmpDir, 'hmac-install-a-'));
+  const dirB = fs.mkdtempSync(path.join(tmpDir, 'hmac-install-b-'));
+
+  // 1) First use in dirA atomically creates a 32-byte key file with mode 0600
+  const acctA1 = credentialAccount({ apiKey: '{exec:getkey 482913}' }, { dataDir: dirA });
+  const keyFileA = path.join(dirA, 'account-hmac.key');
+  assert.equal(fs.existsSync(keyFileA), true, 'account-hmac.key must be created in dataDir on first use');
+  const statA = fs.statSync(keyFileA);
+  assert.equal(statA.size, 32, 'HMAC key must be 32 random bytes');
+  assert.equal(statA.mode & 0o777, 0o600, 'HMAC key file must have mode 0600');
+  const keyBytesA = fs.readFileSync(keyFileA);
+  assert.equal(acctA1, `getkey:${expectedExecHmac('getkey\x00482913', keyBytesA)}`);
+  assert.match(acctA1, /^getkey:[0-9a-f]{12}$/);
+
+  // 2) Subsequent calls in the same install reuse the same key and never overwrite it
+  const acctA2 = credentialAccount({ apiKey: '{exec:getkey 482913}' }, { dataDir: dirA });
+  assert.equal(acctA2, acctA1);
+  assert.deepEqual(fs.readFileSync(keyFileA), keyBytesA);
+
+  // 3) A different install directory gets a different random 32-byte key -> different digest
+  const acctB = credentialAccount({ apiKey: '{exec:getkey 482913}' }, { dataDir: dirB });
+  assert.match(acctB, /^getkey:[0-9a-f]{12}$/);
+  assert.notEqual(acctA1, acctB, 'different install keys must produce different HMAC digests');
+
+  // 4) Injected key overrides on-disk key and is never logged
+  const customKey = crypto.randomBytes(32);
+  const acctCustom = credentialAccount({ apiKey: '{exec:getkey 482913}' }, { hmacKey: customKey, dataDir: dirA });
+  assert.equal(acctCustom, `getkey:${expectedExecHmac('getkey\x00482913', customKey)}`);
+  assert.notEqual(acctCustom, acctA1);
+});
+
+test('unknown wrapper flags on sudo, env, nice, command, exec, or nohup stop name derivation and fall back to exec:<hmac12> instead of shifting onto the flag value', () => {
+  for (const cmd of [
+    'sudo -p "Password:" pass show x',
+    'sudo -g grp pass show x',
+    'sudo -C 3 pass show x',
+    'env -S "pass show x"',
+    'nice -n',
+    'command -v pass',
+    'nohup -x pass show x',
+    'exec -p pass show x',
+    'sudo -p security find-generic-password -s should-not-extract -w',
+  ]) {
+    const acct = credentialAccount({ apiKey: `{exec:${cmd}}` }, { hmacKey: TEST_HMAC_KEY });
+    assert.match(
+      acct,
+      /^exec:[0-9a-f]{12}$/,
+      `expected exec:<hmac12> for "${cmd}", got "${acct}"`,
+    );
+    assert.ok(!acct.includes('Password') && !acct.includes('grp') && !acct.includes('should-not-extract'));
+  }
+
+  // Known wrapper flags with known arity still unwrap to the underlying program
+  const expectedPass = `pass:${expectedExecHmac('pass\0show\0x')}`;
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:sudo -u root pass show x}' }, { hmacKey: TEST_HMAC_KEY }),
+    expectedPass,
+  );
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:env -i -u OLD_KEY pass show x}' }, { hmacKey: TEST_HMAC_KEY }),
+    expectedPass,
+  );
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:nice -n 5 pass show x}' }, { hmacKey: TEST_HMAC_KEY }),
+    expectedPass,
+  );
+});
+
+test('exec HMAC input normalizes program to basename, keeps a | b and a b distinct, and retains leading VAR=value assignments', () => {
+  // 1) Program path is normalized to its basename before hashing
+  const barePass = credentialAccount({ apiKey: '{exec:pass show anthropic/key}' }, { hmacKey: TEST_HMAC_KEY });
+  const usrBinPass = credentialAccount({ apiKey: '{exec:/usr/bin/pass show anthropic/key}' }, { hmacKey: TEST_HMAC_KEY });
+  const homebrewPass = credentialAccount({ apiKey: '{exec:/opt/homebrew/bin/pass show anthropic/key}' }, { hmacKey: TEST_HMAC_KEY });
+  assert.equal(barePass, `pass:${expectedExecHmac('pass\0show\0anthropic/key')}`);
+  assert.equal(usrBinPass, barePass);
+  assert.equal(homebrewPass, barePass);
+
+  // 2) Pipeline/chained segments `a | b` and single command `a b` (or `a "|" b`) hash distinctly
+  const piped = credentialAccount({ apiKey: '{exec:a | b}' }, { hmacKey: TEST_HMAC_KEY });
+  const spaced = credentialAccount({ apiKey: '{exec:a b}' }, { hmacKey: TEST_HMAC_KEY });
+  const literalPipe = credentialAccount({ apiKey: '{exec:a "|" b}' }, { hmacKey: TEST_HMAC_KEY });
+  assert.match(piped, /^a:[0-9a-f]{12}$/);
+  assert.match(spaced, /^a:[0-9a-f]{12}$/);
+  assert.notEqual(piped, spaced, 'a | b and a b must not hash the same');
+  assert.notEqual(piped, literalPipe, 'a | b and a "|" b must not hash the same');
+
+  // 3) Leading VAR=value assignments are kept inside the HMAC input so different stores/envs do not collide
+  const workStore = credentialAccount(
+    { apiKey: '{exec:PASSWORD_STORE_DIR=/work /usr/bin/pass show k}' },
+    { hmacKey: TEST_HMAC_KEY },
+  );
+  const homeStore = credentialAccount(
+    { apiKey: '{exec:PASSWORD_STORE_DIR=/home pass show k}' },
+    { hmacKey: TEST_HMAC_KEY },
+  );
+  const defaultStore = credentialAccount(
+    { apiKey: '{exec:pass show k}' },
+    { hmacKey: TEST_HMAC_KEY },
+  );
+  assert.equal(workStore, `pass:${expectedExecHmac('PASSWORD_STORE_DIR=/work\0pass\0show\0k')}`);
+  assert.equal(homeStore, `pass:${expectedExecHmac('PASSWORD_STORE_DIR=/home\0pass\0show\0k')}`);
+  assert.equal(defaultStore, `pass:${expectedExecHmac('pass\0show\0k')}`);
+  assert.notEqual(workStore, homeStore);
+  assert.notEqual(workStore, defaultStore);
+});
+
+test('security find-generic-password and find-internet-password use only -s and fall back to security:<hmac12> when -s is absent (never -l or -a)', () => {
+  assert.equal(
+    credentialAccount({ apiKey: '{exec:/usr/bin/security find-internet-password -a hakki -s claude-web -w}' }, { hmacKey: TEST_HMAC_KEY }),
+    'claude-web',
+  );
+  const noServiceA = credentialAccount({
+    apiKey: '{exec:/usr/bin/security find-generic-password -a hakki -w}',
+  }, { hmacKey: TEST_HMAC_KEY });
+  const noServiceL = credentialAccount({
+    apiKey: '{exec:/usr/bin/security find-generic-password -l my-label -a hakki -w}',
+  }, { hmacKey: TEST_HMAC_KEY });
+  const noServiceInternet = credentialAccount({
+    apiKey: '{exec:/usr/bin/security find-internet-password -a hakki -w}',
+  }, { hmacKey: TEST_HMAC_KEY });
+  assert.match(noServiceA, /^security:[0-9a-f]{12}$/);
+  assert.match(noServiceL, /^security:[0-9a-f]{12}$/);
+  assert.match(noServiceInternet, /^security:[0-9a-f]{12}$/);
+  assert.ok(!noServiceA.includes('hakki'));
+  assert.ok(!noServiceL.includes('my-label') && !noServiceL.includes('hakki'));
+  assert.notEqual(noServiceA, noServiceL);
+  assert.notEqual(noServiceA, noServiceInternet);
+});
+
+test('resolveSecret keeps its original string-only contract and prepareAdapter does not JSON-serialize object refs in its error', () => {
+  assert.throws(
+    () => resolveSecret({ exec: ['echo', 'secret'] }),
+    /secret must be a string reference/,
+  );
+  assert.throws(
+    () => resolveSecret(['echo', 'secret']),
+    /secret must be a string reference/,
+  );
+  assert.throws(
+    () =>
+      prepareAdapter('bad-obj', {
+        kind: 'http',
+        baseUrl: 'https://api.anthropic.com/v1',
+        apiKey: { exec: ['false'] },
+      }),
+    /apiKey reference: secret must be a string reference/,
+  );
+  assert.throws(
+    () =>
+      prepareAdapter('bad-exec', {
+        kind: 'http',
+        baseUrl: 'https://api.anthropic.com/v1',
+        apiKey: '{exec:false}',
+      }),
+    /no credentials \(\{exec:false\}\)/,
+  );
+});
+
+test('migration warning: keysmith doctor and gateway/serve startup warn once when limits.spend or recent usage is keyed on "exec", naming only exec-backed accounts', () => {
+  const migDir = fs.mkdtempSync(path.join(tmpDir, 'exec-mig-'));
+  fs.writeFileSync(path.join(migDir, 'account-hmac.key'), TEST_HMAC_KEY, { mode: 0o600 });
+  const usageFile = path.join(migDir, 'usage.jsonl');
+  const cfgPath = path.join(migDir, 'config.json');
+  const nowMs = Date.parse('2026-10-22T12:00:00.000Z');
+  const passAccount = `pass:${expectedExecHmac('pass\0show\0anthropic/b')}`;
+
+  const prevData = process.env.KEYSMITH_DATA;
+  process.env.KEYSMITH_DATA = migDir;
+  try {
+    // 1) Spend cap keyed on "exec" warns once on Gateway startup and in `keysmith doctor`, naming only exec-backed adapters
+    const capCfg = {
+      auth: { enabled: true, keys: [{ key: KEY_ADA, label: 'ada' }] },
+      limits: {
+        spend: {
+          exec: 25,
+        },
+      },
+      adapters: {
+        'claude-api-oai': {
+          kind: 'http',
+          wire: 'openai',
+          baseUrl: 'http://127.0.0.1:1/v1',
+          apiKey: '{exec:/usr/bin/security find-generic-password -w -s claude-svc-a}',
+          _apiKey: SECRET_EXEC_VAL,
+          _apiKeyResolved: true,
+          models: ['claude-sonnet-5-5'],
+        },
+        'claude-api-b': {
+          kind: 'http',
+          wire: 'openai',
+          baseUrl: 'http://127.0.0.1:1/v1',
+          apiKey: '{exec:pass show anthropic/b}',
+          _apiKey: SECRET_EXEC_VAL,
+          _apiKeyResolved: true,
+          models: ['claude-sonnet-5-5'],
+        },
+        'openai-env': {
+          kind: 'http',
+          wire: 'openai',
+          baseUrl: 'http://127.0.0.1:1/v1',
+          apiKey: '{env:KEYSMITH_AUDIT_TEST_KEY}',
+          models: ['gpt-5-mini'],
+        },
+      },
+      aliases: {},
+    };
+
+    const capLogs = [];
+    const uCap = new UsageLog(usageFile, { now: () => nowMs });
+    const gwCap = new Gateway(capCfg, { usage: uCap, log: (m) => capLogs.push(m) });
+    const migCapWarnings = capLogs.filter((m) => m.includes('"exec"') && m.includes('claude-svc-a') && m.includes(passAccount));
+    assert.equal(migCapWarnings.length, 1, `expected exactly one startup migration warning for spend cap, got: ${JSON.stringify(capLogs)}`);
+    assert.ok(!migCapWarnings[0].includes('KEYSMITH_AUDIT_TEST_KEY'), 'migration warning must not list {env:...} adapters');
+    // Subsequent spend checks do not re-emit the startup warning
+    gwCap.checkSpend(gwCap.adapters.get('claude-api-oai'), 'claude-sonnet-5-5');
+    assert.equal(
+      capLogs.filter((m) => m.includes('"exec"') && m.includes('claude-svc-a')).length,
+      1,
+      'startup migration warning is emitted only once',
+    );
+
+    fs.writeFileSync(cfgPath, JSON.stringify(capCfg), { mode: 0o600 });
+    const cliEnv = {
+      ...process.env,
+      PATH: '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+      KEYSMITH_DATA: migDir,
+      KEYSMITH_CONFIG: cfgPath,
+    };
+    const docCap = spawnSync(process.execPath, [CLI_PATH, 'doctor'], { env: cliEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.equal(docCap.status, 0, docCap.stderr);
+    assert.ok(
+      docCap.stdout.includes('"exec"') && docCap.stdout.includes('claude-svc-a') && docCap.stdout.includes(passAccount),
+      `doctor output should warn about "exec" cap and name claude-svc-a and ${passAccount}, got:\n${docCap.stdout}`,
+    );
+    assert.ok(!docCap.stdout.includes('KEYSMITH_AUDIT_TEST_KEY'), 'doctor migration warning must not list {env:...} adapters');
+
+    // 2) Recent usage row keyed on account "exec" (even without a limits.spend.exec cap) warns immediately on Gateway startup and in doctor
+    const rowCfg = {
+      ...capCfg,
+      limits: {},
+    };
+    fs.writeFileSync(
+      usageFile,
+      JSON.stringify({
+        ts: '2026-10-22T10:00:00.000Z',
+        adapter: 'claude-api-oai',
+        kind: 'http',
+        account: 'exec',
+        model: 'claude-api-oai/claude-sonnet-5-5',
+        status: 'ok',
+        ms: 20,
+        usage: { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0 },
+        cost: { usd: 0.007, basis: 'metered' },
+      }) + '\n',
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(cfgPath, JSON.stringify(rowCfg), { mode: 0o600 });
+
+    const rowLogs = [];
+    const uRow = new UsageLog(usageFile, { now: () => nowMs });
+    new Gateway(rowCfg, { usage: uRow, log: (m) => rowLogs.push(m) });
+    const migRowWarnings = rowLogs.filter((m) => m.includes('"exec"') && m.includes('claude-svc-a') && m.includes(passAccount));
+    assert.equal(migRowWarnings.length, 1, `expected startup migration warning for recent usage on "exec" even without limits.spend, got: ${JSON.stringify(rowLogs)}`);
+
+    const docRow = spawnSync(process.execPath, [CLI_PATH, 'doctor'], { env: cliEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.equal(docRow.status, 0, docRow.stderr);
+    assert.ok(
+      docRow.stdout.includes('"exec"') && docRow.stdout.includes('claude-svc-a') && docRow.stdout.includes(passAccount),
+      `doctor output should warn about recent "exec" usage and name claude-svc-a and ${passAccount}, got:\n${docRow.stdout}`,
+    );
+  } finally {
+    process.env.KEYSMITH_DATA = prevData;
+  }
+});
+
+test('spend-cap accounting keys on the derived exec account names for both security services and non-security commands', () => {
+  const caseDir = fs.mkdtempSync(path.join(tmpDir, 'exec-acct-cap-'));
+  fs.writeFileSync(path.join(caseDir, 'account-hmac.key'), TEST_HMAC_KEY, { mode: 0o600 });
+  const usageFile = path.join(caseDir, 'usage.jsonl');
+  const nowMs = Date.parse('2026-10-22T12:00:00.000Z');
+  const passAccount = `pass:${expectedExecHmac('pass\0show\0anthropic/b')}`;
+
+  const prevData = process.env.KEYSMITH_DATA;
+  process.env.KEYSMITH_DATA = caseDir;
+  try {
+    // Cap `claude-svc-a` and `pass:<hmac12>` at $0.007 (1 request each) so we verify
+    // they do not collapse into a shared "exec" bucket and each cap keys on its own derived name.
+    const cfg = {
+      auth: { enabled: true, keys: [{ key: KEY_ADA, label: 'ada' }] },
+      limits: {
+        spend: {
+          'claude-svc-a': 0.007,
+          [passAccount]: 0.007,
+        },
+      },
+      adapters: {
+        'claude-api-oai': {
+          kind: 'http',
+          wire: 'openai',
+          baseUrl: 'https://api.anthropic.com/v1',
+          apiKey: '{exec:/usr/bin/security find-generic-password -w -s claude-svc-a}',
+          _apiKey: SECRET_EXEC_VAL,
+          _apiKeyResolved: true,
+          models: ['claude-sonnet-5-5'],
+        },
+        'claude-api-b': {
+          kind: 'http',
+          wire: 'openai',
+          baseUrl: 'https://api.anthropic.com/v1',
+          apiKey: '{exec:pass show anthropic/b}',
+          _apiKey: SECRET_EXEC_VAL,
+          _apiKeyResolved: true,
+          models: ['claude-sonnet-5-5'],
+        },
+      },
+      aliases: {},
+    };
+
+    const u = new UsageLog(usageFile, { now: () => nowMs });
+    const gw = new Gateway(cfg, { usage: u });
+    const adapterA = gw.adapters.get('claude-api-oai');
+    const adapterB = gw.adapters.get('claude-api-b');
+    assert.ok(adapterA, 'claude-api-oai loaded');
+    assert.ok(adapterB, 'claude-api-b loaded');
+    assert.equal(adapterA.account, 'claude-svc-a');
+    assert.equal(adapterB.account, passAccount);
+
+    // 1) Before any spend, both adapters pass checkSpend
+    gw.checkSpend(adapterA, 'claude-sonnet-5-5');
+    gw.checkSpend(adapterB, 'claude-sonnet-5-5');
+
+    // 2) Record $0.007 metered spend on claude-api-oai (account: "claude-svc-a")
+    u.record({
+      model: 'claude-api-oai/claude-sonnet-5-5',
+      adapter: adapterA.id,
+      kind: adapterA.kind,
+      host: adapterA.host,
+      account: adapterA.account,
+      face: 'chat',
+      status: 'ok',
+      ms: 12,
+      usage: { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0 },
+      cost: { usd: 0.007, basis: 'metered' },
+    });
+
+    // 3) claude-api-oai now hits its `claude-svc-a` account cap (429), while claude-api-b is still uncapped
+    assert.throws(
+      () => gw.checkSpend(adapterA, 'claude-sonnet-5-5'),
+      (err) => err.status === 429 && /account "claude-svc-a"/.test(err.message),
+    );
+    gw.checkSpend(adapterB, 'claude-sonnet-5-5');
+
+    // 4) Record $0.007 metered spend on claude-api-b (account: passAccount)
+    u.record({
+      model: 'claude-api-b/claude-sonnet-5-5',
+      adapter: adapterB.id,
+      kind: adapterB.kind,
+      host: adapterB.host,
+      account: adapterB.account,
+      face: 'chat',
+      status: 'ok',
+      ms: 15,
+      usage: { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0 },
+      cost: { usd: 0.007, basis: 'metered' },
+    });
+
+    assert.throws(
+      () => gw.checkSpend(adapterB, 'claude-sonnet-5-5'),
+      (err) => err.status === 429 && err.message.includes(`account "${passAccount}"`),
+    );
+
+    const rows = u.readAll();
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].account, 'claude-svc-a');
+    assert.equal(rows[1].account, passAccount);
+    assert.equal(u.spendFor({ account: 'claude-svc-a' }), 0.007);
+    assert.equal(u.spendFor({ account: passAccount }), 0.007);
+    assert.equal(u.spendFor({ account: 'exec' }), 0);
+  } finally {
+    process.env.KEYSMITH_DATA = prevData;
+  }
+});
+
+test('HMAC key is loaded once per process and cached without statSync per call, keeps adapter and reachableAccounts consistent if the file changes on disk, and ignores cfg.hmacKey', async () => {
+  const cacheDir = fs.mkdtempSync(path.join(tmpDir, 'hmac-cache-once-'));
+  const keyFile = path.join(cacheDir, 'account-hmac.key');
+  const initialKey = crypto.randomBytes(32);
+  fs.writeFileSync(keyFile, initialKey, { mode: 0o600 });
+
+  const prevData = process.env.KEYSMITH_DATA;
+  process.env.KEYSMITH_DATA = cacheDir;
+  try {
+    const expectedAcct = `pass:${expectedExecHmac('pass\x00show\x00anthropic/b', initialKey)}`;
+
+    // 1) First call loads and caches the key for this process
+    assert.equal(credentialAccount({ apiKey: '{exec:pass show anthropic/b}' }), expectedAcct);
+
+    // 2) Config fields hmacKey / _hmacKey on the adapter object are ignored (only opts parameter is accepted)
+    const rogueKey = crypto.randomBytes(32);
+    assert.equal(
+      credentialAccount({ apiKey: '{exec:pass show anthropic/b}', hmacKey: rogueKey, _hmacKey: rogueKey }),
+      expectedAcct,
+      'cfg.hmacKey and cfg._hmacKey on an adapter config must be ignored',
+    );
+
+    // 3) Subsequent credentialAccount calls do not call fs.statSync or fs.readFileSync on account-hmac.key
+    let keyStatCalls = 0;
+    const origStat = fs.statSync;
+    fs.statSync = function (p, ...rest) {
+      if (String(p).endsWith('account-hmac.key')) keyStatCalls++;
+      return origStat.call(this, p, ...rest);
+    };
+    try {
+      for (let i = 0; i < 50; i++) {
+        assert.equal(credentialAccount({ apiKey: '{exec:pass show anthropic/b}' }), expectedAcct);
+      }
+      assert.equal(keyStatCalls, 0, 'cached HMAC key must not stat account-hmac.key on every credentialAccount call');
+    } finally {
+      fs.statSync = origStat;
+    }
+
+    // 4) Even if account-hmac.key is replaced or unlinked on disk while the process runs,
+    // adapter.account and reachableAccounts (/v1/keysmith/routes) keep using the same cached key
+    const cfg = {
+      auth: {
+        enabled: true,
+        keys: [{ key: KEY_BOB, label: 'bob', allow: ['claude-api-b'] }],
+      },
+      limits: {
+        spend: {
+          [expectedAcct]: 20,
+        },
+      },
+      adapters: {
+        'claude-api-b': {
+          kind: 'http',
+          wire: 'openai',
+          baseUrl: 'http://127.0.0.1:1/v1',
+          apiKey: '{exec:pass show anthropic/b}',
+          _apiKey: SECRET_EXEC_VAL,
+          _apiKeyResolved: true,
+          models: ['claude-sonnet-5-5'],
+        },
+      },
+      aliases: {},
+    };
+    const u = new UsageLog(path.join(cacheDir, 'usage.jsonl'));
+    const gw = new Gateway(cfg, { usage: u });
+    const srv = createServer(gw, cfg, { usage: u });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    try {
+      // Replace the file on disk with a different inode & key mid-run
+      fs.unlinkSync(keyFile);
+      fs.writeFileSync(keyFile, crypto.randomBytes(32), { mode: 0o600 });
+
+      const port = srv.address().port;
+      const res = await fetch(`http://127.0.0.1:${port}/v1/keysmith/routes`, {
+        headers: { authorization: `Bearer ${KEY_BOB}` },
+      });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(gw.adapters.get('claude-api-b').account, expectedAcct);
+      assert.equal(body.limits?.spend?.[expectedAcct], 20, 'reachableAccounts on /routes must use the same cached key as adapter.account');
+    } finally {
+      srv.closeAllConnections?.();
+      await new Promise((r) => srv.close(r));
+    }
+  } finally {
+    process.env.KEYSMITH_DATA = prevData;
+  }
+});
+
+test('unreadable or uncreatable HMAC key file never falls back silently: credentialAccount throws, serve refuses to start naming path and errno, and doctor reports the failure', () => {
+  const badDir = fs.mkdtempSync(path.join(tmpDir, 'hmac-unreadable-'));
+  const keyFile = path.join(badDir, 'account-hmac.key');
+  // Put a directory at account-hmac.key so reading/opening it fails deterministically with EISDIR even under root
+  fs.mkdirSync(keyFile, { mode: 0o700 });
+
+  assert.throws(
+    () => credentialAccount({ apiKey: '{exec:pass show anthropic/b}' }, { dataDir: badDir }),
+    (err) => err.message.includes(keyFile) && /EISDIR/.test(err.message),
+    'credentialAccount must throw naming path and errno instead of falling back silently',
+  );
+
+  const cfgPath = path.join(badDir, 'config.json');
+  const cfg = {
+    auth: { enabled: true, keys: [{ key: KEY_ADA, label: 'ada' }] },
+    adapters: {
+      'claude-api-b': {
+        kind: 'http',
+        wire: 'openai',
+        baseUrl: 'http://127.0.0.1:1/v1',
+        apiKey: '{exec:echo sk-test-key-123456}',
+        models: ['claude-sonnet-5-5'],
+      },
+    },
+    aliases: {},
+  };
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg), { mode: 0o600 });
+
+  const cliEnv = {
+    ...process.env,
+    PATH: '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+    KEYSMITH_DATA: badDir,
+    KEYSMITH_CONFIG: cfgPath,
+  };
+
+  // `keysmith serve` refuses to start with a clear error naming the path and errno
+  const serveRun = spawnSync(process.execPath, [CLI_PATH, 'serve', '--port', '0'], {
+    env: cliEnv,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  assert.notEqual(serveRun.status, 0, 'serve must refuse to start when account-hmac.key cannot be read');
+  assert.ok(
+    serveRun.stderr.includes(keyFile) && /EISDIR/.test(serveRun.stderr),
+    `serve stderr should name ${keyFile} and EISDIR, got:\n${serveRun.stderr}`,
+  );
+
+  // `keysmith doctor` reports it as a failure (✗) naming the path and errno
+  const docRun = spawnSync(process.execPath, [CLI_PATH, 'doctor'], {
+    env: cliEnv,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  assert.ok(
+    docRun.stdout.includes('✗') && docRun.stdout.includes(keyFile) && /EISDIR/.test(docRun.stdout),
+    `doctor output should report failure with ✗, ${keyFile}, and EISDIR, got:\n${docRun.stdout}`,
+  );
+});
+
+test('short or invalid account-hmac.key (< 32 bytes) is never overwritten and fails loudly in credentialAccount, serve, and doctor; missing key uses O_EXCL when hard links are unsupported', () => {
+  const shortDir = fs.mkdtempSync(path.join(tmpDir, 'hmac-short-'));
+  const keyFile = path.join(shortDir, 'account-hmac.key');
+  const shortBytes = Buffer.from('short-10b!');
+  fs.writeFileSync(keyFile, shortBytes, { mode: 0o600 });
+
+  // 1) credentialAccount throws and does NOT overwrite the short file
+  assert.throws(
+    () => credentialAccount({ apiKey: '{exec:pass show anthropic/b}' }, { dataDir: shortDir }),
+    (err) => err.message.includes(keyFile) && /EINVAL|32/.test(err.message),
+    'credentialAccount must refuse a key file smaller than 32 bytes',
+  );
+  assert.deepEqual(fs.readFileSync(keyFile), shortBytes, 'short account-hmac.key must never be overwritten');
+
+  const cfgPath = path.join(shortDir, 'config.json');
+  const cfg = {
+    auth: { enabled: true, keys: [{ key: KEY_ADA, label: 'ada' }] },
+    adapters: {
+      'claude-api-b': {
+        kind: 'http',
+        wire: 'openai',
+        baseUrl: 'http://127.0.0.1:1/v1',
+        apiKey: '{exec:echo sk-test-key-123456}',
+        models: ['claude-sonnet-5-5'],
+      },
+    },
+    aliases: {},
+  };
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg), { mode: 0o600 });
+  const cliEnv = {
+    ...process.env,
+    PATH: '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+    KEYSMITH_DATA: shortDir,
+    KEYSMITH_CONFIG: cfgPath,
+  };
+
+  // 2) serve refuses to start and leaves the short file untouched
+  const serveRun = spawnSync(process.execPath, [CLI_PATH, 'serve', '--port', '0'], {
+    env: cliEnv,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  assert.notEqual(serveRun.status, 0);
+  assert.ok(serveRun.stderr.includes(keyFile) && /EINVAL|32/.test(serveRun.stderr), serveRun.stderr);
+  assert.deepEqual(fs.readFileSync(keyFile), shortBytes, 'serve must not overwrite short account-hmac.key');
+
+  // 3) doctor reports the failure and leaves the short file untouched
+  const docRun = spawnSync(process.execPath, [CLI_PATH, 'doctor'], {
+    env: cliEnv,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  assert.ok(docRun.stdout.includes('✗') && docRun.stdout.includes(keyFile) && /EINVAL|32/.test(docRun.stdout), docRun.stdout);
+  assert.deepEqual(fs.readFileSync(keyFile), shortBytes, 'doctor must not overwrite short account-hmac.key');
+
+  // 4) On a filesystem where hard links fail with ENOTSUP, missing key creation uses O_CREAT | O_EXCL (mode 0600)
+  const noLinkDir = fs.mkdtempSync(path.join(tmpDir, 'hmac-nolink-'));
+  const origLink = fs.linkSync;
+  fs.linkSync = function () {
+    const err = new Error('operation not supported');
+    err.code = 'ENOTSUP';
+    throw err;
+  };
+  try {
+    const acct = credentialAccount({ apiKey: '{exec:pass show anthropic/b}' }, { dataDir: noLinkDir });
+    const createdKeyFile = path.join(noLinkDir, 'account-hmac.key');
+    const st = fs.statSync(createdKeyFile);
+    assert.equal(st.size, 32);
+    assert.equal(st.mode & 0o777, 0o600);
+    const k = fs.readFileSync(createdKeyFile);
+    assert.equal(acct, `pass:${expectedExecHmac('pass\x00show\x00anthropic/b', k)}`);
+  } finally {
+    fs.linkSync = origLink;
+  }
+});
+
+test('doctor and gateway startup warn when a limits.spend target matches <program>:<hmac12> but no configured adapter derives that name', () => {
+  const staleDir = fs.mkdtempSync(path.join(tmpDir, 'hmac-stale-cap-'));
+  fs.writeFileSync(path.join(staleDir, 'account-hmac.key'), TEST_HMAC_KEY, { mode: 0o600 });
+  const usageFile = path.join(staleDir, 'usage.jsonl');
+  const cfgPath = path.join(staleDir, 'config.json');
+  const nowMs = Date.parse('2026-10-22T12:00:00.000Z');
+  const currentPassAccount = `pass:${expectedExecHmac('pass\x00show\x00anthropic/b')}`;
+  const stalePassAccount = 'pass:0123456789ab';
+  assert.notEqual(currentPassAccount, stalePassAccount);
+
+  const prevData = process.env.KEYSMITH_DATA;
+  process.env.KEYSMITH_DATA = staleDir;
+  try {
+    const cfg = {
+      auth: { enabled: true, keys: [{ key: KEY_ADA, label: 'ada' }] },
+      limits: {
+        spend: {
+          [stalePassAccount]: 25,
+        },
+      },
+      adapters: {
+        'claude-api-b': {
+          kind: 'http',
+          wire: 'openai',
+          baseUrl: 'http://127.0.0.1:1/v1',
+          apiKey: '{exec:pass show anthropic/b}',
+          _apiKey: SECRET_EXEC_VAL,
+          _apiKeyResolved: true,
+          models: ['claude-sonnet-5-5'],
+        },
+      },
+      aliases: {},
+    };
+
+    const logs = [];
+    const u = new UsageLog(usageFile, { now: () => nowMs });
+    new Gateway(cfg, { usage: u, log: (m) => logs.push(m) });
+    const matched = logs.filter((m) => m.includes(stalePassAccount) && m.includes(currentPassAccount));
+    assert.equal(matched.length, 1, `expected startup warning naming stale ${stalePassAccount} and current ${currentPassAccount}, got: ${JSON.stringify(logs)}`);
+
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg), { mode: 0o600 });
+    const cliEnv = {
+      ...process.env,
+      PATH: '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+      KEYSMITH_DATA: staleDir,
+      KEYSMITH_CONFIG: cfgPath,
+    };
+    const docRun = spawnSync(process.execPath, [CLI_PATH, 'doctor'], {
+      env: cliEnv,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(docRun.status, 0, docRun.stderr);
+    assert.ok(
+      docRun.stdout.includes(stalePassAccount) && docRun.stdout.includes(currentPassAccount),
+      `doctor output should warn about unmatched HMAC spend cap ${stalePassAccount} and name ${currentPassAccount}, got:\n${docRun.stdout}`,
+    );
+
+    // When limits.spend uses the current derived account name, no warning is emitted
+    const validCfg = { ...cfg, limits: { spend: { [currentPassAccount]: 25 } } };
+    assert.deepEqual(execAccountMigrationWarnings(validCfg, u, { checkDisk: true }), []);
+  } finally {
+    process.env.KEYSMITH_DATA = prevData;
+  }
+});
+
+test('hasExecAccountUsage caches no-exec-rows result per month file by size and mtime so subsequent startup and doctor checks do not re-read the log file', () => {
+  const scanDir = fs.mkdtempSync(path.join(tmpDir, 'exec-scan-cache-'));
+  fs.writeFileSync(path.join(scanDir, 'account-hmac.key'), TEST_HMAC_KEY, { mode: 0o600 });
+  const usageFile = path.join(scanDir, 'usage.jsonl');
+  const nowMs = Date.parse('2026-10-22T12:00:00.000Z');
+
+  const cleanRow = JSON.stringify({
+    ts: '2026-10-22T10:00:00.000Z',
+    adapter: 'claude-api-oai',
+    kind: 'http',
+    account: 'claude-svc-a',
+    model: 'claude-api-oai/claude-sonnet-5-5',
+    status: 'ok',
+    ms: 20,
+    usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0 },
+    cost: { usd: 0.001, basis: 'metered' },
+  });
+  fs.writeFileSync(usageFile, Array.from({ length: 200 }, () => cleanRow).join('\n') + '\n', { mode: 0o600 });
+
+  const cfg = {
+    auth: { enabled: true, keys: [{ key: KEY_ADA, label: 'ada' }] },
+    limits: {},
+    adapters: {
+      'claude-api-oai': {
+        kind: 'http',
+        wire: 'openai',
+        baseUrl: 'http://127.0.0.1:1/v1',
+        apiKey: '{exec:/usr/bin/security find-generic-password -w -s claude-svc-a}',
+        _apiKey: SECRET_EXEC_VAL,
+        _apiKeyResolved: true,
+        models: ['claude-sonnet-5-5'],
+      },
+    },
+    aliases: {},
+  };
+
+  // 1) First check scans usage.jsonl and caches "no exec rows" for its (size, mtimeMs)
+  const u1 = new UsageLog(usageFile, { now: () => nowMs });
+  assert.deepEqual(execAccountMigrationWarnings(cfg, u1, { checkDisk: true, dataDir: scanDir }), []);
+
+  // 2) Subsequent checks on a fresh UsageLog instance (and persisted on-disk cache) do not open usage.jsonl
+  let usageOpenCalls = 0;
+  const origOpen = fs.openSync;
+  fs.openSync = function (p, ...rest) {
+    if (String(p) === usageFile) usageOpenCalls++;
+    return origOpen.call(this, p, ...rest);
+  };
+  try {
+    const u2 = new UsageLog(usageFile, { now: () => nowMs });
+    assert.deepEqual(execAccountMigrationWarnings(cfg, u2, { checkDisk: true, dataDir: scanDir }), []);
+    assert.equal(usageOpenCalls, 0, 'cached (size, mtime) must skip re-opening usage.jsonl when nothing changed');
+  } finally {
+    fs.openSync = origOpen;
+  }
+
+  // 3) Appending an "exec" row changes size/mtime, invalidating the cache and triggering the migration warning
+  const execRow = JSON.stringify({
+    ts: '2026-10-22T11:00:00.000Z',
+    adapter: 'claude-api-oai',
+    kind: 'http',
+    account: 'exec',
+    model: 'claude-api-oai/claude-sonnet-5-5',
+    status: 'ok',
+    ms: 20,
+    usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0 },
+    cost: { usd: 0.001, basis: 'metered' },
+  });
+  fs.appendFileSync(usageFile, execRow + '\n');
+  const u3 = new UsageLog(usageFile, { now: () => nowMs });
+  const warnings = execAccountMigrationWarnings(cfg, u3, { checkDisk: true, dataDir: scanDir });
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /recent usage rows are keyed on account "exec"/);
 });

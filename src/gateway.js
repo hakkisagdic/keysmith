@@ -11,7 +11,7 @@ import { addUsage } from './tools/emulate.js';
 import { McpBridge } from './bridge/index.js';
 import { DRIVERS } from './bridge/drivers.js';
 import { resolveEffort, suffixedIds } from './effort.js';
-import { credentialAccount, fmtUsd, hostOf } from './usage.js';
+import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExecCredentialAdapter } from './usage.js';
 
 /**
  * The gateway: config in, one model catalogue + one streaming `complete()` out.
@@ -64,6 +64,17 @@ export class Gateway {
     // request that takes it, or `serve`'s start().
     const bridged = [...this.adapters.values()].some((a) => a.kind === 'cli' && (a.toolMode === 'mcp' || a.toolMode === 'auto') && DRIVERS.some((d) => d.supports(a)));
     if (bridged) this.toolEngines.mcp = new McpBridge({ limits: cfg.limits?.bridge, log: this.log, adapters: () => [...this.adapters.values()] });
+    this._warnedExecMigration = false;
+    const hasExecAdapter = Object.values(cfg.adapters || {}).some((raw) => isExecCredentialAdapter(raw));
+    this._warnExecMigrationOnce({ checkDisk: hasExecAdapter });
+  }
+
+  _warnExecMigrationOnce({ checkDisk = false } = {}) {
+    if (this._warnedExecMigration) return;
+    const warnings = execAccountMigrationWarnings(this.cfg, this.usage, { checkDisk });
+    if (!warnings.length) return;
+    this._warnedExecMigration = true;
+    for (const w of warnings) this.log(w);
   }
 
   /** Stop what the gateway runs on its own: the MCP bridge's sessions (each CLI stopped) and its socket. */
@@ -138,6 +149,7 @@ export class Gateway {
     const spendCfg = this.cfg?.limits?.spend;
     if (!spendCfg || !this.usage || !adapter) return null;
     const capped = this.usage.checkSpendCap(spendCfg, adapter, { adaptersCfg: this.cfg?.adapters });
+    this._warnExecMigrationOnce({ checkDisk: false });
     if (!capped) return null;
     const msg = capped.error
       ? `spend cap for ${capped.kind} "${capped.target}" (${fmtUsd(capped.cap)} monthly cap in ${capped.month}, resets ${capped.resetAt}): refusing request because the usage log is unreadable (${capped.error})`
@@ -1094,7 +1106,7 @@ export function own(obj, name) {
  * this shell cannot see may well be visible to the gateway, and that is `doctor`'s question.
  */
 export function checkAdapter(id, raw) {
-  const cfg = { ...raw, _apiKey: null };
+  const cfg = { ...raw, _rawKeyRef: raw?.apiKey ?? raw?.key ?? null, _apiKey: null };
   delete cfg.key;
   return cfg.kind === 'cli' ? new CliAdapter(id, cfg) : new HttpAdapter(id, cfg);
 }

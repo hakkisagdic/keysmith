@@ -15,3 +15,7 @@
 - Redact `error.provider` on 403/404 responses and raw paths on 404 route errors, omit `baseUrl`/`bin` on `/v1/keysmith/routes` for scoped keys, and return only `{ ok: true }` on `/healthz` when `cf-connecting-ip` is present (L4).
 - Load `config.json` with `{ mint: false }` in `key` subcommands so the first `key add` on an empty key list does not mint a hidden unscoped key (L5).
 - Support SHA-256 `keyHash` entries in `config.json` and `--hash` on `key add`, mark hashed keys in `key list`, preserve identical caller IDs between plaintext and hashed keys, and document that hashed keys cannot be redacted by exact value if echoed by a client (L6).
+
+### Fixes
+
+- Derive stable non-secret account names for `{exec: ...}` credential references (`-s <service>` for `security find-generic-password|find-internet-password`, else `<program>:<hmac12>` using HMAC-SHA256 under a cached per-install 32-byte key in `account-hmac.key` with no argument text, falling back to `exec:<hmac12>` on unknown wrapper flags, and failing loudly in `serve`/`doctor` if the key file cannot be read or is invalid); existing usage rows and `limits.spend` caps keyed on `"exec"` no longer match `{exec: ...}` credentials, and `keysmith doctor` and gateway startup now warn once for `"exec"` or unmatched `<program>:<hmac12>` spend caps, naming the current account names to use instead.
