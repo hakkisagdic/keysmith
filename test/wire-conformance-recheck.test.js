@@ -19,7 +19,7 @@
  *     openai's responses.stream() over a Responses answer with no tools offered;
  *   - docs/clients.md's table of the rule against what src/protocols.js writes.
  *
- * Findings are `todo` cases with what they saw. Nothing spends a token; no live gateway is asked.
+ * Nothing spends a token; no live gateway is asked.
  */
 import { after, afterEach, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -342,11 +342,18 @@ for (const gen of GENERATIONS) {
         assert.equal(lastRows('mixed', 1)[0].status, 'ok', label());
       });
 
-      test('the same route: the row keeps the failed leg\'s counts and says the answering leg had none', async () => {
+      test('the same route: the row says the answering leg had no counts (streamed and not streamed)', async () => {
         const ai = mods[gen.ai];
         await streamRun(ai, { model: make('mixed'), prompt: `Hi ${tag()}`, providerOptions: providerOptions(face) });
-        const [row] = lastRows('mixed', 1);
-        assert.match(row.usageReason ?? '', RAW_GAP, `${label()}: ${JSON.stringify(row)}`);
+        const [streamedRow] = lastRows('mixed', 1);
+        assert.equal(streamedRow.usage, null, label());
+        assert.match(streamedRow.usageReason ?? '', RAW_GAP, `${label()}: ${JSON.stringify(streamedRow)}`);
+        const { out, error } = await generate(ai, { model: make('mixed'), prompt: `Hi ${tag()}`, providerOptions: providerOptions(face) });
+        assert.equal(error, null, `${label()}: ${message(error)}`);
+        assert.equal(out.text, 'plain answer', label());
+        const [plainRow] = lastRows('mixed', 1);
+        assert.equal(plainRow.usage, null, label());
+        assert.match(plainRow.usageReason ?? '', RAW_GAP, `${label()}: ${JSON.stringify(plainRow)}`);
       });
 
       test('a request refused before its stream starts (no such adapter): the client is told keysmith\'s reason', async () => {
@@ -404,14 +411,17 @@ describe('re-check · @anthropic-ai/sdk · Claude Code\'s known counts and the u
 });
 
 for (const pkg of ['openai', 'openbot-openai']) {
-  describe(`re-check · ${pkg} (official openai SDK) · Responses with no tools offered, streamed (server.js writes it, not the tool face)`, () => {
-    test('responses.stream() reads the answer of a CLI with no counts', async () => {
+  describe(`re-check · ${pkg} (official openai SDK) · Responses with no tools offered, streamed`, () => {
+    test('responses.stream() reads the answer of a CLI with no counts, and stores the response when store !== false', async () => {
       const c = new mods[pkg].default({ baseURL: `${base}/v1`, apiKey: KEY, maxRetries: 0 });
-      const s = c.responses.stream({ model: 'plain/m', input: 'hi', store: false });
+      const s = c.responses.stream({ model: 'plain/m', input: 'hi' });
       s.on('error', () => {});
       const r = await s.finalResponse();
       assert.equal(r.output_text, 'plain answer');
       assert.equal(r.usage.keysmith_usage, 'unknown');
+      const retrieved = await c.responses.retrieve(r.id);
+      assert.equal(retrieved.id, r.id);
+      assert.equal(retrieved.output_text, 'plain answer');
     });
   });
 }

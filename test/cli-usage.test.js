@@ -315,17 +315,16 @@ test('codex: a stream error it retried, then a completed turn, is the answer on 
   assert.equal(lastRow().status, 'ok');
 });
 
-// A run keysmith's timeout ends while codex is still retrying its stream (found by the independent
-// re-check of 88f4cd1). The held `Reconnecting...` line is reported at the stream's end, before the
-// adapter looks at the exit: it used to reach the client as a 502 "codex: Reconnecting... 1/5", with
-// no word of the timeout. An error the parser reports after keysmith's own clock stopped the run is
-// that timeout: a 504 naming it, the CLI's last error after it.
+// A run keysmith's timeout ends while codex is still retrying its stream: the client gets a 504
+// that names both the held `Reconnecting...` line and the timeout, and the usage row records both.
 test('codex: a run the timeout ends while codex retries its stream is a 504 that names the timeout, and the retried error with it', async () => {
   const r = await post('/v1/chat/completions', { model: 'cxhang/m', messages: [{ role: 'user', content: 'hi' }] });
   assert.equal(r.status, 504, r.text);
-  assert.match(JSON.parse(r.text).error.message, /timeout after 3000ms/);
-  assert.match(JSON.parse(r.text).error.message, /Reconnecting\.\.\. 1\/5/, 'the retried error rides with it');
+  const msg = JSON.parse(r.text).error.message;
+  assert.match(msg, /timeout after 3000ms/);
+  assert.match(msg, /Reconnecting\.\.\. 1\/5/);
   assert.match(lastRow().error, /timeout/);
+  assert.match(lastRow().error, /Reconnecting\.\.\. 1\/5/);
 });
 
 test('EMULATE through a CLI that reports no tokens: the answer says so the same way', async () => {

@@ -293,7 +293,7 @@ counts only. The usage log is no wire: its row is `usage: null` with a `usageRea
 ([adapters.md](adapters.md#parsers-and-the-event-contract)). Checked with ai 6.0.264
 (`@ai-sdk/anthropic` 3.0.111, `@ai-sdk/openai` 3.0.99: what OpenBot runs), ai 7.0.162
 (`@ai-sdk/anthropic` 4.0.96, `@ai-sdk/openai` 4.0.108, `@ai-sdk/openai-compatible` 3.0.84),
-`@anthropic-ai/sdk` 1.4.0 and `openai` 7.5.0 / 7.50.0 — `test/wire-conformance.test.js` runs each
+`@anthropic-ai/sdk` 1.4.0 and `openai` 7.5.0 / 7.50.0 — `test/wire-conformance.test.js` and `test/wire-conformance-recheck.test.js` run each
 of them against a stub gateway (`npm ci` first: they are pinned devDependencies) — and Codex CLI
 0.163.0 against a stub Responses server, by hand.
 
