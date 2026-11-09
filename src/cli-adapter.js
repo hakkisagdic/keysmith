@@ -564,7 +564,11 @@ export class CliAdapter {
             carriedSent = true;
           }
           const isText = evt.type === 'delta' && !!evt.text;
-          if (!emitted && !isText) {
+          // If the parser already emitted an error before any text (e.g. codex-json-final
+          // flushing an uncompleted turn's held error before its buffered message), the run
+          // has not answered: keep holding until run.done resolves so a timeout still yields 504.
+          const hasHeldErr = held.some((e) => e.type === 'error');
+          if (!emitted && (!isText || hasHeldErr)) {
             held.push(evt);
             continue;
           }

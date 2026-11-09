@@ -34,6 +34,7 @@ import { CLI_PROFILES } from '../src/profiles.js';
 
 const STUB = fileURLToPath(new URL('./stubs/cli-bridge.mjs', import.meta.url));
 const KEY = 'ks_' + crypto.randomBytes(24).toString('base64url');
+const NODE_SHEBANG = process.execPath.length < 120 && !/\s/.test(process.execPath) ? process.execPath : '/usr/bin/env node';
 
 /** A pinned client package, or a failure that says how to get it (the suite needs `npm ci`). */
 async function load(name) {
@@ -51,7 +52,11 @@ const mods = {};
 
 function stubCli(name, body) {
   const file = path.join(dir, name);
-  fs.writeFileSync(file, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 });
+  fs.writeFileSync(
+    file,
+    `#!${NODE_SHEBANG}\nprocess.stdout._handle?.setBlocking?.(true);\nprocess.stderr._handle?.setBlocking?.(true);\n${body}\n`,
+    { mode: 0o755 },
+  );
   return file;
 }
 
@@ -60,6 +65,14 @@ before(async () => {
   // os.tmpdir(): the bridge socket's path must stay under 103 bytes.
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kswc-'));
   const codex = structuredClone(CLI_PROFILES.codex);
+  const cxfailOut = [
+    { type: 'thread.started', thread_id: 'th' },
+    { type: 'turn.started' },
+    { type: 'item.completed', item: { id: 'i0', type: 'agent_message', text: 'Half an answer.' } },
+    { type: 'turn.failed', error: { message: 'stub upstream broke mid-answer' } },
+  ]
+    .map((l) => JSON.stringify(l))
+    .join('\n') + '\n';
   const cfg = {
     auth: { enabled: true, keys: [KEY] },
     limits: { streamHoldMs: 300, streamKeepaliveMs: 60, bridge: { socket: path.join(dir, 'b.sock'), maxSessions: 8, maxSessionsPerKey: 8 } },
@@ -80,8 +93,7 @@ before(async () => {
       // codex exec --json on a turn that fails after its first message went out (exit 1).
       cxfail: {
         kind: 'cli',
-        bin: stubCli('cxfail', `for (const l of [{ type: 'thread.started', thread_id: 'th' }, { type: 'turn.started' }, { type: 'item.completed', item: { id: 'i0', type: 'agent_message', text: 'Half an answer.' } }, { type: 'turn.failed', error: { message: 'stub upstream broke mid-answer' } }]) process.stdout.write(JSON.stringify(l) + '\\n');
-process.exitCode = 1;`),
+        bin: stubCli('cxfail', `process.stdout.write(${JSON.stringify(cxfailOut)});\nprocess.exitCode = 1;`),
         args: ['exec', '--json', '--', '{prompt}'],
         parser: 'codex-json',
         models: ['m'],

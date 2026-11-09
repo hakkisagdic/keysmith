@@ -38,6 +38,7 @@ import { anthropicDeltaUsage, anthropicUsage, openaiUsage, responsesUsage } from
 const STUB = fileURLToPath(new URL('./stubs/cli-bridge.mjs', import.meta.url));
 const DOCS = fileURLToPath(new URL('../docs/clients.md', import.meta.url));
 const KEY = 'ks_' + crypto.randomBytes(24).toString('base64url');
+const NODE_SHEBANG = process.execPath.length < 120 && !/\s/.test(process.execPath) ? process.execPath : '/usr/bin/env node';
 
 async function load(name) {
   try {
@@ -53,7 +54,13 @@ const mods = {};
 
 function stubCli(name, body) {
   const file = path.join(dir, name);
-  fs.writeFileSync(file, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 });
+  // stdout/stderr block before exit, matching test/stubs/cli-bridge.mjs: on macOS pipe writes are
+  // otherwise asynchronous and can drop trailing lines (`turn.completed`) when a short stub exits under load.
+  fs.writeFileSync(
+    file,
+    `#!${NODE_SHEBANG}\nprocess.stdout._handle?.setBlocking?.(true);\nprocess.stderr._handle?.setBlocking?.(true);\n${body}\n`,
+    { mode: 0o755 },
+  );
   return file;
 }
 
@@ -74,7 +81,18 @@ function around(name, cli) {
 }
 
 /** `codex exec --json` that hit a stream error and retried it: the turn completes, with usage or without. */
-const codexRetried = (usage) => `for (const l of [{ type: 'thread.started', thread_id: 'th' }, { type: 'turn.started' }, { type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion: stub)' }, { type: 'item.completed', item: { id: 'i0', type: 'agent_message', text: 'Retried answer.' } }, { type: 'turn.completed'${usage ? `, usage: ${JSON.stringify(usage)}` : ''} }]) process.stdout.write(JSON.stringify(l) + '\\n');`;
+const codexRetried = (usage) => {
+  const out = [
+    { type: 'thread.started', thread_id: 'th' },
+    { type: 'turn.started' },
+    { type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion: stub)' },
+    { type: 'item.completed', item: { id: 'i0', type: 'agent_message', text: 'Retried answer.' } },
+    { type: 'turn.completed', ...(usage ? { usage } : {}) },
+  ]
+    .map((l) => JSON.stringify(l))
+    .join('\n') + '\n';
+  return `process.stdout.write(${JSON.stringify(out)});`;
+};
 const RETRIED = { input_tokens: 700, cached_input_tokens: 100, output_tokens: 40, reasoning_output_tokens: 5 };
 
 before(async () => {

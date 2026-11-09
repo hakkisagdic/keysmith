@@ -153,15 +153,36 @@ test('the Anthropic wire: input_tokens is the uncached input, so the cache\'s co
 
 /* ------------------------------------------------------------------- through the faces */
 
+const NODE_SHEBANG = process.execPath.length < 120 && !/\s/.test(process.execPath) ? process.execPath : '/usr/bin/env node';
+
 function stubCli(name, body) {
   const file = path.join(dir, name);
-  fs.writeFileSync(file, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 });
+  // Block stdout/stderr before exiting so short-lived stubs never drop pipe writes on macOS under load.
+  fs.writeFileSync(
+    file,
+    `#!${NODE_SHEBANG}\nprocess.stdout._handle?.setBlocking?.(true);\nprocess.stderr._handle?.setBlocking?.(true);\n${body}\n`,
+    { mode: 0o755 },
+  );
+  return file;
+}
+
+function stubSh(name, body) {
+  const file = path.join(dir, name);
+  fs.writeFileSync(file, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
   return file;
 }
 
 before(async () => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-usage-'));
   const claudeOut = CLAUDE_RUN.map((l) => JSON.stringify(l)).join('\n');
+  const hangLines = [
+    { type: 'thread.started', thread_id: 'th' },
+    { type: 'turn.started' },
+    { type: 'item.completed', item: { id: 'i0', type: 'agent_message', text: 'Let me check.' } },
+    { type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion)' },
+  ]
+    .map((l) => `'${JSON.stringify(l)}'`)
+    .join(' ');
   const cfg = {
     auth: { enabled: true, keys: [KEY] },
     limits: { streamHoldMs: 200, streamKeepaliveMs: 0 },
@@ -174,18 +195,19 @@ before(async () => {
       cxretry: {
         kind: 'cli',
         bin: stubCli('cxretry', `const p = process.argv.at(-1); const text = p.includes('Answer format') ? '{"final":"emulated"}' : 'PONG';
-for (const l of [{ type: 'thread.started', thread_id: 'th' }, { type: 'turn.started' }, { type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion: error sending request)' }, { type: 'item.completed', item: { id: 'i0', type: 'agent_message', text } }, { type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 } }]) process.stdout.write(JSON.stringify(l) + '\\n');`),
+process.stdout.write([{ type: 'thread.started', thread_id: 'th' }, { type: 'turn.started' }, { type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion: error sending request)' }, { type: 'item.completed', item: { id: 'i0', type: 'agent_message', text } }, { type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 } }].map((l) => JSON.stringify(l)).join('\\n') + '\\n');`),
         args: ['exec', '--json', '--', '{prompt}'],
         parser: 'codex-json-final',
         models: ['m'],
         cwd: path.join(dir, 'ws-cxretry'),
         toolMode: 'emulate',
       },
-      // codex exec --json on a run whose stream codex is still retrying when keysmith's timeout ends it.
+      // codex exec --json on a run whose stream codex is still retrying (even after a preamble
+      // agent_message) when keysmith's timeout ends it. `/bin/sh` flushes immediately without
+      // racing V8 cold-boot against the 1500ms timeout under full-suite concurrency.
       cxhang: {
         kind: 'cli',
-        bin: stubCli('cxhang', `for (const l of [{ type: 'thread.started', thread_id: 'th' }, { type: 'turn.started' }, { type: 'error', message: 'Reconnecting... 1/5 (stream disconnected before completion)' }]) process.stdout.write(JSON.stringify(l) + '\\n');
-setTimeout(() => {}, 20_000);`),
+        bin: stubSh('cxhang', `printf '%s\\n' ${hangLines}\nsleep 20 >/dev/null 2>&1 &\np=$!\ntrap "kill \$p 2>/dev/null; exit 0" TERM INT\nwait \$p`),
         args: ['exec', '--json', '--', '{prompt}'],
         parser: 'codex-json-final',
         models: ['m'],
@@ -323,6 +345,7 @@ test('codex: a run the timeout ends while codex retries its stream is a 504 that
   const msg = JSON.parse(r.text).error.message;
   assert.match(msg, /timeout after 3000ms/);
   assert.match(msg, /Reconnecting\.\.\. 1\/5/);
+  assert.doesNotMatch(msg, /Let me check/, 'an uncompleted preamble message is never treated as an answer');
   assert.match(lastRow().error, /timeout/);
   assert.match(lastRow().error, /Reconnecting\.\.\. 1\/5/);
 });
