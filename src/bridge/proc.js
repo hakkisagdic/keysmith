@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { getParser, toLines } from '../parsers.js';
-import { agentCleanEnv, keepTail } from '../util.js';
-import { spawnCli, which } from '../cli-adapter.js';
+import { agentCleanEnv, keepTail, LlmError } from '../util.js';
+import { createExclusiveScratchDir, KEYSMITH_OPENCODE_ENV_ALLOWLIST, preflightOpencodePermissions, sanitizeOpencodeEnv, spawnCli, which } from '../cli-adapter.js';
 import { redactSecrets } from '../redact.js';
 
 /**
@@ -24,9 +24,42 @@ export const KILL_GRACE_MS = 5_000;
  * events, a stop switch, and the outcome `{ code, signal, stderr, killed }`. Throws what spawnCli
  * throws (a 502 naming the error by its code, never the argv).
  */
-export function spawnGroup(adapter, { argv, env, stdinText = null, parser, parserOpts = {}, killGraceMs = KILL_GRACE_MS }) {
+export async function spawnGroup(adapter, { argv, env, stdinText = null, parser, parserOpts = {}, killGraceMs = KILL_GRACE_MS, signal = null }) {
   const stdin = stdinText != null;
-  const child = spawnCli(adapter.id, which(adapter.bin) || adapter.bin, argv, { cwd: adapter.cwd, env, detached: true, stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+  let runCwd = adapter.cwd;
+  let cleanupCwd = null;
+  let childEnv = env;
+  if (adapter._ownsOpencodeWorkspace) {
+    runCwd = createExclusiveScratchDir(adapter.id, adapter.cwd, 'bridge');
+    let cleaned = false;
+    cleanupCwd = () => {
+      if (cleaned) return;
+      cleaned = true;
+      try {
+        fs.rmSync(runCwd, { recursive: true, force: true });
+      } catch {}
+    };
+    const allowedOpencode = {};
+    for (const k of KEYSMITH_OPENCODE_ENV_ALLOWLIST) {
+      if (env?.[k] !== undefined) allowedOpencode[k] = env[k];
+    }
+    allowedOpencode.OPENCODE_CONFIG_DIR = adapter.env?.OPENCODE_CONFIG_DIR || path.join(adapter.cwd, '.opencode');
+    allowedOpencode.OPENCODE_DISABLE_PROJECT_CONFIG = adapter.env?.OPENCODE_DISABLE_PROJECT_CONFIG || '1';
+    childEnv = sanitizeOpencodeEnv({ ...env, PWD: runCwd }, allowedOpencode);
+  }
+  let child;
+  try {
+    if (adapter._ownsOpencodeWorkspace) {
+      await preflightOpencodePermissions(adapter, { runCwd, childEnv, mode: 'bridge', argv, signal });
+    }
+    if (signal?.aborted) {
+      throw new LlmError(`adapter "${adapter.id}": client disconnected`, { status: 499, provider: adapter.id });
+    }
+    child = spawnCli(adapter.id, which(adapter.bin) || adapter.bin, argv, { cwd: runCwd, env: childEnv, detached: true, stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    cleanupCwd?.();
+    throw e;
+  }
   if (stdin) {
     child.stdin.on('error', () => {});
     child.stdin.end(stdinText);
@@ -52,10 +85,12 @@ export function spawnGroup(adapter, { argv, env, stdinText = null, parser, parse
   const done = new Promise((resolve) => {
     child.on('error', (e) => {
       exited = true;
+      cleanupCwd?.();
       resolve({ code: -1, stderr: redactSecrets(e.message), killed: !!stopped });
     });
     child.on('close', (code, signal) => {
       exited = true;
+      cleanupCwd?.();
       resolve({ code: code ?? -1, signal: signal || null, stderr: redactSecrets(stderr.trim()), killed: !!stopped });
     });
   });

@@ -215,20 +215,47 @@ test('qoder (raw): two replies that are not the JSON object are a 502 tool_emula
   assert.doesNotMatch(r.text, /I would call/, 'the reply itself is not repeated');
 });
 
-for (const [id, name] of [['oc', 'opencode'], ['kr', 'kiro']]) {
-  test(`${name}: a tool call of the CLI's own before the reply is passed by; one after it ends the run there (stopAtToolCall), and the reply stands`, async () => {
-    const beforeR = await post('/v1/chat/completions', { model: `${id}/m`, tools: TOOLS, messages: [{ role: 'user', content: `Weather ${tag()} SCENARIO=tool-before` }] });
-    assert.equal(beforeR.status, 200, beforeR.text);
-    assert.deepEqual(chatAnswer(false, beforeR).calls.map((c) => c.args), [{ city: 'Ankara' }]);
-    assert.equal(rowsOf(`${id}/m`).at(-1).cutAt, undefined);
-    const t0 = Date.now();
-    const afterR = await post('/v1/chat/completions', { model: `${id}/m`, tools: TOOLS, messages: [{ role: 'user', content: `Weather ${tag()} SCENARIO=tool-after` }] });
-    assert.equal(afterR.status, 200, afterR.text);
-    assert.deepEqual(chatAnswer(false, afterR).calls.map((c) => c.args), [{ city: 'Ankara' }], 'the reply before the call, and nothing after it');
-    assert.ok(Date.now() - t0 < 10_000, 'the run was stopped at the call, not left to run on');
-    assert.equal(rowsOf(`${id}/m`).at(-1).cutAt, 'bash');
-  });
-}
+test('kiro: a tool call of the CLI\'s own before the reply is passed by; one after it ends the run there (stopAtToolCall: true), and the reply stands', async () => {
+  const beforeR = await post('/v1/chat/completions', { model: 'kr/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather ${tag()} SCENARIO=tool-before` }] });
+  assert.equal(beforeR.status, 200, beforeR.text);
+  assert.deepEqual(chatAnswer(false, beforeR).calls.map((c) => c.args), [{ city: 'Ankara' }]);
+  assert.equal(rowsOf('kr/m').at(-1).cutAt, undefined);
+  const t0 = Date.now();
+  const afterR = await post('/v1/chat/completions', { model: 'kr/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather ${tag()} SCENARIO=tool-after` }] });
+  assert.equal(afterR.status, 200, afterR.text);
+  assert.deepEqual(chatAnswer(false, afterR).calls.map((c) => c.args), [{ city: 'Ankara' }], 'the reply before the call, and nothing after it');
+  assert.ok(Date.now() - t0 < 10_000, 'the run was stopped at the call, not left to run on');
+  assert.equal(rowsOf('kr/m').at(-1).cutAt, 'bash');
+});
+
+test('opencode: stopAtToolCall "always" ends an EMULATE run at a tool call before any text (502) and after the reply (200), and flags non-DeniedError outcomes', async () => {
+  const beforeR = await post('/v1/chat/completions', { model: 'oc/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather ${tag()} SCENARIO=tool-before` }] });
+  assert.equal(beforeR.status, 502, beforeR.text);
+  assert.match(JSON.parse(beforeR.text).error.message, /started a tool call \(bash\) before answering, and keysmith stopped the run/);
+  assert.doesNotMatch(JSON.parse(beforeR.text).error.message, /unexpected tool outcome/);
+  assert.equal(rowsOf('oc/m').at(-1).status, 'error');
+  assert.match(rowsOf('oc/m').at(-1).error, /started a tool call \(bash\) before answering/);
+  const t0 = Date.now();
+  const afterR = await post('/v1/chat/completions', { model: 'oc/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather ${tag()} SCENARIO=tool-after` }] });
+  assert.equal(afterR.status, 200, afterR.text);
+  assert.deepEqual(chatAnswer(false, afterR).calls.map((c) => c.args), [{ city: 'Ankara' }], 'the reply before the call, and nothing after it');
+  assert.ok(Date.now() - t0 < 10_000, 'the run was stopped at the call, not left to run on');
+  assert.equal(rowsOf('oc/m').at(-1).cutAt, 'bash');
+  // A non-DeniedError outcome (e.g. RejectedError) fails with 502 naming unexpected tool outcome both before and after text.
+  const rejBefore = await post('/v1/chat/completions', { model: 'oc/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather ${tag()} SCENARIO=tool-rejected-before` }] });
+  assert.equal(rejBefore.status, 502, rejBefore.text);
+  assert.match(JSON.parse(rejBefore.text).error.message, /before answering.*unexpected tool outcome: RejectedError/);
+  const rejAfter = await post('/v1/chat/completions', { model: 'oc/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather ${tag()} SCENARIO=tool-rejected-after` }] });
+  assert.equal(rejAfter.status, 502, rejAfter.text);
+  assert.match(JSON.parse(rejAfter.text).error.message, /after answering.*unexpected tool outcome: RejectedError/);
+  // Every tool outcome in the stream is inspected regardless of `cut`: a second non-DeniedError tool event after `cut` was set by a first DeniedError call fails with 502 unexpected tool outcome.
+  const execBefore = await post('/v1/chat/completions', { model: 'oc/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather ${tag()} SCENARIO=tool-denied-then-executed-before` }] });
+  assert.equal(execBefore.status, 502, execBefore.text);
+  assert.match(JSON.parse(execBefore.text).error.message, /before answering.*unexpected tool outcome: executed/);
+  const execAfter = await post('/v1/chat/completions', { model: 'oc/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather ${tag()} SCENARIO=tool-denied-then-executed-after` }] });
+  assert.equal(execAfter.status, 502, execAfter.text);
+  assert.match(JSON.parse(execAfter.text).error.message, /after answering.*unexpected tool outcome: executed/);
+});
 
 test('profiles: opencode, codex and qoder answer tool requests (auto: the bridge, EMULATE through their text argv where it cannot); kiro carries the argv and keeps toolMode off', () => {
   for (const name of ['opencode', 'codex', 'qoder']) {

@@ -204,12 +204,53 @@ test('opencode: the tool-less agent and a deny-all opencode.json travel with the
     assert.deepEqual(argv.slice(-2), ['--', 'User: hi']);
   }
   const agent = p.workspaceFiles['.opencode/agent/keysmith-text.md'];
-  assert.match(agent, /^---\n[\s\S]*permission:\n {2}"\*": deny\n[\s\S]*tools:\n {2}"\*": false\n[\s\S]*---\n/);
+  assert.match(
+    agent,
+    /^---\n[\s\S]*permission:\n {2}"\*": deny\n {2}external_directory:\n {4}"\*": deny\n {4}"~\/\.local\/share\/opencode\/tool-output\/\*": deny\n {2}read:\n {4}"\*": deny\n {4}"": deny\n[\s\S]*---\n/,
+  );
+  assert.doesNotMatch(agent, /^tools:/m, '1.19 deprecated tools in favor of permission');
   const config = JSON.parse(p.workspaceFiles['opencode.json']);
-  assert.deepEqual(config.permission, { '*': 'deny' }, 'an agent name that does not resolve falls back to the default agent: it gets nothing either');
-  assert.deepEqual(config.tools, { '*': false });
+  assert.deepEqual(
+    config.permission,
+    {
+      '*': 'deny',
+      external_directory: { '*': 'deny', '~/.local/share/opencode/tool-output/*': 'deny' },
+      read: { '*': 'deny', '': 'deny' },
+    },
+    'an agent name that does not resolve falls back to the default agent: it gets nothing either, while keeping read in the schema so opencode.ai does not 429-hang',
+  );
+  assert.deepEqual(
+    config.agent?.['keysmith-text']?.permission,
+    config.permission,
+    'opencode.json also sets agent["keysmith-text"].permission so OPENCODE_CONFIG_CONTENT overrides global agent config',
+  );
+  assert.equal('tools' in config, false);
   assert.deepEqual(config.mcp, {});
-  assert.equal(p.stopAtToolCall, true);
+  assert.deepEqual(config.plugin, []);
+  assert.equal(p.stopAtToolCall, 'always');
+  assert.equal(p.verifiedVersion, '1.19.3');
+  assert.match(p.provenance, /^opencode 1\.19\.3\b/);
+  assert.match(p.provenance, /owner decision/i);
+  assert.match(p.provenance, /DeniedError/);
+  assert.match(p.provenance, /external_directory/);
+  assert.match(p.provenance, /OPENCODE_PERMISSION/);
+  assert.match(p.provenance, /Console org config/i);
+  assert.match(p.provenance, /managed config/i);
+  assert.match(p.provenance, /preflight.*guard against config sources keysmith cannot override/i);
+  assert.doesNotMatch(p.provenance, /highest priority/i);
+  assert.match(p.provenance, /permission rule is the only thing that prevents a tool from executing/i);
+  assert.match(p.provenance, /stopAtToolCall.*and the.*scratch dir.*only limit what follows/i);
+  assert.match(p.provenance, /verifiedVersion.*allowUnverifiedVersion/i);
+  assert.match(p.provenance, /runtime drift detector/i);
+  assert.match(p.note, /permission rule is the only thing that prevents a tool from executing/i);
+  assert.match(p.note, /stopAtToolCall.*and the.*scratch dir.*only limit what follows/i);
+  assert.match(p.note, /OPENCODE_PERMISSION/);
+  assert.match(p.note, /Console org config/i);
+  assert.match(p.note, /managed config/i);
+  assert.match(p.note, /preflight.*guard against config sources keysmith cannot override/i);
+  assert.doesNotMatch(p.note, /highest priority/i);
+  assert.match(p.note, /verifiedVersion.*allowUnverifiedVersion/i);
+  assert.match(p.note, /runtime drift detector/i);
 });
 
 test('codex: no web search, no goals, and sub-agents capped at one — what a stub endpoint showed 0.163 still offered', () => {
@@ -413,24 +454,102 @@ test('the warp profile as shipped answers nothing: it is disabled', async () => 
   await assert.rejects(gw.collect({ model: 'warp/auto', messages: [{ role: 'user', content: 'hi' }] }), (e) => e.status === 503 && /disabled/.test(e.message));
 });
 
-/** An opencode-shaped stub: records argv and the workspace files it found, then answers as `opencode run --format json` does. */
+/** An opencode-shaped stub: records argv, scratch cwd and workspace files, then answers as `opencode run --format json` does. */
 function opencodeStub(dir) {
   const record = path.join(dir, 'opencode-argv.json');
   const bin = nodeStub(
     dir,
     'opencode',
     `const fs = require('fs');
+const path = require('path');
 const argv = process.argv.slice(2);
+if (argv.includes('--version')) {
+  process.stdout.write('1.19.3\\n');
+  process.exit(0);
+}
 const readOr = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return null; } };
-fs.writeFileSync(${JSON.stringify(record)}, JSON.stringify({ argv, agent: readOr('.opencode/agent/keysmith-text.md'), config: JSON.parse(readOr('opencode.json') || 'null'), cwd: process.cwd(), pwd: process.env.PWD }));
-const prompt = argv[argv.length - 1];
+const cfgFile = process.env.OPENCODE_CONFIG || 'opencode.json';
+const cfgDir = process.env.OPENCODE_CONFIG_DIR || '.opencode';
+fs.writeFileSync(${JSON.stringify(record)}, JSON.stringify({
+  argv,
+  agent: readOr(path.join(cfgDir, 'agent/keysmith-text.md')),
+  config: JSON.parse(readOr(cfgFile) || 'null'),
+  cwd: process.cwd(),
+  pwd: process.env.PWD,
+  cwdEntries: fs.readdirSync(process.cwd()),
+  opencodeConfig: process.env.OPENCODE_CONFIG || null,
+  opencodeConfigDir: process.env.OPENCODE_CONFIG_DIR || null,
+  opencodeDisableProjectConfig: process.env.OPENCODE_DISABLE_PROJECT_CONFIG || null,
+  opencodeConfigContent: JSON.parse(process.env.OPENCODE_CONFIG_CONTENT || 'null'),
+  opencodePermission: process.env.OPENCODE_PERMISSION || null,
+  opencodeEnvKeys: Object.keys(process.env).filter((k) => k.startsWith('OPENCODE_')).sort(),
+}));
+const prompt = argv[argv.length - 1] || '';
 const line = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+if (prompt.includes('stderr-refusal')) {
+  process.stderr.write("Error: OpenCode's free tier can only be used from within OpenCode.\\n");
+  setTimeout(() => {}, 20000);
+  return;
+}
+if (prompt.includes('silent-hang')) {
+  setTimeout(() => {}, 20000);
+  return;
+}
+if (prompt.includes('slow-first-event')) {
+  setTimeout(() => {
+    line({ type: 'step_start', sessionID: 'ses_1', part: { type: 'step-start' } });
+    line({ type: 'text', sessionID: 'ses_1', part: { type: 'text', text: 'SLOW_OK' } });
+    line({ type: 'step_finish', sessionID: 'ses_1', part: { type: 'step-finish', tokens: { input: 12, output: 1 } } });
+  }, 250);
+  return;
+}
 line({ type: 'step_start', sessionID: 'ses_1', part: { type: 'step-start' } });
 if (prompt.includes('free')) {
   line({ type: 'error', sessionID: 'ses_1', error: { name: 'APIError', data: { message: "OpenCode's free tier can only be used from within OpenCode.", statusCode: 403, isRetryable: false } } });
   process.exit(1);
 }
+if (prompt.includes('read-first')) {
+  const cfgObj = JSON.parse(readOr(cfgFile) || 'null');
+  const perm = cfgObj && cfgObj.permission;
+  const envPerm = process.env.OPENCODE_PERMISSION ? JSON.parse(process.env.OPENCODE_PERMISSION) : null;
+  const envAllowsRead = Boolean(envPerm && (envPerm.read === 'allow' || (envPerm.read && envPerm.read['*'] === 'allow')));
+  const hasReadDeny = perm && perm.read && perm.read['*'] === 'deny' && perm.read[''] === 'deny' && !envAllowsRead;
+  const hasExtDeny = perm && perm.external_directory && perm.external_directory['*'] === 'deny' && perm.external_directory['~/.local/share/opencode/tool-output/*'] === 'deny';
+  if (envAllowsRead) {
+    line({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_r1', state: { status: 'completed', input: { filePath: '/private/tmp/secret.txt' }, output: 'leaked' } } });
+    return;
+  }
+  const errText =
+    hasReadDeny && hasExtDeny && !prompt.includes('read-rejected')
+      ? 'The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules [{"permission":"*","pattern":"*","action":"deny"},{"permission":"external_directory","pattern":"*","action":"deny"},{"permission":"external_directory","pattern":"~/.local/share/opencode/tool-output/*","action":"deny"},{"permission":"read","pattern":"*","action":"deny"},{"permission":"read","pattern":"","action":"deny"}]'
+      : 'The user rejected permission to use this specific tool call.';
+  line({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_r1', state: { status: 'error', input: { filePath: '/private/tmp/secret.txt' }, error: errText } } });
+  if (prompt.includes('then-executed')) {
+    line({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_r2', state: { status: 'completed', input: { filePath: '/etc/hosts' }, output: '127.0.0.1 localhost' } } });
+  }
+  setTimeout(() => line({ type: 'text', sessionID: 'ses_1', part: { type: 'text', text: 'after read' } }), 4000);
+  return;
+}
+if (prompt.includes('hold-cwd')) {
+  setTimeout(() => {
+    const stillExists = fs.existsSync(process.cwd());
+    line({ type: 'text', sessionID: 'ses_1', part: { type: 'text', text: stillExists ? 'CWD_OK' : 'CWD_GONE' } });
+    line({ type: 'step_finish', sessionID: 'ses_1', part: { type: 'step-finish', tokens: { input: 12, output: 1 } } });
+  }, 250);
+  return;
+}
 line({ type: 'text', sessionID: 'ses_1', part: { type: 'text', text: 'OK' } });
+if (prompt.includes('tool-denied-then-executed-after')) {
+  line({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_d1', state: { status: 'error', input: { filePath: '/private/tmp/secret.txt' }, error: 'The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules [{"permission":"*","pattern":"*","action":"deny"}]' } } });
+  line({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_e2', state: { status: 'completed', input: { filePath: '/etc/hosts' }, output: '127.0.0.1 localhost' } } });
+  setTimeout(() => line({ type: 'text', sessionID: 'ses_1', part: { type: 'text', text: 'OK and again' } }), 4000);
+  return;
+}
+if (prompt.includes('tool-rejected-after')) {
+  line({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_r2', state: { status: 'error', input: { filePath: '/private/tmp/secret.txt' }, error: 'The user rejected permission to use this specific tool call.' } } });
+  setTimeout(() => line({ type: 'text', sessionID: 'ses_1', part: { type: 'text', text: 'OK and again' } }), 4000);
+  return;
+}
 if (prompt.includes('tool')) {
   line({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'bash', callID: 'call_1', state: { status: 'error', error: "Model tried to call unavailable tool 'invalid'. Available tools: ." } } });
   setTimeout(() => line({ type: 'text', sessionID: 'ses_1', part: { type: 'text', text: 'OK and again' } }), 4000);
@@ -441,36 +560,320 @@ line({ type: 'step_finish', sessionID: 'ses_1', part: { type: 'step-finish', tok
   return { bin, record: () => JSON.parse(fs.readFileSync(record, 'utf8')) };
 }
 
-test('opencode adapter: the tool-less agent and opencode.json are in its workspace before the spawn, and no --auto reaches it', async () => {
+test('opencode adapter: the tool-less agent and opencode.json are in its workspace, it runs in an empty per-request scratch directory, and no --auto reaches it', async () => {
   const dir = tmp('opencode');
   const { bin, record } = opencodeStub(dir);
   const ws = path.join(dir, 'workspaces', 'opencode');
   const a = new CliAdapter('oc', { ...CLI_PROFILES.opencode, bin, cwd: ws });
-  const evts = await events(a.complete({ model: 'evren/glm-5.3', messages: [{ role: 'user', content: 'say hi' }] }));
+  const savedPerm = process.env.OPENCODE_PERMISSION;
+  const savedRogue = process.env.OPENCODE_ROGUE_VAR;
+  process.env.OPENCODE_PERMISSION = '{"read":"allow"}';
+  process.env.OPENCODE_ROGUE_VAR = '1';
+  let evts;
+  try {
+    evts = await events(a.complete({ model: 'evren/glm-5.3', messages: [{ role: 'user', content: 'say hi' }] }));
+  } finally {
+    if (savedPerm === undefined) delete process.env.OPENCODE_PERMISSION;
+    else process.env.OPENCODE_PERMISSION = savedPerm;
+    if (savedRogue === undefined) delete process.env.OPENCODE_ROGUE_VAR;
+    else process.env.OPENCODE_ROGUE_VAR = savedRogue;
+  }
   assert.equal(textOf(evts), 'OK');
   const r = record();
-  assert.equal(fs.realpathSync(r.cwd), fs.realpathSync(ws), 'its own empty workspace, not the gateway\'s cwd');
-  assert.equal(r.pwd, ws, 'PWD says so too: opencode takes PWD as its project directory, and spawn() leaves the parent\'s');
+  const scratchRoot = path.join(fs.realpathSync(path.dirname(ws)), '.scratch');
+  assert.notEqual(fs.realpathSync(ws), r.cwd, 'runs in a per-request scratch directory, not the workspace holding config files');
+  assert.equal(path.dirname(r.cwd), scratchRoot, 'per-request scratch directory lives under keysmith-owned <cwd>/../.scratch, never os.tmpdir()');
+  assert.equal(fs.lstatSync(scratchRoot).mode & 0o777, 0o700, '<cwd>/../.scratch is mode 0700');
+  assert.equal(r.pwd, r.cwd, 'PWD matches the per-request scratch directory');
+  assert.deepEqual(r.cwdEntries, [], 'the per-request scratch directory is completely empty (nothing readable)');
+  assert.equal(fs.existsSync(r.cwd), false, 'the per-request scratch directory is removed once the run finishes');
+  assert.equal(r.opencodeConfig, path.join(ws, 'opencode.json'));
+  assert.equal(r.opencodeConfigDir, path.join(ws, '.opencode'));
+  assert.equal(r.opencodeDisableProjectConfig, '1', 'disables project config walk-up from inside the scratch directory');
+  assert.deepEqual(r.opencodeConfigContent, r.config, 'passes opencode.json via OPENCODE_CONFIG_CONTENT so it overrides global and project config');
+  assert.equal(r.opencodePermission, null, 'inherited OPENCODE_PERMISSION is stripped from the child environment');
+  assert.deepEqual(
+    r.opencodeEnvKeys,
+    ['OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CONFIG_DIR', 'OPENCODE_DISABLE_PROJECT_CONFIG'],
+    'only the explicit allow-list of OPENCODE_* variables reaches the child',
+  );
+  await events(a.complete({ model: 'evren/glm-5.3', messages: [{ role: 'user', content: 'say hi again' }] }));
+  const r2 = record();
+  assert.notEqual(r2.cwd, r.cwd, 'each request gets its own fresh empty scratch directory');
+  assert.equal(path.dirname(r2.cwd), scratchRoot);
+  assert.deepEqual(r2.cwdEntries, []);
+  assert.equal(fs.existsSync(r2.cwd), false);
   assert.ok(!r.argv.includes('--auto'));
   assert.equal(r.argv[r.argv.indexOf('--agent') + 1], 'keysmith-text');
   assert.equal(r.argv[r.argv.indexOf('--model') + 1], 'evren/glm-5.3');
   assert.deepEqual(r.argv.slice(-2), ['--', 'User: say hi']);
-  assert.match(r.agent || '', /"\*": deny/, 'the agent file existed when opencode started');
-  assert.deepEqual(r.config?.permission, { '*': 'deny' });
+  assert.match(
+    r.agent || '',
+    /"\*": deny\n {2}external_directory:\n {4}"\*": deny\n {4}"~\/\.local\/share\/opencode\/tool-output\/\*": deny\n {2}read:\n {4}"\*": deny\n {4}"": deny/,
+    'the agent file existed when opencode started',
+  );
+  assert.doesNotMatch(r.agent || '', /^tools:/m);
+  assert.deepEqual(r.config?.permission, {
+    '*': 'deny',
+    external_directory: { '*': 'deny', '~/.local/share/opencode/tool-output/*': 'deny' },
+    read: { '*': 'deny', '': 'deny' },
+  });
+  assert.equal('tools' in (r.config || {}), false);
 });
 
-test('opencode adapter: a tool call after the answer ends the run; the free tier\'s 403 reaches the client with its reason', async () => {
+test('opencode adapter: any tool call before text stops the run immediately (stopAtToolCall: always), verifies DeniedError vs RejectedError, and a tool call after text ends the answer; the free tier\'s refusal returns 502', async () => {
   const dir = tmp('opencode-tool');
   const { bin } = opencodeStub(dir);
   const a = new CliAdapter('oc', { ...CLI_PROFILES.opencode, bin, cwd: path.join(dir, 'ws') });
+  const tRead = Date.now();
+  const savedPerm = process.env.OPENCODE_PERMISSION;
+  process.env.OPENCODE_PERMISSION = '{"read":"allow"}';
+  try {
+    await assert.rejects(
+      events(a.complete({ model: '', messages: [{ role: 'user', content: 'read-first' }] })),
+      (e) =>
+        e.status === 502 &&
+        e.toolErrorType === 'DeniedError' &&
+        /^The user has specified a rule which prevents you from using this specific tool call\. Here are some of the relevant rules \[/.test(e.toolError || '') &&
+        /started a tool call \(read\) before answering.*may not run tools/.test(e.message) &&
+        !/unexpected tool outcome/.test(e.message),
+      'forced read still yields DeniedError even when OPENCODE_PERMISSION={"read":"allow"} is in the gateway environment',
+    );
+  } finally {
+    if (savedPerm === undefined) delete process.env.OPENCODE_PERMISSION;
+    else process.env.OPENCODE_PERMISSION = savedPerm;
+  }
+  assert.ok(Date.now() - tRead < 3_500, 'stopped immediately at the read tool call before text');
+  // If opencode ever produces RejectedError ("The user rejected permission...") instead of DeniedError, the error type and message surface that drift.
+  await assert.rejects(
+    events(a.complete({ model: '', messages: [{ role: 'user', content: 'read-first read-rejected' }] })),
+    (e) =>
+      e.status === 502 &&
+      e.toolErrorType === 'RejectedError' &&
+      e.toolErrorType !== 'DeniedError' &&
+      /unexpected tool outcome: RejectedError/.test(e.message),
+  );
   const t0 = Date.now();
   const cut = await events(a.complete({ model: '', messages: [{ role: 'user', content: 'tool' }] }));
   assert.equal(textOf(cut), 'OK', 'what it says after the call is not part of the reply');
   assert.deepEqual(cut.filter((e) => e.type === 'cut').map((e) => e.tool), ['bash']);
   assert.ok(Date.now() - t0 < 3_500, 'the process was stopped, not waited for');
+  // A non-DeniedError tool outcome after text also fails with 502 unexpected tool outcome instead of silently cutting.
+  await assert.rejects(
+    events(a.complete({ model: '', messages: [{ role: 'user', content: 'tool-rejected-after' }] })),
+    (e) =>
+      e.status === 502 &&
+      e.toolErrorType === 'RejectedError' &&
+      /after answering.*unexpected tool outcome: RejectedError/.test(e.message),
+  );
+  // Every tool outcome in the stream is inspected regardless of `cut`: a second non-DeniedError tool event emitted after `cut` was set by a first DeniedError call still fails with 502 unexpected tool outcome (both before and after text).
+  await assert.rejects(
+    events(a.complete({ model: '', messages: [{ role: 'user', content: 'read-first then-executed' }] })),
+    (e) =>
+      e.status === 502 &&
+      e.toolErrorType === 'executed' &&
+      /before answering.*unexpected tool outcome: executed/.test(e.message),
+  );
+  await assert.rejects(
+    events(a.complete({ model: '', messages: [{ role: 'user', content: 'tool-denied-then-executed-after' }] })),
+    (e) =>
+      e.status === 502 &&
+      e.toolErrorType === 'executed' &&
+      /after answering.*unexpected tool outcome: executed/.test(e.message),
+  );
   const gw = new Gateway({ adapters: {} });
   gw.adapters.set('oc', a);
-  await assert.rejects(gw.collect({ model: 'oc/opencode/big-pickle', messages: [{ role: 'user', content: 'free model' }] }), /opencode 403: OpenCode's free tier can only be used from within OpenCode/);
+  await assert.rejects(
+    gw.collect({ model: 'oc/opencode/big-pickle', messages: [{ role: 'user', content: 'free model' }] }),
+    (e) => e.status === 502 && /opencode 403: OpenCode's free tier can only be used from within OpenCode/.test(e.message),
+  );
+});
+
+test('opencode adapter: fails fast on stderr free-tier refusal (status 502) and on the no-first-event timeout instead of hanging', async () => {
+  const dir = tmp('opencode-failfast');
+  const { bin } = opencodeStub(dir);
+  const a = new CliAdapter('oc', { ...CLI_PROFILES.opencode, bin, cwd: path.join(dir, 'ws'), firstEventTimeoutMs: 8_000, timeoutMs: 15_000 });
+
+  const t2 = Date.now();
+  await assert.rejects(
+    events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'stderr-refusal' }] })),
+    (e) => e.status === 502 && /can only be used from within OpenCode/i.test(e.message),
+  );
+  assert.ok(Date.now() - t2 < 4_500, 'free-tier refusal on stderr fails fast with status 502');
+
+  const aTimeout = new CliAdapter('oc', { ...CLI_PROFILES.opencode, bin, cwd: path.join(dir, 'ws-timeout'), firstEventTimeoutMs: 400, timeoutMs: 15_000 });
+  const t3 = Date.now();
+  await assert.rejects(
+    events(aTimeout.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'silent-hang' }] })),
+    (e) => e.status === 504 && /no first event after 400ms/i.test(e.message),
+  );
+  assert.ok(Date.now() - t3 < 4_500, 'no-first-event timeout kills a silent hang well before timeoutMs');
+
+  // Default 45 s firstEventTimeoutMs is scoped to opencode/* (or model-less) runs; firstEventTimeoutMs: 0 disables it.
+  const aDefault = new CliAdapter('oc', { ...CLI_PROFILES.opencode, bin, cwd: path.join(dir, 'ws-default') });
+  assert.equal(aDefault.firstEventTimeoutMs, 45_000);
+  assert.equal(aDefault._firstEventTimeoutScopedToFreeTier, true);
+  aDefault.firstEventTimeoutMs = 100; // keep _firstEventTimeoutScopedToFreeTier = true with a 100ms window
+  const nonFreeSlow = await events(aDefault.complete({ model: 'evren/glm-5.3', messages: [{ role: 'user', content: 'slow-first-event' }] }));
+  assert.equal(textOf(nonFreeSlow), 'SLOW_OK', 'non-opencode/* model is not killed by the default free-tier firstEventTimeoutMs');
+  await assert.rejects(
+    events(aDefault.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'slow-first-event' }] })),
+    (e) => e.status === 504 && /no first event after 100ms/i.test(e.message),
+    'opencode/* model is guarded by the default firstEventTimeoutMs',
+  );
+  const aDisabled = new CliAdapter('oc', { ...CLI_PROFILES.opencode, bin, cwd: path.join(dir, 'ws-disabled'), firstEventTimeoutMs: 0 });
+  assert.equal(aDisabled.firstEventTimeoutMs, null);
+});
+
+test('opencode scope: scratch directory and forced stopAtToolCall "always" apply only to keysmith-owned opencode workspaces; user adapters with their own cwd or unsafeTools keep their behaviour', async () => {
+  const dir = tmp('opencode-scope');
+  const { bin, record } = opencodeStub(dir);
+
+  // 1. User adapter without `cwd` (_ownsCwd === false): runs in process.cwd(), stopAtToolCall stays false.
+  const noCwd = new CliAdapter('oc-nocwd', {
+    kind: 'cli',
+    bin,
+    args: ['run', '--format', 'json', '--', '{prompt}'],
+    parser: 'opencode-ndjson',
+  });
+  assert.equal(noCwd._ownsCwd, false);
+  assert.equal(noCwd.stopAtToolCall, false);
+  await events(noCwd.complete({ model: '', messages: [{ role: 'user', content: 'say hi' }] }));
+  const rNoCwd = record();
+  assert.equal(rNoCwd.cwd, fs.realpathSync(process.cwd()), 'without cwd, runs in process.cwd(), not a scratch dir');
+  assert.equal(rNoCwd.opencodeConfig, null);
+  assert.equal(rNoCwd.opencodeConfigDir, null);
+
+  // 2. User adapter with its own project `cwd` (no workspaceFiles): runs in its project cwd, stopAtToolCall stays as configured.
+  const projectDir = path.join(dir, 'my-project');
+  fs.mkdirSync(projectDir, { recursive: true });
+  const customCwd = new CliAdapter('oc-proj', {
+    kind: 'cli',
+    bin,
+    cwd: projectDir,
+    args: ['run', '--format', 'json', '--', '{prompt}'],
+    parser: 'opencode-ndjson',
+    stopAtToolCall: true,
+  });
+  assert.equal(customCwd.stopAtToolCall, true, 'not forced to "always" when the adapter has its own project cwd without keysmith workspaceFiles');
+  await events(customCwd.complete({ model: '', messages: [{ role: 'user', content: 'say hi' }] }));
+  const rProj = record();
+  assert.equal(rProj.cwd, fs.realpathSync(projectDir), 'runs in the user project directory, not a scratch dir');
+  assert.equal(rProj.opencodeConfig, null);
+
+  // 3. User adapter with `unsafeTools: true`: runs in its cwd, stopAtToolCall is not forced to "always".
+  const unsafeWs = path.join(dir, 'unsafe-ws');
+  const unsafeOc = new CliAdapter('oc-unsafe', {
+    ...CLI_PROFILES.opencode,
+    bin,
+    cwd: unsafeWs,
+    unsafeTools: true,
+    disabled: false,
+    toolMode: 'off',
+    stopAtToolCall: false,
+  });
+  assert.equal(unsafeOc.stopAtToolCall, false);
+  await events(unsafeOc.complete({ model: '', messages: [{ role: 'user', content: 'say hi' }] }));
+  const rUnsafe = record();
+  assert.equal(rUnsafe.cwd, fs.realpathSync(unsafeWs), 'unsafeTools adapter runs in its own cwd, not a scratch dir');
+});
+
+test('opencode session resume: uses a stable per-session scratch directory derived from the session id so --session resumes from the same directory', async () => {
+  const dir = tmp('opencode-session-resume');
+  const { bin, record } = opencodeStub(dir);
+  const ws = path.join(dir, 'ws');
+  const gw = new Gateway({
+    adapters: {
+      oc: { ...CLI_PROFILES.opencode, bin, cwd: ws },
+    },
+  });
+
+  // Turn 1 via Gateway (no incoming session id; Gateway assigns a public session id and remembers ses_1).
+  const turn1 = await gw.collect({ model: 'oc/opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'turn 1' }] });
+  assert.equal(turn1.text, 'OK');
+  assert.ok(turn1.session, 'Gateway returns a session id');
+  const r1 = record();
+  assert.notEqual(r1.cwd, fs.realpathSync(ws));
+
+  // Turn 2 via Gateway resuming turn1.session: uses resumeArgs (--session ses_1) and the EXACT SAME scratch directory path.
+  const turn2 = await gw.collect({
+    model: 'oc/opencode/deepseek-v4.1-flash-free',
+    session: turn1.session,
+    messages: [{ role: 'user', content: 'turn 2' }],
+  });
+  assert.equal(turn2.text, 'OK');
+  const r2 = record();
+  assert.ok(r2.argv.includes('--session') && r2.argv[r2.argv.indexOf('--session') + 1] === 'ses_1', 'resumed with --session ses_1');
+  assert.equal(r2.cwd, r1.cwd, 'resumed turn runs in the exact same per-session scratch directory as turn 1');
+  assert.equal(r2.pwd, r1.pwd);
+
+  // Unrelated Turn 3 without session gets a different scratch directory.
+  await gw.collect({ model: 'oc/opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'turn 3 unrelated' }] });
+  const r3 = record();
+  assert.notEqual(r3.cwd, r1.cwd, 'an unrelated conversation gets a different scratch directory');
+  const scratchRoot = path.join(fs.realpathSync(dir), '.scratch');
+  assert.equal(path.dirname(r1.cwd), scratchRoot, 'session scratch directory lives under <cwd>/../.scratch, never os.tmpdir()');
+  assert.equal(path.dirname(r3.cwd), scratchRoot);
+});
+
+test('opencode scratch security and concurrency: refuses pre-existing symlink, non-0700 or wrong-owner scratch dirs, and keeps per-session scratch dir alive across concurrent requests', async () => {
+  const { ensureScratchRoot, ensurePrivateScratchDir } = await import('../src/cli-adapter.js');
+  const dir = tmp('opencode-scratch-sec');
+  const { bin } = opencodeStub(dir);
+
+  // 1. Refuse a pre-existing symlink at <cwd>/../.scratch.
+  const symParent = path.join(dir, 'sym-parent');
+  const symTarget = path.join(dir, 'sym-target');
+  fs.mkdirSync(symParent, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(symTarget, { recursive: true, mode: 0o700 });
+  fs.symlinkSync(symTarget, path.join(symParent, '.scratch'));
+  assert.throws(
+    () => ensureScratchRoot('oc', path.join(symParent, 'opencode')),
+    (e) => e.status === 500 && /not a regular directory/.test(e.message),
+    'refuses a symlink at .scratch without following it',
+  );
+
+  // 2. Refuse a pre-existing .scratch directory whose permissions are not 0700 (e.g. 0755).
+  const modeParent = path.join(dir, 'mode-parent');
+  fs.mkdirSync(modeParent, { recursive: true, mode: 0o700 });
+  const badModeScratch = path.join(modeParent, '.scratch');
+  fs.mkdirSync(badModeScratch, { mode: 0o755 });
+  fs.chmodSync(badModeScratch, 0o755);
+  assert.throws(
+    () => ensureScratchRoot('oc', path.join(modeParent, 'opencode')),
+    (e) => e.status === 500 && /mode is 0755, expected 0700/.test(e.message),
+    'refuses a pre-existing directory that is not 0700',
+  );
+
+  // 3. Refuse a pre-existing directory not owned by the current user.
+  const uidParent = path.join(dir, 'uid-parent');
+  fs.mkdirSync(uidParent, { recursive: true, mode: 0o700 });
+  const wrongUidScratch = path.join(uidParent, '.scratch');
+  fs.mkdirSync(wrongUidScratch, { mode: 0o700 });
+  assert.throws(
+    () => ensureScratchRoot('oc', path.join(uidParent, 'opencode'), { getuid: () => 999999 }),
+    (e) => e.status === 500 && /owned by uid .* expected 999999/.test(e.message),
+    'refuses a pre-existing directory owned by another user',
+  );
+
+  // 4. Exclusive create refuses any pre-existing directory even if 0700 and owned by the user.
+  const exDir = path.join(dir, 'already-exists');
+  fs.mkdirSync(exDir, { mode: 0o700 });
+  assert.throws(
+    () => ensurePrivateScratchDir('oc', exDir, { exclusive: true }),
+    (e) => e.status === 500 && /could not create scratch directory/.test(e.message),
+    'exclusive create refuses a pre-existing directory',
+  );
+
+  // 5. Two concurrent requests on the same session share the per-session scratch directory without the first deleting it while the second runs.
+  const ws = path.join(dir, 'conc-parent', 'ws');
+  const a = new CliAdapter('oc', { ...CLI_PROFILES.opencode, bin, cwd: ws, maxConcurrent: 2 });
+  const [evtsSlow, evtsFast] = await Promise.all([
+    events(a.complete({ model: 'm', sessionKey: 'shared-sess', messages: [{ role: 'user', content: 'hold-cwd' }] })),
+    events(a.complete({ model: 'm', sessionKey: 'shared-sess', messages: [{ role: 'user', content: 'fast' }] })),
+  ]);
+  assert.equal(textOf(evtsFast), 'OK');
+  assert.equal(textOf(evtsSlow), 'CWD_OK', 'the slower concurrent request still has its session scratch directory after the faster one finishes');
 });
 
 test('opencode-ndjson: each tool call is reported once, however many lines it takes', async () => {
@@ -956,4 +1359,1488 @@ test('a change saved while a gateway runs says it needs a restart, and keysmith 
   const quiet = run('add', 'agy');
   assert.equal(quiet.status, 0);
   assert.doesNotMatch(quiet.all, /still serves the config/, 'no gateway running, nothing to restart');
+});
+
+test('opencode adapter and keysmith doctor warn when the installed opencode version differs from verifiedVersion (1.19.3), including in probe and startup', async () => {
+  const dir = tmp('opencode-version');
+  const makeOc = (name, ver, countFile = null) =>
+    nodeStub(
+      dir,
+      name,
+      `const fs = require('fs');
+const argv = process.argv.slice(2);
+if (argv.includes('--version')) {
+  ${countFile ? `fs.appendFileSync(${JSON.stringify(countFile)}, '1\\n');` : ''}
+  process.stdout.write(${JSON.stringify(ver + '\n')});
+  process.exit(0);
+}
+process.stdout.write('opencode/deepseek-v4.1-flash-free\\n');`,
+    );
+  const countMatchFile = path.join(dir, 'version-calls-match.txt');
+  const countMismatchFile = path.join(dir, 'version-calls-mismatch.txt');
+  const binMatch = makeOc('opencode-match', '1.19.3', countMatchFile);
+  const binMismatch = makeOc('opencode-mismatch', '1.18.27', countMismatchFile);
+
+  // verifiedVersion takes precedence over any version numbers in free-text provenance.
+  const customProv = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin: binMatch,
+    cwd: path.join(dir, 'ws-custom-prov'),
+    provenance: 'tested after foo 0.1.0 and bar 2.0.0 on opencode',
+  });
+  assert.equal(customProv.verifiedVersion, '1.19.3');
+  assert.deepEqual(await customProv.checkVersion(), { installed: '1.19.3', expected: '1.19.3', warning: null });
+
+  const oldAdapter = new CliAdapter('oc', { ...CLI_PROFILES.opencode, bin: binMismatch, cwd: path.join(dir, 'ws-old') });
+  const ver = await oldAdapter.checkVersion();
+  assert.equal(ver.installed, '1.18.27');
+  assert.equal(ver.expected, '1.19.3');
+  assert.match(ver.warning || '', /1\.18\.27 !== verified 1\.19\.3.*keysmith upgrade oc --take workspaceFiles/);
+
+  // Adapter probe (`probe()`) and Gateway startup (`checkAdapters()`) / `listModels()` also surface the version warning.
+  const probed = await oldAdapter.probe();
+  assert.ok(probed.warnings.some((w) => /1\.18\.27 !== verified 1\.19\.3/.test(w)));
+
+  const logs = [];
+  const gw = new Gateway(
+    {
+      adapters: {
+        oc: { ...CLI_PROFILES.opencode, bin: binMismatch, cwd: path.join(dir, 'ws-gw-old') },
+        oc2: { ...CLI_PROFILES.opencode, bin: binMatch, cwd: path.join(dir, 'ws-gw-ok') },
+      },
+    },
+    { log: (m) => logs.push(m) },
+  );
+  await gw.listModels({ refresh: true });
+  await gw.listModels({ refresh: true });
+  await gw.checkAdapters();
+  assert.ok(logs.some((m) => /adapter "oc":.*1\.18\.27 !== verified 1\.19\.3/.test(m)), `expected listModels probe warning in logs, got: ${logs.join('\n')}`);
+  assert.ok(!logs.some((m) => /adapter "oc2":.*!==/.test(m)));
+
+  // `--version` is cached per binary path for the process lifetime: spawned only once per binary across all checks/refreshes.
+  const matchCalls = fs.readFileSync(countMatchFile, 'utf8').trim().split('\n').filter(Boolean).length;
+  const mismatchCalls = fs.readFileSync(countMismatchFile, 'utf8').trim().split('\n').filter(Boolean).length;
+  assert.equal(matchCalls, 1, 'opencode --version spawned only once for binMatch across adapters and refreshes');
+  assert.equal(mismatchCalls, 1, 'opencode --version spawned only once for binMismatch across checkVersion, probe, listModels, and checkAdapters');
+
+  const sb = sandbox();
+  const cfg = sb.read();
+  cfg.adapters.oc = { ...CLI_PROFILES.opencode, bin: binMismatch, cwd: path.join(dir, 'ws-doc-old'), models: ['opencode/deepseek-v4.1-flash-free'] };
+  cfg.adapters.oc2 = { ...CLI_PROFILES.opencode, bin: binMatch, cwd: path.join(dir, 'ws-doc-ok'), models: ['opencode/deepseek-v4.1-flash-free'] };
+  sb.write(cfg);
+  const doc = sb.run('doctor');
+  assert.equal(doc.status, 0, doc.all);
+  assert.match(doc.stdout, /!\s+oc\s+version warning\s+.*1\.18\.27 !== verified 1\.19\.3/);
+  assert.doesNotMatch(doc.stdout, /oc2\s+version warning/);
+});
+
+test('opencode preflight: refuses inherited pattern-map allow and managed-config scalar allow before spawning, passes clean config, and caches by (version, config source hashes, env)', async () => {
+  const { clearOpencodePreflightCache, getOpencodePreflightStats } = await import('../src/cli-adapter.js');
+  const dir = tmp('opencode-preflight');
+  const testHome = path.join(dir, 'test-home');
+  const managedDir = path.join(dir, 'managed-config');
+  fs.mkdirSync(path.join(testHome, '.config', 'opencode'), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(managedDir, { recursive: true, mode: 0o700 });
+  const recordFile = path.join(dir, 'opencode-argv.json');
+  const { bin } = opencodeStub(dir);
+  const ws = path.join(dir, 'workspaces', 'opencode');
+  const a = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin,
+    cwd: ws,
+    managedConfigDir: managedDir,
+    managedPlistPaths: [],
+    env: {
+      HOME: testHome,
+      XDG_CONFIG_HOME: path.join(testHome, '.config'),
+      XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+    },
+  });
+
+  clearOpencodePreflightCache();
+
+  // 1. Clean config passes preflight, spawns the child, and caches the result.
+  const evts1 = await events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'clean 1' }] }));
+  assert.equal(textOf(evts1), 'OK');
+  assert.equal(fs.existsSync(recordFile), true, 'clean config allowed opencode to spawn');
+  const stats1 = getOpencodePreflightStats();
+  assert.equal(stats1.runs, 1);
+  assert.equal(stats1.hits, 0);
+
+  // Second request with identical version, config source hashes, and env hits the cache without re-running preflight.
+  const evts2 = await events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'clean 2' }] }));
+  assert.equal(textOf(evts2), 'OK');
+  const stats2 = getOpencodePreflightStats();
+  assert.equal(stats2.runs, 1, 'preflight was not re-run when version, config source hashes, and env were unchanged');
+  assert.equal(stats2.hits, 1, 'second request hit the preflight cache');
+
+  // 2. Inherited pattern-map allow in ~/.config/opencode/opencode.json:
+  // remeda.mergeDeep merges OPENCODE_CONFIG_CONTENT's {"*":"deny","":"deny"} into the user's pattern map,
+  // preserving {"*hosts":"allow"} and {"*etc/*":"allow"}. Preflight detects the changed file hash, re-runs,
+  // and refuses the run BEFORE spawning opencode, naming the offending source file and key.
+  fs.rmSync(recordFile, { force: true });
+  const globalOpencodeJson = path.join(testHome, '.config', 'opencode', 'opencode.json');
+  fs.writeFileSync(
+    globalOpencodeJson,
+    JSON.stringify({
+      permission: {
+        read: { '*': 'deny', '*hosts': 'allow' },
+        external_directory: { '*': 'deny', '*etc/*': 'allow' },
+      },
+      agent: {
+        'keysmith-text': {
+          permission: {
+            read: { '*': 'deny', '*hosts': 'allow' },
+            external_directory: { '*': 'deny', '*etc/*': 'allow' },
+          },
+        },
+      },
+    }),
+  );
+  await assert.rejects(
+    events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'should not spawn' }] })),
+    (e) =>
+      e.status === 502 &&
+      /opencode effective permission preflight failed/.test(e.message) &&
+      e.message.includes(globalOpencodeJson) &&
+      e.message.includes('permission.read["*hosts"] = "allow"') &&
+      e.message.includes('permission.external_directory["*etc/*"] = "allow"'),
+  );
+  assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when preflight refused the inherited pattern-map allow');
+  const stats3 = getOpencodePreflightStats();
+  assert.equal(stats3.runs, 2, 'changing global opencode.json hash invalidated the cache and re-ran preflight');
+
+  // 3. Managed-config scalar allow in managedConfigDir/opencode.json:
+  // loaded after OPENCODE_CONFIG_CONTENT, so a scalar "allow" replaces keysmith's object map.
+  // Preflight refuses the run before spawning opencode, naming the managed config file and key.
+  fs.rmSync(globalOpencodeJson, { force: true });
+  const managedJson = path.join(managedDir, 'opencode.json');
+  fs.writeFileSync(
+    managedJson,
+    JSON.stringify({
+      permission: {
+        read: 'allow',
+        bash: 'ask',
+      },
+    }),
+  );
+  await assert.rejects(
+    events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'managed allow' }] })),
+    (e) =>
+      e.status === 502 &&
+      /opencode effective permission preflight failed/.test(e.message) &&
+      e.message.includes(managedJson) &&
+      e.message.includes('permission.read = "allow"'),
+  );
+  assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when preflight refused the managed-config scalar allow');
+  const stats4 = getOpencodePreflightStats();
+  assert.equal(stats4.runs, 3, 'writing managed opencode.json invalidated the cache and re-ran preflight');
+
+  // 4. Removing the managed config restores the clean state; changing verifiedVersion or env invalidates the cache and re-runs preflight.
+  fs.rmSync(managedJson, { force: true });
+  const evts3 = await events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'clean 3' }] }));
+  assert.equal(textOf(evts3), 'OK');
+  assert.equal(getOpencodePreflightStats().hits, 2, 'clean state matched the earlier clean cache entry');
+
+  a.verifiedVersion = '1.19.4';
+  fs.rmSync(recordFile, { force: true });
+  await assert.rejects(
+    events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'version change' }] })),
+    (e) =>
+      e.status === 502 &&
+      /opencode effective permission preflight failed/.test(e.message) &&
+      /sets version = "1\.19\.3 !== verifiedVersion 1\.19\.4/.test(e.message),
+  );
+  assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when verifiedVersion mismatched');
+  assert.equal(getOpencodePreflightStats().runs, 4, 'changing opencode version key invalidated the cache and re-ran preflight');
+  a.verifiedVersion = '1.19.3';
+
+  a.env.XDG_CONFIG_HOME = path.join(dir, 'alt-xdg-config');
+  await events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'env change' }] }));
+  assert.equal(getOpencodePreflightStats().runs, 5, 'changing relevant env invalidated the cache and re-ran preflight');
+});
+
+test('opencode preflight org-config (opencode.db): passes with no db or clean 1.19.3 db without hashing session writes, and refuses active org allowing read, unreadable, locked, or unknown-schema db', async () => {
+  const { clearOpencodePreflightCache, getOpencodePreflightStats } = await import('../src/cli-adapter.js');
+  const http = await import('node:http');
+  const { createRequire } = await import('node:module');
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+
+  const dir = tmp('opencode-org-db');
+  const testHome = path.join(dir, 'test-home');
+  const dataDir = path.join(testHome, '.local', 'share', 'opencode');
+  fs.mkdirSync(path.join(testHome, '.config', 'opencode'), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const dbPath = path.join(dataDir, 'opencode.db');
+  const recordFile = path.join(dir, 'opencode-argv.json');
+  const { bin } = opencodeStub(dir);
+  const ws = path.join(dir, 'workspaces', 'opencode');
+
+  const makeAdapter = () =>
+    new CliAdapter('oc', {
+      ...CLI_PROFILES.opencode,
+      bin,
+      cwd: ws,
+      env: {
+        HOME: testHome,
+        XDG_CONFIG_HOME: path.join(testHome, '.config'),
+        XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+      },
+    });
+
+  // Exact opencode 1.19.3 DDL extracted from AccountRepo + sqlite_master of a fresh 1.19.3 opencode.db.
+  const init1193Schema = (file) => {
+    const db = new DatabaseSync(file);
+    db.exec(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE \`account\` (
+        \`id\` text PRIMARY KEY,
+        \`email\` text NOT NULL,
+        \`url\` text NOT NULL,
+        \`access_token\` text NOT NULL,
+        \`refresh_token\` text NOT NULL,
+        \`token_expiry\` integer,
+        \`time_created\` integer NOT NULL,
+        \`time_updated\` integer NOT NULL
+      );
+      CREATE TABLE \`account_state\` (
+        \`id\` integer PRIMARY KEY,
+        \`active_account_id\` text,
+        \`active_org_id\` text,
+        CONSTRAINT \`fk_account_state_active_account_id_account_id_fk\`
+          FOREIGN KEY (\`active_account_id\`) REFERENCES \`account\`(\`id\`) ON DELETE SET NULL
+      );
+      CREATE TABLE \`project\` (
+        \`id\` text PRIMARY KEY,
+        \`worktree\` text NOT NULL,
+        \`sandboxes\` text NOT NULL,
+        \`time_created\` integer NOT NULL,
+        \`time_updated\` integer NOT NULL
+      );
+      CREATE TABLE \`session\` (
+        \`id\` text PRIMARY KEY,
+        \`project_id\` text NOT NULL,
+        \`slug\` text NOT NULL,
+        \`directory\` text NOT NULL,
+        \`title\` text NOT NULL,
+        \`version\` text NOT NULL,
+        \`time_created\` integer NOT NULL,
+        \`time_updated\` integer NOT NULL
+      );
+    `);
+    db.close();
+  };
+
+  // Start an in-process mock Console /api/config HTTP server on the main event loop (proving async fetch never deadlocks).
+  let currentPayload = { config: { permission: { read: 'allow' } } };
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    hits.push({
+      method: req.method,
+      url: req.url,
+      orgId: req.headers['x-org-id'] || null,
+      hasAuth: /^Bearer\s+\S+$/.test(req.headers.authorization || ''),
+    });
+    if (req.url === '/api/config') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(currentPayload));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const { port } = srv.address();
+    const a = makeAdapter();
+    clearOpencodePreflightCache();
+
+    // 1. No opencode.db -> passes.
+    assert.equal(fs.existsSync(dbPath), false);
+    const evNoDb = await events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'no db' }] }));
+    assert.equal(textOf(evNoDb), 'OK');
+    assert.equal(fs.existsSync(recordFile), true);
+
+    // 2. Clean 1.19.3 opencode.db with no active org -> passes, and session/WAL mutations do NOT invalidate the preflight cache.
+    clearOpencodePreflightCache();
+    init1193Schema(dbPath);
+    const evCleanDb1 = await events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'clean db 1' }] }));
+    assert.equal(textOf(evCleanDb1), 'OK');
+    assert.equal(getOpencodePreflightStats().runs, 1);
+    assert.equal(getOpencodePreflightStats().hits, 0);
+
+    // Write session history rows (mutating opencode.db / opencode.db-wal bytes without changing active org).
+    {
+      const db = new DatabaseSync(dbPath);
+      const now = Date.now();
+      db.prepare('INSERT INTO project (id, worktree, sandboxes, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run('proj_1', dir, '[]', now, now);
+      db.prepare('INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+        'ses_1',
+        'proj_1',
+        's1',
+        dir,
+        'big session payload '.repeat(200),
+        '1.19.3',
+        now,
+        now,
+      );
+      db.close();
+    }
+    const evCleanDb2 = await events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'clean db 2' }] }));
+    assert.equal(textOf(evCleanDb2), 'OK');
+    assert.equal(getOpencodePreflightStats().runs, 1, 'session writes in opencode.db (+wal) did not re-run preflight');
+    assert.equal(getOpencodePreflightStats().hits, 1, 'narrow active-org query hit the preflight cache');
+
+    // 3. Real 1.19.3 SQLite fixture with an active org whose Console /api/config allows `read` -> refused before spawning.
+    fs.rmSync(recordFile, { force: true });
+    {
+      const db = new DatabaseSync(dbPath);
+      const now = Date.now();
+      db.prepare(
+        'INSERT INTO account (id, email, url, access_token, refresh_token, token_expiry, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      ).run('acc_1', 'org@example.com', `http://127.0.0.1:${port}`, 'tok_secret_never_print', 'ref_secret', now + 3_600_000, now, now);
+      db.prepare('INSERT INTO account_state (id, active_account_id, active_org_id) VALUES (1, ?, ?)').run('acc_1', 'org_alpha');
+      db.close();
+    }
+    await assert.rejects(
+      events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'active org allow read' }] })),
+      (e) =>
+        e.status === 502 &&
+        /opencode effective permission preflight failed/.test(e.message) &&
+        e.message.includes(`http://127.0.0.1:${port}/api/config (org org_alpha)`) &&
+        e.message.includes('permission.read = "allow"') &&
+        !e.message.includes('tok_secret_never_print'),
+    );
+    assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when active org config allowed read');
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].orgId, 'org_alpha');
+    assert.equal(hits[0].hasAuth, true);
+
+    // Active org with a clean config ({ autoupdate: false }) passes and caches keyed on (active_org_id, org config content), ignoring session writes.
+    currentPayload = { config: { autoupdate: false } };
+    clearOpencodePreflightCache();
+    const evCleanOrg1 = await events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'clean org 1' }] }));
+    assert.equal(textOf(evCleanOrg1), 'OK');
+    assert.equal(getOpencodePreflightStats().runs, 1);
+    {
+      const db = new DatabaseSync(dbPath);
+      const now = Date.now();
+      db.prepare('INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+        'ses_2',
+        'proj_1',
+        's2',
+        dir,
+        'more session rows '.repeat(100),
+        '1.19.3',
+        now,
+        now,
+      );
+      db.close();
+    }
+    const evCleanOrg2 = await events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'clean org 2' }] }));
+    assert.equal(textOf(evCleanOrg2), 'OK');
+    assert.equal(getOpencodePreflightStats().runs, 1, 'preflight cache keyed on active-org id + config content was not busted by session writes');
+    assert.equal(getOpencodePreflightStats().hits, 1);
+
+    // 4. Locked opencode.db (exclusive reader-blocking lock held by another connection) -> refused naming opencode.db and lock error.
+    fs.rmSync(recordFile, { force: true });
+    const locker = new DatabaseSync(dbPath);
+    locker.exec('PRAGMA journal_mode = DELETE; BEGIN EXCLUSIVE;');
+    try {
+      await assert.rejects(
+        events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'locked db' }] })),
+        (e) =>
+          e.status === 502 &&
+          /opencode effective permission preflight failed/.test(e.message) &&
+          e.message.includes(dbPath) &&
+          /locked|SQLITE_BUSY/i.test(e.message),
+      );
+      assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when opencode.db was locked');
+    } finally {
+      try {
+        locker.exec('ROLLBACK;');
+      } catch {}
+      locker.close();
+    }
+
+    // 5. Unknown-schema opencode.db (lacks 1.19.3 account / account_state tables or columns) -> refused.
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${dbPath}${suffix}`, { force: true });
+    {
+      const badSchemaDb = new DatabaseSync(dbPath);
+      badSchemaDb.exec('CREATE TABLE org_config (org_id TEXT PRIMARY KEY, config TEXT);');
+      badSchemaDb.close();
+    }
+    await assert.rejects(
+      events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'unknown schema' }] })),
+      (e) =>
+        e.status === 502 &&
+        /opencode effective permission preflight failed/.test(e.message) &&
+        e.message.includes(dbPath) &&
+        e.message.includes('opencode.db.schema') &&
+        /lacks expected 1\.19\.3 table \\?"account_state\\?"/.test(e.message),
+    );
+    assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when opencode.db had an unknown schema');
+
+    // Missing expected column on account table -> refused.
+    fs.rmSync(dbPath, { force: true });
+    {
+      const partialSchemaDb = new DatabaseSync(dbPath);
+      partialSchemaDb.exec(`
+        CREATE TABLE account_state (id INTEGER PRIMARY KEY, active_account_id TEXT, active_org_id TEXT);
+        CREATE TABLE account (id TEXT PRIMARY KEY, email TEXT NOT NULL);
+      `);
+      partialSchemaDb.close();
+    }
+    await assert.rejects(
+      events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'partial schema' }] })),
+      (e) =>
+        e.status === 502 &&
+        e.message.includes(dbPath) &&
+        e.message.includes('opencode.db.schema') &&
+        /table \\?"account\\?" lacks expected 1\.19\.3 columns/.test(e.message),
+    );
+
+    // 6. Corrupt / unreadable opencode.db -> refused.
+    fs.writeFileSync(dbPath, 'not a valid sqlite3 header at all');
+    await assert.rejects(
+      events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'corrupt db' }] })),
+      (e) =>
+        e.status === 502 &&
+        e.message.includes(dbPath) &&
+        /not a database|cannot read opencode\.db/i.test(e.message),
+    );
+
+    fs.chmodSync(dbPath, 0o000);
+    try {
+      await assert.rejects(
+        events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'unreadable db' }] })),
+        (e) =>
+          e.status === 502 &&
+          e.message.includes(dbPath) &&
+          /not readable|EACCES/i.test(e.message),
+      );
+      assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when opencode.db was unreadable');
+    } finally {
+      fs.chmodSync(dbPath, 0o600);
+    }
+  } finally {
+    await new Promise((resolve) => srv.close(resolve));
+  }
+});
+
+test('opencode preflight managed-config redirect guard: adapter.managedConfigDir, managedPlistPaths, and KEYSMITH_TEST_OPENCODE_MANAGED_DIR only add paths and never replace or mask real system managed paths', async () => {
+  const {
+    clearOpencodePreflightCache,
+    resolveOpencodeEffectiveConfig,
+    TEST_ONLY_SYSTEM_MANAGED_PATHS,
+  } = await import('../src/cli-adapter.js');
+
+  const dir = tmp('opencode-managed-redirect');
+  const testHome = path.join(dir, 'test-home');
+  const fakeRealSystemDir = path.join(dir, 'simulated-etc-opencode');
+  const fakeRealSystemPlist = path.join(dir, 'simulated-managed-prefs', 'ai.opencode.managed.plist');
+  const cleanOverrideDir = path.join(dir, 'override-managed-dir');
+  const extraCleanPlist = path.join(dir, 'override-managed-plist', 'extra.plist');
+  fs.mkdirSync(path.join(testHome, '.config', 'opencode'), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(fakeRealSystemDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.dirname(fakeRealSystemPlist), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(cleanOverrideDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.dirname(extraCleanPlist), { recursive: true, mode: 0o700 });
+
+  // Put a deny-all file in cleanOverrideDir to prove an override cannot mask a hostile file at the real system path either.
+  fs.writeFileSync(
+    path.join(cleanOverrideDir, 'opencode.json'),
+    JSON.stringify({
+      permission: {
+        '*': 'deny',
+        external_directory: { '*': 'deny', '~/.local/share/opencode/tool-output/*': 'deny' },
+        read: { '*': 'deny', '': 'deny' },
+      },
+    }),
+  );
+  fs.writeFileSync(
+    extraCleanPlist,
+    JSON.stringify({
+      permission: { '*': 'deny' },
+    }),
+  );
+
+  // Hostile file at the (test-injected) real system managed directory.
+  const hostileSystemJson = path.join(fakeRealSystemDir, 'opencode.json');
+  fs.writeFileSync(hostileSystemJson, JSON.stringify({ permission: { read: 'allow' } }));
+
+  const recordFile = path.join(dir, 'opencode-argv.json');
+  const { bin } = opencodeStub(dir);
+  const ws = path.join(dir, 'workspaces', 'opencode');
+  const a = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin,
+    cwd: ws,
+    managedConfigDir: cleanOverrideDir,
+    managedPlistPaths: [extraCleanPlist],
+    env: {
+      HOME: testHome,
+      XDG_CONFIG_HOME: path.join(testHome, '.config'),
+      XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+      KEYSMITH_TEST_OPENCODE_MANAGED_DIR: cleanOverrideDir,
+      OPENCODE_TEST_MANAGED_CONFIG_DIR: cleanOverrideDir,
+    },
+  });
+  a[TEST_ONLY_SYSTEM_MANAGED_PATHS] = {
+    dirs: [fakeRealSystemDir],
+    plists: [fakeRealSystemPlist],
+  };
+
+  clearOpencodePreflightCache();
+
+  // Verify real OS managed paths (/etc/opencode, and on macOS /Library/Application Support/opencode + Managed Preferences) remain in the resolved list alongside overrides.
+  const resolvedCtx = resolveOpencodeEffectiveConfig(a, { runCwd: ws, childEnv: a.env });
+  assert.ok(resolvedCtx.managedFiles.includes(path.resolve('/etc/opencode/opencode.json')), '/etc/opencode/opencode.json is always checked');
+  if (process.platform === 'darwin') {
+    assert.ok(
+      resolvedCtx.managedFiles.includes(path.resolve('/Library/Application Support/opencode/opencode.json')),
+      '/Library/Application Support/opencode/opencode.json is always checked on macOS',
+    );
+    assert.ok(
+      resolvedCtx.managedPlistCandidates.includes(path.resolve('/Library/Managed Preferences/ai.opencode.managed.plist')),
+      '/Library/Managed Preferences/ai.opencode.managed.plist is always checked on macOS',
+    );
+  }
+  assert.ok(resolvedCtx.managedFiles.includes(path.resolve(cleanOverrideDir, 'opencode.json')), 'override managed dir is added, not ignored');
+  assert.ok(resolvedCtx.managedFiles.includes(path.resolve(hostileSystemJson)), 'system managed dir is retained alongside overrides');
+
+  // 1. Override set + hostile opencode.json at the real system path -> still refused.
+  await assert.rejects(
+    events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'redirect attempt' }] })),
+    (e) =>
+      e.status === 502 &&
+      /opencode effective permission preflight failed/.test(e.message) &&
+      e.message.includes(hostileSystemJson) &&
+      e.message.includes('permission.read = "allow"'),
+  );
+  assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when real system managed dir allowed read');
+
+  // 2. Override managedPlistPaths = [] + hostile plist at the real system plist path -> still refused.
+  fs.rmSync(hostileSystemJson, { force: true });
+  a.managedPlistPaths = [];
+  fs.writeFileSync(fakeRealSystemPlist, JSON.stringify({ permission: { bash: 'allow' } }));
+  await assert.rejects(
+    events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'plist redirect attempt' }] })),
+    (e) =>
+      e.status === 502 &&
+      /opencode effective permission preflight failed/.test(e.message) &&
+      e.message.includes(`mobileconfig:${fakeRealSystemPlist}`) &&
+      e.message.includes('permission.bash = "allow"'),
+  );
+  assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when real system managed plist allowed bash');
+});
+
+test('opencode lazy node:sqlite import: src/cli-adapter.js loads and non-opencode adapters (plus opencode without opencode.db) work when node:sqlite is unavailable, while opencode with opencode.db is refused', () => {
+  const dir = tmp('no-node-sqlite');
+  const { bin: ocBin } = opencodeStub(dir);
+  const echoStub = path.join(dir, 'echo-stub.mjs');
+  fs.writeFileSync(
+    echoStub,
+    `#!/usr/bin/env node\nprocess.stdout.write('PLAIN_OK\\n');\n`,
+    { mode: 0o755 },
+  );
+  const cliAdapterUrl = new URL('../src/cli-adapter.js', import.meta.url).href;
+  const profilesUrl = new URL('../src/profiles.js', import.meta.url).href;
+
+  const probeScript = `
+    import Module from 'node:module';
+    import assert from 'node:assert/strict';
+    import fs from 'node:fs';
+    import path from 'node:path';
+
+    // Simulate Node 20 / 22.0-22.4 where node:sqlite does not exist BEFORE importing src/cli-adapter.js.
+    const origLoad = Module._load;
+    Module._load = function patchedLoad(request, parent, isMain) {
+      if (request === 'node:sqlite' || request === 'sqlite') {
+        const err = new Error('No such built-in module: ' + request);
+        err.code = 'ERR_UNKNOWN_BUILTIN_MODULE';
+        throw err;
+      }
+      return origLoad.call(this, request, parent, isMain);
+    };
+
+    const { CliAdapter, clearOpencodePreflightCache } = await import(${JSON.stringify(cliAdapterUrl)});
+    const { CLI_PROFILES } = await import(${JSON.stringify(profilesUrl)});
+
+    const baseDir = ${JSON.stringify(dir)};
+    const testHome = path.join(baseDir, 'home');
+    const dataDir = path.join(testHome, '.local', 'share', 'opencode');
+    fs.mkdirSync(path.join(testHome, '.config', 'opencode'), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+
+    const collect = async (gen) => {
+      const out = [];
+      for await (const e of gen) out.push(e);
+      return out;
+    };
+
+    // 1. opencode WITHOUT opencode.db works cleanly without node:sqlite.
+    const oc = new CliAdapter('oc', {
+      ...CLI_PROFILES.opencode,
+      bin: ${JSON.stringify(ocBin)},
+      cwd: path.join(baseDir, 'ws-oc'),
+      env: {
+        HOME: testHome,
+        XDG_CONFIG_HOME: path.join(testHome, '.config'),
+        XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+      },
+    });
+    clearOpencodePreflightCache();
+    const ocEvents = await collect(oc.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'hi' }] }));
+    assert.equal(ocEvents.filter((e) => e.type === 'delta').map((e) => e.text).join(''), 'OK');
+
+    // 2. When opencode.db EXISTS while node:sqlite is unavailable, opencode runs are refused (fail-closed),
+    //    while non-opencode adapters remain completely unaffected.
+    const dbFile = path.join(dataDir, 'opencode.db');
+    fs.writeFileSync(dbFile, 'sqlite placeholder');
+    const recordFile = path.join(baseDir, 'opencode-argv.json');
+    fs.rmSync(recordFile, { force: true });
+
+    const other = new CliAdapter('plain', {
+      bin: ${JSON.stringify(echoStub)},
+      args: ['{prompt}'],
+      parser: 'raw',
+      env: {
+        HOME: testHome,
+        XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+      },
+    });
+    const otherEvents = await collect(other.complete({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }));
+    assert.equal(otherEvents.filter((e) => e.type === 'delta').map((e) => e.text).join('').trim(), 'PLAIN_OK');
+
+    clearOpencodePreflightCache();
+    await assert.rejects(
+      collect(oc.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'blocked' }] })),
+      (e) =>
+        e.status === 502 &&
+        /opencode effective permission preflight failed/.test(e.message) &&
+        e.message.includes(dbFile) &&
+        e.message.includes('node:sqlite') &&
+        /unavailable|No such built-in module/.test(e.message),
+    );
+    assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when opencode.db existed without node:sqlite');
+    process.stdout.write('SIMULATION_PASSED\\n');
+  `;
+
+  const res = spawnSync(process.execPath, ['--input-type=module', '-e', probeScript], {
+    cwd: dir,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8',
+    timeout: 30_000,
+  });
+  assert.equal(res.status, 0, `stdout=${res.stdout}\nstderr=${res.stderr}`);
+  assert.match(res.stdout, /SIMULATION_PASSED/);
+});
+
+test('opencode preflight agent markdown frontmatter: refuses agent .md files with unclassifiable YAML constructs', async () => {
+  const { clearOpencodePreflightCache } = await import('../src/cli-adapter.js');
+  const dir = tmp('opencode-frontmatter-strict');
+  const testHome = path.join(dir, 'test-home');
+  const globalAgentDir = path.join(testHome, '.config', 'opencode', 'agent');
+  fs.mkdirSync(globalAgentDir, { recursive: true, mode: 0o700 });
+  const recordFile = path.join(dir, 'opencode-argv.json');
+  const { bin } = opencodeStub(dir);
+  const ws = path.join(dir, 'workspaces', 'opencode');
+  const a = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin,
+    cwd: ws,
+    env: {
+      HOME: testHome,
+      XDG_CONFIG_HOME: path.join(testHome, '.config'),
+      XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+    },
+  });
+
+  const hostileMd = path.join(globalAgentDir, 'keysmith-text.md');
+  const invalidFrontmatters = [
+    // Block scalar
+    '---\ndescription: |\n  multi-line block\n---\nPrompt\n',
+    // Tab indentation
+    '---\npermission:\n\tread: deny\n---\nPrompt\n',
+    // YAML sequence item
+    '---\ntools:\n  - read\n---\nPrompt\n',
+    // Unclosed frontmatter fence
+    '---\npermission:\n  read: allow\nPrompt without closing fence\n',
+  ];
+
+  for (const content of invalidFrontmatters) {
+    fs.writeFileSync(hostileMd, content);
+    clearOpencodePreflightCache();
+    await assert.rejects(
+      events(a.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'bad md' }] })),
+      (e) =>
+        e.status === 502 &&
+        /opencode effective permission preflight failed/.test(e.message) &&
+        e.message.includes(hostileMd) &&
+        e.message.includes('frontmatter'),
+    );
+    assert.equal(fs.existsSync(recordFile), false);
+  }
+});
+
+test('opencode preflight version drift: refuses unprobed/unknown and mismatched (1.19.4) versions before spawning, allows 1.19.3, and allows explicit allowUnverifiedVersion override', async () => {
+  const {
+    clearOpencodePreflightCache,
+    clearOpencodeVersionCache,
+    preflightOpencodePermissions,
+  } = await import('../src/cli-adapter.js');
+
+  const dir = tmp('opencode-version-drift');
+  const testHome = path.join(dir, 'test-home');
+  fs.mkdirSync(path.join(testHome, '.config', 'opencode'), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(testHome, '.local', 'share', 'opencode'), { recursive: true, mode: 0o700 });
+
+  const makeVersionedStub = (name, versionOut, exitCode = 0) => {
+    const subDir = path.join(dir, name);
+    fs.mkdirSync(subDir, { recursive: true });
+    const recordFile = path.join(subDir, 'run-record.json');
+    const binPath = nodeStub(
+      subDir,
+      'opencode',
+      `const fs = require('node:fs');
+const argv = process.argv.slice(2);
+if (argv.length === 1 && argv[0] === '--version') {
+  process.stdout.write(${JSON.stringify(versionOut)});
+  process.exit(${exitCode});
+}
+fs.writeFileSync(${JSON.stringify(recordFile)}, JSON.stringify({ argv }));
+const line = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+line({ type: 'step_start', sessionID: 'ses_v', part: { type: 'step-start' } });
+line({ type: 'text', sessionID: 'ses_v', part: { id: 'prt_1', type: 'text', text: 'VER_OK' } });
+line({ type: 'step_finish', sessionID: 'ses_v', part: { type: 'step-finish', reason: 'stop', tokens: { total: 4, input: 2, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } } });
+`,
+    );
+    return { binPath, recordFile };
+  };
+
+  const baseEnv = {
+    HOME: testHome,
+    XDG_CONFIG_HOME: path.join(testHome, '.config'),
+    XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+  };
+
+  // 1a. Unprobed cache state (`probeVersion: false` before any `--version` check) -> refused.
+  clearOpencodeVersionCache();
+  clearOpencodePreflightCache();
+  const stub1193 = makeVersionedStub('oc-1193', '1.19.3\n');
+  const ws1193 = path.join(dir, 'ws-1193');
+  const a1193 = new CliAdapter('oc', { ...CLI_PROFILES.opencode, bin: stub1193.binPath, cwd: ws1193, env: { ...baseEnv } });
+  a1193._ensureCwd();
+  await assert.rejects(
+    preflightOpencodePermissions(a1193, {
+      runCwd: ws1193,
+      childEnv: a1193._childEnv(ws1193),
+      mode: 'text',
+      probeVersion: false,
+    }),
+    (e) =>
+      e.status === 502 &&
+      /opencode effective permission preflight failed/.test(e.message) &&
+      /sets version = "unprobed\/unknown !== verifiedVersion 1\.19\.3/.test(e.message),
+  );
+  assert.equal(fs.existsSync(stub1193.recordFile), false, 'unprobed version refused without running opencode');
+
+  // 1b. Unknown/unparseable `--version` output on the real request path -> refused before spawning `opencode run`.
+  const stubUnknown = makeVersionedStub('oc-unknown', 'opencode custom-dev-build\n');
+  const aUnknown = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin: stubUnknown.binPath,
+    cwd: path.join(dir, 'ws-unknown'),
+    env: { ...baseEnv },
+  });
+  await assert.rejects(
+    events(aUnknown.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'hi' }] })),
+    (e) =>
+      e.status === 502 &&
+      /opencode effective permission preflight failed/.test(e.message) &&
+      /sets version = "unprobed\/unknown !== verifiedVersion 1\.19\.3/.test(e.message),
+  );
+  assert.equal(fs.existsSync(stubUnknown.recordFile), false, 'opencode run was never spawned when --version was unknown');
+
+  // 2. Mismatched version 1.19.4 -> refused before spawning `opencode run` (both text and EMULATE).
+  const stub1194 = makeVersionedStub('oc-1194', '1.19.4\n');
+  const a1194 = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin: stub1194.binPath,
+    cwd: path.join(dir, 'ws-1194'),
+    env: { ...baseEnv },
+    toolMode: 'emulate',
+    models: ['opencode/deepseek-v4.1-flash-free'],
+  });
+  const verCheck = await a1194.checkVersion();
+  assert.equal(verCheck.installed, '1.19.4');
+  assert.match(verCheck.warning || '', /runs are refused unless `keysmith set oc allowUnverifiedVersion true` is set/);
+  await assert.rejects(
+    events(a1194.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'hi' }] })),
+    (e) =>
+      e.status === 502 &&
+      /opencode effective permission preflight failed/.test(e.message) &&
+      /sets version = "1\.19\.4 !== verifiedVersion 1\.19\.3/.test(e.message),
+  );
+  assert.equal(fs.existsSync(stub1194.recordFile), false, 'opencode 1.19.4 run was never spawned on text path');
+
+  const gwRefuse = new Gateway({
+    adapters: {
+      oc: {
+        ...CLI_PROFILES.opencode,
+        bin: stub1194.binPath,
+        cwd: path.join(dir, 'ws-1194-gw'),
+        env: { ...baseEnv },
+        toolMode: 'emulate',
+        models: ['opencode/deepseek-v4.1-flash-free'],
+      },
+    },
+  });
+  await assert.rejects(
+    events(
+      gwRefuse.complete({
+        model: 'oc/opencode/deepseek-v4.1-flash-free',
+        messages: [{ role: 'user', content: 'use tool' }],
+        tools: {
+          face: 'openai',
+          spec: {
+            tools: [{ name: 'ping', description: 'ping', parameters: { type: 'object', properties: {} } }],
+            choice: { mode: 'auto' },
+            unsupported: [],
+          },
+        },
+      }),
+    ),
+    (e) => e.status === 502 && /1\.19\.4 !== verifiedVersion 1\.19\.3/.test(e.message),
+  );
+  assert.equal(fs.existsSync(stub1194.recordFile), false, 'opencode 1.19.4 run was never spawned on EMULATE path');
+
+  // 3. Verified version 1.19.3 -> allowed (auto-probed on first request).
+  clearOpencodeVersionCache();
+  clearOpencodePreflightCache();
+  const evOk = await events(a1193.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'hi' }] }));
+  assert.equal(textOf(evOk), 'VER_OK');
+  assert.equal(fs.existsSync(stub1193.recordFile), true, 'verified 1.19.3 opencode was allowed to run');
+
+  // 4. Explicit owner override (`allowUnverifiedVersion: true`, settable via `keysmith set oc allowUnverifiedVersion true`) -> allowed.
+  const sb = sandbox();
+  const sbCfg = sb.read();
+  sbCfg.adapters.oc = {
+    ...CLI_PROFILES.opencode,
+    bin: stub1194.binPath,
+    cwd: path.join(dir, 'ws-override'),
+    env: { ...baseEnv },
+    models: ['opencode/deepseek-v4.1-flash-free'],
+  };
+  sb.write(sbCfg);
+  const setRes = sb.run('set', 'oc', 'allowUnverifiedVersion', 'true');
+  assert.equal(setRes.status, 0, setRes.all);
+  assert.equal(sb.read().adapters.oc.allowUnverifiedVersion, true);
+
+  const aOverride = new CliAdapter('oc', sb.read().adapters.oc);
+  const evOverride = await events(
+    aOverride.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'override run' }] }),
+  );
+  assert.equal(textOf(evOverride), 'VER_OK');
+  assert.equal(fs.existsSync(stub1194.recordFile), true, 'opencode 1.19.4 ran when allowUnverifiedVersion: true was set');
+});
+
+test("opencode preflight async org-config fetch: slow /api/config fetch does not block another adapter's request, caches briefly by (account, org, tokenExpiry), and fails closed on timeout or error", async () => {
+  const {
+    clearOpencodePreflightCache,
+    getOpencodeOrgConfigStats,
+  } = await import('../src/cli-adapter.js');
+  const http = await import('node:http');
+  const { createRequire } = await import('node:module');
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+
+  const dir = tmp('opencode-async-org');
+  const testHome = path.join(dir, 'test-home');
+  const dataDir = path.join(testHome, '.local', 'share', 'opencode');
+  fs.mkdirSync(path.join(testHome, '.config', 'opencode'), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const dbPath = path.join(dataDir, 'opencode.db');
+  const recordFile = path.join(dir, 'opencode-argv.json');
+  const { bin: ocBin } = opencodeStub(dir);
+  const fastBin = nodeStub(
+    dir,
+    'fast-cli',
+    `process.stdout.write('FAST_ADAPTER_OK');\n`,
+  );
+
+  const initDb = ({ accountId = 'acc_1', orgId = 'org_1', tokenExpiry, baseUrl }) => {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${dbPath}${suffix}`, { force: true });
+    const db = new DatabaseSync(dbPath);
+    const now = Date.now();
+    db.exec(`
+      CREATE TABLE account (
+        id text PRIMARY KEY,
+        email text NOT NULL,
+        url text NOT NULL,
+        access_token text NOT NULL,
+        refresh_token text NOT NULL,
+        token_expiry integer,
+        time_created integer NOT NULL,
+        time_updated integer NOT NULL
+      );
+      CREATE TABLE account_state (
+        id integer PRIMARY KEY,
+        active_account_id text,
+        active_org_id text
+      );
+    `);
+    db.prepare(
+      'INSERT INTO account (id, email, url, access_token, refresh_token, token_expiry, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(accountId, 'u@example.com', baseUrl, 'tok_async_secret', 'ref_async', tokenExpiry, now, now);
+    db.prepare('INSERT INTO account_state (id, active_account_id, active_org_id) VALUES (1, ?, ?)').run(accountId, orgId);
+    db.close();
+  };
+
+  let delayMs = 1_500;
+  let statusCode = 200;
+  let bodyPayload = { config: { autoupdate: false } };
+  let serverFetches = 0;
+  let serverResponded = false;
+  let notifyFetchStarted = null;
+
+  const srv = http.createServer((req, res) => {
+    if (req.url !== '/api/config') {
+      res.writeHead(404).end();
+      return;
+    }
+    serverFetches++;
+    notifyFetchStarted?.();
+    const wait = delayMs;
+    const code = statusCode;
+    const payload = bodyPayload;
+    setTimeout(() => {
+      serverResponded = true;
+      res.writeHead(code, { 'content-type': 'application/json' });
+      res.end(typeof payload === 'string' ? payload : JSON.stringify(payload));
+    }, wait);
+  });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const { port } = srv.address();
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const baseExpiry = Date.now() + 3_600_000;
+    initDb({ accountId: 'acc_1', orgId: 'org_1', tokenExpiry: baseExpiry, baseUrl });
+    clearOpencodePreflightCache();
+
+    const gw = new Gateway({
+      adapters: {
+        oc: {
+          ...CLI_PROFILES.opencode,
+          bin: ocBin,
+          cwd: path.join(dir, 'ws-oc'),
+          models: ['opencode/deepseek-v4.1-flash-free'],
+          orgConfigCacheTtlMs: 10_000,
+          orgConfigFetchTimeoutMs: 3_000,
+          env: {
+            HOME: testHome,
+            XDG_CONFIG_HOME: path.join(testHome, '.config'),
+            XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+          },
+        },
+        fast: {
+          kind: 'cli',
+          bin: fastBin,
+          args: ['{prompt}'],
+          parser: 'raw',
+          cwd: path.join(dir, 'ws-fast'),
+          models: ['echo-fast'],
+        },
+      },
+    });
+
+    // 1. Slow /api/config fetch (700 ms) on `oc` does NOT block `fast` adapter's request on the same gateway.
+    const fetchArrived = new Promise((resolve) => {
+      notifyFetchStarted = resolve;
+    });
+    serverResponded = false;
+    const ocPromise = events(
+      gw.complete({
+        model: 'oc/opencode/deepseek-v4.1-flash-free',
+        messages: [{ role: 'user', content: 'slow org preflight' }],
+      }),
+    );
+    await Promise.race([
+      fetchArrived,
+      ocPromise.then(() => {
+        throw new Error('oc finished before /api/config fetch arrived');
+      }),
+    ]);
+
+    const fastStart = performance.now();
+    const fastEvts = await events(
+      gw.complete({
+        model: 'fast/echo-fast',
+        messages: [{ role: 'user', content: 'ping' }],
+      }),
+    );
+    const fastElapsedMs = performance.now() - fastStart;
+    assert.equal(textOf(fastEvts), 'FAST_ADAPTER_OK');
+    assert.equal(
+      serverResponded,
+      false,
+      `fast adapter completed (${fastElapsedMs.toFixed(1)} ms) while oc /api/config fetch was still in flight`,
+    );
+    assert.ok(fastElapsedMs < 1_200, `expected fast adapter not to wait for 1500ms org fetch, took ${fastElapsedMs.toFixed(1)}ms`);
+
+    const ocEvts = await ocPromise;
+    assert.equal(textOf(ocEvts), 'OK');
+    assert.equal(serverFetches, 1);
+
+    // 2. Brief cache keyed on (account, org, tokenExpiry): immediate repeat hits cache with zero extra HTTP fetches.
+    delayMs = 5;
+    const ocEvts2 = await events(
+      gw.complete({
+        model: 'oc/opencode/deepseek-v4.1-flash-free',
+        messages: [{ role: 'user', content: 'cached org preflight' }],
+      }),
+    );
+    assert.equal(textOf(ocEvts2), 'OK');
+    assert.equal(serverFetches, 1, 'second request within TTL hit the brief org-config cache');
+    assert.equal(getOpencodeOrgConfigStats().hits, 1);
+
+    // Changing org, account, or token_expiry invalidates the cache key and triggers a fresh async fetch.
+    {
+      const db = new DatabaseSync(dbPath);
+      db.prepare('UPDATE account_state SET active_org_id = ? WHERE id = 1').run('org_2');
+      db.close();
+    }
+    await events(gw.complete({ model: 'oc/opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'new org' }] }));
+    assert.equal(serverFetches, 2, 'changing active_org_id missed org-config cache and re-fetched');
+
+    {
+      const db = new DatabaseSync(dbPath);
+      db.prepare('UPDATE account SET token_expiry = ? WHERE id = ?').run(baseExpiry + 60_000, 'acc_1');
+      db.close();
+    }
+    await events(gw.complete({ model: 'oc/opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'new expiry' }] }));
+    assert.equal(serverFetches, 3, 'changing token_expiry missed org-config cache and re-fetched');
+
+    {
+      const db = new DatabaseSync(dbPath);
+      const now = Date.now();
+      db.prepare(
+        'INSERT INTO account (id, email, url, access_token, refresh_token, token_expiry, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      ).run('acc_2', 'u2@example.com', baseUrl, 'tok_async_secret_2', 'ref_2', baseExpiry + 60_000, now, now);
+      db.prepare('UPDATE account_state SET active_account_id = ? WHERE id = 1').run('acc_2');
+      db.close();
+    }
+    await events(gw.complete({ model: 'oc/opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'new account' }] }));
+    assert.equal(serverFetches, 4, 'changing active_account_id missed org-config cache and re-fetched');
+
+    // Brief TTL expiry re-fetches /api/config and catches a newly hostile org config.
+    const shortTtlAdapter = new CliAdapter('oc', {
+      ...CLI_PROFILES.opencode,
+      bin: ocBin,
+      cwd: path.join(dir, 'ws-short-ttl'),
+      orgConfigCacheTtlMs: 40,
+      orgConfigFetchTimeoutMs: 200,
+      env: {
+        HOME: testHome,
+        XDG_CONFIG_HOME: path.join(testHome, '.config'),
+        XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+      },
+    });
+    clearOpencodePreflightCache();
+    await events(shortTtlAdapter.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'ttl 1' }] }));
+    assert.equal(serverFetches, 5);
+    bodyPayload = { config: { permission: { read: 'allow' } } };
+    await new Promise((r) => setTimeout(r, 65));
+    fs.rmSync(recordFile, { force: true });
+    await assert.rejects(
+      events(shortTtlAdapter.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'ttl expired hostile' }] })),
+      (e) => e.status === 502 && e.message.includes('permission.read = "allow"'),
+    );
+    assert.equal(serverFetches, 6, 'expired TTL re-fetched /api/config');
+    assert.equal(fs.existsSync(recordFile), false, 'opencode was not spawned after TTL refresh detected allow rule');
+
+    // 3. Timeout and HTTP 500 fail closed (refuse the run without spawning opencode) and recover once server is healthy.
+    clearOpencodePreflightCache();
+    bodyPayload = { config: { autoupdate: false } };
+    delayMs = 450; // exceeds shortTtlAdapter.orgConfigFetchTimeoutMs (200 ms)
+    fs.rmSync(recordFile, { force: true });
+    await assert.rejects(
+      events(shortTtlAdapter.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'timeout check' }] })),
+      (e) =>
+        e.status === 502 &&
+        /timed out fetching active Console org config/.test(e.message) &&
+        !e.message.includes('tok_async_secret'),
+    );
+    assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when /api/config timed out');
+
+    delayMs = 5;
+    statusCode = 503;
+    await assert.rejects(
+      events(shortTtlAdapter.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'http 503 check' }] })),
+      (e) => e.status === 502 && /returned HTTP 503/.test(e.message),
+    );
+    assert.equal(fs.existsSync(recordFile), false, 'opencode was never spawned when /api/config returned HTTP 503');
+
+    // Transient fetch failure was not permanently cached: restoring 200 OK succeeds immediately.
+    statusCode = 200;
+    const evRecovered = await events(
+      shortTtlAdapter.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'recovered' }] }),
+    );
+    assert.equal(textOf(evRecovered), 'OK');
+  } finally {
+    await new Promise((resolve) => srv.close(resolve));
+  }
+});
+
+test('opencode version cache invalidation: detects in-place upgrade with identical size and fixed npm mtime, symlink retargeting, and launcher upgrades via TTL or preflight miss', async () => {
+  const { clearOpencodePreflightCache, clearOpencodeVersionCache } = await import('../src/cli-adapter.js');
+
+  const dir = tmp('opencode-version-stat-invalidation');
+  const testHome = path.join(dir, 'test-home');
+  fs.mkdirSync(path.join(testHome, '.config', 'opencode'), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(testHome, '.local', 'share', 'opencode'), { recursive: true, mode: 0o700 });
+  const baseEnv = {
+    HOME: testHome,
+    XDG_CONFIG_HOME: path.join(testHome, '.config'),
+    XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+  };
+
+  // npm packs tarball files with the fixed mtime 1985-10-26T08:15:00.000Z.
+  const NPM_FIXED_MTIME = new Date('1985-10-26T08:15:00.000Z');
+  const buildScript = (ver, probeCounterFile, runRecordFile) => `#!/usr/bin/env node
+const fs = require('node:fs');
+const argv = process.argv.slice(2);
+if (argv.length === 1 && argv[0] === '--version') {
+  fs.appendFileSync(${JSON.stringify(probeCounterFile)}, '1\\n');
+  process.stdout.write(${JSON.stringify(`${ver}\n`)});
+  process.exit(0);
+}
+fs.writeFileSync(${JSON.stringify(runRecordFile)}, JSON.stringify({ argv }));
+const line = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+line({ type: 'step_start', sessionID: 'ses_up', part: { type: 'step-start' } });
+line({ type: 'text', sessionID: 'ses_up', part: { id: 'prt_1', type: 'text', text: 'UP_OK' } });
+line({ type: 'step_finish', sessionID: 'ses_up', part: { type: 'step-finish', reason: 'stop', tokens: { total: 4, input: 2, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } } });
+`;
+
+  const countLines = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8').trim().split('\n').filter(Boolean).length : 0);
+
+  // 1. In-place upgrade with identical byte size and identical npm fixed mtime (only ctime changes) -> detected and refused.
+  clearOpencodeVersionCache();
+  clearOpencodePreflightCache();
+  const inplaceDir = path.join(dir, 'inplace');
+  fs.mkdirSync(inplaceDir, { recursive: true });
+  const inplaceBin = path.join(inplaceDir, 'opencode');
+  const inplaceProbes = path.join(inplaceDir, 'probes.log');
+  const inplaceRunRecord = path.join(inplaceDir, 'run.json');
+  const script1193 = buildScript('1.19.3', inplaceProbes, inplaceRunRecord);
+  const script1194 = buildScript('1.19.4', inplaceProbes, inplaceRunRecord);
+  assert.equal(Buffer.byteLength(script1193), Buffer.byteLength(script1194), '1.19.3 and 1.19.4 scripts have identical byte size');
+
+  fs.writeFileSync(inplaceBin, script1193, { mode: 0o755 });
+  fs.utimesSync(inplaceBin, NPM_FIXED_MTIME, NPM_FIXED_MTIME);
+  const stBefore = fs.statSync(fs.realpathSync(inplaceBin), { bigint: true });
+
+  const aInplace = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin: inplaceBin,
+    cwd: path.join(dir, 'ws-inplace'),
+    env: { ...baseEnv },
+  });
+  const ev1 = await events(aInplace.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'before upgrade' }] }));
+  assert.equal(textOf(ev1), 'UP_OK');
+  assert.equal(countLines(inplaceProbes), 1);
+
+  // Cached hit before upgrade does not respawn `--version`.
+  const ev2 = await events(aInplace.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'cached before upgrade' }] }));
+  assert.equal(textOf(ev2), 'UP_OK');
+  assert.equal(countLines(inplaceProbes), 1, 'cached version avoided re-spawning --version while binary was unchanged');
+
+  // Overwrite in-place (preserving inode) with identical size and restore npm's fixed 1985-10-26 mtime.
+  fs.rmSync(inplaceRunRecord, { force: true });
+  fs.writeFileSync(inplaceBin, script1194, { mode: 0o755 });
+  fs.utimesSync(inplaceBin, NPM_FIXED_MTIME, NPM_FIXED_MTIME);
+  const stAfter = fs.statSync(fs.realpathSync(inplaceBin), { bigint: true });
+  assert.equal(stAfter.ino, stBefore.ino, 'in-place overwrite kept the same inode');
+  assert.equal(stAfter.size, stBefore.size, 'in-place overwrite kept the exact same byte size');
+  assert.equal(stAfter.mtimeNs, stBefore.mtimeNs, 'in-place overwrite kept npm fixed 1985-10-26 mtime');
+
+  await assert.rejects(
+    events(aInplace.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'after in-place upgrade' }] })),
+    (e) =>
+      e.status === 502 &&
+      /opencode effective permission preflight failed/.test(e.message) &&
+      /1\.19\.4 !== verifiedVersion 1\.19\.3/.test(e.message),
+  );
+  assert.equal(countLines(inplaceProbes), 2, 'ctime change invalidated version cache and re-probed --version');
+  assert.equal(fs.existsSync(inplaceRunRecord), false, 'opencode 1.19.4 run was never spawned after in-place upgrade');
+
+  // 2. Symlink retargeting to a pre-existing binary with identical size and fixed 1985-10-26 mtime -> detected via realpathSync + ino and refused.
+  const symDir = path.join(dir, 'sym');
+  fs.mkdirSync(symDir, { recursive: true });
+  const symProbes = path.join(symDir, 'probes.log');
+  const symRunRecord = path.join(symDir, 'run.json');
+  const target1193 = path.join(symDir, 'opencode-1193');
+  const target1194 = path.join(symDir, 'opencode-1194');
+  fs.writeFileSync(target1193, buildScript('1.19.3', symProbes, symRunRecord), { mode: 0o755 });
+  fs.writeFileSync(target1194, buildScript('1.19.4', symProbes, symRunRecord), { mode: 0o755 });
+  fs.utimesSync(target1193, NPM_FIXED_MTIME, NPM_FIXED_MTIME);
+  fs.utimesSync(target1194, NPM_FIXED_MTIME, NPM_FIXED_MTIME);
+  const symLink = path.join(symDir, 'opencode');
+  fs.symlinkSync(target1193, symLink);
+
+  const aSym = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin: symLink,
+    cwd: path.join(dir, 'ws-sym'),
+    env: { ...baseEnv },
+  });
+  const evSym1 = await events(aSym.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'sym v1' }] }));
+  assert.equal(textOf(evSym1), 'UP_OK');
+
+  fs.rmSync(symRunRecord, { force: true });
+  const tmpLink = path.join(symDir, 'opencode.next');
+  fs.symlinkSync(target1194, tmpLink);
+  fs.renameSync(tmpLink, symLink);
+
+  await assert.rejects(
+    events(aSym.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'sym v2' }] })),
+    (e) => e.status === 502 && /1\.19\.4 !== verifiedVersion 1\.19\.3/.test(e.message),
+  );
+  assert.equal(fs.existsSync(symRunRecord), false, 'opencode 1.19.4 run was never spawned after symlink retarget');
+
+  // 3. Untouched JS launcher script (realpath, ino, ctime, size, mtime all unchanged) delegating to a sibling platform binary:
+  //    detected both when preflight cache misses AND when short versionCacheTtlMs expires.
+  const launcherDir = path.join(dir, 'launcher');
+  fs.mkdirSync(launcherDir, { recursive: true });
+  const versionSidecar = path.join(launcherDir, 'platform-version.txt');
+  const launcherProbes = path.join(launcherDir, 'probes.log');
+  const launcherRunRecord = path.join(launcherDir, 'run.json');
+  fs.writeFileSync(versionSidecar, '1.19.3\n');
+  const launcherBin = nodeStub(
+    launcherDir,
+    'opencode',
+    `const fs = require('node:fs');
+const argv = process.argv.slice(2);
+if (argv.length === 1 && argv[0] === '--version') {
+  fs.appendFileSync(${JSON.stringify(launcherProbes)}, '1\\n');
+  process.stdout.write(fs.readFileSync(${JSON.stringify(versionSidecar)}, 'utf8'));
+  process.exit(0);
+}
+fs.writeFileSync(${JSON.stringify(launcherRunRecord)}, JSON.stringify({ argv }));
+const line = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+line({ type: 'step_start', sessionID: 'ses_l', part: { type: 'step-start' } });
+line({ type: 'text', sessionID: 'ses_l', part: { id: 'prt_1', type: 'text', text: 'LAUNCH_OK' } });
+line({ type: 'step_finish', sessionID: 'ses_l', part: { type: 'step-finish', reason: 'stop', tokens: { total: 4, input: 2, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } } });
+`,
+  );
+  fs.utimesSync(launcherBin, NPM_FIXED_MTIME, NPM_FIXED_MTIME);
+  const launcherStat0 = fs.statSync(fs.realpathSync(launcherBin), { bigint: true });
+
+  // 3a. Preflight cache miss triggers re-probe even before TTL expires.
+  const aLauncherMiss = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin: launcherBin,
+    cwd: path.join(dir, 'ws-launcher-miss'),
+    versionCacheTtlMs: 60_000,
+    env: { ...baseEnv },
+  });
+  const evL1 = await events(aLauncherMiss.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'launcher 1' }] }));
+  assert.equal(textOf(evL1), 'LAUNCH_OK');
+
+  fs.writeFileSync(versionSidecar, '1.19.4\n');
+  fs.rmSync(launcherRunRecord, { force: true });
+  const launcherStat1 = fs.statSync(fs.realpathSync(launcherBin), { bigint: true });
+  assert.equal(launcherStat1.ctimeNs, launcherStat0.ctimeNs, 'launcher binary itself was completely untouched on disk');
+
+  // Trigger a preflight cache miss via env change -> re-probes `--version` and refuses 1.19.4!
+  aLauncherMiss.env.XDG_CONFIG_HOME = path.join(dir, 'alt-launcher-xdg');
+  await assert.rejects(
+    events(aLauncherMiss.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'launcher after miss' }] })),
+    (e) => e.status === 502 && /1\.19\.4 !== verifiedVersion 1\.19\.3/.test(e.message),
+  );
+  assert.equal(fs.existsSync(launcherRunRecord), false);
+
+  // 3b. Short TTL expiry triggers re-probe even with zero config/env changes.
+  clearOpencodeVersionCache();
+  clearOpencodePreflightCache();
+  fs.writeFileSync(versionSidecar, '1.19.3\n');
+  const aLauncherTtl = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin: launcherBin,
+    cwd: path.join(dir, 'ws-launcher-ttl'),
+    versionCacheTtlMs: 45,
+    env: { ...baseEnv },
+  });
+  const evL2 = await events(aLauncherTtl.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'ttl before' }] }));
+  assert.equal(textOf(evL2), 'LAUNCH_OK');
+
+  fs.writeFileSync(versionSidecar, '1.19.4\n');
+  fs.rmSync(launcherRunRecord, { force: true });
+  await new Promise((r) => setTimeout(r, 70));
+
+  await assert.rejects(
+    events(aLauncherTtl.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'ttl after' }] })),
+    (e) => e.status === 502 && /1\.19\.4 !== verifiedVersion 1\.19\.3/.test(e.message),
+  );
+  assert.equal(fs.existsSync(launcherRunRecord), false, 'TTL expiry re-probed untouched launcher and refused 1.19.4');
+
+  // 4. Missing stat means "not cached": if stat fails when `--version` finishes (or later), nothing is served from cache.
+  const vanishDir = path.join(dir, 'vanish');
+  fs.mkdirSync(vanishDir, { recursive: true });
+  const vanishProbes = path.join(vanishDir, 'probes.log');
+  const vanishLink = path.join(vanishDir, 'opencode');
+  const vanishTarget = nodeStub(
+    vanishDir,
+    'opencode-vanish-target',
+    `const fs = require('node:fs');
+const argv = process.argv.slice(2);
+if (argv.length === 1 && argv[0] === '--version') {
+  fs.appendFileSync(${JSON.stringify(vanishProbes)}, '1\\n');
+  try { fs.unlinkSync(${JSON.stringify(vanishLink)}); } catch {}
+  process.stdout.write('1.19.3\\n');
+  process.exit(0);
+}
+`,
+  );
+  fs.symlinkSync(vanishTarget, vanishLink);
+  const aVanish = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin: vanishLink,
+    cwd: path.join(dir, 'ws-vanish'),
+    env: { ...baseEnv },
+  });
+  assert.equal(await aVanish.checkVersion().then((r) => r.installed), '1.19.3');
+  assert.equal(countLines(vanishProbes), 1);
+  // Restore symlink at identical target/stat: because post-probe stat was missing (unlinked), it was NOT cached and re-probes.
+  fs.symlinkSync(vanishTarget, vanishLink);
+  await aVanish.checkVersion();
+  assert.equal(countLines(vanishProbes), 2, 'missing stat during probe was not cached');
+});
+
+test('opencode negative --version cache: caches failed or unrecognised --version probes briefly so repeated requests do not respawn --version, while still refusing every run', async () => {
+  const { clearOpencodePreflightCache, clearOpencodeVersionCache } = await import('../src/cli-adapter.js');
+
+  const dir = tmp('opencode-negative-version-cache');
+  const testHome = path.join(dir, 'test-home');
+  fs.mkdirSync(path.join(testHome, '.config', 'opencode'), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(testHome, '.local', 'share', 'opencode'), { recursive: true, mode: 0o700 });
+  const baseEnv = {
+    HOME: testHome,
+    XDG_CONFIG_HOME: path.join(testHome, '.config'),
+    XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+  };
+  const countLines = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8').trim().split('\n').filter(Boolean).length : 0);
+
+  // 1. Unrecognised `--version` output (exit 0, no semver): cached briefly, refuses every run without respawning per request.
+  clearOpencodeVersionCache();
+  clearOpencodePreflightCache();
+  const unrecDir = path.join(dir, 'unrec');
+  fs.mkdirSync(unrecDir, { recursive: true });
+  const unrecProbes = path.join(unrecDir, 'probes.log');
+  const unrecRunRecord = path.join(unrecDir, 'run.json');
+  const unrecBin = nodeStub(
+    unrecDir,
+    'opencode',
+    `const fs = require('node:fs');
+const argv = process.argv.slice(2);
+if (argv.length === 1 && argv[0] === '--version') {
+  fs.appendFileSync(${JSON.stringify(unrecProbes)}, '1\\n');
+  process.stdout.write('opencode custom-nightly-build\\n');
+  process.exit(0);
+}
+fs.writeFileSync(${JSON.stringify(unrecRunRecord)}, JSON.stringify({ argv }));
+`,
+  );
+
+  const aUnrec = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin: unrecBin,
+    cwd: path.join(dir, 'ws-unrec'),
+    negativeVersionCacheTtlMs: 80,
+    env: { ...baseEnv },
+  });
+
+  for (let i = 0; i < 3; i++) {
+    if (i === 2) {
+      // Force a preflight cache miss on the 3rd request too: negative version cache must still hold!
+      aUnrec.env.XDG_CONFIG_HOME = path.join(dir, 'alt-unrec-xdg');
+    }
+    await assert.rejects(
+      events(aUnrec.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: `req ${i}` }] })),
+      (e) =>
+        e.status === 502 &&
+        /opencode effective permission preflight failed/.test(e.message) &&
+        /unprobed\/unknown !== verifiedVersion 1\.19\.3/.test(e.message),
+    );
+  }
+  assert.equal(countLines(unrecProbes), 1, 'unrecognised --version probe was spawned only once within brief negative TTL');
+  assert.equal(fs.existsSync(unrecRunRecord), false, 'opencode run was never spawned');
+
+  // After the brief negative TTL expires, the next request probes `--version` once again and still refuses.
+  await new Promise((r) => setTimeout(r, 110));
+  await assert.rejects(
+    events(aUnrec.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'after neg ttl' }] })),
+    (e) => e.status === 502 && /unprobed\/unknown !== verifiedVersion 1\.19\.3/.test(e.message),
+  );
+  assert.equal(countLines(unrecProbes), 2, 'expired negative TTL allowed a fresh --version probe');
+
+  // 2. Failed `--version` probe (exit 1): cached briefly, refuses every run, and immediately recovers if binary is fixed on disk.
+  const failDir = path.join(dir, 'fail');
+  fs.mkdirSync(failDir, { recursive: true });
+  const failProbes = path.join(failDir, 'probes.log');
+  const failRunRecord = path.join(failDir, 'run.json');
+  const failBin = nodeStub(
+    failDir,
+    'opencode',
+    `const fs = require('node:fs');
+const argv = process.argv.slice(2);
+if (argv.length === 1 && argv[0] === '--version') {
+  fs.appendFileSync(${JSON.stringify(failProbes)}, '1\\n');
+  process.stderr.write('fatal: broken install\\n');
+  process.exit(1);
+}
+fs.writeFileSync(${JSON.stringify(failRunRecord)}, JSON.stringify({ argv }));
+`,
+  );
+
+  const aFail = new CliAdapter('oc', {
+    ...CLI_PROFILES.opencode,
+    bin: failBin,
+    cwd: path.join(dir, 'ws-fail'),
+    negativeVersionCacheTtlMs: 5_000,
+    env: { ...baseEnv },
+  });
+
+  for (let i = 0; i < 2; i++) {
+    await assert.rejects(
+      events(aFail.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: `fail ${i}` }] })),
+      (e) => e.status === 502 && /unprobed\/unknown !== verifiedVersion 1\.19\.3/.test(e.message),
+    );
+  }
+  assert.equal(countLines(failProbes), 1, 'failed --version probe was spawned only once across repeated requests');
+  assert.equal(fs.existsSync(failRunRecord), false);
+
+  // Fixing the binary in-place changes its stat key immediately (no need to wait out the 5 s negative TTL).
+  nodeStub(
+    failDir,
+    'opencode',
+    `const fs = require('node:fs');
+const argv = process.argv.slice(2);
+if (argv.length === 1 && argv[0] === '--version') {
+  fs.appendFileSync(${JSON.stringify(failProbes)}, '1\\n');
+  process.stdout.write('1.19.3\\n');
+  process.exit(0);
+}
+fs.writeFileSync(${JSON.stringify(failRunRecord)}, JSON.stringify({ argv }));
+const line = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+line({ type: 'step_start', sessionID: 'ses_fx', part: { type: 'step-start' } });
+line({ type: 'text', sessionID: 'ses_fx', part: { id: 'prt_1', type: 'text', text: 'FIXED_OK' } });
+line({ type: 'step_finish', sessionID: 'ses_fx', part: { type: 'step-finish', reason: 'stop', tokens: { total: 4, input: 2, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } } });
+`,
+  );
+
+  const evFixed = await events(aFail.complete({ model: 'opencode/deepseek-v4.1-flash-free', messages: [{ role: 'user', content: 'after fix' }] }));
+  assert.equal(textOf(evFixed), 'FIXED_OK');
+  assert.equal(countLines(failProbes), 2, 'in-place binary fix invalidated negative cache immediately');
 });

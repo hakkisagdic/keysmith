@@ -357,3 +357,134 @@ test('enable, disable, vision and tools are set by another name, with its checks
     assert.match(r.all, usage, args.join(' '));
   }
 });
+
+test('keysmith upgrade: an opencode entry left over from 1.18.27 keeps old provenance while stale workspaceFiles stay; doctor and startup warn with keysmith upgrade oc --take workspaceFiles', async (t) => {
+  const { run, read, edit } = sandbox(t);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-oc-118-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, 'opencode');
+  fs.writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+if (process.argv.includes('--version')) { process.stdout.write('1.19.3\\n'); process.exit(0); }
+process.stdout.write('opencode/deepseek-v4.1-flash-free\\n');
+`,
+    { mode: 0o755 },
+  );
+  assert.equal(run('add', 'opencode', '--as', 'oc', '--bin', bin).status, 0);
+  const oldProvenance = 'opencode 1.18.27 — `opencode run --format json --pure --agent keysmith-text` emits step_start / text / step_finish.';
+  const oldConfig = JSON.stringify({ $schema: 'https://opencode.ai/config.json', permission: { '*': 'deny' }, tools: { '*': false }, mcp: {}, plugin: [] }, null, 2) + '\n';
+  const oldAgent = '---\ndescription: Plain text completions for keysmith. No tools.\nmode: primary\ntools:\n  "*": false\npermission:\n  "*": deny\n---\n\nOld agent.\n';
+  edit('oc', (e) => {
+    delete e.verifiedVersion;
+    e.provenance = oldProvenance;
+    e.stopAtToolCall = true;
+    e.workspaceFiles = {
+      'opencode.json': oldConfig,
+      '.opencode/agent/keysmith-text.md': oldAgent,
+    };
+  });
+
+  // Plain `keysmith upgrade oc --apply` (without `--take workspaceFiles`) must NOT refresh provenance or verifiedVersion while stale workspaceFiles remain.
+  let r = run('upgrade', 'oc', '--apply');
+  assert.equal(r.status, 0, r.all);
+  let oc = read().adapters.oc;
+  assert.equal(oc.provenance, oldProvenance, 'provenance is not refreshed while stale 1.18.27 workspaceFiles are kept');
+  assert.equal(oc.verifiedVersion, undefined, 'verifiedVersion is not added while stale workspaceFiles are kept');
+  assert.equal(oc.workspaceFiles['opencode.json'], oldConfig);
+
+  // Both startup (Gateway) and `keysmith doctor` detect the stale workspaceFiles and name `keysmith upgrade oc --take workspaceFiles`.
+  // The startup warning is logged once across `new Gateway` + `gw.checkAdapters({ log })`.
+  const { Gateway } = await import('../src/gateway.js');
+  const startupLogs = [];
+  const gw = new Gateway(read(), { log: (m) => startupLogs.push(m) });
+  const checked = await gw.checkAdapters({ log: (m) => startupLogs.push(m) });
+  assert.ok(checked.some((w) => /keysmith upgrade oc --take workspaceFiles/.test(w)));
+  assert.equal(
+    startupLogs.filter((m) => /oc.*workspaceFiles.*keysmith upgrade oc --take workspaceFiles/.test(m)).length,
+    1,
+    `expected stale-workspace startup warning to be logged once, got: ${startupLogs.join('\n')}`,
+  );
+
+  const doc = run('doctor');
+  assert.equal(doc.status, 0, doc.all);
+  assert.match(doc.stdout, /!\s+oc\s+.*keysmith upgrade oc --take workspaceFiles/);
+
+  // Taking workspaceFiles updates the files AND refreshes provenance / verifiedVersion, clearing the warning.
+  r = run('upgrade', 'oc', '--take', 'workspaceFiles', '--apply');
+  assert.equal(r.status, 0, r.all);
+  oc = read().adapters.oc;
+  assert.deepEqual(oc.workspaceFiles, CLI_PROFILES.opencode.workspaceFiles);
+  assert.equal(oc.provenance, CLI_PROFILES.opencode.provenance);
+  assert.equal(oc.verifiedVersion, '1.19.3');
+
+  const docAfter = run('doctor');
+  assert.equal(docAfter.status, 0, docAfter.all);
+  assert.doesNotMatch(docAfter.stdout, /keysmith upgrade oc --take workspaceFiles/);
+
+  // An entry whose workspaceFiles is missing a profile file (e.g. .opencode/agent/keysmith-text.md) is also treated as stale by upgrade (provenance/verifiedVersion not refreshed until --take workspaceFiles).
+  edit('oc', (e) => {
+    delete e.verifiedVersion;
+    e.provenance = oldProvenance;
+    delete e.workspaceFiles['.opencode/agent/keysmith-text.md'];
+  });
+  r = run('upgrade', 'oc');
+  assert.equal(r.status, 0, r.all);
+  assert.doesNotMatch(r.stdout, /~ provenance/, 'missing file in workspaceFiles prevents provenance refresh without --take workspaceFiles');
+  assert.doesNotMatch(r.stdout, /\+ verifiedVersion/, 'missing file in workspaceFiles prevents verifiedVersion addition without --take workspaceFiles');
+});
+
+test('opencode: workspaceFilesCustom acknowledges customised workspaceFiles, silences the stale-workspace warning in startup and doctor, and lets upgrade refresh provenance', async (t) => {
+  const { run, read, edit } = sandbox(t);
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-oc-custom-'));
+  t.after(() => fs.rmSync(binDir, { recursive: true, force: true }));
+  const bin = path.join(binDir, 'opencode');
+  fs.writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+const argv = process.argv.slice(2);
+if (argv.includes('--version')) { process.stdout.write('1.19.3\\n'); process.exit(0); }
+process.stdout.write('opencode/deepseek-v4.1-flash-free\\n');
+`,
+    { mode: 0o755 },
+  );
+  assert.equal(run('add', 'opencode', '--as', 'oc', '--bin', bin).status, 0);
+  const customConfig = JSON.stringify({ $schema: 'https://opencode.ai/config.json', permission: { '*': 'deny', read: { '*': 'deny', '': 'deny' } }, mcp: {}, plugin: [] }) + '\n';
+  edit('oc', (e) => {
+    delete e.verifiedVersion;
+    e.provenance = 'opencode 1.18.27 — custom.';
+    e.workspaceFiles = {
+      ...CLI_PROFILES.opencode.workspaceFiles,
+      'opencode.json': customConfig,
+    };
+  });
+
+  // Acknowledge customised workspaceFiles via `keysmith set oc workspaceFilesCustom true`.
+  let r = run('set', 'oc', 'workspaceFilesCustom', 'true');
+  assert.equal(r.status, 0, r.all);
+  assert.equal(read().adapters.oc.workspaceFilesCustom, true);
+
+  // Neither startup nor `keysmith doctor` warns about stale workspaceFiles.
+  const { Gateway } = await import('../src/gateway.js');
+  const startupLogs = [];
+  const gw = new Gateway(read(), { log: (m) => startupLogs.push(m) });
+  const checked = await gw.checkAdapters({ log: (m) => startupLogs.push(m) });
+  assert.equal(startupLogs.filter((m) => /workspaceFiles out of date/.test(m)).length, 0, `unexpected stale-workspace startup warning: ${startupLogs.join('\n')}`);
+  assert.equal(checked.filter((w) => /workspaceFiles out of date/.test(w)).length, 0, `unexpected stale-workspace checkAdapters warning: ${checked.join('\n')}`);
+
+  const doc = run('doctor');
+  assert.equal(doc.status, 0, doc.all);
+  assert.doesNotMatch(doc.stdout, /workspaceFiles out of date/);
+
+  // And `keysmith upgrade oc --apply` refreshes provenance and verifiedVersion while keeping the customised workspaceFiles.
+  r = run('upgrade', 'oc', '--apply');
+  assert.equal(r.status, 0, r.all);
+  const oc = read().adapters.oc;
+  assert.equal(oc.workspaceFiles['opencode.json'], customConfig);
+  assert.equal(oc.provenance, CLI_PROFILES.opencode.provenance);
+  assert.equal(oc.verifiedVersion, '1.19.3');
+
+  const docAfter = run('doctor');
+  assert.equal(docAfter.status, 0, docAfter.all);
+  assert.doesNotMatch(docAfter.stdout, /workspaceFiles/);
+});

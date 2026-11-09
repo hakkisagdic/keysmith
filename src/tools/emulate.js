@@ -256,11 +256,14 @@ async function* engine(adapter, { model, effort = null, spec, messages, signal, 
     for (let attempt = 0; ; attempt++) {
       spent.retries = attempt;
       const text = attempt === 0 ? prompt : `${correction(reason)}\n\n${prompt}`;
-      const run = adapter.emulateRun({ text, model, effort, timeoutMs: Math.max(1_000, deadline - Date.now()), signal });
+      const run = await adapter.emulateRun({ text, model, effort, timeoutMs: Math.max(1_000, deadline - Date.now()), signal });
       let reply = '';
       let runUsage = null;
       let runUsageReason = null;
       let cut = null;
+      let cutError = null;
+      let cutErrorType = null;
+      let cutAfterText = false;
       const errors = [];
       for await (const evt of run.events) {
         if (evt.type === 'delta') {
@@ -276,9 +279,25 @@ async function* engine(adapter, { model, effort = null, spec, messages, signal, 
         } else if (evt.type === 'tool') {
           // A call of the CLI's own (agy keeps `manage_task` on every agent) after the reply is the
           // model starting over: the reply is complete, the run ends here (stopAtToolCall).
-          if (adapter.stopAtToolCall && !cut && reply.trim()) {
-            cut = evt.name || 'a tool';
-            run.stop(`reply complete, stopped at a call to ${cut}`);
+          // With `'always'`, a tool call before any text ends the run too and fails the request.
+          // On a keysmith-owned opencode workspace, EVERY tool event in the stream is inspected
+          // (even after `cut` is set) and any outcome other than DeniedError / UnavailableToolError
+          // fails the request.
+          const toolName = evt.name || 'a tool';
+          const isUnexpected =
+            adapter._ownsOpencodeWorkspace && evt.errorType !== 'DeniedError' && evt.errorType !== 'UnavailableToolError';
+          if (isUnexpected && (!cutErrorType || cutErrorType === 'DeniedError' || cutErrorType === 'UnavailableToolError')) {
+            cut = toolName;
+            cutError = evt.error || null;
+            cutErrorType = evt.errorType || 'unknown';
+            cutAfterText = !!reply.trim();
+            run.stop(`stopped at a call to ${cut}: unexpected tool outcome ${cutErrorType}`);
+          } else if (adapter.stopAtToolCall && !cut && (reply.trim() || adapter.stopAtToolCall === 'always')) {
+            cut = toolName;
+            cutError = evt.error || null;
+            cutErrorType = evt.errorType || null;
+            cutAfterText = !!reply.trim();
+            run.stop(reply.trim() ? `reply complete, stopped at a call to ${cut}` : `stopped at a call to ${cut} before any text`);
             yield { type: 'cut', reason: 'tool_call', tool: cut };
           }
         } else if (evt.type === 'error') {
@@ -291,6 +310,21 @@ async function* engine(adapter, { model, effort = null, spec, messages, signal, 
       if (signal?.aborted) throw new LlmError(`adapter "${adapter.id}": client disconnected`, { status: 499, provider: adapter.id });
       if (outcome.killed && !cut) {
         throw new LlmError(`${adapter.id} was stopped before its reply was complete: ${truncate(outcome.stderr || 'killed', 300)}`, { status: 504, provider: adapter.id, retriable: true });
+      }
+      const unexpectedOutcome =
+        adapter._ownsOpencodeWorkspace && cutErrorType && cutErrorType !== 'DeniedError' && cutErrorType !== 'UnavailableToolError';
+      if (cut && (!reply.trim() || unexpectedOutcome)) {
+        const unexpected = unexpectedOutcome
+          ? ` (unexpected tool outcome: ${cutErrorType}${cutError ? ` — ${truncate(cutError, 160)}` : ''})`
+          : '';
+        const where = cutAfterText ? 'after answering' : 'before answering';
+        const err = new LlmError(
+          `${adapter.id}: the agent started a tool call (${cut}) ${where}, and keysmith stopped the run — this adapter may not run tools${unexpected}`,
+          { status: 502, provider: adapter.id },
+        );
+        if (cutErrorType) err.toolErrorType = cutErrorType;
+        if (cutError) err.toolError = cutError;
+        throw err;
       }
       if (reply.trim()) {
         const parsed = parseReply(reply, spec);

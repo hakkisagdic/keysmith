@@ -159,6 +159,7 @@ adapter takes (`media`, and `vision` for images).
 | `promptVia` | `arg` | `"stdin"` pipes the prompt instead, for CLIs that choke on long argv. A command line cannot carry a NUL character (U+0000): a request with one in its argv (the prompt, a system prompt) is a 400 that quotes none of it, before anything is started — the route goes on to its next leg, which an HTTP upstream can take |
 | `cwd` | process cwd | the agent's workspace: an empty directory keysmith owns (`~/.local/share/keysmith/workspaces/<name>`), created 0700 on first spawn. Every built-in CLI profile sets one, and so does `keysmith add custom`; without it the agent runs in the gateway's own working directory (under launchd, keysmith's source tree). The child's `PWD` is set to it as well: spawn() would leave the gateway's, and opencode takes `PWD` as its project directory |
 | `workspaceFiles` | — | `{ "relative/path": "content" }` — files keysmith keeps inside a configured `cwd` (0600), put back before a spawn whenever they drift. Needs `cwd`; a path that leaves it is refused at load. See [agy as a plain text model](#agy-as-a-plain-text-model) |
+| `allowUnverifiedVersion` | `false` | owner override for keysmith-owned `opencode` workspaces: when `false` (default), preflight refuses `opencode` runs if `--version` is unknown/unprobed or differs from `verifiedVersion` (`"1.19.3"`). Set `keysmith set oc allowUnverifiedVersion true` to allow running an unverified `opencode` version |
 | `toolDenialRetry` | — | an instruction; when a run ends in a refused tool call and no text, the request runs once more with this text in front of the prompt, inside the same `timeoutMs` |
 | `stopAtToolCall` | `false` | for a CLI run as a text model: once the answer has text, the first tool call ends the run — the process is stopped and anything it says after that call is not part of the reply. A tool call before any text is left alone. `"always"` stops a call before any text too, and fails that request: for a CLI that kept its tools, a call is never the way to an answer |
 | `toolMode` | `off` | how this CLI answers a request that offers tools: `off` (it is passed by, as before toolMode existed), `emulate` (EMULATE: the model writes its calls as JSON, keysmith hands them to the client — see [agy and tool requests: EMULATE](#agy-and-tool-requests-emulate)), `mcp` (the MCP bridge: the CLI calls the request's tools over MCP and waits while the client runs each one — see [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge); agy, opencode, codex and qoder have a bridge driver) or `auto` (the bridge where it can, EMULATE otherwise and when the bridge fails before any call). The `agy`, `opencode`, `codex` and `qoder` profiles ship `auto` (see [opencode, codex, qoder and kiro](#opencode-codex-qoder-and-kiro-tool-requests)); `claude` and `kiro` say `off`. A load error on an `unsafeTools` entry, on an entry without a `cwd` (a tool engine runs the CLI only in an empty workspace keysmith owns, never the gateway's own directory; every built-in profile has one) and on an HTTP adapter. `keysmith set <id> toolMode <mode>` fills in the templates below from the entry's built-in profile when it lacks them |
@@ -499,15 +500,29 @@ file), `{toolTimeoutSec}` and `{readyTimeoutSec}`; for qoder and claude `{mcpCon
 session's MCP config file). The session's files are in `.keysmith-bridge/` in the workspace
 (0700, each file 0600) and go with the session.
 
-- **opencode** (`opencode-ndjson`): `OPENCODE_CONFIG` names `ks-b-<rid>.json` — `mcp.<server>`
-  (`type: local`, the shim, `timeout` 30 s past `toolResultTimeoutMs`: opencode's own 60 s gave
-  up on a 75 s wait in the probe) and the inline agent `--agent {agent}`, whose permission and
-  tools deny `"*"` and allow `<server>_*`. opencode merges the workspace's `opencode.json`
-  (deny-all) over it — `opencode debug config` showed both, and `debug agent` every built-in
-  tool off. `--pure` loads no plugin. The model sees `ks<rid6>_<tool>`. opencode runs a step's
-  calls at once and reports each only when it finished, so the calls that come within 600 ms of
-  each other go out in one answer; its `invalid` tool (its answer to a call of a tool it does not
-  have) runs nothing and is not the tripwire's.
+- **opencode** (`opencode-ndjson`): runs in an empty per-session `0700` scratch directory under
+  `<cwd>/../.scratch` (`bridge-<id>-...`), so `.keysmith-bridge/ks-b-<rid>.json` is never in the
+  working directory. Every inherited `OPENCODE_*` variable (`OPENCODE_PERMISSION` included) is
+  removed from the child environment before setting keysmith's allow-listed `OPENCODE_*` variables:
+  `OPENCODE_CONFIG` points to the `0600` `ks-b-<rid>.json` file — `mcp.<server>` (`type: local`,
+  the shim, `timeout` 30 s past `toolResultTimeoutMs`: opencode's own 60 s gave up on a 75 s wait
+  in the probe), top-level `permission` and the inline agent `--agent {agent}` both setting
+  `permission: {"*": "deny", "external_directory": {"*": "deny", "~/.local/share/opencode/tool-output/*": "deny"}, "read": {"*": "deny", "": "deny"}, "<server>_*": "allow"}`,
+  and `plugin: []` — while `OPENCODE_CONFIG_CONTENT` carries `{ $schema, permission, agent, plugin }`
+  (without `mcp`, so `KEYSMITH_BRIDGE_TOKEN` stays in the `0600` file alone),
+  `OPENCODE_DISABLE_PROJECT_CONFIG=1` suppresses upward `opencode.json` / `.opencode` walks from
+  the scratch directory, and `OPENCODE_CONFIG_DIR` points at `<workspace>/.opencode`. Before
+  spawning the bridge session, keysmith's cached effective-permission preflight (keyed by opencode
+  version, SHA-256 hashes of all config files read plus active-org id/config from a narrow
+  read-only `opencode.db` query, and env) verifies that every tool permission
+  other than `<server>_*` resolves to `"deny"` for all patterns and refuses the session otherwise.
+  `opencode debug config` and `opencode debug agent` from inside the bridge scratch directory show
+  the inline agent and top-level permission allowing `<server>_*` alone, with every built-in tool
+  denied (`read` kept only as a denied schema placeholder for opencode 1.19.3 and caught by the
+  bridge tripwire if ever called). `--pure` loads no plugin. The
+  model sees `ks<rid6>_<tool>`. opencode runs a step's calls at once and reports each only when it
+  finished, so the calls that come within 600 ms of each other go out in one answer; its `invalid`
+  tool (its answer to a call of a tool it does not have) runs nothing and is not the tripwire's.
 - **codex** (`codex-json`, `exec --json`): the profile's tool-less switches, and `-c
   mcp_servers.{server}.…` — the shim as command, `env` with the socket and
   `KEYSMITH_BRIDGE_TOKEN_FILE` (the token is in `ks-b-<rid>.token`, never in the argv),
@@ -638,26 +653,91 @@ permission check and `tool_running`, so usually before the call runs, but not gu
 
 opencode's default `build` agent starts from `"*": "allow"` — bash, edit, write, read, glob,
 grep, task, webfetch, todowrite and skill run without asking — and `--auto` only approves the
-few rules left at "ask". The `opencode` profile drops `--auto` and takes the tools away twice,
-with two files `workspaceFiles` keeps in its workspace:
+few rules left at "ask". The `opencode` profile (verified against opencode 1.19.3) drops
+`--auto` and sets
+`permission: {"*": "deny", "external_directory": {"*": "deny", "~/.local/share/opencode/tool-output/*": "deny"}, "read": {"*": "deny", "": "deny"}}`
+in both files `workspaceFiles` keeps in its workspace:
 
-- `.opencode/agent/keysmith-text.md`, a workspace agent with `permission: {"*": deny}` and
-  `tools: {"*": false}`, selected by `--agent keysmith-text`;
-- `opencode.json`, the project config: `permission: {"*": "deny"}`, `tools: {"*": false}`, no
-  MCP servers, no plugins — for every agent, because opencode answers an `--agent` it cannot
-  find with a warning and its default agent.
+- `.opencode/agent/keysmith-text.md`, a workspace agent selected by `--agent keysmith-text`;
+- `opencode.json`, the project config (`permission: {"*": "deny", "external_directory": {"*": "deny", "~/.local/share/opencode/tool-output/*": "deny"}, "read": {"*": "deny", "": "deny"}}`,
+  `agent: {"keysmith-text": {"permission": ...}}`, `mcp: {}`, `plugin: []`) — both at top level
+  (for every agent, because opencode answers an `--agent` it cannot find with a warning and its
+  default agent) and under `agent["keysmith-text"]`.
 
-`--pure` loads no external plugin and `--` ends the options. Checked with opencode 1.18.27
-against a stub OpenAI endpoint: the default agent was offered 10 tools, this one none (`tools:
-[]`); a bash call the stub returned anyway failed as "unavailable tool" and created nothing;
-an unknown agent name fell back to the default agent, which the project config left with no
-tools either. `stopAtToolCall` ends the run at a tool call that comes after the answer.
+In opencode 1.19.3 `tools` is deprecated (merged into `permission`), and `Permission.disabled`
+strips a tool from the outbound `tools` list iff its last matching permission rule has
+`pattern === "*"` and `action === "deny"`. When `read` is stripped, `opencode.ai`'s free-tier
+models (`opencode/*`) respond with a 429 `FreeUsageLimitError` (`Retry-After` ~24h) that
+`SessionRetry` sleeps on silently. Per the 2026-11-06 owner decision to pass `opencode.ai`'s
+free-tier client check provided no tool call can ever execute, ending `read`'s rules with
+`"": "deny"` after `"*": "deny"` keeps `read` in the outbound schema while stripping every
+other built-in tool.
 
-opencode's free models (`opencode/*`, e.g. `opencode/big-pickle`) refused this run with
-`403 OpenCode's free tier can only be used from within OpenCode` — and the default agent under
-the deny-all config too; the same model answered only the default agent with its tools, which
-keysmith does not run. A provider you configured in opencode with your own key is not subject
-to that check (not run live from here).
+Honest safety model: opencode's permission rule is the **only** thing that prevents a tool from
+executing. In opencode 1.19.3 (`ReadTool.execute` and `Agent.state`), a `read` call on a path
+outside the working directory first checks `permission: "external_directory"` against
+`<parentDir>/*` (`Agent.state` appends `external_directory: {"~/.local/share/opencode/tool-output/*": "allow"}`
+unless that pattern is explicitly set to `"deny"` when opencode uses its default
+`~/.local/share/opencode` data directory; if `XDG_DATA_HOME` points elsewhere, `Truncate.GLOB`
+uses that directory and `ReadTool.execute`'s second check on `permission: "read"` is what denies
+`read`), then checks `permission: "read"` against the
+worktree-relative path; a `read` call inside the working directory checks `permission: "read"`
+against the worktree-relative path. With `external_directory: {"*": "deny", "~/.local/share/opencode/tool-output/*": "deny"}`
+and `read: {"*": "deny", "": "deny"}`, both outside and inside paths evaluate to `"deny"` and
+fail before execution with `Permission.DeniedError` (`"The user has specified a rule which prevents you from using this specific tool call..."`),
+never `"ask"` (`RejectedError`). Because opencode emits `tool_use` only after a tool step
+finishes, `stopAtToolCall: "always"` and the empty scratch directory — created with an exclusive,
+non-following `0700` create under `<cwd>/../.scratch` (a keysmith-owned sibling directory, never
+`os.tmpdir()`), per-session when resuming with `--session`, per-request otherwise, and per-session
+on the MCP bridge so `.keysmith-bridge` session files are never in the working directory — only
+limit what follows a denied call. For keysmith-owned opencode runs, keysmith removes every
+inherited `OPENCODE_*` variable (`OPENCODE_PERMISSION` included) from the child environment before
+setting its allow-listed `OPENCODE_*` variables (`OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`,
+`OPENCODE_CONFIG_CONTENT`, `OPENCODE_DISABLE_PROJECT_CONFIG=1`), so upward `opencode.json` /
+`.opencode` walks from the scratch directory are suppressed and scalar overrides in
+`~/.config/opencode/opencode.json` are overwritten by `OPENCODE_CONFIG_CONTENT`. Before spawning
+`opencode` (both on the text/`EMULATE` path and on the MCP bridge), keysmith runs a cached
+preflight check on `opencode`'s effective configuration and agent permissions as the run will see
+them (fetching any active Console org `/api/config` asynchronously before spawn without blocking
+the gateway event loop and caching it briefly keyed on `(account, org, tokenExpiry)`, then caching
+the preflight keyed by `opencode` version, SHA-256 hashes of all config files read plus active-org
+config, and relevant env, re-run whenever any changes) and refuses the run before model execution
+(naming the offending source and key) when `opencode --version` is unknown/unprobed or differs from
+`verifiedVersion` (`"1.19.3"`) unless the owner sets `allowUnverifiedVersion: true`
+(`keysmith set <id> allowUnverifiedVersion true`), or unless every tool permission for
+`keysmith-text` (`read`, `external_directory`, `edit`, `bash`, `webfetch`, `mcp`, `task`, and any
+tool present; or on the MCP bridge, every tool permission other than `<server>_*`) resolves to
+`"deny"` for all patterns. This preflight is the guard against version drift and against config
+sources keysmith cannot override — active Console org config (`opencode.db`
+`account_state`/`account` + async `/api/config`, failing closed on DB/HTTP errors or timeouts),
+system managed config / managed preferences (`/Library/Application Support/opencode`,
+`/etc/opencode`, and managed plists), and inherited pattern-map rules such as
+`{"*": "deny", "*hosts": "allow"}` in `~/.config/opencode/opencode.json`. Known limitation:
+`opencode` fetches `/api/config` again when it starts, so an org admin changing `/api/config`
+between keysmith's brief cached preflight fetch and `opencode`'s own startup fetch cannot be
+stopped before spawn and is caught after the step by keysmith's runtime drift detector, which
+inspects every tool outcome in the stream regardless of the `cut` state (failing with `502`
+`unexpected tool outcome` on any tool call outcome other than `DeniedError` or
+`UnavailableToolError`, both before and after text, in both plain completions and `EMULATE`).
+The `opencode` profile also sets
+`firstEventTimeoutMs: 45_000` (45 s), which fails fast with status `504` if an `opencode/*`
+free-tier run produces no output within 45 s (e.g. when `SessionRetry` sleeps on a 24 h
+`Retry-After`); by default this 45 s guard is scoped to `opencode/*` (or model-less) runs so slow
+reasoning models on other providers can use the full `timeoutMs`, and setting custom
+`firstEventTimeoutMs` on the adapter overrides it (or `0` / `null` disables it). The scratch
+directory and forced `stopAtToolCall: "always"` apply to keysmith-owned opencode workspaces
+(`_ownsOpencodeWorkspace`: any opencode adapter that sets both `cwd` and `workspaceFiles` without
+`unsafeTools: true`); user opencode adapters without `cwd`, with their own project `cwd` and no
+`workspaceFiles`, or with `unsafeTools: true` run in their configured `cwd` and keep their
+configured `stopAtToolCall`. `verifiedVersion: "1.19.3"` warns in `keysmith doctor`, at startup,
+and in `adapter.probe()`, and refuses keysmith-owned `opencode` runs unless
+`allowUnverifiedVersion: true` (`keysmith set <id> allowUnverifiedVersion true`) is set, when the
+installed opencode version is unknown or differs from the verified version; `checkWorkspaceFiles()`
+warns when an existing install's `workspaceFiles` are stale
+(`keysmith upgrade <id> --take workspaceFiles --apply`).
+If you intentionally customise `workspaceFiles` on an opencode adapter, set
+`workspaceFilesCustom: true` (`keysmith set <id> workspaceFilesCustom true`) to silence the
+stale-workspace warning and allow `keysmith upgrade` to refresh `provenance` and `verifiedVersion`.
 
 ### Reasoning effort on a CLI
 

@@ -22,7 +22,7 @@ import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExec
  * slash-free by construction.
  */
 export class Gateway {
-  constructor(cfg, { log = () => {}, usage = null } = {}) {
+  constructor(cfg, { log = () => {}, usage = null, deferAdapterChecks = false } = {}) {
     this.cfg = cfg;
     this.usage = usage;
     // Redacted here as well as by the CLI's writer: an embedding's own log function is
@@ -53,6 +53,13 @@ export class Gateway {
         const adapter = prepared.kind === 'cli' ? new CliAdapter(id, prepared) : new HttpAdapter(id, prepared);
         this.adapters.set(id, adapter);
         if (adapter.unsafeTools && !adapter.disabled) this.log(`adapter "${id}" can run commands and edit files (unsafeTools) and is enabled: it answers requests that name it, never an alias`);
+        if (adapter.kind === 'cli' && !adapter.disabled && !deferAdapterChecks) {
+          const wsCheck = adapter.checkWorkspaceFiles?.();
+          if (wsCheck?.warning) {
+            adapter._workspaceWarned = true;
+            this.log(`adapter "${id}": ${wsCheck.warning}`);
+          }
+        }
       } catch (e) {
         // Shown on /status, /v1/models, /v1/keysmith/routes and by doctor: redacted at the source.
         this.loadErrors[id] = redactSecrets(e.message);
@@ -80,6 +87,36 @@ export class Gateway {
   /** Stop what the gateway runs on its own: the MCP bridge's sessions (each CLI stopped) and its socket. */
   async close() {
     await this.toolEngines.mcp?.close?.();
+  }
+
+  /**
+   * Run startup/health checks (workspace files + CLI version) across enabled CLI adapters.
+   * Logs any warnings not yet logged and returns all current warnings as `Array<string>`.
+   */
+  async checkAdapters({ log = null } = {}) {
+    const logger = log ? (m) => log(redactSecrets(m)) : this.log;
+    const warnings = [];
+    for (const adapter of this.publicAdapters) {
+      if (adapter.kind !== 'cli' || typeof adapter.probe !== 'function') continue;
+      const res = await adapter.probe();
+      if (res.workspaceWarning) {
+        const line = `adapter "${adapter.id}": ${res.workspaceWarning}`;
+        warnings.push(line);
+        if (!adapter._workspaceWarned) {
+          adapter._workspaceWarned = true;
+          logger(line);
+        }
+      }
+      if (res.versionWarning) {
+        const line = `adapter "${adapter.id}": ${res.versionWarning}`;
+        warnings.push(line);
+        if (!adapter._versionWarned) {
+          adapter._versionWarned = true;
+          logger(line);
+        }
+      }
+    }
+    return warnings;
   }
 
   /**
@@ -363,6 +400,14 @@ export class Gateway {
     await Promise.all(
       this.publicAdapters.filter((a) => this.adapterVisible(a.id, scope)).map(async (a) => {
         if (refresh) a._modelCache = null;
+        if (a.kind === 'cli' && a._isOpencode && !a._versionProbed) {
+          a._versionProbed = true;
+          const ver = await a.checkVersion?.();
+          if (ver?.warning && !a._versionWarned) {
+            a._versionWarned = true;
+            this.log(`adapter "${a.id}": ${ver.warning}`);
+          }
+        }
         try {
           const list = await a.models();
           const entry = (id, m, extra = {}) => ({
@@ -593,6 +638,7 @@ export class Gateway {
           model: planned.model,
           messages: args.messages,
           session: canResume ? run.known.upstreamSession : null,
+          sessionKey: adapter.resumable ? run.publicId : null,
           signal: args.signal,
           maxTokens: adapter.kind === 'cli' ? (args.maxTokens || args.maxCompletionTokens || args.maxOutputTokens) : args.maxTokens,
           maxCompletionTokens: args.maxCompletionTokens,
@@ -785,6 +831,7 @@ export class Gateway {
             model: planned.model,
             messages: args.messages,
             session: canResume ? run.known.upstreamSession : null,
+            sessionKey: leg.adapter.resumable ? run.publicId : null,
             signal: args.signal,
             maxTokens: leg.adapter.kind === 'cli' ? (args.maxTokens || args.maxCompletionTokens || args.maxOutputTokens) : args.maxTokens,
             maxCompletionTokens: args.maxCompletionTokens,

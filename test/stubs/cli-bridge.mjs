@@ -38,6 +38,10 @@ import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 
 const argv = process.argv.slice(2);
+if (argv.length === 1 && argv[0] === '--version') {
+  process.stdout.write(`${process.env.STUB_VERSION || '1.19.3'}\n`);
+  process.exit(0);
+}
 const cli = process.env.STUB_CLI || 'opencode';
 const prompt = argv.at(-1) ?? '';
 const scenario = (prompt.match(/SCENARIO=([a-z0-9-]+)/) || [])[1] || 'one-call';
@@ -51,7 +55,7 @@ process.stdout._handle?.setBlocking?.(true);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const val = (flag) => (argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : null);
 
-note({ event: 'start', argv, scenario, qoderEnv: Object.keys(process.env).filter((k) => k.startsWith('QODER_')), opencodeConfig: process.env.OPENCODE_CONFIG || null });
+note({ event: 'start', argv, scenario, cwd: process.cwd(), cwdEntries: fs.readdirSync(process.cwd()), qoderEnv: Object.keys(process.env).filter((k) => k.startsWith('QODER_')), opencodeEnv: Object.keys(process.env).filter((k) => k.startsWith('OPENCODE_')).sort(), opencodePermission: process.env.OPENCODE_PERMISSION || null, opencodeConfig: process.env.OPENCODE_CONFIG || null, opencodeConfigDir: process.env.OPENCODE_CONFIG_DIR || null, opencodeDisableProjectConfig: process.env.OPENCODE_DISABLE_PROJECT_CONFIG || null, opencodeConfigContent: process.env.OPENCODE_CONFIG_CONTENT ? JSON.parse(process.env.OPENCODE_CONFIG_CONTENT) : null });
 
 /* --------------------------------------------------------- the session's MCP server */
 

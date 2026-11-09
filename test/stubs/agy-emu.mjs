@@ -43,6 +43,7 @@ const SCRIPTS = {
   'bad-args': [calls(call('get_weather', { city: 7 })), ANKARA],
   'tool-denied': [{ denied: true }, ANKARA],
   'manage-task': [{ text: ANKARA, thenTool: 'manage_task' }],
+  'tool-before': [{ text: '', thenTool: 'read' }],
   'slow-deltas': [{ chunks: [ANKARA.slice(0, 10), ANKARA.slice(10, 30), ANKARA.slice(30)], gapMs: 300 }],
   'slow-prose': [{ text: 'prose', delayMs: 1500 }, ANKARA],
   'slow-prose-always': [{ text: 'prose', delayMs: 400 }, { text: 'prose again', delayMs: 400 }],
@@ -76,9 +77,9 @@ if (typeof reply === 'string') {
   }
   line({ event: 'result', result: { conversation_id: 'c-emu', status: 'SUCCESS', response: reply.chunks.join('') } });
 } else if (reply.thenTool) {
-  step(reply.text, true);
-  line({ event: 'step_update', step_update: { conversation_id: 'c-emu', step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: reply.thenTool } });
+  if (reply.text) step(reply.text, true);
   log();
+  line({ event: 'step_update', step_update: { conversation_id: 'c-emu', step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: reply.thenTool } });
   // A model that started over: it would answer again after the tool, for as long as it is let.
   await sleep(30_000);
   step(' and again', true);

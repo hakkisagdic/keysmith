@@ -248,8 +248,16 @@ test('golden: what each driver starts for one session — the argv, the session\
   for (const name of Object.keys(plans)) assert.deepEqual(plans[name], golden[name], `${name}: the plan changed — review it, then the fixture`);
   // What the plans must hold, whatever the fixture says.
   const oc = plans.opencode.files[0].content;
-  assert.deepEqual(oc.permission, { '*': 'deny', 'ks012345_*': 'allow' });
-  assert.deepEqual(oc.agent['ks-b-0123456789ab'].tools, { '*': false, 'ks012345_*': true });
+  const expectedOcBridgePerm = {
+    '*': 'deny',
+    external_directory: { '*': 'deny', '~/.local/share/opencode/tool-output/*': 'deny' },
+    read: { '*': 'deny', '': 'deny' },
+    'ks012345_*': 'allow',
+  };
+  assert.deepEqual(oc.permission, expectedOcBridgePerm);
+  assert.deepEqual(oc.agent['ks-b-0123456789ab'].permission, expectedOcBridgePerm);
+  assert.equal('tools' in oc, false, 'opencode 1.19.3 deprecated tools in favor of permission');
+  assert.equal('tools' in oc.agent['ks-b-0123456789ab'], false);
   assert.ok(oc.mcp.ks012345.timeout > SESSION_DEFAULTS.toolResultTimeoutMs, 'opencode waits on a call longer than keysmith does');
   assert.deepEqual(oc.plugin, []);
   const cx = plans.codex.argv;
@@ -275,10 +283,17 @@ test('golden: what each driver starts for one session — the argv, the session\
   assert.ok(cc.includes('--no-session-persistence') && cc.includes('--disable-slash-commands'));
 });
 
-test('every session file is 0600 in a 0700 directory of the workspace; qoder\'s run gets no QODER_* variable, opencode\'s gets OPENCODE_CONFIG', async () => {
-  const saved = { QODER_MCP_LAZY: process.env.QODER_MCP_LAZY, QODER_AGENT_SDK_ENTRYPOINT: process.env.QODER_AGENT_SDK_ENTRYPOINT };
+test('every session file is 0600 in a 0700 directory of the workspace; qoder\'s run gets no QODER_* variable, opencode\'s gets OPENCODE_CONFIG and strips inherited OPENCODE_*', async () => {
+  const saved = {
+    QODER_MCP_LAZY: process.env.QODER_MCP_LAZY,
+    QODER_AGENT_SDK_ENTRYPOINT: process.env.QODER_AGENT_SDK_ENTRYPOINT,
+    OPENCODE_PERMISSION: process.env.OPENCODE_PERMISSION,
+    OPENCODE_ROGUE_VAR: process.env.OPENCODE_ROGUE_VAR,
+  };
   process.env.QODER_MCP_LAZY = '1';
   process.env.QODER_AGENT_SDK_ENTRYPOINT = 'stub';
+  process.env.OPENCODE_PERMISSION = '{"read":"allow"}';
+  process.env.OPENCODE_ROGUE_VAR = '1';
   try {
     for (const id of ['oc', 'qd']) {
       const t = tag();
@@ -295,6 +310,23 @@ test('every session file is 0600 in a 0700 directory of the workspace; qoder\'s 
         assert.equal(cfg.mode, '600');
         assert.ok(start.qoderEnv.includes('QODER_MCP_LAZY'), 'only qoder\'s run drops them');
         assert.ok(!start.qoderEnv.includes('QODER_AGENT_SDK_ENTRYPOINT'), 'agentCleanEnv drops the entrypoint marker for every CLI');
+        const wsOc = path.join(dir, 'ws-opencode');
+        const scratchRoot = path.join(fs.realpathSync(dir), '.scratch');
+        assert.notEqual(start.cwd, wsOc, 'opencode bridge runs in an isolated scratch directory, not adapter.cwd where .keysmith-bridge lives');
+        assert.equal(path.dirname(start.cwd), scratchRoot, 'opencode bridge scratch directory lives under <cwd>/../.scratch (0700), never os.tmpdir()');
+        assert.equal(fs.lstatSync(scratchRoot).mode & 0o777, 0o700);
+        assert.deepEqual(start.cwdEntries, [], 'opencode bridge scratch directory is empty (no .keysmith-bridge session files)');
+        assert.equal(start.opencodeConfigDir, path.join(wsOc, '.opencode'));
+        assert.equal(start.opencodeDisableProjectConfig, '1', 'opencode bridge disables project config walk-up');
+        assert.deepEqual(start.opencodeConfigContent?.permission, cfg.permission, 'opencode bridge passes session permission via OPENCODE_CONFIG_CONTENT');
+        assert.equal(start.opencodeConfigContent?.mcp, undefined, 'OPENCODE_CONFIG_CONTENT omits mcp so KEYSMITH_BRIDGE_TOKEN stays only in the 0600 file');
+        assert.ok(!JSON.stringify(start.opencodeConfigContent).includes('TOKEN'), 'no bridge token in OPENCODE_CONFIG_CONTENT');
+        assert.equal(start.opencodePermission, null, 'inherited OPENCODE_PERMISSION is stripped from the bridge child env');
+        assert.deepEqual(
+          start.opencodeEnv,
+          ['OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'OPENCODE_CONFIG_DIR', 'OPENCODE_DISABLE_PROJECT_CONFIG'],
+          'only the explicit allow-list of OPENCODE_* variables reaches the bridge child',
+        );
       }
       const d = path.join(dir, `ws-${id === 'oc' ? 'opencode' : 'qoder'}`, '.keysmith-bridge');
       assert.equal(fs.statSync(d).mode & 0o777, 0o700);
@@ -924,4 +956,98 @@ test('claude-stream-json: a tool_use block is a tool event once per id; qoder\'s
   ]);
   assert.deepEqual(events.filter((e) => e.type === 'tool').map((e) => e.name), ['mcp__ks012345__get_weather', 'mcp_get', 'mcp__ks012345__get_weather', 'Bash']);
   assert.deepEqual(events.filter((e) => e.type === 'delta').map((e) => e.text), ['Let me check.']);
+});
+
+test('opencode bridge preflight: refuses inherited pattern-map allow and managed-config scalar allow before spawning opencode', async () => {
+  const testHome = path.join(dir, 'bridge-preflight-home');
+  const managedDir = path.join(dir, 'bridge-preflight-managed');
+  fs.mkdirSync(path.join(testHome, '.config', 'opencode'), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(managedDir, { recursive: true, mode: 0o700 });
+  const ocAdapter = gateway.adapters.get('oc');
+  const savedEnv = { ...ocAdapter.env };
+  const savedManagedDir = ocAdapter.managedConfigDir;
+  const savedPlists = ocAdapter.managedPlistPaths;
+  const savedVerifiedVersion = ocAdapter.verifiedVersion;
+  const savedAllowUnverified = ocAdapter.allowUnverifiedVersion;
+  ocAdapter.env = {
+    ...savedEnv,
+    HOME: testHome,
+    XDG_CONFIG_HOME: path.join(testHome, '.config'),
+    XDG_DATA_HOME: path.join(testHome, '.local', 'share'),
+  };
+  ocAdapter.managedConfigDir = managedDir;
+  ocAdapter.managedPlistPaths = [];
+
+  try {
+    // 1. Hostile pattern-map allow in ~/.config/opencode/opencode.json is refused before spawning.
+    const globalCfg = path.join(testHome, '.config', 'opencode', 'opencode.json');
+    fs.writeFileSync(
+      globalCfg,
+      JSON.stringify({
+        permission: {
+          read: { '*': 'deny', '*hosts': 'allow' },
+        },
+      }),
+    );
+    const t1 = tag();
+    const r1 = await post('/v1/chat/completions', {
+      model: 'oc/m',
+      tools: TOOLS,
+      messages: [{ role: 'user', content: `Weather ${t1} SCENARIO=one-call` }],
+    });
+    assert.equal(r1.status, 502, r1.text);
+    assert.match(r1.text, /opencode effective permission preflight failed/);
+    assert.ok(r1.text.includes(globalCfg), `expected ${globalCfg} in ${r1.text}`);
+    assert.ok(r1.text.includes('permission.read[\\"*hosts\\"] = \\"allow\\"'), `expected key path in ${r1.text}`);
+    assert.equal(startsOf(t1).length, 0, 'opencode bridge process was never spawned when preflight failed');
+    assert.equal(sessionFiles('opencode').length, 0, 'session file was cleaned up when preflight failed');
+
+    // 2. Managed-config scalar allow is refused before spawning.
+    fs.rmSync(globalCfg, { force: true });
+    const managedCfg = path.join(managedDir, 'opencode.json');
+    fs.writeFileSync(managedCfg, JSON.stringify({ permission: { read: 'allow' } }));
+    const t2 = tag();
+    const r2 = await post('/v1/chat/completions', {
+      model: 'oc/m',
+      tools: TOOLS,
+      messages: [{ role: 'user', content: `Weather ${t2} SCENARIO=one-call` }],
+    });
+    assert.equal(r2.status, 502, r2.text);
+    assert.match(r2.text, /opencode effective permission preflight failed/);
+    assert.ok(r2.text.includes(managedCfg), `expected ${managedCfg} in ${r2.text}`);
+    assert.ok(r2.text.includes('permission.read = \\"allow\\"'), `expected key path in ${r2.text}`);
+    assert.equal(startsOf(t2).length, 0, 'opencode bridge process was never spawned when managed-config preflight failed');
+    assert.equal(sessionFiles('opencode').length, 0);
+
+    // 3. Version mismatch on the MCP bridge is refused unless allowUnverifiedVersion: true is set.
+    fs.rmSync(managedCfg, { force: true });
+    ocAdapter.verifiedVersion = '1.19.4';
+    const t3 = tag();
+    const r3 = await post('/v1/chat/completions', {
+      model: 'oc/m',
+      tools: TOOLS,
+      messages: [{ role: 'user', content: `Weather ${t3} SCENARIO=one-call` }],
+    });
+    assert.equal(r3.status, 502, r3.text);
+    assert.match(r3.text, /1\.19\.3 !== verifiedVersion 1\.19\.4/);
+    assert.equal(startsOf(t3).length, 0, 'opencode bridge process was never spawned on version mismatch');
+    assert.equal(sessionFiles('opencode').length, 0, 'session file was cleaned up on version mismatch');
+
+    ocAdapter.allowUnverifiedVersion = true;
+    const t4 = tag();
+    const r4 = await post('/v1/chat/completions', {
+      model: 'oc/m',
+      tools: TOOLS,
+      messages: [{ role: 'user', content: `Weather ${t4} SCENARIO=one-call` }],
+    });
+    assert.equal(r4.status, 200, r4.text);
+    assert.equal(startsOf(t4).length, 1, 'opencode bridge ran when allowUnverifiedVersion: true was set');
+  } finally {
+    ocAdapter.env = savedEnv;
+    ocAdapter.managedConfigDir = savedManagedDir;
+    ocAdapter.managedPlistPaths = savedPlists;
+    ocAdapter.verifiedVersion = savedVerifiedVersion;
+    ocAdapter.allowUnverifiedVersion = savedAllowUnverified;
+    await closeAll();
+  }
 });

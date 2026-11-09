@@ -191,6 +191,17 @@ test('JSON, then a call to manage_task: the run is cut there and the reply stand
   assert.deepEqual(callsOf(events), [['get_weather', { city: 'Ankara' }]], 'what came after the tool call is not part of it');
 });
 
+test('stopAtToolCall "always": a tool call before any text ends the EMULATE run immediately and fails with 502 (no retry)', async () => {
+  const dir = tmp();
+  const t0 = Date.now();
+  const { events, error } = await drive(emu(dir, { stopAtToolCall: 'always' }), { spec: spec(), messages: ask('tool-before') });
+  assert.ok(Date.now() - t0 < 10_000, 'the process was stopped at the tool call, not left to run its 30 s');
+  assert.equal(error?.status, 502);
+  assert.match(error.message, /started a tool call \(read\) before answering, and keysmith stopped the run/);
+  assert.deepEqual(events, [{ type: 'cut', reason: 'tool_call', tool: 'read' }]);
+  assert.equal(runs(dir).length, 1, 'no retry on a stopped pre-text tool call');
+});
+
 test('the usage of both runs is added up and reported once', async () => {
   const dir = tmp();
   const { events } = await drive(emu(dir), { spec: spec(), messages: ask('prose-then-ok') });

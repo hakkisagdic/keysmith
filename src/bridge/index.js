@@ -302,8 +302,13 @@ export class McpBridge {
         await opened.proc?.stop('session closed');
         driver.cleanup(adapter, opened);
       });
-      const proc = driver.spawn(adapter, { session: s, model: o.model, prompt, killGraceMs: this.killGraceMs });
+      const proc = await driver.spawn(adapter, { session: s, model: o.model, prompt, killGraceMs: this.killGraceMs, signal: o.signal });
       s.proc = proc;
+      if (s.closed) {
+        await proc.stop('session closed');
+        driver.cleanup(adapter, s);
+        throw bridgeError(adapter, 'spawn_failed', 499, `bridge ${s.server}: session closed before spawn finished`);
+      }
       this._pump(adapter, driver, s, proc);
     } catch (e) {
       release();

@@ -1,6 +1,9 @@
-import { statSync, mkdirSync, readFileSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
+import { accessSync, constants as fsConstants, statSync, lstatSync, mkdirSync, realpathSync, rmSync, readFileSync, readdirSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { getParser, toLines } from './parsers.js';
 import { expand } from './config.js';
 import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, agentCleanEnv } from './util.js';
@@ -44,22 +47,32 @@ export class CliAdapter {
     // whenever they drift. This is how an agent's own configuration travels with the profile:
     // agy reads a tool-less agent definition from `.agents/agents/` in its cwd.
     this.workspaceFiles = checkWorkspaceFiles(id, cfg.workspaceFiles, this._ownsCwd);
+    this.workspaceFilesCustom = !!cfg.workspaceFilesCustom;
     // One more attempt, with this instruction in front of the prompt, when a run ends in a
     // refused tool call and no text (a parser `error` event with code 'tool_denied').
     this.toolDenialRetry = typeof cfg.toolDenialRetry === 'string' && cfg.toolDenialRetry.trim() ? cfg.toolDenialRetry.trim() : null;
+    // A CLI whose tools keysmith could not take away: it can run commands and edit files.
+    // Never an alias leg, never probed by `doctor --probe-models` (see Gateway.resolve).
+    this.unsafeTools = !!cfg.unsafeTools;
     // For a CLI run as a text model: once the answer has text, the first tool call ends it.
     // A harness can keep a tool of its own that no agent definition removes (agy:
     // `manage_task`), and a model that calls it after answering answers again, and again.
     // `'always'` ends the run at a tool call before any text too, and fails the request: for
-    // a CLI whose tools could not be taken away (Warp), a tool call is never the way to an answer.
-    this.stopAtToolCall = cfg.stopAtToolCall === 'always' ? 'always' : !!cfg.stopAtToolCall;
+    // a CLI whose tools could not be taken away (Warp), or a keysmith-owned opencode workspace
+    // where `read` stays in the schema only as a denied placeholder, a tool call is never the
+    // way to an answer. User opencode adapters without `cwd`, with their own project `cwd` and
+    // no `workspaceFiles`, or with `unsafeTools: true` keep their setting; a user opencode
+    // adapter that sets both `cwd` and `workspaceFiles` (without `unsafeTools`) is treated as a
+    // keysmith-owned workspace (`_ownsOpencodeWorkspace`) and gets the scratch directory and
+    // forced `stopAtToolCall: 'always'` unless `stopAtToolCall: false` is set explicitly.
+    const isOpencode = path.basename(String(this.bin)) === 'opencode' || this.parser === 'opencode-ndjson';
+    this._isOpencode = isOpencode;
+    this._ownsOpencodeWorkspace = isOpencode && this._ownsCwd && !this.unsafeTools && !!this.workspaceFiles;
+    this.stopAtToolCall = cfg.stopAtToolCall === 'always' || (this._ownsOpencodeWorkspace && cfg.stopAtToolCall !== false) ? 'always' : !!cfg.stopAtToolCall;
     // What `{noSession}` renders as when the run is not resumed. CLIs disagree on the spelling:
     // Command Code takes `--no-session`, Claude Code and Qoder refuse it and take
     // `--no-session-persistence`.
     this.noSessionFlag = typeof cfg.noSessionFlag === 'string' ? cfg.noSessionFlag : '--no-session';
-    // A CLI whose tools keysmith could not take away: it can run commands and edit files.
-    // Never an alias leg, never probed by `doctor --probe-models` (see Gateway.resolve).
-    this.unsafeTools = !!cfg.unsafeTools;
     // How this CLI answers a request that offers tools (src/tools/router.js): never ('off', the
     // default), EMULATE, the MCP bridge, or `auto`. Never on a CLI that kept its own tools.
     this.toolMode = checkToolMode(id, cfg);
@@ -110,6 +123,9 @@ export class CliAdapter {
     this.effortGap = lacking.length && lacking.length < present.length ? `${id}'s ${lacking.join(', ')} take${lacking.length > 1 ? '' : 's'} no {effort} — keysmith upgrade ${id} --take ${this.takeFor(lacking).join(',')} --apply brings the profile's` : null;
     this.env = cfg.env || {};
     this.timeoutMs = cfg.timeoutMs ?? 300_000;
+    const defaultFirstEventMs = this._isOpencode ? CLI_PROFILES.opencode?.firstEventTimeoutMs ?? 45_000 : null;
+    this.firstEventTimeoutMs = cfg.firstEventTimeoutMs === 0 || cfg.firstEventTimeoutMs === null ? null : (cfg.firstEventTimeoutMs ?? defaultFirstEventMs);
+    this._firstEventTimeoutScopedToFreeTier = this._isOpencode && (cfg.firstEventTimeoutMs === undefined || cfg.firstEventTimeoutMs === defaultFirstEventMs);
     this.priority = cfg.priority ?? 200;
     this.disabled = !!cfg.disabled;
     this.stripSystemPrompt = !!cfg.stripSystemPrompt;
@@ -119,10 +135,27 @@ export class CliAdapter {
     this.declaredModels = cfg.models || null;
     this.defaultModel = cfg.defaultModel || null;
     this.note = cfg.note || null;
+    this.provenance = typeof cfg.provenance === 'string' && cfg.provenance.trim() ? cfg.provenance.trim() : this._isOpencode ? CLI_PROFILES.opencode?.provenance || null : null;
+    this.verifiedVersion =
+      typeof cfg.verifiedVersion === 'string' && cfg.verifiedVersion.trim()
+        ? cfg.verifiedVersion.trim()
+        : this.provenance?.match(/^opencode\s+(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/i)?.[1] || (this._isOpencode ? CLI_PROFILES.opencode?.verifiedVersion || null : null);
+    this.provenanceVersion = this.verifiedVersion;
+    this.allowUnverifiedVersion = !!cfg.allowUnverifiedVersion;
+    this.versionCacheTtlMs = cfg.versionCacheTtlMs ?? OPENCODE_VERSION_TTL_MS;
+    this.negativeVersionCacheTtlMs = cfg.negativeVersionCacheTtlMs ?? OPENCODE_NEGATIVE_VERSION_TTL_MS;
+    this.orgConfigCacheTtlMs = cfg.orgConfigCacheTtlMs ?? OPENCODE_ORG_CONFIG_TTL_MS;
+    this.orgConfigFetchTimeoutMs = cfg.orgConfigFetchTimeoutMs ?? OPENCODE_ORG_CONFIG_TIMEOUT_MS;
+    this.managedConfigDir = cfg.managedConfigDir ? expand(cfg.managedConfigDir) : null;
+    this.managedPlistPaths = Array.isArray(cfg.managedPlistPaths) ? cfg.managedPlistPaths.map((p) => expand(p)) : [];
     this.account = credentialAccount(cfg);
     this.costBasis = cfg.costBasis || 'subscription';
     this._sem = new Semaphore(cfg.maxConcurrent ?? 1);
     this._modelCache = null;
+    this._sessionDirs = new Map();
+    this._activeScratchRuns = new Map();
+    this._preflightRuns = 0;
+    this._preflightHits = 0;
   }
 
   get resumable() {
@@ -234,6 +267,127 @@ export class CliAdapter {
   }
 
   /**
+   * Check whether an opencode adapter's `workspaceFiles` match `CLI_PROFILES.opencode.workspaceFiles`.
+   * Returns `{ stale, missing, warning }` (`warning` names `keysmith upgrade <id> --take workspaceFiles`).
+   */
+  checkWorkspaceFiles() {
+    if (!this._ownsOpencodeWorkspace || this.disabled || this.workspaceFilesCustom) return { stale: [], missing: [], warning: null };
+    const expected = CLI_PROFILES.opencode?.workspaceFiles || {};
+    const actual = this.workspaceFiles || {};
+    const missing = [];
+    const stale = [];
+    for (const [file, content] of Object.entries(expected)) {
+      if (!Object.hasOwn(actual, file)) missing.push(file);
+      else if (actual[file] !== content) stale.push(file);
+    }
+    if (!missing.length && !stale.length) return { stale, missing, warning: null };
+    const detail = [stale.length ? `stale: ${stale.join(', ')}` : '', missing.length ? `missing: ${missing.join(', ')}` : ''].filter(Boolean).join('; ');
+    return {
+      stale,
+      missing,
+      warning: `workspaceFiles out of date (${detail}) — run \`keysmith upgrade ${this.id} --take workspaceFiles\` (with \`--apply\` to write, or \`keysmith set ${this.id} workspaceFilesCustom true\` if customised)`,
+    };
+  }
+
+  /**
+   * Probe and cache the installed CLI's `--version` semver, keyed on `realpathSync(binPath)` plus
+   * `ino`, `ctimeMs`/`ctimeNs`, `size`, and `mtimeMs`/`mtimeNs`, with a short TTL (60 s default;
+   * failed/unrecognised probes cached briefly for 5 s so every request does not spawn a new probe
+   * while still failing closed). A missing stat is never cached.
+   */
+  async _probeInstalledVersion({ force = false } = {}) {
+    const binPath = which(this.bin);
+    if (this.disabled || !binPath) return null;
+    if (!force) {
+      const hit = readVersionCache(binPath);
+      if (hit) return hit.installed;
+    }
+    const preStatKey = getBinStatKey(binPath);
+    const flightKey = `${binPath}|${preStatKey || 'nostat'}|${force ? 'force' : 'cached'}`;
+    if (_versionInFlight.has(flightKey)) {
+      return _versionInFlight.get(flightKey);
+    }
+    const p = (async () => {
+      const out = await this._spawn({ args: ['--version'], timeoutMs: 15_000 });
+      let installed = null;
+      if (out.code === 0) {
+        const text = `${out.stdout || ''}\n${out.stderr || ''}`.trim();
+        const m = text.match(/\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/);
+        installed = m ? m[1] : null;
+      }
+      const postStatKey = getBinStatKey(binPath);
+      // Missing stat or mid-probe binary replacement means "not cached".
+      if (postStatKey && (!preStatKey || postStatKey === preStatKey)) {
+        const ttlMs = installed
+          ? Number(this.versionCacheTtlMs ?? OPENCODE_VERSION_TTL_MS)
+          : Number(this.negativeVersionCacheTtlMs ?? OPENCODE_NEGATIVE_VERSION_TTL_MS);
+        if (ttlMs > 0) {
+          const now = Date.now();
+          if (_versionCache.size >= 256) {
+            for (const [k, v] of _versionCache) {
+              if (now >= v.expiresAt) _versionCache.delete(k);
+            }
+            if (_versionCache.size >= 256) {
+              const oldest = _versionCache.keys().next().value;
+              if (oldest !== undefined) _versionCache.delete(oldest);
+            }
+          }
+          _versionCache.set(postStatKey, {
+            installed,
+            expiresAt: now + ttlMs,
+          });
+        } else {
+          _versionCache.delete(postStatKey);
+        }
+      }
+      return installed;
+    })().finally(() => {
+      _versionInFlight.delete(flightKey);
+    });
+    _versionInFlight.set(flightKey, p);
+    return p;
+  }
+
+  /**
+   * Compare the installed CLI's `--version` output against `this.verifiedVersion`.
+   * Cached briefly per `(realpathSync(binPath), ino, ctime, size, mtime)`.
+   * Returns `{ installed, expected, warning }` (`warning` is null when they match or when the
+   * binary / version output is unavailable).
+   */
+  async checkVersion() {
+    const expected = this.verifiedVersion;
+    const binPath = which(this.bin);
+    if (!expected || this.disabled || !binPath) return { installed: null, expected, warning: null };
+    const installed = await this._probeInstalledVersion();
+    if (!installed || installed === expected) return { installed, expected, warning: null };
+    const refusalNote =
+      this._ownsOpencodeWorkspace && !this.allowUnverifiedVersion
+        ? `; runs are refused unless \`keysmith set ${this.id} allowUnverifiedVersion true\` is set`
+        : '';
+    return {
+      installed,
+      expected,
+      warning: `${path.basename(this.bin)} ${installed} !== verified ${expected} (provenance ${expected}) — workspace config was verified against ${expected} (run \`keysmith upgrade ${this.id} --take workspaceFiles\`${refusalNote})`,
+    };
+  }
+
+  /**
+   * Run adapter health checks (workspace files + CLI version).
+   */
+  async probe() {
+    const ws = this.checkWorkspaceFiles();
+    const ver = await this.checkVersion();
+    const warnings = [ws.warning, ver.warning].filter(Boolean);
+    return {
+      installed: ver.installed,
+      expected: ver.expected,
+      versionWarning: ver.warning,
+      workspaceWarning: ws.warning,
+      warnings,
+    };
+  }
+
+  /**
    * A process slot (`maxConcurrent`) for an engine that runs the CLI itself; the release function.
    * A request whose client left while it waited never gets one: its abort already fired.
    */
@@ -251,7 +405,7 @@ export class CliAdapter {
    * is `emulateArgs` (or `args`), and nothing is resumed. `{ events, stop, done }`: the parser's
    * events, a stop switch, and the process outcome. The caller holds a slot (acquire()).
    */
-  emulateRun({ text, model, effort = null, timeoutMs, signal }) {
+  async emulateRun({ text, model, effort = null, timeoutMs, signal }) {
     const tpl = this.emulateArgs || this.args;
     const field = this.emulateArgs ? 'emulateArgs' : 'args';
     effortIn(this.id, field, tpl, effort, this.takeFor([field]));
@@ -264,7 +418,7 @@ export class CliAdapter {
       noSession: this.persistSessions ? '' : this.noSessionFlag,
       maxTokens: '',
     });
-    const run = this._spawnStream({ args: argv, stdin: this.promptVia === 'stdin' ? text : null, timeoutMs, signal });
+    const run = await this._spawnStream({ args: argv, stdin: this.promptVia === 'stdin' ? text : null, timeoutMs, signal, model });
     return { events: getParser(this.parser)(toLines(run.stdout)), stop: run.stop, done: run.done };
   }
 
@@ -272,7 +426,7 @@ export class CliAdapter {
    * One completion. `rendered` ({ system, prompt }) is a prompt a tool engine wrote itself in
    * place of the flattened `messages` (router.js, tool_choice none); such a run is never resumed.
    */
-  async *complete({ model, messages, session, signal, maxTokens, effort = null, rendered = null }) {
+  async *complete({ model, messages, session, sessionKey = null, signal, maxTokens, effort = null, rendered = null }) {
     this.ready();
 
     // A request with media, on a CLI that takes some of it: the prompt goes on stdin, media and all.
@@ -290,6 +444,10 @@ export class CliAdapter {
     const keepSystem = !this.stripSystemPrompt;
     const body = keepSystem && system && !this.systemFlag ? `<system>\n${system}\n</system>\n\n${prompt}` : prompt;
     const useResume = !!(session && this.resumable) && !rendered && !vision;
+    const scratchDir =
+      this._ownsOpencodeWorkspace && this.resumable && !rendered && !vision
+        ? (session && this._sessionDirs.get(session)) || (sessionKey || session ? this._sessionScratchDir(sessionKey || session) : null)
+        : null;
     const stdinFor = (text) => (vision ? vision.stdin(text) : this.promptVia === 'stdin' ? text : null);
     const tpl = vision ? this.visionArgs : useResume ? this.resumeArgs : this.args;
     const field = vision ? 'visionArgs' : useResume ? 'resumeArgs' : 'args';
@@ -321,11 +479,13 @@ export class CliAdapter {
       for (let attempt = 0; ; attempt++) {
         const retryable = attempt === 0 && !!this.toolDenialRetry;
         const text = attempt === 0 ? body : `${this.toolDenialRetry}\n\n${body}`;
-        const run = this._spawnStream({
+        const run = await this._spawnStream({
           args: argvFor(text),
           stdin: stdinFor(text),
           timeoutMs: Math.max(1_000, deadline - Date.now()),
           signal,
+          scratchDir,
+          model,
         });
         let emitted = false;
         // While a run may still be retried, everything but text is held back: a refused run's
@@ -335,20 +495,47 @@ export class CliAdapter {
         let carriedSent = false;
         let cut = null; // the tool call the answer was ended at
         let blocked = null; // a tool call before any text, stopped (`stopAtToolCall: 'always'`)
+        let blockedError = null;
+        let blockedErrorType = null;
         for await (let evt of noteUsageGap(parse(toLines(run.stdout)), () => this.usageGap())) {
+          if (evt.type === 'session' && evt.id && this._ownsOpencodeWorkspace && this.resumable) {
+            this._rememberSessionDir(evt.id, run.cwd);
+          }
           if (evt.type === 'tool') {
             // Before any text the call may be how the model gets to its answer, so the run
             // goes on. After text, the answer exists: stop the process instead of letting
             // it loop until its own timeout, and keep whatever it says next out of the reply.
+            // On a keysmith-owned opencode workspace, EVERY tool event in the stream is
+            // inspected (even after `cut` is set) and any outcome other than DeniedError /
+            // UnavailableToolError fails the run.
+            const toolName = evt.name || 'a tool';
+            const isUnexpected =
+              this._ownsOpencodeWorkspace && evt.errorType !== 'DeniedError' && evt.errorType !== 'UnavailableToolError';
+            if (isUnexpected && (!blockedErrorType || blockedErrorType === 'DeniedError' || blockedErrorType === 'UnavailableToolError')) {
+              blocked = toolName;
+              blockedError = evt.error || null;
+              blockedErrorType = evt.errorType || 'unknown';
+            }
             if (this.stopAtToolCall && emitted && !cut) {
-              cut = evt.name || 'a tool';
-              run.stop(`answer complete, stopped at a call to ${cut}`);
-              yield { type: 'cut', reason: 'tool_call', tool: cut };
+              cut = toolName;
+              if (isUnexpected) {
+                run.stop(`stopped at a call to ${cut}: unexpected tool outcome ${blockedErrorType}`);
+              } else {
+                run.stop(`answer complete, stopped at a call to ${cut}`);
+                yield { type: 'cut', reason: 'tool_call', tool: cut };
+              }
             } else if (this.stopAtToolCall === 'always' && !emitted && !cut) {
               // A CLI that kept its tools: a call is stopped wherever it comes. The harness
               // may have started it already — this is a limit on the damage, not a sandbox.
-              cut = blocked = evt.name || 'a tool';
+              cut = blocked = toolName;
+              if (!blockedErrorType) {
+                blockedError = evt.error || null;
+                blockedErrorType = evt.errorType || null;
+              }
               run.stop(`stopped at a call to ${cut}: this adapter may not run tools`);
+            } else if (isUnexpected) {
+              if (!cut) cut = toolName;
+              run.stop(`stopped at a call to ${toolName}: unexpected tool outcome ${blockedErrorType}`);
             }
             continue;
           }
@@ -382,13 +569,32 @@ export class CliAdapter {
           continue;
         }
         yield* held.splice(0);
-        if (blocked && !emitted) {
-          throw new LlmError(`adapter "${this.id}": the agent started a tool call (${blocked}) before answering, and keysmith stopped the run — this adapter may not run tools`, {
-            status: 502,
-            provider: this.id,
-          });
+        const unexpectedOutcome =
+          this._ownsOpencodeWorkspace && blockedErrorType && blockedErrorType !== 'DeniedError' && blockedErrorType !== 'UnavailableToolError';
+        if (blocked && (!emitted || unexpectedOutcome)) {
+          const unexpected = unexpectedOutcome
+            ? ` (unexpected tool outcome: ${blockedErrorType}${blockedError ? ` — ${truncate(blockedError, 160)}` : ''})`
+            : '';
+          const where = emitted ? 'after answering' : 'before answering';
+          const err = new LlmError(
+            `adapter "${this.id}": the agent started a tool call (${blocked}) ${where}, and keysmith stopped the run — this adapter may not run tools${unexpected}`,
+            {
+              status: 502,
+              provider: this.id,
+            },
+          );
+          if (blockedErrorType) err.toolErrorType = blockedErrorType;
+          if (blockedError) err.toolError = blockedError;
+          throw err;
         }
         if (outcome.code !== 0 && !emitted) {
+          if (outcome.abortError) {
+            throw new LlmError(outcome.abortError.message, {
+              status: outcome.abortError.status,
+              provider: this.id,
+              retriable: outcome.abortError.retriable,
+            });
+          }
           throw new LlmError(
             `${this.id} exited ${outcome.code}${outcome.killed ? ' (killed)' : ''}: ${truncate(outcome.stderr || outcome.error || 'no output', 300)}`,
             { status: outcome.killed ? 504 : 502, provider: this.id, retriable: !!outcome.killed },
@@ -437,19 +643,72 @@ export class CliAdapter {
     }
   }
 
+  _sessionScratchDir(key) {
+    this._ensureCwd();
+    const root = ensureScratchRoot(this.id, this.cwd);
+    const digest = createHash('sha256').update(String(key)).digest('hex').slice(0, 24);
+    const dir = path.join(root, `sess-${this.id}-${digest}`);
+    ensurePrivateScratchDir(this.id, dir, { exclusive: false });
+    return realpathSync(dir);
+  }
+
+  _rememberSessionDir(sessionId, dir) {
+    if (!sessionId || !dir) return;
+    if (this._sessionDirs.size >= 1000 && !this._sessionDirs.has(sessionId)) {
+      const oldest = this._sessionDirs.keys().next().value;
+      this._sessionDirs.delete(oldest);
+    }
+    this._sessionDirs.set(sessionId, dir);
+  }
+
   /**
-   * The child's environment. `PWD` is set to the workspace: spawn() changes the directory but
+   * The child's environment. `PWD` is set to the working directory: spawn() changes the directory but
    * leaves the parent's PWD, and opencode takes PWD as its project directory — with the
    * gateway's (or the shell's that started it) it fails ("Unexpected server error"), or reads
    * that directory's config instead of the tool-less one in its workspace.
+   * For keysmith-owned opencode workspaces (`this._ownsOpencodeWorkspace`), every inherited
+   * `OPENCODE_*` variable from the gateway's environment (`OPENCODE_PERMISSION` included) is
+   * removed first, and only allow-listed `OPENCODE_*` variables (`KEYSMITH_OPENCODE_ENV_ALLOWLIST`)
+   * are set: when running in a scratch directory (`runCwd !== this.cwd`),
+   * `OPENCODE_DISABLE_PROJECT_CONFIG=1` suppresses `ConfigPaths.projectFiles` and project
+   * `.opencode` upward walks from the scratch directory (so an ancestor `~/opencode.json` is
+   * skipped), `OPENCODE_CONFIG` and `OPENCODE_CONFIG_DIR` point back to the adapter's workspace
+   * files, and `OPENCODE_CONFIG_CONTENT` re-applies `opencode.json` after `ConfigPaths.directories`.
    */
-  _childEnv() {
-    return { ...agentCleanEnv(), PWD: this.cwd, ...this.env };
+  _childEnv(runCwd = this.cwd) {
+    if (!this._ownsOpencodeWorkspace) {
+      return { ...agentCleanEnv(), PWD: runCwd, ...this.env };
+    }
+    const baseEnv = { ...agentCleanEnv(), PWD: runCwd };
+    const xdgDataHome = this.env?.XDG_DATA_HOME || baseEnv.XDG_DATA_HOME;
+    let ocConfigContent = this.workspaceFiles?.['opencode.json'];
+    if (typeof ocConfigContent === 'string' && ocConfigContent.trim() && xdgDataHome) {
+      try {
+        const parsed = JSON.parse(ocConfigContent);
+        const xdgGlob = path.join(xdgDataHome, 'opencode', 'tool-output', '*');
+        if (isPlainObject(parsed?.permission?.external_directory)) {
+          parsed.permission.external_directory[xdgGlob] = 'deny';
+        }
+        if (isPlainObject(parsed?.agent?.['keysmith-text']?.permission?.external_directory)) {
+          parsed.agent['keysmith-text'].permission.external_directory[xdgGlob] = 'deny';
+        }
+        ocConfigContent = JSON.stringify(parsed);
+      } catch {}
+    }
+    const ocConfigEnv = {
+      OPENCODE_CONFIG: path.join(this.cwd, 'opencode.json'),
+      OPENCODE_CONFIG_DIR: path.join(this.cwd, '.opencode'),
+      OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+      ...(typeof ocConfigContent === 'string' && ocConfigContent.trim()
+        ? { OPENCODE_CONFIG_CONTENT: ocConfigContent }
+        : {}),
+    };
+    return sanitizeOpencodeEnv(baseEnv, ocConfigEnv, this.env);
   }
 
   _spawn({ args, stdin = null, timeoutMs }) {
     this._ensureCwd();
-    const child = spawnCli(this.id, which(this.bin) || this.bin, args, { cwd: this.cwd, env: this._childEnv(), stdio: [stdin != null ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+    const child = spawnCli(this.id, which(this.bin) || this.bin, args, { cwd: this.cwd, env: this._childEnv(this.cwd), stdio: [stdin != null ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
     if (stdin != null) {
       child.stdin.on('error', () => {});
       child.stdin.end(stdin);
@@ -471,29 +730,107 @@ export class CliAdapter {
     });
   }
 
-  _spawnStream({ args, stdin, timeoutMs, signal }) {
+  async _spawnStream({ args, stdin, timeoutMs, signal, scratchDir = null, model = null }) {
     this._ensureCwd();
-    const child = spawnCli(this.id, which(this.bin) || this.bin, args, {
-      cwd: this.cwd,
-      env: this._childEnv(),
-      stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-    });
+    let runCwd = this.cwd;
+    let cleanupCwd = null;
+    if (this._ownsOpencodeWorkspace) {
+      if (scratchDir) {
+        ensureScratchRoot(this.id, this.cwd);
+        ensurePrivateScratchDir(this.id, scratchDir, { exclusive: false });
+        runCwd = realpathSync(scratchDir);
+        const active = (this._activeScratchRuns.get(runCwd) || 0) + 1;
+        this._activeScratchRuns.set(runCwd, active);
+        let cleaned = false;
+        cleanupCwd = () => {
+          if (cleaned) return;
+          cleaned = true;
+          const left = (this._activeScratchRuns.get(runCwd) || 1) - 1;
+          if (left > 0) {
+            this._activeScratchRuns.set(runCwd, left);
+            return;
+          }
+          this._activeScratchRuns.delete(runCwd);
+          try {
+            rmSync(runCwd, { recursive: true, force: true });
+          } catch {}
+        };
+      } else {
+        runCwd = createExclusiveScratchDir(this.id, this.cwd, 'req');
+        let cleaned = false;
+        cleanupCwd = () => {
+          if (cleaned) return;
+          cleaned = true;
+          try {
+            rmSync(runCwd, { recursive: true, force: true });
+          } catch {}
+        };
+      }
+    }
+    let child;
+    try {
+      const childEnv = this._childEnv(runCwd);
+      if (this._ownsOpencodeWorkspace) {
+        await preflightOpencodePermissions(this, { runCwd, childEnv, mode: 'text', argv: args, signal });
+      }
+      if (signal?.aborted) {
+        throw new LlmError(`adapter "${this.id}": client disconnected`, { status: 499, provider: this.id });
+      }
+      child = spawnCli(this.id, which(this.bin) || this.bin, args, {
+        cwd: runCwd,
+        env: childEnv,
+        stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      cleanupCwd?.();
+      throw e;
+    }
     if (stdin) {
       child.stdin.on('error', () => {});
       child.stdin.end(stdin);
     }
     let stderr = '';
+    let killed = null;
+    let abortError = null;
+    const stop = (why, err = null) => {
+      if (killed) return;
+      killed = why;
+      if (err) abortError = err;
+      terminate(child, why);
+    };
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (c) => {
       stderr += c;
       if (stderr.length > 64_000) stderr = keepTail(stderr, 32_000);
+      if (this._isOpencode && !killed && /can only be used from within OpenCode/i.test(stderr)) {
+        stop("refused by upstream: OpenCode's free tier can only be used from within OpenCode", {
+          status: 502,
+          retriable: false,
+          message: `${this.id}: OpenCode's free tier can only be used from within OpenCode (${truncate(stderr, 200)})`,
+        });
+      }
     });
-    let killed = null;
-    const stop = (why) => {
-      if (killed) return;
-      killed = why;
-      terminate(child, why);
-    };
+    let sawFirstEvent = false;
+    const applyFirstEventTimeout =
+      !this._firstEventTimeoutScopedToFreeTier || !model || String(model).startsWith('opencode/');
+    const firstEventMs =
+      applyFirstEventTimeout && Number.isFinite(this.firstEventTimeoutMs) && this.firstEventTimeoutMs > 0
+        ? this.firstEventTimeoutMs
+        : null;
+    const firstEventTimer =
+      firstEventMs && firstEventMs < timeoutMs
+        ? setTimeout(() => {
+            if (!sawFirstEvent) {
+              stop(`no first event after ${firstEventMs}ms (opencode produced no output — possible silent 429 / Retry-After sleep)`);
+            }
+          }, firstEventMs)
+        : null;
+    child.stdout.on('data', (c) => {
+      if (!sawFirstEvent && String(c).trim()) {
+        sawFirstEvent = true;
+        if (firstEventTimer) clearTimeout(firstEventTimer);
+      }
+    });
     const timer = setTimeout(() => stop(`timeout after ${timeoutMs}ms`), timeoutMs);
     const onAbort = () => stop('client disconnected');
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -501,15 +838,19 @@ export class CliAdapter {
     const done = new Promise((resolve) => {
       child.on('error', (e) => {
         clearTimeout(timer);
-        resolve({ code: -1, stderr: e.message, killed: true });
+        if (firstEventTimer) clearTimeout(firstEventTimer);
+        cleanupCwd?.();
+        resolve({ code: -1, stderr: e.message, killed: true, abortError });
       });
       child.on('close', (code) => {
         clearTimeout(timer);
+        if (firstEventTimer) clearTimeout(firstEventTimer);
         signal?.removeEventListener('abort', onAbort);
-        resolve({ code: killed ? -1 : code, stderr: killed ? `${stderr}\n(${killed})`.trim() : stderr, killed: !!killed });
+        cleanupCwd?.();
+        resolve({ code: killed ? -1 : code, stderr: killed ? `${stderr}\n(${killed})`.trim() : stderr, killed: !!killed, abortError });
       });
     });
-    return { stdout: child.stdout, done, stop };
+    return { stdout: child.stdout, done, stop, cwd: runCwd };
   }
 }
 
@@ -589,6 +930,86 @@ function checkLineage(id, lineage, templates) {
 
 /** Below this much of `timeoutMs` left, a refused run is reported instead of retried. */
 const MIN_RETRY_BUDGET_MS = 15_000;
+
+/**
+ * Return the keysmith-owned 0700 scratch root (`<workspaceCwd>/../.scratch`) for an adapter
+ * workspace, creating it with a non-following `mkdirSync` if absent and refusing any pre-existing
+ * path that is a symlink, not a directory, not owned by `getuid()`, or not mode 0700.
+ */
+export function ensureScratchRoot(adapterId, workspaceCwd, { getuid = process.getuid } = {}) {
+  const parent = path.dirname(path.resolve(workspaceCwd));
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const root = path.join(parent, '.scratch');
+  ensurePrivateScratchDir(adapterId, root, { exclusive: false, getuid });
+  return realpathSync(root);
+}
+
+/**
+ * Create or validate a 0700 scratch directory at `dir` without following symlinks.
+ * When `exclusive` is true, `dir` must not already exist (`mkdirSync` without `recursive`).
+ * When `exclusive` is false, a pre-existing entry is accepted only if `lstatSync` shows a
+ * real directory (not a symlink) owned by `getuid()` with mode 0700.
+ */
+export function ensurePrivateScratchDir(adapterId, dir, { exclusive = true, getuid = process.getuid } = {}) {
+  let created = false;
+  try {
+    mkdirSync(dir, { mode: 0o700 });
+    created = true;
+  } catch (e) {
+    if (exclusive || e?.code !== 'EEXIST') {
+      throw new LlmError(`adapter "${adapterId}": could not create scratch directory ${dir}: ${e.message}`, {
+        status: 500,
+        provider: adapterId,
+      });
+    }
+  }
+  let st;
+  try {
+    st = lstatSync(dir);
+  } catch (e) {
+    throw new LlmError(`adapter "${adapterId}": could not stat scratch directory ${dir}: ${e.message}`, {
+      status: 500,
+      provider: adapterId,
+    });
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new LlmError(`adapter "${adapterId}": refusing scratch directory ${dir}: not a regular directory`, {
+      status: 500,
+      provider: adapterId,
+    });
+  }
+  const uid = typeof getuid === 'function' ? getuid.call(process) : null;
+  if (uid != null && st.uid !== uid) {
+    throw new LlmError(`adapter "${adapterId}": refusing scratch directory ${dir}: owned by uid ${st.uid}, expected ${uid}`, {
+      status: 500,
+      provider: adapterId,
+    });
+  }
+  const mode = st.mode & 0o777;
+  if (mode !== 0o700) {
+    if (created) {
+      chmodSync(dir, 0o700);
+    } else {
+      throw new LlmError(`adapter "${adapterId}": refusing pre-existing scratch directory ${dir}: mode is 0${mode.toString(8)}, expected 0700`, {
+        status: 500,
+        provider: adapterId,
+      });
+    }
+  }
+  return dir;
+}
+
+/**
+ * Create a fresh, unique 0700 scratch directory under `<workspaceCwd>/../.scratch` using an
+ * exclusive, non-following `mkdirSync` (never `os.tmpdir()`).
+ */
+export function createExclusiveScratchDir(adapterId, workspaceCwd, prefix = 'req', opts = {}) {
+  const root = ensureScratchRoot(adapterId, workspaceCwd, opts);
+  const rand = randomBytes(12).toString('hex');
+  const dir = path.join(root, `${prefix}-${adapterId}-${rand}`);
+  ensurePrivateScratchDir(adapterId, dir, { exclusive: true, ...opts });
+  return realpathSync(dir);
+}
 
 /**
  * spawn() for an adapter's CLI (the text path, EMULATE, the MCP bridge's driver). spawn() refuses
@@ -843,6 +1264,82 @@ function terminate(child) {
 }
 
 const _whichCache = new Map();
+const _versionCache = new Map();
+const _versionInFlight = new Map();
+const OPENCODE_VERSION_TTL_MS = 60_000;
+const OPENCODE_NEGATIVE_VERSION_TTL_MS = 5_000;
+const OPENCODE_ORG_CONFIG_TTL_MS = 15_000;
+const OPENCODE_ORG_CONFIG_TIMEOUT_MS = 3_000;
+const _opencodeOrgConfigCache = new Map();
+const _opencodeOrgConfigInFlight = new Map();
+const _opencodeOrgConfigStats = { fetches: 0, hits: 0 };
+
+function getBinStatKey(binPath) {
+  if (!binPath) return null;
+  try {
+    const realPath = realpathSync(binPath);
+    const st = statSync(realPath, { bigint: true });
+    if (!st.isFile()) return null;
+    return `${realPath}|ino=${st.ino}:ctimeMs=${st.ctimeMs}:ctimeNs=${st.ctimeNs}:size=${st.size}:mtimeMs=${st.mtimeMs}:mtimeNs=${st.mtimeNs}`;
+  } catch {
+    return null;
+  }
+}
+
+function readVersionCache(binPath, now = Date.now()) {
+  const statKey = getBinStatKey(binPath);
+  if (!statKey) return null;
+  const entry = _versionCache.get(statKey);
+  if (!entry) return null;
+  if (now >= entry.expiresAt) {
+    _versionCache.delete(statKey);
+    return null;
+  }
+  return { installed: entry.installed ?? null, statKey, expiresAt: entry.expiresAt };
+}
+
+function getCachedInstalledVersion(binPath, now = Date.now()) {
+  const hit = readVersionCache(binPath, now);
+  return hit ? hit.installed : null;
+}
+
+export function clearOpencodeVersionCache() {
+  _versionCache.clear();
+  _versionInFlight.clear();
+}
+
+/**
+ * Explicit allow-list of `OPENCODE_*` environment variables that keysmith sets on a
+ * keysmith-owned opencode run. Every inherited `OPENCODE_*` variable from the gateway's
+ * environment (`OPENCODE_PERMISSION` included) is stripped before applying this allow-list.
+ */
+export const KEYSMITH_OPENCODE_ENV_ALLOWLIST = new Set([
+  'OPENCODE_CONFIG',
+  'OPENCODE_CONFIG_DIR',
+  'OPENCODE_CONFIG_CONTENT',
+  'OPENCODE_DISABLE_PROJECT_CONFIG',
+]);
+
+/**
+ * Strip every `OPENCODE_*` variable from `env`, then apply `overrides` keeping only
+ * non-`OPENCODE_*` variables and `OPENCODE_*` variables in `KEYSMITH_OPENCODE_ENV_ALLOWLIST`.
+ */
+export function sanitizeOpencodeEnv(env, ...overrides) {
+  const out = {};
+  for (const [k, v] of Object.entries(env || {})) {
+    if (v === undefined || k.startsWith('OPENCODE_')) continue;
+    out[k] = v;
+  }
+  for (const layer of overrides) {
+    if (!layer) continue;
+    for (const [k, v] of Object.entries(layer)) {
+      if (v === undefined || v === null) continue;
+      if (k.startsWith('OPENCODE_') && !KEYSMITH_OPENCODE_ENV_ALLOWLIST.has(k)) continue;
+      out[k] = v;
+    }
+  }
+  return out;
+}
 export function which(bin) {
   if (!bin) return null;
   if (_whichCache.has(bin)) return _whichCache.get(bin);
@@ -859,4 +1356,1981 @@ export function which(bin) {
   else for (const dir of (process.env.PATH || '').split(':')) if (dir && ok(`${dir}/${bin}`)) { found = `${dir}/${bin}`; break; }
   _whichCache.set(bin, found);
   return found;
+}
+
+const _opencodePreflightCache = new Map();
+const _opencodePreflightStats = { runs: 0, hits: 0, misses: 0 };
+
+const OPENCODE_REQUIRED_DENY_PERMISSIONS = [
+  '*',
+  'read',
+  'external_directory',
+  'edit',
+  'write',
+  'apply_patch',
+  'bash',
+  'glob',
+  'grep',
+  'list',
+  'webfetch',
+  'websearch',
+  'codesearch',
+  'task',
+  'skill',
+  'lsp',
+  'todowrite',
+  'todoread',
+  'question',
+  'plan_enter',
+  'plan_exit',
+  'doom_loop',
+  'mcp',
+];
+
+const MANAGED_PLIST_META_KEYS = new Set([
+  'PayloadDisplayName',
+  'PayloadIdentifier',
+  'PayloadType',
+  'PayloadUUID',
+  'PayloadVersion',
+  '_manualProfile',
+]);
+
+function isPlainObject(v) {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === null || proto === Object.prototype;
+}
+
+function isTruthyOpencodeFlag(v) {
+  if (typeof v !== 'string') return false;
+  const low = v.toLowerCase();
+  return low === '1' || low === 'true';
+}
+
+function formatKeyPath(parts) {
+  let out = '';
+  for (const p of parts) {
+    const s = String(p);
+    if (/^[A-Za-z_$][A-Za-z0-9_$-]*$/.test(s)) {
+      out = out ? `${out}.${s}` : s;
+    } else {
+      out = `${out}[${JSON.stringify(s)}]`;
+    }
+  }
+  return out;
+}
+
+function stripJsonc(input) {
+  const text = String(input || '').replace(/^\uFEFF/, '');
+  let out = '';
+  let inStr = false;
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (inStr) {
+      out += ch;
+      if (ch === '\\' && i + 1 < text.length) {
+        out += text[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === '"') inStr = false;
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '/') {
+      i += 2;
+      while (i < text.length && text[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      if (end === -1) break;
+      i = end + 2;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  let res = '';
+  inStr = false;
+  for (let j = 0; j < out.length; j++) {
+    const ch = out[j];
+    if (inStr) {
+      res += ch;
+      if (ch === '\\' && j + 1 < out.length) {
+        res += out[++j];
+        continue;
+      }
+      if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      res += ch;
+      continue;
+    }
+    if (ch === ',') {
+      let k = j + 1;
+      while (k < out.length && /\s/.test(out[k])) k++;
+      if (out[k] === '}' || out[k] === ']') continue;
+    }
+    res += ch;
+  }
+  return res;
+}
+
+function parseJsoncText(text, sourceLabel) {
+  const stripped = stripJsonc(text).trim();
+  if (!stripped) return {};
+  try {
+    return JSON.parse(stripped);
+  } catch (e) {
+    const err = new Error(`${sourceLabel}: invalid JSON/JSONC (${e.message})`);
+    err.source = sourceLabel;
+    err.key = 'json';
+    throw err;
+  }
+}
+
+function substituteOpencodeConfigVars(text, { sourceLabel, baseDir, home, env, extraFiles }) {
+  const withEnv = String(text).replace(/\{env:([^}]+)\}/g, (_, name) => String(env?.[name] ?? ''));
+  const matches = Array.from(withEnv.matchAll(/\{file:[^}]+\}/g));
+  if (!matches.length) return withEnv;
+  let out = '';
+  let cursor = 0;
+  for (const m of matches) {
+    const tok = m[0];
+    const idx = m.index;
+    out += withEnv.slice(cursor, idx);
+    const lineStart = withEnv.lastIndexOf('\n', idx - 1) + 1;
+    if (withEnv.slice(lineStart, idx).trimStart().startsWith('//')) {
+      out += tok;
+      cursor = idx + tok.length;
+      continue;
+    }
+    let rel = tok.slice(6, -1);
+    if (rel.startsWith('~/')) rel = path.join(home, rel.slice(2));
+    const resolved = path.isAbsolute(rel) ? rel : path.resolve(baseDir, rel);
+    extraFiles?.push(resolved);
+    let fileText;
+    try {
+      fileText = readFileSync(resolved, 'utf8').trim();
+    } catch (e) {
+      const err = new Error(`${sourceLabel}: bad file reference "${tok}" (${e.message})`);
+      err.source = sourceLabel;
+      err.key = tok;
+      throw err;
+    }
+    out += JSON.stringify(fileText).slice(1, -1);
+    cursor = idx + tok.length;
+  }
+  out += withEnv.slice(cursor);
+  return out;
+}
+
+function unquoteYamlScalar(raw) {
+  const s = raw.trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    if (s.startsWith('"')) {
+      try {
+        return JSON.parse(s);
+      } catch {
+        return s.slice(1, -1);
+      }
+    }
+    return s.slice(1, -1);
+  }
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  if (s === 'null') return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(s)) return Number(s);
+  return s;
+}
+
+function stripYamlInlineComment(raw) {
+  let inQuote = null;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inQuote) {
+      if (ch === '\\' && inQuote === '"') {
+        i++;
+        continue;
+      }
+      if (ch === inQuote) inQuote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inQuote = ch;
+      continue;
+    }
+    if (ch === '#' && (i === 0 || /\s/.test(raw[i - 1]))) {
+      return raw.slice(0, i).trim();
+    }
+  }
+  return raw.trim();
+}
+
+function parseMarkdownFrontmatter(text, sourceLabel) {
+  const raw = String(text || '').replace(/^\uFEFF/, '');
+  if (!/^---(?:\r?\n|$)/.test(raw)) {
+    return { data: {}, content: raw.trim() };
+  }
+  const emptyFence = raw.match(/^---\r?\n---(?:\r?\n([\s\S]*))?$/);
+  if (emptyFence) {
+    return { data: {}, content: (emptyFence[1] || '').trim() };
+  }
+  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n([\s\S]*))?$/);
+  if (!m) {
+    throw new Error(`${sourceLabel}: unclosed or malformed YAML frontmatter`);
+  }
+  const yamlBlock = m[1];
+  const body = (m[2] || '').trim();
+  const root = {};
+  const stack = [{ indent: -1, childIndent: null, obj: root }];
+  for (const rawLine of yamlBlock.split(/\r?\n/)) {
+    const leadingWs = rawLine.match(/^\s*/)[0];
+    if (/[^ ]/.test(leadingWs)) {
+      throw new Error(`${sourceLabel}: non-space indentation in YAML frontmatter`);
+    }
+    if (!rawLine.trim()) continue;
+    const trimmed = rawLine.trim();
+    if (trimmed.startsWith('#')) continue;
+    if (/^(?:---|\.\.\.|[-?&*!%@`|>])/.test(trimmed)) {
+      throw new Error(`${sourceLabel}: unsupported YAML construct in frontmatter (${trimmed.slice(0, 24)})`);
+    }
+    let colonIdx = -1;
+    let inQuote = null;
+    for (let i = 0; i < trimmed.length; i++) {
+      const ch = trimmed[i];
+      if (inQuote) {
+        if (ch === '\\' && inQuote === '"') {
+          i++;
+          continue;
+        }
+        if (ch === inQuote) inQuote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        inQuote = ch;
+        continue;
+      }
+      if (ch === ':' && (i + 1 === trimmed.length || /\s/.test(trimmed[i + 1]))) {
+        colonIdx = i;
+        break;
+      }
+    }
+    if (inQuote !== null || colonIdx === -1) {
+      throw new Error(`${sourceLabel}: unclassifiable YAML line in frontmatter (${trimmed.slice(0, 32)})`);
+    }
+    const keyRaw = trimmed.slice(0, colonIdx).trim();
+    if (!keyRaw) {
+      throw new Error(`${sourceLabel}: empty key in YAML frontmatter`);
+    }
+    const keyIsQuoted = (keyRaw.startsWith('"') && keyRaw.endsWith('"')) || (keyRaw.startsWith("'") && keyRaw.endsWith("'"));
+    if (!keyIsQuoted && /[{}\[\],&*!|>%@`]/.test(keyRaw)) {
+      throw new Error(`${sourceLabel}: unsupported flow/complex YAML key in frontmatter (${keyRaw})`);
+    }
+    const valRaw = stripYamlInlineComment(trimmed.slice(colonIdx + 1));
+    const indent = leadingWs.length;
+    const key = String(unquoteYamlScalar(keyRaw));
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) {
+      stack.pop();
+    }
+    const parentFrame = stack[stack.length - 1];
+    if (parentFrame.childIndent === null) {
+      parentFrame.childIndent = indent;
+    } else if (indent !== parentFrame.childIndent) {
+      throw new Error(`${sourceLabel}: inconsistent YAML indentation in frontmatter`);
+    }
+    const parent = parentFrame.obj;
+    if (!valRaw) {
+      const child = {};
+      parent[key] = child;
+      stack.push({ indent, childIndent: null, obj: child });
+    } else if (/^[|>&*!%@`]/.test(valRaw)) {
+      throw new Error(`${sourceLabel}: unsupported YAML scalar/tag in frontmatter (${valRaw.slice(0, 24)})`);
+    } else if (valRaw.startsWith('{') || valRaw.startsWith('[')) {
+      parent[key] = parseJsoncText(valRaw, sourceLabel);
+    } else {
+      const valIsQuoted = (valRaw.startsWith('"') && valRaw.endsWith('"')) || (valRaw.startsWith("'") && valRaw.endsWith("'"));
+      if (!valIsQuoted && /(?:^|\s):(?:\s|$)/.test(valRaw)) {
+        throw new Error(`${sourceLabel}: ambiguous unquoted YAML value in frontmatter (${valRaw.slice(0, 24)})`);
+      }
+      parent[key] = unquoteYamlScalar(valRaw);
+    }
+  }
+  return { data: root, content: body };
+}
+
+function deleteOriginPrefix(originMap, prefix) {
+  for (const k of Array.from(originMap.keys())) {
+    if (k === prefix || k.startsWith(`${prefix}.`) || k.startsWith(`${prefix}[`)) {
+      originMap.delete(k);
+    }
+  }
+}
+
+function mergeDeepWithProvenance(target, patch, sourceLabel, originMap, pathParts = []) {
+  const out = isPlainObject(target) ? { ...target } : {};
+  if (!isPlainObject(patch)) return out;
+  for (const [k, v] of Object.entries(patch)) {
+    const curParts = [...pathParts, k];
+    const keyPath = formatKeyPath(curParts);
+    if (isPlainObject(v) && isPlainObject(out[k])) {
+      out[k] = mergeDeepWithProvenance(out[k], v, sourceLabel, originMap, curParts);
+      if (!originMap.has(keyPath)) originMap.set(keyPath, sourceLabel);
+    } else if (isPlainObject(v)) {
+      deleteOriginPrefix(originMap, keyPath);
+      originMap.set(keyPath, sourceLabel);
+      out[k] = mergeDeepWithProvenance({}, v, sourceLabel, originMap, curParts);
+    } else {
+      deleteOriginPrefix(originMap, keyPath);
+      originMap.set(keyPath, sourceLabel);
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function lowerOpencodeV2Compat(rawObj, sourceLabel, violations) {
+  if (!isPlainObject(rawObj)) return {};
+  if (Object.hasOwn(rawObj, 'permissions')) {
+    violations.push({ source: sourceLabel, key: 'permissions', value: rawObj.permissions });
+  }
+  for (const sec of ['agents', 'agent', 'mode']) {
+    if (!isPlainObject(rawObj[sec])) continue;
+    for (const [name, entry] of Object.entries(rawObj[sec])) {
+      if (isPlainObject(entry) && Object.hasOwn(entry, 'permissions')) {
+        violations.push({ source: sourceLabel, key: formatKeyPath([sec, name, 'permissions']), value: entry.permissions });
+      }
+    }
+  }
+  const out = { ...rawObj };
+  if (isPlainObject(out.agents)) {
+    const agent = isPlainObject(out.agent) ? { ...out.agent } : {};
+    for (const [name, entry] of Object.entries(out.agents)) {
+      if (Object.hasOwn(agent, name) || !isPlainObject(entry)) continue;
+      const lowered = {};
+      for (const k of ['description', 'mode', 'hidden', 'color', 'steps', 'permission', 'tools']) {
+        if (entry[k] !== undefined) lowered[k] = entry[k];
+      }
+      if (entry.system !== undefined) lowered.prompt = entry.system;
+      if (entry.disabled !== undefined) lowered.disable = entry.disabled;
+      agent[name] = lowered;
+    }
+    out.agent = agent;
+  }
+  if (isPlainObject(out.mcp) && isPlainObject(out.mcp.servers)) {
+    const mcp = { ...out.mcp };
+    const servers = mcp.servers;
+    delete mcp.servers;
+    for (const [name, entry] of Object.entries(servers)) {
+      if (Object.hasOwn(mcp, name) || !isPlainObject(entry)) continue;
+      mcp[name] = { ...entry, enabled: entry.enabled ?? entry.disabled !== true };
+    }
+    out.mcp = mcp;
+  }
+  return out;
+}
+
+function walkUpTargets(startDir, targets) {
+  const found = [];
+  let cur = path.resolve(startDir);
+  while (true) {
+    for (const t of targets) {
+      const candidate = path.join(cur, t);
+      try {
+        statSync(candidate);
+        found.push(candidate);
+      } catch {}
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return found.reverse();
+}
+
+function scanMarkdownFiles(baseDir, subdirs, recursive = true) {
+  const results = [];
+  const visit = (dir, allowRecurse) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      let isDir = entry.isDirectory();
+      let isFile = entry.isFile();
+      if (entry.isSymbolicLink()) {
+        try {
+          const st = statSync(full);
+          isDir = st.isDirectory();
+          isFile = st.isFile();
+        } catch {
+          continue;
+        }
+      }
+      if (isDir && allowRecurse) {
+        visit(full, true);
+      } else if (isFile && entry.name.endsWith('.md')) {
+        results.push(full);
+      }
+    }
+  };
+  for (const sub of subdirs) {
+    visit(path.join(baseDir, sub), recursive);
+  }
+  return results.sort();
+}
+
+function expandOpencodeHomePattern(pattern, home) {
+  const p = String(pattern);
+  if (p.startsWith('~/')) return home + p.slice(1);
+  if (p === '~') return home;
+  if (p.startsWith('$HOME/')) return home + p.slice(5);
+  if (p.startsWith('$HOME')) return home + p.slice(5);
+  return p;
+}
+
+function wildcardMatchOpencode(str, pattern) {
+  const e = str ? String(str).replaceAll('\\', '/') : '';
+  const o = pattern ? String(pattern).replaceAll('\\', '/') : '';
+  let l = o.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  if (l.endsWith(' .*')) l = `${l.slice(0, -3)}( .*)?`;
+  return new RegExp(`^${l}$`, 's').test(e);
+}
+
+function permissionRulesFromConfig(permObj, home, prefixParts, originMap) {
+  const rules = [];
+  if (!isPlainObject(permObj)) return rules;
+  for (const [perm, val] of Object.entries(permObj)) {
+    const keyParts = [...prefixParts, perm];
+    const keyPath = formatKeyPath(keyParts);
+    if (typeof val === 'string') {
+      rules.push({
+        permission: perm,
+        pattern: '*',
+        rawPattern: '*',
+        action: val,
+        source: originMap.get(keyPath) || originMap.get(formatKeyPath(prefixParts)) || 'opencode config',
+        keyPath,
+      });
+    } else if (isPlainObject(val)) {
+      for (const [pat, action] of Object.entries(val)) {
+        const patParts = [...keyParts, pat];
+        const patKeyPath = formatKeyPath(patParts);
+        rules.push({
+          permission: perm,
+          pattern: expandOpencodeHomePattern(pat, home),
+          rawPattern: pat,
+          action,
+          source: originMap.get(patKeyPath) || originMap.get(keyPath) || originMap.get(formatKeyPath(prefixParts)) || 'opencode config',
+          keyPath: patKeyPath,
+        });
+      }
+    }
+  }
+  return rules;
+}
+
+function evaluateOpencodePermission(permission, pattern, ruleset) {
+  for (let i = ruleset.length - 1; i >= 0; i--) {
+    const r = ruleset[i];
+    if (wildcardMatchOpencode(permission, r.permission) && wildcardMatchOpencode(pattern, r.pattern)) {
+      return r;
+    }
+  }
+  return { action: 'ask', permission, pattern: '*', source: 'opencode default (unmatched -> ask)', keyPath: `${permission}["*"]` };
+}
+
+function getOpencodeVersionInfo(adapter) {
+  const binPath = which(adapter?.bin) || adapter?.bin || 'opencode';
+  const cachedVer = readVersionCache(binPath);
+  const binStat = cachedVer ? cachedVer.statKey : getBinStatKey(binPath);
+  const installed = cachedVer ? cachedVer.installed : null;
+  const expected =
+    typeof adapter?.verifiedVersion === 'string' && adapter.verifiedVersion.trim()
+      ? adapter.verifiedVersion.trim()
+      : null;
+  const allowUnverified = !!adapter?.allowUnverifiedVersion;
+  const versionKey = `${installed || 'unprobed'}|${expected || 'unverified'}|${allowUnverified ? 'override' : 'strict'}|${binPath}|${binStat || 'nostat'}`;
+  return { binPath, binStat, installed, expected, allowUnverified, versionKey };
+}
+
+function normalizeBridgeCacheContent(text) {
+  return String(text || '')
+    .replace(/\bks-b-[0-9a-f]{12}\b/g, 'ks-b-SESSION')
+    .replace(/\bks[0-9a-f]{6}_agent\b/g, 'ks_SESSION_agent')
+    .replace(/\bks[0-9a-f]{6}_\*/g, 'ks_SESSION_*')
+    .replace(/\bks[0-9a-f]{6}\b/g, 'ks_SESSION')
+    .replace(/"KEYSMITH_BRIDGE_TOKEN"\s*:\s*"[^"]*"/g, '"KEYSMITH_BRIDGE_TOKEN":"<redacted>"')
+    .replace(/"KEYSMITH_BRIDGE_SOCK"\s*:\s*"[^"]*"/g, '"KEYSMITH_BRIDGE_SOCK":"<redacted>"')
+    .replace(/"timeout"\s*:\s*\d+/g, '"timeout":0');
+}
+
+/**
+ * Internal unit-test seam (non-global Symbol, impossible to set from JSON config or env)
+ * that adds simulated system managed directories/plists so tests can verify that
+ * `adapter.managedConfigDir`, `adapter.managedPlistPaths`, and `KEYSMITH_TEST_OPENCODE_MANAGED_DIR`
+ * never replace or mask the real system managed paths.
+ */
+export const TEST_ONLY_SYSTEM_MANAGED_PATHS = Symbol('keysmith.testOnly.systemManagedPaths');
+
+const _lazyRequire = createRequire(import.meta.url);
+
+function loadDatabaseSync() {
+  const mod = _lazyRequire('node:sqlite');
+  if (typeof mod?.DatabaseSync !== 'function') {
+    throw new Error('node:sqlite did not export DatabaseSync');
+  }
+  return mod.DatabaseSync;
+}
+
+// Verified against opencode 1.19.3 AccountRepo + embedded Drizzle migrations + live sqlite_master:
+// `account` (id, email, url, access_token, refresh_token, token_expiry, time_created, time_updated)
+// and `account_state` (id, active_account_id, active_org_id; active singleton row id = 1).
+const OPENCODE_DB_ACCOUNT_STATE_COLUMNS = ['id', 'active_account_id', 'active_org_id'];
+const OPENCODE_DB_ACCOUNT_COLUMNS = ['id', 'email', 'url', 'access_token', 'refresh_token', 'token_expiry'];
+const OPENCODE_TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+
+function normalizeOpencodeAccountUrl(rawUrl) {
+  const parsed = new URL(String(rawUrl));
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`unsupported Console account URL protocol "${parsed.protocol}"`);
+  }
+  parsed.search = '';
+  parsed.hash = '';
+  const cleanPath = parsed.pathname.replace(/\/+$/, '');
+  return cleanPath.length === 0 ? parsed.origin : `${parsed.origin}${cleanPath}`;
+}
+
+function makeOrgConfigCacheKey({ accountId, orgId, tokenExpiry, configUrl, accessToken }) {
+  const tokHash = createHash('sha256').update(String(accessToken || '')).digest('hex').slice(0, 16);
+  return `${accountId}|${orgId}|${tokenExpiry}|${configUrl}|${tokHash}`;
+}
+
+function getCachedOrgConfig(cacheKey, now = Date.now()) {
+  const entry = _opencodeOrgConfigCache.get(cacheKey);
+  if (!entry) return null;
+  if (now >= entry.expiresAt) {
+    _opencodeOrgConfigCache.delete(cacheKey);
+    return null;
+  }
+  return entry.value;
+}
+
+function raceWithAbortSignal(promise, signal, adapterId) {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    return Promise.reject(new LlmError(`adapter "${adapterId}": client disconnected`, { status: 499, provider: adapterId }));
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      reject(new LlmError(`adapter "${adapterId}": client disconnected`, { status: 499, provider: adapterId }));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
+async function fetchActiveOrgConfigAsync({ url, accessToken, orgId, timeoutMs = OPENCODE_ORG_CONFIG_TIMEOUT_MS }) {
+  const effectiveTimeout = Math.max(1, Number(timeoutMs) || OPENCODE_ORG_CONFIG_TIMEOUT_MS);
+  let res;
+  let text;
+  try {
+    res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+        'x-org-id': orgId,
+      },
+      signal: AbortSignal.timeout(effectiveTimeout),
+    });
+    text = await res.text();
+  } catch (e) {
+    const isTimeout = e?.name === 'TimeoutError' || e?.name === 'AbortError' || /timed?\s*out/i.test(e?.message || '');
+    if (isTimeout) {
+      return { ok: false, error: `timed out fetching active Console org config from ${url}` };
+    }
+    return {
+      ok: false,
+      error: `failed to fetch active Console org config from ${url} (${e?.cause?.message || e?.message || String(e)})`,
+    };
+  }
+  if (res.status === 404) {
+    return { ok: true, config: {} };
+  }
+  if (res.status < 200 || res.status >= 300) {
+    return { ok: false, error: `active Console org config ${url} returned HTTP ${res.status}` };
+  }
+  let decoded;
+  try {
+    decoded = JSON.parse(text);
+  } catch (e) {
+    return { ok: false, error: `failed to decode active Console org config from ${url} (${e.message})` };
+  }
+  if (!isPlainObject(decoded) || !isPlainObject(decoded.config)) {
+    return { ok: false, error: `malformed active Console org config payload from ${url} (expected { config: {...} })` };
+  }
+  return { ok: true, config: decoded.config };
+}
+
+async function resolveActiveOrgConfig(adapter, orgState, { signal = null } = {}) {
+  const adapterId = adapter?.id || 'oc';
+  if (signal?.aborted) {
+    throw new LlmError(`adapter "${adapterId}": client disconnected`, { status: 499, provider: adapterId });
+  }
+  const ttlMs = Number(adapter?.orgConfigCacheTtlMs ?? OPENCODE_ORG_CONFIG_TTL_MS);
+  const timeoutMs = Number(adapter?.orgConfigFetchTimeoutMs ?? OPENCODE_ORG_CONFIG_TIMEOUT_MS);
+  const cacheKey = makeOrgConfigCacheKey(orgState);
+  if (ttlMs > 0) {
+    const hit = getCachedOrgConfig(cacheKey);
+    if (hit) {
+      _opencodeOrgConfigStats.hits++;
+      return hit;
+    }
+  }
+  let inFlight = _opencodeOrgConfigInFlight.get(cacheKey);
+  if (!inFlight) {
+    _opencodeOrgConfigStats.fetches++;
+    inFlight = (async () => {
+      const fetched = await fetchActiveOrgConfigAsync({
+        url: orgState.configUrl,
+        accessToken: orgState.accessToken,
+        orgId: orgState.orgId,
+        timeoutMs,
+      });
+      if (!fetched.ok) {
+        return {
+          status: 'error',
+          isTransientFetchError: true,
+          source: orgState.sourceLabel,
+          key: 'active_org_config',
+          error: fetched.error,
+          cacheToken: `err:fetch:${orgState.orgId}:${createHash('sha256').update(fetched.error).digest('hex').slice(0, 16)}`,
+        };
+      }
+      const configJson = JSON.stringify(fetched.config);
+      const configHash = createHash('sha256')
+        .update(`${orgState.accountId}|${orgState.orgId}|${orgState.tokenExpiry}|${orgState.configUrl}|${configJson}`)
+        .digest('hex');
+      const resolved = {
+        status: 'active_org',
+        orgId: orgState.orgId,
+        accountId: orgState.accountId,
+        tokenExpiry: orgState.tokenExpiry,
+        configUrl: orgState.configUrl,
+        sourceLabel: orgState.sourceLabel,
+        configJson,
+        cacheToken: `${orgState.orgId}:${configHash}`,
+      };
+      const now = Date.now();
+      const maxExpiry = orgState.tokenExpiry - OPENCODE_TOKEN_REFRESH_BUFFER_MS;
+      const expiresAt = Math.min(now + Math.max(0, ttlMs), maxExpiry);
+      if (ttlMs > 0 && expiresAt > now) {
+        _opencodeOrgConfigCache.set(cacheKey, { expiresAt, value: resolved });
+      }
+      return resolved;
+    })().finally(() => {
+      _opencodeOrgConfigInFlight.delete(cacheKey);
+    });
+    _opencodeOrgConfigInFlight.set(cacheKey, inFlight);
+  }
+  return raceWithAbortSignal(inFlight, signal, adapterId);
+}
+
+function inspectOpencodeOrgDb(dbPath) {
+  const resolved = path.resolve(dbPath);
+  try {
+    lstatSync(resolved);
+  } catch (e) {
+    if (e && e.code === 'ENOENT') {
+      return { status: 'absent', cacheToken: null };
+    }
+    return {
+      status: 'error',
+      source: resolved,
+      key: 'opencode.db',
+      error: `cannot stat opencode.db (${e?.code || e?.message || 'stat_error'})`,
+      cacheToken: `err:lstat:${e?.code || 'ERR'}`,
+    };
+  }
+
+  let st;
+  try {
+    st = statSync(resolved);
+  } catch (e) {
+    return {
+      status: 'error',
+      source: resolved,
+      key: 'opencode.db',
+      error: `cannot stat opencode.db (${e?.code || e?.message || 'stat_error'})`,
+      cacheToken: `err:stat:${e?.code || 'ERR'}`,
+    };
+  }
+  if (!st.isFile()) {
+    return {
+      status: 'error',
+      source: resolved,
+      key: 'opencode.db',
+      error: 'opencode.db exists but is not a regular file',
+      cacheToken: 'err:not_file',
+    };
+  }
+  if ((st.mode & 0o444) === 0) {
+    return {
+      status: 'error',
+      source: resolved,
+      key: 'opencode.db',
+      error: 'opencode.db is not readable (EACCES: mode has no read bits)',
+      cacheToken: 'err:mode_0',
+    };
+  }
+  try {
+    accessSync(resolved, fsConstants.R_OK);
+  } catch (e) {
+    return {
+      status: 'error',
+      source: resolved,
+      key: 'opencode.db',
+      error: `opencode.db is not readable (${e?.code || e?.message || 'EACCES'})`,
+      cacheToken: `err:access:${e?.code || 'EACCES'}`,
+    };
+  }
+
+  let DatabaseSync;
+  try {
+    DatabaseSync = loadDatabaseSync();
+  } catch (e) {
+    return {
+      status: 'error',
+      source: resolved,
+      key: 'node:sqlite',
+      error: `opencode.db exists but node:sqlite is unavailable (${e?.code || e?.message || String(e)})`,
+      cacheToken: `err:no_sqlite:${e?.code || 'UNAVAILABLE'}`,
+    };
+  }
+
+  let rows;
+  let db;
+  try {
+    db = new DatabaseSync(resolved, { readOnly: true, timeout: 0 });
+    const stateInfo = db.prepare("PRAGMA table_info('account_state')").all();
+    if (!Array.isArray(stateInfo) || stateInfo.length === 0) {
+      return {
+        status: 'error',
+        source: resolved,
+        key: 'opencode.db.schema',
+        error: 'opencode.db lacks expected 1.19.3 table "account_state"',
+        cacheToken: 'err:missing_table:account_state',
+      };
+    }
+    const stateCols = new Set(stateInfo.map((c) => c.name));
+    const missingStateCols = OPENCODE_DB_ACCOUNT_STATE_COLUMNS.filter((c) => !stateCols.has(c));
+    if (missingStateCols.length > 0) {
+      return {
+        status: 'error',
+        source: resolved,
+        key: 'opencode.db.schema',
+        error: `opencode.db table "account_state" lacks expected 1.19.3 columns: ${missingStateCols.join(', ')}`,
+        cacheToken: `err:missing_cols:account_state:${missingStateCols.join(',')}`,
+      };
+    }
+
+    const accountInfo = db.prepare("PRAGMA table_info('account')").all();
+    if (!Array.isArray(accountInfo) || accountInfo.length === 0) {
+      return {
+        status: 'error',
+        source: resolved,
+        key: 'opencode.db.schema',
+        error: 'opencode.db lacks expected 1.19.3 table "account"',
+        cacheToken: 'err:missing_table:account',
+      };
+    }
+    const accountCols = new Set(accountInfo.map((c) => c.name));
+    const missingAccountCols = OPENCODE_DB_ACCOUNT_COLUMNS.filter((c) => !accountCols.has(c));
+    if (missingAccountCols.length > 0) {
+      return {
+        status: 'error',
+        source: resolved,
+        key: 'opencode.db.schema',
+        error: `opencode.db table "account" lacks expected 1.19.3 columns: ${missingAccountCols.join(', ')}`,
+        cacheToken: `err:missing_cols:account:${missingAccountCols.join(',')}`,
+      };
+    }
+
+    rows = db
+      .prepare(
+        `SELECT s.id AS state_id,
+                s.active_account_id,
+                s.active_org_id,
+                a.id AS account_id,
+                a.url AS account_url,
+                a.access_token,
+                a.token_expiry
+           FROM account_state s
+           LEFT JOIN account a ON a.id = s.active_account_id
+          WHERE s.id = 1 OR (s.active_org_id IS NOT NULL AND s.active_org_id != '')
+          ORDER BY CASE WHEN s.id = 1 THEN 0 ELSE 1 END, s.id`,
+      )
+      .all();
+  } catch (e) {
+    return {
+      status: 'error',
+      source: resolved,
+      key: 'opencode.db',
+      error: `cannot read opencode.db (${e?.message || String(e)})`,
+      cacheToken: `err:sqlite:${e?.code || e?.message || 'ERR'}`,
+    };
+  } finally {
+    try {
+      db?.close();
+    } catch {}
+  }
+
+  for (const r of rows) {
+    if (r.state_id !== 1 && r.active_account_id && r.active_org_id) {
+      return {
+        status: 'error',
+        source: resolved,
+        key: 'account_state',
+        error: `unexpected active org row id=${r.state_id} in opencode.db`,
+        cacheToken: `err:unexpected_row:${r.state_id}`,
+      };
+    }
+  }
+
+  const row1 = rows.find((r) => r.state_id === 1);
+  if (!row1 || !row1.active_account_id || !row1.active_org_id) {
+    return {
+      status: 'no_active_org',
+      cacheToken: 'no_active_org',
+    };
+  }
+
+  const orgId = String(row1.active_org_id);
+  if (!row1.account_id) {
+    return {
+      status: 'error',
+      source: resolved,
+      key: 'account_state.active_account_id',
+      error: `active_account_id "${row1.active_account_id}" (org "${orgId}") not found in account table`,
+      cacheToken: `err:dangling_account:${row1.active_account_id}:${orgId}`,
+    };
+  }
+
+  let baseUrl;
+  try {
+    baseUrl = normalizeOpencodeAccountUrl(row1.account_url);
+  } catch (e) {
+    return {
+      status: 'error',
+      source: resolved,
+      key: 'account.url',
+      error: `invalid Console account URL for org "${orgId}" (${e.message})`,
+      cacheToken: `err:bad_url:${orgId}`,
+    };
+  }
+
+  const tokenExpiry = Number(row1.token_expiry);
+  if (
+    typeof row1.access_token !== 'string' ||
+    !row1.access_token ||
+    row1.token_expiry == null ||
+    !Number.isFinite(tokenExpiry) ||
+    tokenExpiry <= Date.now() + OPENCODE_TOKEN_REFRESH_BUFFER_MS
+  ) {
+    return {
+      status: 'error',
+      source: resolved,
+      key: 'account.token_expiry',
+      error: `active Console org "${orgId}" access token is expired or requires refresh; cannot verify ${baseUrl}/api/config`,
+      cacheToken: `err:expired_token:${orgId}`,
+    };
+  }
+
+  const configUrl = `${baseUrl}/api/config`;
+  const sourceLabel = `${configUrl} (org ${orgId})`;
+  return {
+    status: 'needs_org_fetch',
+    accountId: String(row1.account_id),
+    orgId,
+    tokenExpiry,
+    accessToken: row1.access_token,
+    configUrl,
+    sourceLabel,
+  };
+}
+
+function inspectManagedPermissionMap(permObj, prefixParts, sourceLabel, violations, allowMcpPat) {
+  if (permObj === undefined) return;
+  const prefixKey = formatKeyPath(prefixParts);
+  if (!isPlainObject(permObj)) {
+    violations.push({ source: sourceLabel, key: prefixKey, value: permObj });
+    return;
+  }
+  for (const [permKey, permVal] of Object.entries(permObj)) {
+    if (allowMcpPat && permKey === allowMcpPat && permVal === 'allow') continue;
+    const keyParts = [...prefixParts, permKey];
+    const keyPath = formatKeyPath(keyParts);
+    if (typeof permVal === 'string') {
+      if (permVal !== 'deny') {
+        violations.push({ source: sourceLabel, key: keyPath, value: permVal });
+      }
+    } else if (isPlainObject(permVal)) {
+      for (const [pat, action] of Object.entries(permVal)) {
+        if (action !== 'deny') {
+          violations.push({ source: sourceLabel, key: formatKeyPath([...keyParts, pat]), value: action });
+        }
+      }
+    } else {
+      violations.push({ source: sourceLabel, key: keyPath, value: permVal });
+    }
+  }
+}
+
+function inspectManagedSourceViolations(
+  lowered,
+  sourceLabel,
+  violations,
+  { mode, allowedMcpServer, allowedMcpPattern, bridgeAgentName },
+) {
+  if (!isPlainObject(lowered)) {
+    violations.push({ source: sourceLabel, key: 'config', value: lowered });
+    return;
+  }
+  const allowMcpPat = mode === 'bridge' ? allowedMcpPattern : null;
+  inspectManagedPermissionMap(lowered.permission, ['permission'], sourceLabel, violations, allowMcpPat);
+  if (isPlainObject(lowered.tools)) {
+    for (const [toolKey, enabled] of Object.entries(lowered.tools)) {
+      if (enabled !== false) {
+        violations.push({ source: sourceLabel, key: formatKeyPath(['tools', toolKey]), value: enabled });
+      }
+    }
+  }
+  if (isPlainObject(lowered.mcp)) {
+    for (const [serverName, serverCfg] of Object.entries(lowered.mcp)) {
+      if (mode === 'bridge' && serverName === allowedMcpServer) continue;
+      if (isPlainObject(serverCfg) && serverCfg.enabled !== false) {
+        violations.push({ source: sourceLabel, key: formatKeyPath(['mcp', serverName]), value: 'enabled' });
+      }
+    }
+  }
+  for (const sec of ['agent', 'mode']) {
+    if (!isPlainObject(lowered[sec])) continue;
+    for (const [entryName, entryCfg] of Object.entries(lowered[sec])) {
+      if (!isPlainObject(entryCfg)) continue;
+      inspectManagedPermissionMap(
+        entryCfg.permission,
+        [sec, entryName, 'permission'],
+        sourceLabel,
+        violations,
+        allowMcpPat,
+      );
+      if (isPlainObject(entryCfg.tools)) {
+        for (const [toolName, enabled] of Object.entries(entryCfg.tools)) {
+          if (enabled !== false && toolName !== 'read' && toolName !== 'invalid') {
+            violations.push({
+              source: sourceLabel,
+              key: formatKeyPath([sec, entryName, 'tools', toolName]),
+              value: enabled,
+            });
+          }
+        }
+      }
+      if (entryName === 'keysmith-text' || (bridgeAgentName && entryName === bridgeAgentName)) {
+        if (entryCfg.disable === true) {
+          violations.push({ source: sourceLabel, key: formatKeyPath([sec, entryName, 'disable']), value: true });
+        }
+        if (entryCfg.mode === 'subagent') {
+          violations.push({ source: sourceLabel, key: formatKeyPath([sec, entryName, 'mode']), value: 'subagent' });
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Resolve opencode 1.19.3's effective configuration and agent permission ruleset for `(runCwd, childEnv)`,
+ * tracking the exact config source and key path for every setting and computing the SHA-256 hash of every
+ * config source read (and active Console org state/config via a narrow SQLite query on `opencode.db`).
+ */
+export function resolveOpencodeEffectiveConfig(
+  adapter,
+  { runCwd, childEnv = {}, mode = 'text', argv = null, preloadedOrgDb = null } = {},
+) {
+  const cwd = runCwd || adapter?.cwd || process.cwd();
+  const home = childEnv.OPENCODE_TEST_HOME || childEnv.HOME || os.homedir();
+  const xdgConfig = childEnv.XDG_CONFIG_HOME || path.join(home, '.config');
+  const globalConfigDir = path.join(xdgConfig, 'opencode');
+  const xdgData = childEnv.XDG_DATA_HOME || path.join(home, '.local', 'share');
+  const globalDataDir = path.join(xdgData, 'opencode');
+
+  // Real system managed locations are ALWAYS checked; adapter.managedConfigDir,
+  // KEYSMITH_TEST_OPENCODE_MANAGED_DIR, and OPENCODE_TEST_MANAGED_CONFIG_DIR may only ADD paths,
+  // never replace or mask the real system paths.
+  const testSysPaths = adapter?.[TEST_ONLY_SYSTEM_MANAGED_PATHS] || null;
+  const systemManagedDirs = [
+    ...(process.platform === 'darwin'
+      ? ['/Library/Application Support/opencode', '/etc/opencode']
+      : process.platform === 'win32'
+        ? [path.join(process.env.ProgramData || 'C:\\ProgramData', 'opencode')]
+        : ['/etc/opencode']),
+    ...(Array.isArray(testSysPaths?.dirs) ? testSysPaths.dirs : []),
+  ];
+  const extraManagedDirs = [
+    ...(process.platform === 'win32' && childEnv.ProgramData ? [path.join(childEnv.ProgramData, 'opencode')] : []),
+    ...(adapter?.managedConfigDir ? [adapter.managedConfigDir] : []),
+    ...(childEnv.KEYSMITH_TEST_OPENCODE_MANAGED_DIR ? [childEnv.KEYSMITH_TEST_OPENCODE_MANAGED_DIR] : []),
+    ...(childEnv.OPENCODE_TEST_MANAGED_CONFIG_DIR ? [childEnv.OPENCODE_TEST_MANAGED_CONFIG_DIR] : []),
+  ];
+  const managedConfigDirs = [...new Set([...extraManagedDirs, ...systemManagedDirs].map((d) => path.resolve(d)))];
+  const managedConfigDir = systemManagedDirs[0];
+  const disableProjectConfig = isTruthyOpencodeFlag(childEnv.OPENCODE_DISABLE_PROJECT_CONFIG);
+
+  let bridgeAgentName = null;
+  let allowedMcpServer = null;
+  let allowedMcpPattern = null;
+  if (mode === 'bridge') {
+    const flatArgv = Array.isArray(argv) ? argv.flat(Infinity) : [];
+    const agentIdx = flatArgv.indexOf('--agent');
+    if (agentIdx !== -1 && typeof flatArgv[agentIdx + 1] === 'string') {
+      bridgeAgentName = flatArgv[agentIdx + 1];
+      const ridMatch = bridgeAgentName.match(/^ks-b-([0-9a-f]{6})[0-9a-f]{6}$/);
+      if (ridMatch) {
+        allowedMcpServer = `ks${ridMatch[1]}`;
+        allowedMcpPattern = `${allowedMcpServer}_*`;
+      } else if (bridgeAgentName.endsWith('_agent')) {
+        allowedMcpServer = bridgeAgentName.slice(0, -6);
+        allowedMcpPattern = `${allowedMcpServer}_*`;
+      }
+    }
+  }
+
+  const candidateFiles = [];
+  const fileContents = new Map();
+  const sourceHashes = [];
+
+  const readCandidateFile = (filePath, { normalizeForBridge = false } = {}) => {
+    const resolved = path.resolve(filePath);
+    candidateFiles.push(resolved);
+    try {
+      const buf = readFileSync(resolved);
+      const text = buf.toString('utf8');
+      fileContents.set(resolved, text);
+      const hashInput = normalizeForBridge ? Buffer.from(normalizeBridgeCacheContent(text), 'utf8') : buf;
+      const digest = createHash('sha256').update(hashInput).digest('hex');
+      sourceHashes.push([normalizeForBridge ? '<bridge:OPENCODE_CONFIG>' : resolved, digest]);
+      return text;
+    } catch (e) {
+      if (e && e.code === 'ENOENT') {
+        sourceHashes.push([normalizeForBridge ? '<bridge:OPENCODE_CONFIG>' : resolved, null]);
+        return null;
+      }
+      sourceHashes.push([normalizeForBridge ? '<bridge:OPENCODE_CONFIG>' : resolved, `error:${e?.code || 'ERR'}`]);
+      fileContents.set(resolved, e);
+      return e;
+    }
+  };
+
+  // 1. Auth wellknown
+  const authJsonPath = path.join(globalDataDir, 'auth.json');
+  readCandidateFile(authJsonPath);
+
+  // 2. Global config directory files
+  const globalFiles = [
+    path.join(globalConfigDir, 'config.json'),
+    path.join(globalConfigDir, 'opencode.json'),
+    path.join(globalConfigDir, 'opencode.jsonc'),
+    path.join(globalConfigDir, 'config'),
+  ];
+  for (const gf of globalFiles) readCandidateFile(gf);
+
+  // 3. OPENCODE_CONFIG
+  const customConfigFile = childEnv.OPENCODE_CONFIG ? path.resolve(childEnv.OPENCODE_CONFIG) : null;
+  if (customConfigFile) {
+    readCandidateFile(customConfigFile, { normalizeForBridge: mode === 'bridge' });
+  }
+
+  // 4. Project config files (skipped when OPENCODE_DISABLE_PROJECT_CONFIG is truthy)
+  const projectFiles = !disableProjectConfig ? walkUpTargets(cwd, ['opencode.jsonc', 'opencode.json']) : [];
+  for (const pf of projectFiles) readCandidateFile(pf);
+
+  // 5. ConfigPaths.directories
+  const rawDirs = [
+    globalConfigDir,
+    ...(!disableProjectConfig ? walkUpTargets(cwd, ['.opencode']) : []),
+    ...walkUpTargets(home, ['.opencode']).filter((d) => path.dirname(d) === path.resolve(home)),
+    ...(childEnv.OPENCODE_CONFIG_DIR ? [path.resolve(childEnv.OPENCODE_CONFIG_DIR)] : []),
+  ];
+  const configDirs = [...new Set(rawDirs.map((d) => path.resolve(d)))];
+  const dirSources = [];
+  for (const d of configDirs) {
+    const dirJsonFiles = [];
+    if (d.endsWith('.opencode') || (childEnv.OPENCODE_CONFIG_DIR && d === path.resolve(childEnv.OPENCODE_CONFIG_DIR))) {
+      for (const name of ['opencode.json', 'opencode.jsonc']) {
+        const jf = path.join(d, name);
+        readCandidateFile(jf);
+        dirJsonFiles.push(jf);
+      }
+    }
+    const agentMdFiles = scanMarkdownFiles(d, ['agent', 'agents'], true);
+    for (const mf of agentMdFiles) readCandidateFile(mf);
+    const modeMdFiles = scanMarkdownFiles(d, ['mode', 'modes'], false);
+    for (const mf of modeMdFiles) readCandidateFile(mf);
+    dirSources.push({ dir: d, dirJsonFiles, agentMdFiles, modeMdFiles });
+  }
+
+  // 6. Active Console org DB (narrow read-only SQLite query; async /api/config fetch is resolved before spawn)
+  const dbPath = path.join(globalDataDir, 'opencode.db');
+  let orgDb = preloadedOrgDb || inspectOpencodeOrgDb(dbPath);
+  if (orgDb.status === 'needs_org_fetch') {
+    const ttlMs = Number(adapter?.orgConfigCacheTtlMs ?? OPENCODE_ORG_CONFIG_TTL_MS);
+    const cachedOrg = ttlMs > 0 ? getCachedOrgConfig(makeOrgConfigCacheKey(orgDb)) : null;
+    if (cachedOrg) {
+      orgDb = cachedOrg;
+    } else {
+      orgDb = {
+        status: 'error',
+        isTransientFetchError: true,
+        source: orgDb.sourceLabel,
+        key: 'active_org_config',
+        error: `active Console org "${orgDb.orgId}" requires async preflight fetch of ${orgDb.configUrl} before spawn`,
+        cacheToken: `err:sync_unfetched:${orgDb.orgId}`,
+      };
+    }
+  }
+  sourceHashes.push([`opencode.db:${path.resolve(dbPath)}`, orgDb.cacheToken]);
+
+  // 7. System managed config directories (real system locations + any added overrides)
+  const managedFiles = [];
+  for (const mDir of managedConfigDirs) {
+    managedFiles.push(path.join(mDir, 'opencode.json'), path.join(mDir, 'opencode.jsonc'));
+  }
+  for (const mf of managedFiles) readCandidateFile(mf);
+
+  // 8. System managed preferences plists (real system locations + any added overrides)
+  const osUsername = (() => {
+    try {
+      return os.userInfo().username || 'user';
+    } catch {
+      return 'user';
+    }
+  })();
+  const plistUsernames = [...new Set([osUsername, childEnv.USER, childEnv.LOGNAME].filter(Boolean))];
+  const systemManagedPlists = [
+    ...(process.platform === 'darwin'
+      ? [
+          ...plistUsernames.map((u) => path.join('/Library/Managed Preferences', u, 'ai.opencode.managed.plist')),
+          '/Library/Managed Preferences/ai.opencode.managed.plist',
+        ]
+      : []),
+    ...(Array.isArray(testSysPaths?.plists) ? testSysPaths.plists : []),
+  ];
+  const extraManagedPlists = Array.isArray(adapter?.managedPlistPaths) ? adapter.managedPlistPaths : [];
+  const managedPlistCandidates = [
+    ...new Set([...extraManagedPlists, ...systemManagedPlists].map((pf) => path.resolve(pf))),
+  ];
+  for (const pf of managedPlistCandidates) readCandidateFile(pf);
+
+  // Relevant env snapshot for cache key
+  const relevantEnv = {};
+  const envKeys = [
+    'HOME',
+    'OPENCODE_TEST_HOME',
+    'XDG_CONFIG_HOME',
+    'XDG_DATA_HOME',
+    'XDG_STATE_HOME',
+    'XDG_CACHE_HOME',
+    'OPENCODE_TEST_MANAGED_CONFIG_DIR',
+    'KEYSMITH_TEST_OPENCODE_MANAGED_DIR',
+    'ProgramData',
+    'USER',
+    'LOGNAME',
+  ];
+  for (const k of envKeys) {
+    if (childEnv[k] !== undefined) relevantEnv[k] = childEnv[k];
+  }
+  for (const [k, v] of Object.entries(childEnv).sort(([a], [b]) => a.localeCompare(b))) {
+    if (!k.startsWith('OPENCODE_') || v === undefined) continue;
+    if (mode === 'bridge' && k === 'OPENCODE_CONFIG') {
+      relevantEnv[k] = '<bridge:OPENCODE_CONFIG>';
+    } else if (mode === 'bridge' && k === 'OPENCODE_CONFIG_CONTENT') {
+      relevantEnv[k] = normalizeBridgeCacheContent(v);
+    } else {
+      relevantEnv[k] = v;
+    }
+  }
+  if (adapter?.managedConfigDir) {
+    relevantEnv._adapterManagedConfigDir = adapter.managedConfigDir;
+  }
+  if (Array.isArray(adapter?.managedPlistPaths) && adapter.managedPlistPaths.length > 0) {
+    relevantEnv._adapterManagedPlistPaths = adapter.managedPlistPaths;
+  }
+  if (adapter?.allowUnverifiedVersion) {
+    relevantEnv._allowUnverifiedVersion = true;
+  }
+
+  const versionInfo = getOpencodeVersionInfo(adapter);
+  const versionKey = versionInfo.versionKey;
+
+  return {
+    cwd,
+    home,
+    globalConfigDir,
+    globalDataDir,
+    managedConfigDir,
+    managedConfigDirs,
+    disableProjectConfig,
+    mode,
+    bridgeAgentName,
+    allowedMcpServer,
+    allowedMcpPattern,
+    authJsonPath,
+    globalFiles,
+    customConfigFile,
+    projectFiles,
+    dirSources,
+    dbPath,
+    orgDb,
+    managedFiles,
+    managedPlistCandidates,
+    fileContents,
+    sourceHashes,
+    relevantEnv,
+    versionInfo,
+    versionKey,
+    readCandidateFile,
+  };
+}
+
+function evaluateOpencodeSources(adapter, ctx, childEnv) {
+  const {
+    cwd,
+    home,
+    globalDataDir,
+    mode,
+    bridgeAgentName,
+    allowedMcpServer,
+    allowedMcpPattern,
+    authJsonPath,
+    globalFiles,
+    customConfigFile,
+    projectFiles,
+    dirSources,
+    dbPath,
+    orgDb,
+    managedFiles,
+    managedPlistCandidates,
+    fileContents,
+    versionInfo,
+    readCandidateFile,
+  } = ctx;
+
+  const violations = [];
+  const originMap = new Map();
+  let effectiveConfig = {};
+  const extraReferencedFiles = [];
+
+  // 0. Installed opencode version must be probed and match verifiedVersion unless owner explicitly overrides
+  if (versionInfo && !versionInfo.allowUnverified) {
+    if (!versionInfo.expected) {
+      violations.push({
+        source: versionInfo.binPath,
+        key: 'version',
+        value: `verifiedVersion is unset (installed: ${versionInfo.installed || 'unprobed'}; set allowUnverifiedVersion: true to override)`,
+      });
+    } else if (!versionInfo.installed) {
+      violations.push({
+        source: versionInfo.binPath,
+        key: 'version',
+        value: `unprobed/unknown !== verifiedVersion ${versionInfo.expected} (set allowUnverifiedVersion: true to override)`,
+      });
+    } else if (versionInfo.installed !== versionInfo.expected) {
+      violations.push({
+        source: versionInfo.binPath,
+        key: 'version',
+        value: `${versionInfo.installed} !== verifiedVersion ${versionInfo.expected} (set allowUnverifiedVersion: true to override)`,
+      });
+    }
+  }
+
+  const mergeJsonSource = (rawText, sourceLabel, baseDir, { inspectAsManaged = false } = {}) => {
+    try {
+      const substituted = substituteOpencodeConfigVars(rawText, {
+        sourceLabel,
+        baseDir,
+        home,
+        env: childEnv,
+        extraFiles: extraReferencedFiles,
+      });
+      const parsed = parseJsoncText(substituted, sourceLabel);
+      const lowered = lowerOpencodeV2Compat(parsed, sourceLabel, violations);
+      if (inspectAsManaged) {
+        inspectManagedSourceViolations(lowered, sourceLabel, violations, {
+          mode,
+          allowedMcpServer,
+          allowedMcpPattern,
+          bridgeAgentName,
+        });
+      }
+      effectiveConfig = mergeDeepWithProvenance(effectiveConfig, lowered, sourceLabel, originMap);
+    } catch (e) {
+      violations.push({
+        source: e.source || sourceLabel,
+        key: e.key || 'config',
+        value: e.message || String(e),
+      });
+    }
+  };
+
+  const mergeFileIfPresent = (filePath, { inspectAsManaged = false } = {}) => {
+    const resolved = path.resolve(filePath);
+    const content = fileContents.get(resolved);
+    if (content === undefined || content === null) return;
+    if (content instanceof Error) {
+      violations.push({ source: resolved, key: 'read', value: content.code || content.message });
+      return;
+    }
+    mergeJsonSource(content, resolved, path.dirname(resolved), { inspectAsManaged });
+  };
+
+  // 1. Auth wellknown
+  let authData = null;
+  let authSource = authJsonPath;
+  if (childEnv.OPENCODE_AUTH_CONTENT) {
+    authSource = 'OPENCODE_AUTH_CONTENT';
+    try {
+      authData = JSON.parse(childEnv.OPENCODE_AUTH_CONTENT);
+    } catch (e) {
+      violations.push({ source: 'OPENCODE_AUTH_CONTENT', key: 'json', value: e.message });
+    }
+  } else {
+    const resolvedAuth = path.resolve(authJsonPath);
+    const rawAuth = fileContents.get(resolvedAuth);
+    if (rawAuth instanceof Error) {
+      violations.push({ source: resolvedAuth, key: 'read', value: rawAuth.code || rawAuth.message });
+    } else if (typeof rawAuth === 'string' && rawAuth.trim()) {
+      try {
+        authData = JSON.parse(rawAuth);
+      } catch (e) {
+        violations.push({ source: resolvedAuth, key: 'json', value: e.message });
+      }
+    }
+  }
+  if (isPlainObject(authData)) {
+    for (const [k, entry] of Object.entries(authData)) {
+      if (isPlainObject(entry) && entry.type === 'wellknown') {
+        if (isPlainObject(entry.config)) {
+          const lowered = lowerOpencodeV2Compat(entry.config, `${authSource} (${k})`, violations);
+          effectiveConfig = mergeDeepWithProvenance(effectiveConfig, lowered, `${authSource} (${k})`, originMap);
+        } else {
+          violations.push({ source: authSource, key: formatKeyPath(['wellknown', k]), value: 'remote_wellknown_config' });
+        }
+      }
+    }
+  }
+
+  // 2. Global config files
+  for (const gf of globalFiles) {
+    if (gf.endsWith(`${path.sep}config`)) {
+      const resolvedGf = path.resolve(gf);
+      const content = fileContents.get(resolvedGf);
+      if (content instanceof Error) {
+        violations.push({ source: resolvedGf, key: 'read', value: content.code || content.message });
+      } else if (typeof content === 'string' && content.trim()) {
+        violations.push({ source: resolvedGf, key: 'legacy_toml_config', value: 'present' });
+      }
+      continue;
+    }
+    mergeFileIfPresent(gf);
+  }
+
+  // 3. OPENCODE_CONFIG
+  if (customConfigFile) mergeFileIfPresent(customConfigFile);
+
+  // 4. Project config files
+  for (const pf of projectFiles) mergeFileIfPresent(pf);
+
+  // 5. ConfigPaths.directories
+  for (const ds of dirSources) {
+    for (const jf of ds.dirJsonFiles) mergeFileIfPresent(jf);
+    for (const mf of ds.agentMdFiles) {
+      const resolved = path.resolve(mf);
+      const content = fileContents.get(resolved);
+      if (content === undefined || content === null) continue;
+      if (content instanceof Error) {
+        violations.push({ source: resolved, key: 'read', value: content.code || content.message });
+        continue;
+      }
+      try {
+        const parsed = parseMarkdownFrontmatter(content, resolved);
+        const rel = path.relative(ds.dir, resolved).replaceAll('\\', '/');
+        const stripped = rel.startsWith('agent/') ? rel.slice(6) : rel.startsWith('agents/') ? rel.slice(7) : path.basename(rel);
+        const name = stripped.endsWith('.md') ? stripped.slice(0, -3) : stripped;
+        const agentObj = { name, ...parsed.data, prompt: parsed.content };
+        effectiveConfig = mergeDeepWithProvenance(effectiveConfig, { agent: { [name]: agentObj } }, resolved, originMap);
+      } catch (e) {
+        violations.push({ source: resolved, key: 'frontmatter', value: e.message });
+      }
+    }
+    for (const mf of ds.modeMdFiles) {
+      const resolved = path.resolve(mf);
+      const content = fileContents.get(resolved);
+      if (content === undefined || content === null) continue;
+      if (content instanceof Error) {
+        violations.push({ source: resolved, key: 'read', value: content.code || content.message });
+        continue;
+      }
+      try {
+        const parsed = parseMarkdownFrontmatter(content, resolved);
+        const base = path.basename(resolved, '.md');
+        const modeObj = { name: base, ...parsed.data, prompt: parsed.content, mode: 'primary' };
+        effectiveConfig = mergeDeepWithProvenance(effectiveConfig, { agent: { [base]: modeObj } }, resolved, originMap);
+      } catch (e) {
+        violations.push({ source: resolved, key: 'frontmatter', value: e.message });
+      }
+    }
+  }
+
+  // 6. OPENCODE_CONFIG_CONTENT
+  if (childEnv.OPENCODE_CONFIG_CONTENT) {
+    mergeJsonSource(childEnv.OPENCODE_CONFIG_CONTENT, 'OPENCODE_CONFIG_CONTENT', cwd);
+  }
+
+  // 7. Active Console org config (fail-closed SQLite opencode.db + /api/config check)
+  const resolvedDbPath = path.resolve(dbPath);
+  if (orgDb?.status === 'error') {
+    violations.push({
+      source: orgDb.source || resolvedDbPath,
+      key: orgDb.key || 'opencode.db',
+      value: orgDb.error,
+    });
+  } else if (orgDb?.status === 'active_org') {
+    mergeJsonSource(orgDb.configJson, orgDb.sourceLabel, globalDataDir);
+  }
+
+  // 8. System managed config directories (every candidate checked directly and merged; real system paths last)
+  for (const mf of managedFiles) mergeFileIfPresent(mf, { inspectAsManaged: true });
+
+  // 9. System managed preferences plists (macOS)
+  for (const pf of managedPlistCandidates) {
+    const resolved = path.resolve(pf);
+    const content = fileContents.get(resolved);
+    if (content === undefined || content === null) continue;
+    if (content instanceof Error) {
+      violations.push({ source: resolved, key: 'read', value: content.code || content.message });
+      continue;
+    }
+    try {
+      let jsonText = String(content);
+      if (!jsonText.trim().startsWith('{')) {
+        jsonText = execFileSync('plutil', ['-convert', 'json', '-o', '-', resolved], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 5_000,
+          encoding: 'utf8',
+        });
+      }
+      const parsed = JSON.parse(jsonText);
+      for (const k of Object.keys(parsed)) {
+        if (MANAGED_PLIST_META_KEYS.has(k)) delete parsed[k];
+      }
+      mergeJsonSource(JSON.stringify(parsed), `mobileconfig:${resolved}`, path.dirname(resolved), {
+        inspectAsManaged: true,
+      });
+    } catch (e) {
+      violations.push({ source: `mobileconfig:${resolved}`, key: 'plist', value: e.message });
+    }
+  }
+
+  // 10. Mode-to-agent lowering
+  if (isPlainObject(effectiveConfig.mode)) {
+    for (const [modeName, modeCfg] of Object.entries(effectiveConfig.mode)) {
+      if (!isPlainObject(modeCfg)) continue;
+      const modeSource = originMap.get(formatKeyPath(['mode', modeName])) || 'opencode config';
+      effectiveConfig = mergeDeepWithProvenance(
+        effectiveConfig,
+        { agent: { [modeName]: { ...modeCfg, mode: 'primary' } } },
+        modeSource,
+        originMap,
+      );
+    }
+  }
+
+  // 11. OPENCODE_PERMISSION
+  if (childEnv.OPENCODE_PERMISSION) {
+    try {
+      const parsedPerm = JSON.parse(childEnv.OPENCODE_PERMISSION);
+      effectiveConfig = mergeDeepWithProvenance(
+        effectiveConfig,
+        { permission: parsedPerm },
+        'OPENCODE_PERMISSION',
+        originMap,
+      );
+    } catch (e) {
+      violations.push({ source: 'OPENCODE_PERMISSION', key: 'OPENCODE_PERMISSION', value: e.message });
+    }
+  }
+
+  // 12. Deprecated config.tools lowering
+  if (isPlainObject(effectiveConfig.tools)) {
+    for (const [toolKey, enabled] of Object.entries(effectiveConfig.tools)) {
+      const permKey = toolKey === 'write' || toolKey === 'edit' || toolKey === 'patch' ? 'edit' : toolKey;
+      const action = enabled ? 'allow' : 'deny';
+      const toolSource = originMap.get(formatKeyPath(['tools', toolKey])) || originMap.get('tools') || 'opencode config';
+      if (enabled) {
+        violations.push({
+          source: toolSource,
+          key: formatKeyPath(['tools', toolKey]),
+          value: enabled,
+        });
+      }
+      if (!isPlainObject(effectiveConfig.permission) || !(permKey in effectiveConfig.permission)) {
+        effectiveConfig = mergeDeepWithProvenance(
+          { permission: { [permKey]: action } },
+          effectiveConfig,
+          toolSource,
+          originMap,
+        );
+      }
+    }
+  }
+
+  // Hash any extra {file:...} referenced files into sourceHashes
+  for (const ef of extraReferencedFiles) {
+    readCandidateFile(ef);
+  }
+
+  // Verify top-level permission object
+  const checkPermissionBlock = (permBlock, prefixParts, allowMcpPat) => {
+    const prefixKey = formatKeyPath(prefixParts);
+    if (!isPlainObject(permBlock)) {
+      violations.push({
+        source: originMap.get(prefixKey) || 'opencode config',
+        key: prefixKey,
+        value: permBlock ?? 'missing',
+      });
+      return;
+    }
+    if (permBlock['*'] !== 'deny') {
+      const starKey = formatKeyPath([...prefixParts, '*']);
+      violations.push({
+        source: originMap.get(starKey) || originMap.get(prefixKey) || 'opencode config',
+        key: starKey,
+        value: permBlock['*'] ?? 'missing',
+      });
+    }
+    for (const reqKey of ['read', 'external_directory']) {
+      if (!(reqKey in permBlock)) {
+        violations.push({
+          source: originMap.get(prefixKey) || 'opencode config',
+          key: formatKeyPath([...prefixParts, reqKey]),
+          value: 'missing',
+        });
+      }
+    }
+    for (const [permKey, permVal] of Object.entries(permBlock)) {
+      if (allowMcpPat && permKey === allowMcpPat && permVal === 'allow') continue;
+      const keyParts = [...prefixParts, permKey];
+      const keyPath = formatKeyPath(keyParts);
+      if (typeof permVal === 'string') {
+        if (permVal !== 'deny') {
+          violations.push({
+            source: originMap.get(keyPath) || originMap.get(prefixKey) || 'opencode config',
+            key: keyPath,
+            value: permVal,
+          });
+        }
+      } else if (isPlainObject(permVal)) {
+        for (const [pat, action] of Object.entries(permVal)) {
+          const patKeyPath = formatKeyPath([...keyParts, pat]);
+          if (action !== 'deny') {
+            violations.push({
+              source: originMap.get(patKeyPath) || originMap.get(keyPath) || originMap.get(prefixKey) || 'opencode config',
+              key: patKeyPath,
+              value: action,
+            });
+          }
+        }
+        if (permVal['*'] !== 'deny') {
+          const starPatKey = formatKeyPath([...keyParts, '*']);
+          violations.push({
+            source: originMap.get(starPatKey) || originMap.get(keyPath) || originMap.get(prefixKey) || 'opencode config',
+            key: starPatKey,
+            value: permVal['*'] ?? 'missing',
+          });
+        }
+      } else {
+        violations.push({
+          source: originMap.get(keyPath) || originMap.get(prefixKey) || 'opencode config',
+          key: keyPath,
+          value: permVal,
+        });
+      }
+    }
+  };
+
+  checkPermissionBlock(effectiveConfig.permission, ['permission'], mode === 'bridge' ? allowedMcpPattern : null);
+
+  // Check MCP servers
+  if (isPlainObject(effectiveConfig.mcp)) {
+    for (const [serverName, serverCfg] of Object.entries(effectiveConfig.mcp)) {
+      if (mode === 'bridge' && serverName === allowedMcpServer) continue;
+      if (isPlainObject(serverCfg) && serverCfg.enabled !== false) {
+        const mcpKey = formatKeyPath(['mcp', serverName]);
+        violations.push({
+          source: originMap.get(mcpKey) || originMap.get('mcp') || 'opencode config',
+          key: mcpKey,
+          value: 'enabled',
+        });
+      }
+    }
+  }
+
+  // Check target agents
+  const targetAgents =
+    mode === 'bridge' && bridgeAgentName
+      ? [
+          { name: bridgeAgentName, allowMcpPat: allowedMcpPattern },
+          ...(isPlainObject(effectiveConfig.agent?.['keysmith-text'])
+            ? [{ name: 'keysmith-text', allowMcpPat: allowedMcpPattern }]
+            : []),
+        ]
+      : [{ name: 'keysmith-text', allowMcpPat: null }];
+
+  const truncateGlob = path.join(globalDataDir, 'tool-output', '*');
+  const tmpGlob = path.join(os.tmpdir(), 'opencode', '*');
+  const agentRulesets = {};
+
+  for (const { name: agentName, allowMcpPat } of targetAgents) {
+    const agentCfg = effectiveConfig.agent?.[agentName];
+    const agentKey = formatKeyPath(['agent', agentName]);
+    if (!isPlainObject(agentCfg)) {
+      violations.push({
+        source: originMap.get('agent') || 'opencode config',
+        key: agentKey,
+        value: 'missing',
+      });
+      continue;
+    }
+    if (agentCfg.disable === true) {
+      const disKey = formatKeyPath(['agent', agentName, 'disable']);
+      violations.push({
+        source: originMap.get(disKey) || originMap.get(agentKey) || 'opencode config',
+        key: disKey,
+        value: true,
+      });
+    }
+    if (agentCfg.mode === 'subagent') {
+      const modeKey = formatKeyPath(['agent', agentName, 'mode']);
+      violations.push({
+        source: originMap.get(modeKey) || originMap.get(agentKey) || 'opencode config',
+        key: modeKey,
+        value: 'subagent',
+      });
+    }
+    if (isPlainObject(agentCfg.tools)) {
+      for (const [toolName, enabled] of Object.entries(agentCfg.tools)) {
+        if (enabled !== false && toolName !== 'read' && toolName !== 'invalid') {
+          const toolKey = formatKeyPath(['agent', agentName, 'tools', toolName]);
+          violations.push({
+            source: originMap.get(toolKey) || originMap.get(agentKey) || 'opencode config',
+            key: toolKey,
+            value: enabled,
+          });
+        }
+      }
+    }
+
+    checkPermissionBlock(agentCfg.permission, ['agent', agentName, 'permission'], allowMcpPat);
+
+    // Construct Agent.state effective permission ruleset
+    const defaultOrigin = new Map([['defaults', 'Agent.state defaults']]);
+    const baseRules = permissionRulesFromConfig(
+      {
+        '*': 'allow',
+        doom_loop: 'ask',
+        external_directory: {
+          '*': 'ask',
+          [truncateGlob]: 'allow',
+          [tmpGlob]: 'allow',
+        },
+        question: 'deny',
+        plan_enter: 'deny',
+        plan_exit: 'deny',
+        read: {
+          '*': 'allow',
+          '*.env': 'ask',
+          '*.env.*': 'ask',
+          '*.env.example': 'allow',
+        },
+      },
+      home,
+      ['defaults'],
+      defaultOrigin,
+    );
+    const configRules = permissionRulesFromConfig(effectiveConfig.permission, home, ['permission'], originMap);
+    const agentRules = permissionRulesFromConfig(agentCfg.permission, home, ['agent', agentName, 'permission'], originMap);
+    const ruleset = [...baseRules, ...configRules, ...agentRules];
+    if (
+      !ruleset.some(
+        (r) => r.permission === 'external_directory' && r.action === 'deny' && r.pattern === truncateGlob,
+      )
+    ) {
+      ruleset.push({
+        permission: 'external_directory',
+        pattern: truncateGlob,
+        rawPattern: truncateGlob,
+        action: 'allow',
+        source: 'Agent.state (Truncate.GLOB)',
+        keyPath: formatKeyPath(['agent', agentName, 'permission', 'external_directory', truncateGlob]),
+      });
+    }
+    agentRulesets[agentName] = ruleset;
+
+    // Every rule after baseRules must be 'deny' (except allowMcpPat on the bridge agent)
+    for (const r of ruleset.slice(baseRules.length)) {
+      if (allowMcpPat && r.permission === allowMcpPat && r.action === 'allow') continue;
+      if (r.action !== 'deny') {
+        violations.push({
+          source: r.source,
+          key: r.keyPath,
+          value: r.action,
+        });
+      }
+    }
+
+    // Evaluate all permissions across all patterns in the ruleset + sample probe targets
+    const allPerms = new Set([
+      ...OPENCODE_REQUIRED_DENY_PERMISSIONS,
+      ...Object.keys(effectiveConfig.permission || {}),
+      ...Object.keys(agentCfg.permission || {}),
+      ...Object.keys(effectiveConfig.tools || {}),
+      ...Object.keys(agentCfg.tools || {}),
+      ...Object.keys(effectiveConfig.mcp || {}),
+      ...ruleset.map((r) => r.permission),
+    ]);
+    const allPatterns = new Set([
+      '*',
+      '',
+      '/etc/hosts',
+      './inside.txt',
+      truncateGlob,
+      tmpGlob,
+      ...ruleset.map((r) => r.pattern),
+      ...ruleset.map((r) => r.rawPattern).filter(Boolean),
+    ]);
+    for (const perm of allPerms) {
+      if (allowMcpPat && (perm === allowMcpPat || perm === allowedMcpServer)) continue;
+      for (const pat of allPatterns) {
+        const matched = evaluateOpencodePermission(perm, pat, ruleset);
+        if (matched.action !== 'deny') {
+          violations.push({
+            source: matched.source || 'opencode config',
+            key: matched.keyPath || formatKeyPath(['agent', agentName, 'permission', perm, pat]),
+            value: matched.action,
+          });
+        }
+      }
+    }
+  }
+
+  // Deduplicate violations by source + key
+  const uniqueViolations = [];
+  const seen = new Set();
+  for (const v of violations) {
+    const id = `${v.source}::${v.key}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    uniqueViolations.push(v);
+  }
+
+  return {
+    effectiveConfig,
+    agentRulesets,
+    originMap,
+    violations: uniqueViolations,
+  };
+}
+
+function createOpencodePreflightError(adapterId, violations, agentName = 'keysmith-text') {
+  const details = violations
+    .slice(0, 4)
+    .map((v) => `${v.source} sets ${v.key} = ${JSON.stringify(v.value)}`)
+    .join('; ');
+  const err = new LlmError(
+    `adapter "${adapterId}": opencode effective permission preflight failed — ${details} (every tool permission for ${agentName} must resolve to "deny" for all patterns)`,
+    {
+      status: 502,
+      provider: adapterId,
+    },
+  );
+  err.preflightViolations = violations;
+  err.noFallback = true;
+  return err;
+}
+
+/**
+ * Preflight check on opencode's effective permissions and verified CLI version before spawning `opencode`.
+ * Asynchronously probes `opencode --version` (unless cached or `probeVersion: false`) and fetches any active
+ * Console org `/api/config` (briefly cached by `(account, org, tokenExpiry)` without blocking the event loop),
+ * then computes opencode's effective config and agent permission ruleset as the run will see it
+ * (`runCwd`, `childEnv`), caches the result keyed by `(opencode version, hashes of all config sources read +
+ * active-org config, env)`, and refuses the run with a 502 `LlmError` naming the offending source and key.
+ */
+export async function preflightOpencodePermissions(
+  adapter,
+  { runCwd, childEnv = {}, mode = 'text', argv = null, signal = null, probeVersion = true } = {},
+) {
+  const adapterId = adapter?.id || 'oc';
+  if (signal?.aborted) {
+    throw new LlmError(`adapter "${adapterId}": client disconnected`, { status: 499, provider: adapterId });
+  }
+  let probedVersionThisCall = false;
+  if (probeVersion && typeof adapter?._probeInstalledVersion === 'function') {
+    const binPath = which(adapter.bin);
+    if (binPath && !readVersionCache(binPath)) {
+      probedVersionThisCall = true;
+      await raceWithAbortSignal(adapter._probeInstalledVersion(), signal, adapterId);
+    }
+  }
+
+  const home = childEnv.OPENCODE_TEST_HOME || childEnv.HOME || os.homedir();
+  const xdgData = childEnv.XDG_DATA_HOME || path.join(home, '.local', 'share');
+  const dbPath = path.join(xdgData, 'opencode', 'opencode.db');
+  let preloadedOrgDb = inspectOpencodeOrgDb(dbPath);
+  if (preloadedOrgDb.status === 'needs_org_fetch') {
+    preloadedOrgDb = await resolveActiveOrgConfig(adapter, preloadedOrgDb, { signal });
+  }
+
+  const computePreflightKey = (c) =>
+    createHash('sha256')
+      .update(
+        JSON.stringify({
+          version: c.versionKey,
+          mode: c.mode,
+          sources: c.sourceHashes,
+          env: c.relevantEnv,
+        }),
+      )
+      .digest('hex');
+
+  let ctx = resolveOpencodeEffectiveConfig(adapter, { runCwd, childEnv, mode, argv, preloadedOrgDb });
+  let preCacheKey = computePreflightKey(ctx);
+
+  if (_opencodePreflightCache.has(preCacheKey)) {
+    const cached = _opencodePreflightCache.get(preCacheKey);
+    // Verify any extra {file:...} referenced files haven't changed either
+    let extraChanged = false;
+    if (cached.extraFiles?.length) {
+      for (const [efPath, oldHash] of cached.extraFiles) {
+        let curHash = null;
+        try {
+          curHash = createHash('sha256').update(readFileSync(efPath)).digest('hex');
+        } catch (e) {
+          curHash = e?.code === 'ENOENT' ? null : `error:${e?.code || 'ERR'}`;
+        }
+        if (curHash !== oldHash) {
+          extraChanged = true;
+          break;
+        }
+      }
+    }
+    if (!extraChanged) {
+      _opencodePreflightStats.hits++;
+      if (adapter) adapter._preflightHits = (adapter._preflightHits || 0) + 1;
+      if (!cached.ok) {
+        throw createOpencodePreflightError(adapterId, cached.violations, cached.agentName);
+      }
+      return cached;
+    }
+  }
+
+  // Re-probe `--version` whenever the preflight cache misses and we used a cached positive version
+  // (respecting any fresh negative-version cache entry so failed/unrecognised probes are not respawned per request).
+  if (probeVersion && !probedVersionThisCall && typeof adapter?._probeInstalledVersion === 'function') {
+    const binPath = which(adapter.bin);
+    const cachedVer = binPath ? readVersionCache(binPath) : null;
+    if (binPath && (!cachedVer || cachedVer.installed !== null)) {
+      const prevInstalled = ctx.versionInfo?.installed ?? null;
+      const prevStat = ctx.versionInfo?.binStat ?? null;
+      const freshInstalled = await raceWithAbortSignal(
+        adapter._probeInstalledVersion({ force: true }),
+        signal,
+        adapterId,
+      );
+      const freshStat = getBinStatKey(binPath);
+      if (freshInstalled !== prevInstalled || freshStat !== prevStat) {
+        ctx = resolveOpencodeEffectiveConfig(adapter, { runCwd, childEnv, mode, argv, preloadedOrgDb });
+        preCacheKey = computePreflightKey(ctx);
+      }
+    }
+  }
+
+  _opencodePreflightStats.misses++;
+  _opencodePreflightStats.runs++;
+  if (adapter) adapter._preflightRuns = (adapter._preflightRuns || 0) + 1;
+
+  const baseSourceCount = ctx.sourceHashes.length;
+  const evaluated = evaluateOpencodeSources(adapter, ctx, childEnv);
+  const extraFiles = ctx.sourceHashes.slice(baseSourceCount);
+  const agentName = mode === 'bridge' && ctx.bridgeAgentName ? ctx.bridgeAgentName : 'keysmith-text';
+  const entry = {
+    ok: evaluated.violations.length === 0,
+    violations: evaluated.violations,
+    agentName,
+    effectiveConfig: evaluated.effectiveConfig,
+    agentRulesets: evaluated.agentRulesets,
+    cacheKey: preCacheKey,
+    extraFiles,
+  };
+  if (ctx.versionInfo?.binStat && !ctx.orgDb?.isTransientFetchError) {
+    _opencodePreflightCache.set(preCacheKey, entry);
+  }
+
+  if (!entry.ok) {
+    throw createOpencodePreflightError(adapterId, entry.violations, agentName);
+  }
+  return entry;
+}
+
+export function getOpencodePreflightStats() {
+  return { ..._opencodePreflightStats, cacheSize: _opencodePreflightCache.size };
+}
+
+export function getOpencodeOrgConfigStats() {
+  return { ..._opencodeOrgConfigStats, cacheSize: _opencodeOrgConfigCache.size };
+}
+
+export function clearOpencodePreflightCache() {
+  _opencodePreflightCache.clear();
+  _opencodePreflightStats.runs = 0;
+  _opencodePreflightStats.hits = 0;
+  _opencodePreflightStats.misses = 0;
+  _opencodeOrgConfigCache.clear();
+  _opencodeOrgConfigInFlight.clear();
+  _opencodeOrgConfigStats.fetches = 0;
+  _opencodeOrgConfigStats.hits = 0;
 }

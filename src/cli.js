@@ -489,7 +489,7 @@ function showValue(field, v) {
 
 /** Fields worth knowing about that an entry may not have yet, by kind (docs/adapters.md has them all). */
 const SETTABLE = {
-  cli: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'models', 'defaultModel', 'toolMode', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'stopAtToolCall', 'stripSystemPrompt', 'systemFlag', 'promptVia', 'env'],
+  cli: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'models', 'defaultModel', 'toolMode', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'stopAtToolCall', 'workspaceFilesCustom', 'allowUnverifiedVersion', 'stripSystemPrompt', 'systemFlag', 'promptVia', 'env'],
   http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'streamUsage', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
 };
 
@@ -522,19 +522,33 @@ function showAdapter(id) {
 }
 
 /** Profile text `upgrade` refreshes without being asked: what the profile says it verified, and its advice. */
-const PROFILE_TEXT = new Set(['provenance', 'note']);
+const PROFILE_TEXT = new Set(['provenance', 'note', 'verifiedVersion']);
+
+function hasStaleWorkspaceFiles(entry, profile, take) {
+  if (!profile?.workspaceFiles || take.includes('workspaceFiles') || entry?.workspaceFilesCustom) return false;
+  if (!Object.hasOwn(entry, 'workspaceFiles')) return false;
+  const actual = entry.workspaceFiles;
+  if (!actual || typeof actual !== 'object') return true;
+  return Object.entries(profile.workspaceFiles).some(([file, content]) => !Object.hasOwn(actual, file) || actual[file] !== content);
+}
 
 /**
  * What `keysmith upgrade` would do to one entry: `{ next, added, refreshed, taken, kept }`, the
  * field names in each. A field the entry lacks is added; `provenance` and `note` are refreshed; a
  * field the entry has with another value is kept, unless `take` names it. `workspaceFiles` is a
- * map of files, so a file the entry lacks is added and one it has is kept. A guard is never
- * loosened, and a CLI marked unsafeTools gets no tool engine.
+ * map of files, so a file the entry lacks is added and one it has is kept. When `workspaceFiles`
+ * keeps stale files, `provenance` and `verifiedVersion` are not refreshed so version/workspace
+ * warnings still fire until `--take workspaceFiles` is used. A guard is never loosened, and a CLI
+ * marked unsafeTools gets no tool engine.
  */
 function upgradePlan(id, entry, profile, take = []) {
   const next = structuredClone(entry);
   const plan = { next, added: [], refreshed: [], taken: [], kept: [] };
+  const staleWs = hasStaleWorkspaceFiles(entry, profile, take);
   for (const [field, v] of Object.entries(profile)) {
+    if (staleWs && (field === 'provenance' || field === 'verifiedVersion') && !take.includes(field)) {
+      continue;
+    }
     if (take.includes(field) && JSON.stringify(entry[field]) !== JSON.stringify(v)) {
       next[field] = structuredClone(v);
       plan.taken.push(field);
@@ -795,12 +809,12 @@ function maskRef(ref) {
 
 /* ------------------------------------------------------------------------ models */
 
-function buildGateway(cfg) {
+function buildGateway(cfg, { deferAdapterChecks = false } = {}) {
   const usage = new UsageLog(undefined, { pricing: cfg?.pricing });
   // Under launchd this stderr is a log file. Adapter errors quote whatever a CLI printed,
   // which can be a prompt that held the key, so every line is redacted on the way out.
   const log = process.env.KEYSMITH_VERBOSE ? (m) => process.stderr.write(`[keysmith] ${redactSecrets(m)}\n`) : () => {};
-  return { gateway: new Gateway(cfg, { log, usage }), usage, log };
+  return { gateway: new Gateway(cfg, { log, usage, deferAdapterChecks }), usage, log };
 }
 
 async function cmdModels(flags) {
@@ -833,7 +847,7 @@ async function cmdServe(flags) {
   } catch (e) {
     fail(e.message);
   }
-  const { gateway, usage, log } = buildGateway(cfg);
+  const { gateway, usage, log } = buildGateway(cfg, { deferAdapterChecks: true });
   const server = createServer(gateway, cfg, { usage, log, tunnelActive: !!flags.tunnel });
 
   await new Promise((resolve, reject) => {
@@ -851,6 +865,7 @@ async function cmdServe(flags) {
   if (!process.env.KEYSMITH_VERBOSE || !gateway._warnedExecMigration) {
     for (const w of execAccountMigrationWarnings(cfg, usage, { checkDisk: true })) warn(`! ${w}`);
   }
+  await gateway.checkAdapters({ log: (w) => warn(`! ${w}`) });
   if (secured.changed.length) out(`  logs    : tightened ${secured.changed.length} file(s)/dir(s) to 0600/0700`);
   for (const f of secured.failed) warn(`! could not tighten ${f}`);
   // The MCP bridge (agy's toolMode auto/mcp): its socket, and what a gateway killed before it
@@ -1224,14 +1239,21 @@ async function cmdDoctor(flags) {
         rows.push([id, 'binary missing', `${adapter.bin} not on PATH`]);
         continue;
       }
+      const isOc = path.basename(adapter.bin) === 'opencode' || adapter.parser === 'opencode-ndjson';
+      const wsCheck = isOc ? adapter.checkWorkspaceFiles() : null;
+      const ver = isOc ? await adapter.checkVersion() : null;
       let models = [];
       try {
         models = await adapter.models();
       } catch (e) {
         rows.push([id, 'model list failed', truncate(e.message, 60)]);
+        if (wsCheck?.warning) rows.push([id, 'workspace warning', wsCheck.warning]);
+        if (ver?.warning) rows.push([id, 'version warning', ver.warning]);
         continue;
       }
       rows.push([id, models.length ? 'ok' : 'no models', `${bin} · ${models.length} models · parser ${adapter.parser}${tag}`]);
+      if (wsCheck?.warning) rows.push([id, 'workspace warning', wsCheck.warning]);
+      if (ver?.warning) rows.push([id, 'version warning', ver.warning]);
     } else {
       try {
         const models = await adapter.models();
@@ -1261,7 +1283,7 @@ async function cmdDoctor(flags) {
   for (const [id, state, detail] of rows) {
     // '!' rather than '✗': the route still answers, because the next leg in the chain picks it
     // up. What is broken is the ordering you asked for, and the money you think you are saving.
-    out(`  ${state === 'ok' ? '✓' : state === 'alias warning' ? '!' : state === 'disabled' ? '·' : '✗'} ${id.padEnd(w)}  ${state.padEnd(16)} ${detail}`);
+    out(`  ${state === 'ok' ? '✓' : state === 'alias warning' || state === 'version warning' || state === 'workspace warning' ? '!' : state === 'disabled' ? '·' : '✗'} ${id.padEnd(w)}  ${state.padEnd(16)} ${detail}`);
   }
 
   const t = tunnel.tunnelStatus(cfg);

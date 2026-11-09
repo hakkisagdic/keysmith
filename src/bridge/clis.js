@@ -124,13 +124,13 @@ function fileDriver({ id, parser, parserOpts = {}, usageAtEnd = false, prefix, h
      * `{ pid, events, stop(why), done }` (proc.js spawnGroup). A 400 for an argv a command line
      * cannot carry comes before any file is written; a spawn that fails at once removes them again.
      */
-    spawn(adapter, { session, model, prompt, killGraceMs = KILL_GRACE_MS }) {
+    async spawn(adapter, { session, model, prompt, killGraceMs = KILL_GRACE_MS, signal = null }) {
       const { argv, files: written, env: childEnv } = this.plan(adapter, { session, model, prompt });
       refuseNul(adapter.id, argv);
       adapter._ensureCwd();
       try {
         for (const { file, content } of written) writePrivate(file, content);
-        return spawnGroup(adapter, { argv, env: childEnv, stdinText: adapter.promptVia === 'stdin' ? prompt : null, parser, parserOpts, killGraceMs });
+        return await spawnGroup(adapter, { argv, env: childEnv, stdinText: adapter.promptVia === 'stdin' ? prompt : null, parser, parserOpts, killGraceMs, signal });
       } catch (e) {
         for (const { file } of written) rm(file);
         throw e;
@@ -159,17 +159,24 @@ function fileDriver({ id, parser, parserOpts = {}, usageAtEnd = false, prefix, h
   };
 }
 
-/** The tools allowed in the session: `<server>_*` (opencode's names for an MCP server's tools). */
-function opencodeConfig(session, agent, timeout) {
+/** The tools allowed in the session: `<server>_*` (opencode's names for an MCP server's tools), with `read` kept only as a denied schema placeholder (`{'*': 'deny', '': 'deny'}`) and `external_directory` explicitly denied (`{'*': 'deny', '~/.local/share/opencode/tool-output/*': 'deny'}`) for opencode 1.19.3 (owner decision 2026-11-06) and caught by the bridge tripwire if ever called. */
+function opencodePermission(session) {
   const allow = `${session.server}_*`;
-  const permission = { '*': 'deny', [allow]: 'allow' };
-  const tools = { '*': false, [allow]: true };
+  return {
+    '*': 'deny',
+    external_directory: { '*': 'deny', '~/.local/share/opencode/tool-output/*': 'deny' },
+    read: { '*': 'deny', '': 'deny' },
+    [allow]: 'allow',
+  };
+}
+
+function opencodeConfig(session, agent, timeout) {
+  const permission = opencodePermission(session);
   return {
     $schema: 'https://opencode.ai/config.json',
     permission,
-    tools,
     mcp: { [session.server]: { type: 'local', command: [process.execPath, SHIM], environment: session.env, enabled: true, timeout } },
-    agent: { [agent]: { description: "One keysmith MCP bridge session. Its only tools are the request's, run by the client.", mode: 'primary', prompt: AGENT_PROMPT, permission, tools } },
+    agent: { [agent]: { description: "One keysmith MCP bridge session. Its only tools are the request's, run by the client.", mode: 'primary', prompt: AGENT_PROMPT, permission } },
     plugin: [],
   };
 }
@@ -188,7 +195,21 @@ export const opencodeDriver = fileDriver({
     return [{ file: `${base}.json`, content: JSON.stringify(opencodeConfig(session, this.agentName(session), timeout), null, 2) + '\n' }];
   },
   env(adapter, session, written) {
-    return bridgeEnv(adapter, { set: { OPENCODE_CONFIG: written[0].file } });
+    const agent = this.agentName(session);
+    const permission = opencodePermission(session);
+    return bridgeEnv(adapter, {
+      drop: /^OPENCODE_/,
+      set: {
+        OPENCODE_CONFIG: written[0].file,
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          $schema: 'https://opencode.ai/config.json',
+          permission,
+          agent: { [agent]: { permission } },
+          plugin: [],
+        }),
+        OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+      },
+    });
   },
 });
 

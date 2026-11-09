@@ -23,6 +23,10 @@
 import fs from 'node:fs';
 
 const argv = process.argv.slice(2);
+if (argv.length === 1 && argv[0] === '--version') {
+  process.stdout.write(`${process.env.STUB_VERSION || '1.19.3'}\n`);
+  process.exit(0);
+}
 const prompt = argv.at(-1) ?? '';
 const format = process.env.STUB_FORMAT || 'raw';
 const scenario = (prompt.match(/SCENARIO=([a-z0-9-]+)/) || [])[1] || 'round-trip';
@@ -54,6 +58,14 @@ function plan() {
     case 'tool-after':
       // The reply, then a call of the CLI's own and — if nothing stops the run — a second answer.
       return { reply: ANKARA, after: 'bash' };
+    case 'tool-rejected-before':
+      return { reply: ANKARA, before: 'read', rejected: true };
+    case 'tool-rejected-after':
+      return { reply: ANKARA, after: 'read', rejected: true };
+    case 'tool-denied-then-executed-before':
+      return { reply: ANKARA, before: 'read', thenExecuted: true };
+    case 'tool-denied-then-executed-after':
+      return { reply: ANKARA, after: 'read', thenExecuted: true };
     case 'final':
       return { reply: JSON.stringify({ final: 'It is sunny in Ankara.' }) };
     default:
@@ -61,7 +73,7 @@ function plan() {
   }
 }
 
-const { reply, before = null, after = null } = plan();
+const { reply, before = null, after = null, rejected = false, thenExecuted = false } = plan();
 const usage = second ? { input: 1100, output: 30 } : { input: 1000, output: 20 };
 const writers = { opencode, raw, codex, claude, kiro };
 await (writers[format] || raw)();
@@ -69,12 +81,23 @@ await (writers[format] || raw)();
 async function opencode() {
   const session = 'ses_stub';
   const part = (o) => ({ sessionID: session, part: { sessionID: session, ...o } });
+  const toolError = rejected
+    ? 'The user rejected permission to use this specific tool call.'
+    : 'The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules [{"permission":"*","pattern":"*","action":"deny"}]';
   line({ type: 'step_start', ...part({ type: 'step-start' }) });
-  if (before) line({ type: 'tool_use', ...part({ type: 'tool', tool: before, callID: 'call_before', state: { status: 'error', error: 'unavailable tool' } }) });
+  if (before) {
+    line({ type: 'tool_use', ...part({ type: 'tool', tool: before, callID: 'call_before', state: { status: 'error', error: toolError } }) });
+    if (thenExecuted) {
+      line({ type: 'tool_use', ...part({ type: 'tool', tool: before, callID: 'call_before_exec', state: { status: 'completed', output: 'leaked' } }) });
+    }
+  }
   line({ type: 'text', ...part({ type: 'text', text: reply }) });
   line({ type: 'step_finish', ...part({ type: 'step-finish', reason: 'stop', tokens: { input: usage.input, output: usage.output, reasoning: 0, cache: { read: 0, write: 0 } } }) });
   if (after) {
-    line({ type: 'tool_use', ...part({ type: 'tool', tool: after, callID: 'call_after', state: { status: 'error', error: 'unavailable tool' } }) });
+    line({ type: 'tool_use', ...part({ type: 'tool', tool: after, callID: 'call_after', state: { status: 'error', error: toolError } }) });
+    if (thenExecuted) {
+      line({ type: 'tool_use', ...part({ type: 'tool', tool: after, callID: 'call_after_exec', state: { status: 'completed', output: 'leaked' } }) });
+    }
     await sleep(30_000);
     line({ type: 'text', ...part({ type: 'text', text: ' and again' }) });
   }

@@ -175,7 +175,19 @@ export async function* opencodeNdjson(lines) {
       const key = part.callID || part.id || `${part.tool}#${tools.size}`;
       if (!tools.has(key)) {
         tools.add(key);
-        yield EV.tool(part.tool || 'a tool');
+        const err = typeof part.state?.error === 'string' && part.state.error ? part.state.error : null;
+        const errorType = err
+          ? /^The user has specified a rule which prevents you from using this specific tool call\./.test(err)
+            ? 'DeniedError'
+            : /^The user rejected permission to use this specific tool call/.test(err)
+              ? 'RejectedError'
+              : /^Model tried to call unavailable tool\b/.test(err)
+                ? 'UnavailableToolError'
+                : 'ToolError'
+          : part.state?.status === 'completed'
+            ? 'executed'
+            : null;
+        yield { ...EV.tool(part.tool || 'a tool'), ...(err ? { error: err } : {}), ...(errorType ? { errorType } : {}) };
       }
       continue;
     }

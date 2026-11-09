@@ -141,7 +141,7 @@ export const agyDriver = {
    * line cannot carry, before the file is written; a 502 for a spawn that fails at once, with the
    * file removed again.
    */
-  spawn(adapter, { session, model, prompt, killGraceMs = KILL_GRACE_MS }) {
+  async spawn(adapter, { session, model, prompt, killGraceMs = KILL_GRACE_MS, signal = null }) {
     effortIn(adapter.id, 'bridge.args', adapter.bridge.args, session.effort);
     const argv = joinArgs(adapter.bridge.args, {
       model: model || '',
@@ -160,13 +160,14 @@ export const agyDriver = {
     const file = this.agentFile(adapter, session);
     writePrivate(file, this.agentText(session));
     try {
-      return spawnGroup(adapter, {
+      return await spawnGroup(adapter, {
         argv,
         env: bridgeEnv(adapter),
         stdinText: adapter.promptVia === 'stdin' ? prompt : null,
         parser: 'agy-stream-json',
         parserOpts: { perStepUsage: true },
         killGraceMs,
+        signal,
       });
     } catch (e) {
       // No process will read it: the file, and the token in it, go now.
