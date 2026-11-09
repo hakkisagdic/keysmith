@@ -207,9 +207,6 @@ const counts = (u) => [u?.inputTokens, u?.outputTokens];
 
 /* ------------------------------------------------------------- the AI SDK, per face */
 
-/** The /v1/messages error body, read by @ai-sdk/anthropic (a finding of this re-check). */
-const ERROR_BODY_TODO = 'server.js: the error body on /v1/messages is OpenAI-shaped ({ error: { message, type, param, code } }); @ai-sdk/anthropic\'s error schema wants { type: "error", error: { type, message } }, so the client\'s message is the HTTP status text and keysmith\'s reason is only in responseBody';
-
 for (const gen of GENERATIONS) {
   for (const [face, make] of Object.entries(gen.faces)) {
     describe(`re-check · AI SDK ${gen.id} · ${face} (${ROUTE[face]})`, () => {
@@ -319,7 +316,7 @@ for (const gen of GENERATIONS) {
         }
 
         // The chat faces hand an HTTP leg the request verbatim (the relay): its answer is the upstream's bytes, not keysmith's.
-        if (face === 'messages' || face === 'responses') test(`${how}, tools offered (tool_choice none): an HTTP leg whose upstream says nothing of its tokens — the client reads the answer`, { todo: nullUsageTodo(gen, face, stream) }, async () => {
+        if (face === 'messages' || face === 'responses') test(`${how}, tools offered (tool_choice none): an HTTP leg whose upstream says nothing of its tokens — the client reads the answer`, async () => {
           const ai = mods[gen.ai];
           const options = { model: make('up/nousage'), prompt: `Hi ${tag()}`, tools: aiTools(ai), toolChoice: 'none', providerOptions: providerOptions(face) };
           if (stream) {
@@ -337,11 +334,7 @@ for (const gen of GENERATIONS) {
         });
       }
 
-      // A Responses request with no tools is written by server.js (the plain stream), which
-      // @ai-sdk/openai 4.x cannot read at all (test/wire-conformance.test.js, plainResponsesStream).
-      const plainLatest = face === 'responses' && gen.id === 'latest' ? 'server.js: the plain /v1/responses stream\'s response.created has no created_at (test/wire-conformance.test.js)' : false;
-
-      test('a route whose first leg reported counts and failed before a word, then a leg with none: the client reads the answer', { todo: plainLatest }, async () => {
+      test('a route whose first leg reported counts and failed before a word, then a leg with none: the client reads the answer', async () => {
         const ai = mods[gen.ai];
         const run = await streamRun(ai, { model: make('mixed'), prompt: `Hi ${tag()}`, providerOptions: providerOptions(face) });
         noErrors(run.errors, label());
@@ -349,21 +342,21 @@ for (const gen of GENERATIONS) {
         assert.equal(lastRows('mixed', 1)[0].status, 'ok', label());
       });
 
-      test('the same route: the row keeps the failed leg\'s counts and says the answering leg had none', { todo: 'gateway.js/server.js: a failed leg\'s usage events reach the face, so the wire writes its counts as the answer\'s (output 0, no marker) and the row is { input: 500, output: 0 } with no usageReason: the answering leg\'s gap is lost' }, async () => {
+      test('the same route: the row keeps the failed leg\'s counts and says the answering leg had none', async () => {
         const ai = mods[gen.ai];
         await streamRun(ai, { model: make('mixed'), prompt: `Hi ${tag()}`, providerOptions: providerOptions(face) });
         const [row] = lastRows('mixed', 1);
         assert.match(row.usageReason ?? '', RAW_GAP, `${label()}: ${JSON.stringify(row)}`);
       });
 
-      test('a request refused before its stream starts (no such adapter): the client is told keysmith\'s reason', { todo: face === 'messages' ? ERROR_BODY_TODO : false }, async () => {
+      test('a request refused before its stream starts (no such adapter): the client is told keysmith\'s reason', async () => {
         const ai = mods[gen.ai];
         const run = await streamRun(ai, { model: make('nosuch/m'), prompt: `Hi ${tag()}`, providerOptions: providerOptions(face) });
         assert.ok(run.errors.length > 0, label());
         assert.match(message(run.errors[0]), /no adapter named "nosuch"/, `${label()}: ${message(run.errors[0])}`);
       });
 
-      test('not streamed, a CLI that dies before a word: a 502 with keysmith\'s reason', { todo: face === 'messages' ? ERROR_BODY_TODO : false }, async () => {
+      test('not streamed, a CLI that dies before a word: a 502 with keysmith\'s reason', async () => {
         const ai = mods[gen.ai];
         const { error } = await generate(ai, { model: make('dead/m'), prompt: `Hi ${tag()}`, providerOptions: providerOptions(face) });
         assert.ok(error, label());
@@ -371,7 +364,7 @@ for (const gen of GENERATIONS) {
         assert.equal(lastRows('dead/m', 1)[0].status, 'error', label());
       });
 
-      test('streamed, a CLI that dies before a word: the client is told it failed', { todo: 'cli-adapter.js/server.js: a streamed face stops reading at the parser\'s `done`, so the exit-code check after the parse loop (CliAdapter.complete: "exited 1") never runs — the client gets an empty answer that ends normally (stop / end_turn / completed) with unknown usage, and the row is `ok`' }, async () => {
+      test('streamed, a CLI that dies before a word: the client is told it failed', async () => {
         const ai = mods[gen.ai];
         const run = await streamRun(ai, { model: make('dead/m'), prompt: `Hi ${tag()}`, providerOptions: providerOptions(face) });
         assert.ok(run.errors.length > 0, `${label()}: finish ${run.finish?.finishReason}, text ${JSON.stringify(run.text)}`);
@@ -379,19 +372,6 @@ for (const gen of GENERATIONS) {
       });
     });
   }
-}
-
-/**
- * The Responses tool face writes `usage: null` when an answer's leg said nothing of its tokens
- * (src/tools/faces.js, responseObject: `usage ? responsesUsage(usage) : null`), where every other
- * face writes the zeros of before. @ai-sdk/openai 3.0.99 (OpenBot's) types a Response's usage
- * `.optional()` — no null — and response.completed's as required.
- */
-function nullUsageTodo(gen, face, stream) {
-  if (face !== 'responses' || gen.id !== 'openbot') return false;
-  return stream
-    ? 'faces.js: response.completed with usage null fails @ai-sdk/openai 3.0.99\'s schema; it reads it as an unknown chunk and skips it, so the run ends with no finish reason ("other"), no usage and no response id'
-    : 'faces.js: a Response with usage null fails @ai-sdk/openai 3.0.99\'s schema: generateText throws "Type validation failed … usage"';
 }
 
 /* --------------------------------------------------------------- the official SDKs */
@@ -425,7 +405,7 @@ describe('re-check · @anthropic-ai/sdk · Claude Code\'s known counts and the u
 
 for (const pkg of ['openai', 'openbot-openai']) {
   describe(`re-check · ${pkg} (official openai SDK) · Responses with no tools offered, streamed (server.js writes it, not the tool face)`, () => {
-    test('responses.stream() reads the answer of a CLI with no counts', { todo: 'server.js: the plain /v1/responses stream opens its message item (output_item.added, content_part.added) and never closes it (no content_part.done, no output_item.done), so the openai SDK\'s ResponseStream refuses to finish: "Cannot complete response with unfinished output items". On main, 1dcbd05 puts the output in response.completed and this passes: lift the todo after the merge' }, async () => {
+    test('responses.stream() reads the answer of a CLI with no counts', async () => {
       const c = new mods[pkg].default({ baseURL: `${base}/v1`, apiKey: KEY, maxRetries: 0 });
       const s = c.responses.stream({ model: 'plain/m', input: 'hi', store: false });
       s.on('error', () => {});

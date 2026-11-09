@@ -559,11 +559,12 @@ export class CliAdapter {
             carriedSent = true;
           }
           if (evt.type === 'done' && carried && !carriedSent) {
-            yield { type: 'usage', usage: carried };
+            if (!emitted) held.push({ type: 'usage', usage: carried });
+            else yield { type: 'usage', usage: carried };
             carriedSent = true;
           }
           const isText = evt.type === 'delta' && !!evt.text;
-          if (retryable && !emitted && !isText) {
+          if (!emitted && !isText) {
             held.push(evt);
             continue;
           }
@@ -582,10 +583,12 @@ export class CliAdapter {
           yield { type: 'retry', reason: 'tool_denied', message: denial.message };
           continue;
         }
-        yield* held.splice(0);
         const unexpectedOutcome =
           this._ownsOpencodeWorkspace && blockedErrorType && blockedErrorType !== 'DeniedError' && blockedErrorType !== 'UnavailableToolError';
         if (blocked && (!emitted || unexpectedOutcome)) {
+          for (const e of held.splice(0)) {
+            if (e.type !== 'error' && e.type !== 'usage_unknown' && e.type !== 'done') yield e;
+          }
           const unexpected = unexpectedOutcome
             ? ` (unexpected tool outcome: ${blockedErrorType}${blockedError ? ` — ${truncate(blockedError, 160)}` : ''})`
             : '';
@@ -601,7 +604,11 @@ export class CliAdapter {
           if (blockedError) err.toolError = blockedError;
           throw err;
         }
-        if (outcome.code !== 0 && !emitted) {
+        const heldErr = held.find((e) => e.type === 'error');
+        if (outcome.code !== 0 && !emitted && (outcome.killed || outcome.abortError || !heldErr)) {
+          for (const e of held.splice(0)) {
+            if (e.type !== 'error' && e.type !== 'usage_unknown' && e.type !== 'done') yield e;
+          }
           if (outcome.abortError) {
             throw new LlmError(outcome.abortError.message, {
               status: outcome.abortError.status,
@@ -609,11 +616,13 @@ export class CliAdapter {
               retriable: outcome.abortError.retriable,
             });
           }
+          const detail = [heldErr?.message, outcome.stderr || outcome.error].filter(Boolean).join(' — ') || 'no output';
           throw new LlmError(
-            `${this.id} exited ${outcome.code}${outcome.killed ? ' (killed)' : ''}: ${truncate(outcome.stderr || outcome.error || 'no output', 300)}`,
+            `${this.id} exited ${outcome.code}${outcome.killed ? ' (killed)' : ''}: ${truncate(detail, 300)}`,
             { status: outcome.killed ? 504 : 502, provider: this.id, retriable: !!outcome.killed },
           );
         }
+        yield* held.splice(0);
         return;
       }
     } finally {

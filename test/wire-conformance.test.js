@@ -240,7 +240,7 @@ for (const gen of GENERATIONS) {
         assert.match(row.usageReason, RAW_GAP, label());
       });
 
-      test('the same text answer, streamed', { todo: plainResponsesStream(gen, face, 'text') }, async () => {
+      test('the same text answer, streamed', async () => {
         const ai = mods[gen.ai];
         const run = await streamRun(ai, { model: make('plain/m'), prompt: 'hi', providerOptions: providerOptions(face) });
         noErrors(run.errors, label());
@@ -251,10 +251,9 @@ for (const gen of GENERATIONS) {
       });
 
       for (const tools of [true, false]) {
-        const todo = tools ? false : plainResponsesStream(gen, face, 'error');
         // Tools offered with tool_choice none: the CLI (no toolMode) answers in text, through the
         // tool faces. With auto it could not carry them, and the request would fail before a word.
-        test(`a stream that fails after it started${tools ? ', tools offered (the tool faces, src/tools/faces.js)' : ''}: the client gets keysmith's error, and nothing it cannot parse`, { todo }, async () => {
+        test(`a stream that fails after it started${tools ? ', tools offered (the tool faces, src/tools/faces.js)' : ''}: the client gets keysmith's error, and nothing it cannot parse`, async () => {
           const ai = mods[gen.ai];
           const run = await streamRun(ai, { model: make('cxfail/m'), prompt: 'hi', ...(tools ? { tools: aiTools(ai), toolChoice: 'none' } : {}), providerOptions: providerOptions(face) });
           assert.ok(run.errors.length > 0, `${label()}: the failure reached the client`);
@@ -267,24 +266,6 @@ for (const gen of GENERATIONS) {
       }
     });
   }
-}
-
-/**
- * Findings of this test, not of the usage rule — for after the UHP branch (Traycer's) is merged,
- * since both live in src/server.js, which that branch rewrites. A /v1/responses stream that
- * offers no tools is written by server.js itself (responsesStreamEventsHead and the lines after
- * it), not by the Responses tool face: its response.created has no `created_at` and no event has
- * a `sequence_number`. @ai-sdk/openai 3.x reads a chunk that fails its schema as an unknown one
- * and skips it — so response.failed is skipped and the response.completed after it ends the run
- * as a success: the error never reaches the client. 4.x refuses a known chunk that fails its
- * schema, response.created first, so no such stream reads at all. The tool face writes both
- * right (the cases with tools offered above).
- */
-function plainResponsesStream(gen, face, kind) {
-  if (face !== 'responses') return false;
-  if (gen.id === 'latest') return 'server.js: the plain /v1/responses stream\'s response.created has no created_at, which @ai-sdk/openai 4.x requires';
-  if (kind === 'error') return 'server.js: the plain /v1/responses stream\'s response.failed has no sequence_number: @ai-sdk/openai 3.x skips it and reads the response.completed after it as a success';
-  return false;
 }
 
 /* ---------------------------------------------------------------- the official SDKs */

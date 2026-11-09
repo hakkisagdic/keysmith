@@ -370,7 +370,7 @@ function responseObject({ id, model, created, status, output, usage = null, erro
     tool_choice: request.tool_choice ?? 'auto',
     tools: Array.isArray(request.tools) ? request.tools : [],
     top_p: null,
-    usage: usage ? responsesUsage(usage) : null,
+    usage: status === 'completed' || usage ? responsesUsage(usage) : null,
   };
 }
 
@@ -459,6 +459,7 @@ export class ResponsesStream {
   /** Close what is open; response.completed with the output and usage — or, with `error`, the failure. */
   finish({ usage = null, error = null } = {}) {
     if (error) return this.fail(error);
+    if (!this.msg && !this.calls) this.text('');
     this._closeText();
     this._event('response.completed', { response: this._response('completed', { output: this.output, usage }) });
     this._end();

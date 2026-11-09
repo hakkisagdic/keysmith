@@ -1364,6 +1364,7 @@ export class Gateway {
     // Which effort the leg ran at is said once its answer is: a leg that fails before answering
     // takes its `effort` event with it.
     let effort = null;
+    const heldUsage = [];
     if (run.virtualState) {
       run.virtualState.chosen = target || `${adapter.id}/${upstreamModel}`;
       run.virtualState.chosenAdapter = adapter.id;
@@ -1380,9 +1381,18 @@ export class Gateway {
         effort = evt;
         continue;
       }
-      if (effort && (evt.type === 'delta' || evt.type === 'tool_call' || evt.type === 'done')) {
-        yield effort;
-        effort = null;
+      if (!state.emitted && (evt.type === 'usage' || evt.type === 'usage_unknown')) {
+        heldUsage.push(evt);
+        continue;
+      }
+      if (evt.type === 'delta' || evt.type === 'tool_call' || evt.type === 'done') {
+        if (effort) {
+          yield effort;
+          effort = null;
+        }
+        if (heldUsage.length) {
+          yield* heldUsage.splice(0);
+        }
       }
       if (evt.type === 'done') {
         if (run.virtualState) {
@@ -1439,6 +1449,7 @@ export class Gateway {
       yield evt;
     }
     if (effort) yield effort;
+    if (heldUsage.length) yield* heldUsage.splice(0);
     if (sessions && !run.reportedSession && run.known) {
       run.reportedSession = true;
       yield { type: 'session', id: run.publicId, resumed: true };

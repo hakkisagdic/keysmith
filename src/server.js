@@ -1250,7 +1250,9 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
   }
   const events = await held(gateway.complete({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
   startSse(res, 'text/event-stream');
-  for (const e of responsesStreamEventsHead({ id, model: requestedModel })) sseEvent(res, e.event, e.data);
+  const face = new ResponsesStream(res, { id, model: requestedModel, created, keepaliveMs });
+  meta.face = face;
+  face.open();
   let full = '';
   let u = null;
   let uReason = null;
@@ -1271,18 +1273,14 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     else if (evt.type === 'session') sid = evt.id;
     else if (evt.type === 'delta') {
       full += evt.text;
-      sseEvent(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: `msg_${id}`, output_index: 0, content_index: 0, delta: evt.text });
+      face.text(evt.text);
     } else if (evt.type === 'tool_call') throw noResponsesToolCalls();
     else if (evt.type === 'usage') u = mergeUsage(u, evt.usage);
     else if (evt.type === 'error') errMessage = redactSecrets(evt.message); // written to the client below
     else if (evt.type === 'done') break;
   }
-  if (errMessage) sseEvent(res, 'response.failed', { type: 'response.failed', response: { id: `resp_${id}`, object: 'response', model: requestedModel, status: 'failed', error: { message: errMessage } } });
-  else sseEvent(res, 'response.output_text.done', { type: 'response.output_text.done', item_id: `msg_${id}`, output_index: 0, content_index: 0, text: full });
-  const completedPayload = responsesResult({ id, model: requestedModel, text: full, usage: faceUsage(u, uReason), created });
-  if (!errMessage) onStore(completedPayload, sid);
-  sseEvent(res, 'response.completed', { type: 'response.completed', response: { id: `resp_${id}`, object: 'response', model: requestedModel, status: errMessage ? 'failed' : 'completed', output: completedPayload.output, usage: responsesUsage(faceUsage(u, uReason)) } });
-  res.end();
+  face.finish({ usage: faceUsage(u, uReason), error: errMessage });
+  if (!errMessage) onStore(responsesResult({ id, model: requestedModel, text: full, usage: faceUsage(u, uReason), created }), sid);
   meta.done = true;
   record(usage, {
     model: requestedModel,
@@ -2290,18 +2288,6 @@ function track(res, model, stream, t0, via = null) {
   Object.defineProperty(meta, 'onSkip', { value: (x) => (meta.legSkips ||= []).push(x), enumerable: false });
   res._keysmith = meta;
   return meta;
-}
-
-function responsesStreamEventsHead({ id, model }) {
-  return [
-    { event: 'response.created', data: { type: 'response.created', response: { id: `resp_${id}`, object: 'response', model, status: 'in_progress', output: [] } } },
-    { event: 'response.output_item.added', data: { type: 'response.output_item.added', output_index: 0, item: { id: `msg_${id}`, type: 'message', role: 'assistant', status: 'in_progress', content: [] } } },
-    { event: 'response.content_part.added', data: { type: 'response.content_part.added', item_id: `msg_${id}`, output_index: 0, content_index: 0, part: { type: 'output_text', text: '' } } },
-  ];
-}
-
-function sseEvent(res, name, data) {
-  res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 /**
