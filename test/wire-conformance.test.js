@@ -252,9 +252,11 @@ for (const gen of GENERATIONS) {
 
       for (const tools of [true, false]) {
         const todo = tools ? false : plainResponsesStream(gen, face, 'error');
+        // Tools offered with tool_choice none: the CLI (no toolMode) answers in text, through the
+        // tool faces. With auto it could not carry them, and the request would fail before a word.
         test(`a stream that fails after it started${tools ? ', tools offered (the tool faces, src/tools/faces.js)' : ''}: the client gets keysmith's error, and nothing it cannot parse`, { todo }, async () => {
           const ai = mods[gen.ai];
-          const run = await streamRun(ai, { model: make('cxfail/m'), prompt: 'hi', ...(tools ? { tools: aiTools(ai) } : {}), providerOptions: providerOptions(face) });
+          const run = await streamRun(ai, { model: make('cxfail/m'), prompt: 'hi', ...(tools ? { tools: aiTools(ai), toolChoice: 'none' } : {}), providerOptions: providerOptions(face) });
           assert.ok(run.errors.length > 0, `${label()}: the failure reached the client`);
           for (const e of run.errors) {
             assert.doesNotMatch(message(e), /Type validation failed|Invalid JSON response/, label());
@@ -397,7 +399,8 @@ for (const pkg of ['openai', 'openbot-openai']) {
       const quiet = (s) => (s.on('error', () => {}), s);
       await assert.rejects(quiet(c.chat.completions.stream({ model: 'cxfail/m', messages: [{ role: 'user', content: 'hi' }] })).finalChatCompletion(), /stub upstream broke mid-answer/, `${label()} chat`);
       // The Responses face with tools (src/tools/faces.js): an `error` event, then response.failed.
-      await assert.rejects(quiet(c.responses.stream({ model: 'cxfail/m', tools: R_TOOLS, input: 'hi', store: false })).finalResponse(), /stub upstream broke mid-answer/, `${label()} responses`);
+      // tool_choice none: the CLI (no toolMode) answers in text; with auto it cannot carry the tools.
+      await assert.rejects(quiet(c.responses.stream({ model: 'cxfail/m', tools: R_TOOLS, tool_choice: 'none', input: 'hi', store: false })).finalResponse(), /stub upstream broke mid-answer/, `${label()} responses`);
     });
   });
 }

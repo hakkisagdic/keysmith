@@ -844,7 +844,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
   if (!stream) {
-    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace, holdSpend, onVirtual });
+    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     if (relayed) {
       // An HTTP leg's answer went out verbatim, with its own usage row.
@@ -876,7 +876,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     return;
   }
 
-  const events = await held(gateway.complete({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace, holdSpend, onVirtual }), holdMs);
+  const events = await held(gateway.complete({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
   if (meta.virtual?.chosen && !res.headersSent) res.setHeader('x-keysmith-route', meta.virtual.chosen);
   if (res.headersSent) {
     // An HTTP leg is answering verbatim — its status, its headers, its bytes — and writes its
@@ -988,7 +988,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   };
   // The Messages API defaults to a single JSON reply; SSE only when asked.
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     const calls = toolCalls.map((c) => faceCall(c, 'anthropic'));
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
@@ -1010,7 +1010,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
     });
     return;
   }
-  const events = await held(gateway.complete({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual }), holdMs);
+  const events = await held(gateway.complete({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
   startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
   const face = new AnthropicStream(res, { id, model: requested, keepaliveMs });
   meta.face = face;
@@ -1167,7 +1167,7 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     if (v?.skipped?.length) meta.skipped = v.skipped;
   };
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace, holdSpend, onVirtual });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     if (toolCalls.length) throw noResponsesToolCalls();
     meta.done = true;
@@ -1189,7 +1189,7 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     });
     return;
   }
-  const events = await held(gateway.complete({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace, holdSpend, onVirtual }), holdMs);
+  const events = await held(gateway.complete({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
   startSse(res, 'text/event-stream');
   for (const e of responsesStreamEventsHead({ id, model: requestedModel })) sseEvent(res, e.event, e.data);
   let full = '';
@@ -1258,7 +1258,7 @@ async function responsesWithTools(req, res, gateway, body, { usage, caller, hold
     if (v?.skipped?.length) meta.skipped = v.skipped;
   };
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: body.model, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: body.model, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     const calls = toolCalls.map((c) => faceCall(c, 'responses'));
     const payload = responsesBody({ id, model: body.model, created, text, usage: faceUsage(u, usageReason), toolCalls: calls, request });
@@ -1281,7 +1281,7 @@ async function responsesWithTools(req, res, gateway, body, { usage, caller, hold
     });
     return;
   }
-  const events = await held(gateway.complete({ model: body.model, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual }), holdMs);
+  const events = await held(gateway.complete({ model: body.model, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
   startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
   const face = new ResponsesStream(res, { id, model: body.model, created, request, keepaliveMs });
   meta.face = face;
@@ -1962,9 +1962,11 @@ function stamp(entry, { who, req, res, route, gateway, cfg } = {}) {
       }
     : {};
 
+  const legSkips = res?._keysmith?.legSkips;
   const base = {
     ...rest,
     ...virtualFields,
+    ...(legSkips?.length ? { skippedLegs: legSkips.map((x) => ({ ...x })) } : {}),
     adapter,
     kind,
     ...(kind === 'http' && host ? { host } : {}),
@@ -2149,8 +2151,12 @@ function sessionFrom(req, body) {
  * for at 1am, so it must not only exist in the client's terminal.
  */
 function track(res, model, stream, t0, via = null) {
-  res._keysmith = { model, stream, t0, done: false, via };
-  return res._keysmith;
+  const meta = { model, stream, t0, done: false, via };
+  // The legs the gateway passed by without asking (one that cannot carry the request's tools, one
+  // the credit guard holds back): every row this request writes names them (`skippedLegs`).
+  Object.defineProperty(meta, 'onSkip', { value: (x) => (meta.legSkips ||= []).push(x), enumerable: false });
+  res._keysmith = meta;
+  return meta;
 }
 
 function responsesStreamEventsHead({ id, model }) {

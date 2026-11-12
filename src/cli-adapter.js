@@ -7,6 +7,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { getParser, toLines } from './parsers.js';
 import { expand } from './config.js';
 import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, agentCleanEnv } from './util.js';
+import { checkCreditGuard } from './credit-guard.js';
 import { checkToolMode } from './tools/router.js';
 import { checkMedia, hasMedia, mediaPrompt } from './media.js';
 import { takesEffort } from './effort.js';
@@ -122,6 +123,9 @@ export class CliAdapter {
     this.takesEffort = present.length > 0 && !lacking.length;
     this.effortGap = lacking.length && lacking.length < present.length ? `${id}'s ${lacking.join(', ')} take${lacking.length > 1 ? '' : 's'} no {effort} — keysmith upgrade ${id} --take ${this.takeFor(lacking).join(',')} --apply brings the profile's` : null;
     this.env = cfg.env || {};
+    // Kiro's plan credits, which its runs report no token counts of (src/credit-guard.js): held
+    // back at creditGuardThreshold of the plan (0.9 by default) on every entry that runs kiro-cli.
+    this.creditGuard = checkCreditGuard(id, cfg, this.bin);
     this.timeoutMs = cfg.timeoutMs ?? 300_000;
     const defaultFirstEventMs = this._isOpencode ? CLI_PROFILES.opencode?.firstEventTimeoutMs ?? 45_000 : null;
     this.firstEventTimeoutMs = cfg.firstEventTimeoutMs === 0 || cfg.firstEventTimeoutMs === null ? null : (cfg.firstEventTimeoutMs ?? defaultFirstEventMs);

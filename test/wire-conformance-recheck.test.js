@@ -8,8 +8,10 @@
  *     the known counts arrive exact, the totals are the run's;
  *   - Claude Code's counts on every face (known all through): exact per step and in all, no marker;
  *   - `codex exec --json` that retried a stream error (`Reconnecting... 1/5`), with turn.completed
- *     usage and without it, through the tool faces (tools offered, a CLI with no toolMode);
- *   - an HTTP leg whose upstream reports no usage (nothing said at all), tools offered;
+ *     usage and without it, through the tool faces (tools offered with tool_choice none, a CLI with
+ *     no toolMode: a text answer is what was asked — with tool_choice auto such a leg cannot carry
+ *     the tools, and the request fails instead, test/tools-router.test.js);
+ *   - an HTTP leg whose upstream reports no usage (nothing said at all), tools offered (none);
  *   - a route whose first leg reported counts and failed before answering, then a leg with none;
  *   - a request refused before its stream starts, and a CLI that dies before a word, streamed or
  *     not (the JSON error body; the stream's end);
@@ -290,9 +292,9 @@ for (const gen of GENERATIONS) {
         });
 
         for (const [model, known] of [['cxr/m', true], ['cxru/m', false]]) {
-          test(`${how}, tools offered: codex exec that retried a stream error, ${known ? 'with' : 'without'} usage — the answer stands${known ? ', its counts exact' : ', the row null with why'}`, async () => {
+          test(`${how}, tools offered (tool_choice none): codex exec that retried a stream error, ${known ? 'with' : 'without'} usage — the answer stands${known ? ', its counts exact' : ', the row null with why'}`, async () => {
             const ai = mods[gen.ai];
-            const options = { model: make(model), prompt: `Hi ${tag()}`, tools: aiTools(ai), providerOptions: providerOptions(face) };
+            const options = { model: make(model), prompt: `Hi ${tag()}`, tools: aiTools(ai), toolChoice: 'none', providerOptions: providerOptions(face) };
             let text, total;
             if (stream) {
               const run = await streamRun(ai, options);
@@ -317,9 +319,9 @@ for (const gen of GENERATIONS) {
         }
 
         // The chat faces hand an HTTP leg the request verbatim (the relay): its answer is the upstream's bytes, not keysmith's.
-        if (face === 'messages' || face === 'responses') test(`${how}, tools offered: an HTTP leg whose upstream says nothing of its tokens — the client reads the answer`, { todo: nullUsageTodo(gen, face, stream) }, async () => {
+        if (face === 'messages' || face === 'responses') test(`${how}, tools offered (tool_choice none): an HTTP leg whose upstream says nothing of its tokens — the client reads the answer`, { todo: nullUsageTodo(gen, face, stream) }, async () => {
           const ai = mods[gen.ai];
-          const options = { model: make('up/nousage'), prompt: `Hi ${tag()}`, tools: aiTools(ai), providerOptions: providerOptions(face) };
+          const options = { model: make('up/nousage'), prompt: `Hi ${tag()}`, tools: aiTools(ai), toolChoice: 'none', providerOptions: providerOptions(face) };
           if (stream) {
             const run = await streamRun(ai, options);
             noErrors(run.errors, label());

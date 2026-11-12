@@ -1,8 +1,9 @@
 /**
  * Tool routing (src/tools/router.js, gateway._toolRoute): a request that offers tools walks its
  * route in declared order — an HTTP upstream verbatim, a CLI with a toolMode through a tool
- * engine, a CLI without one passed by — fails over while nothing went out, and when no leg took
- * it answers in text only where tool_choice allows. Also the gates around toolMode: the config
+ * engine, a CLI without one passed by (named in the row's skippedLegs) — fails over while
+ * nothing went out, and when no leg took it answers in text only for tool_choice none: any other
+ * is an error, never a text answer that drops the tools without a word. Also the gates around toolMode: the config
  * errors, the auto-approve scan over every argv template, `keysmith set <id> toolMode`.
  *
  * The CLI is test/stubs/agy-emu.mjs, Google a stub upstream, the MCP bridge a stub engine:
@@ -118,6 +119,7 @@ before(async () => {
       offonly: ['plain/m'],
       thinks: ['thinker/m', 'google/gemini-4-argon'],
       emuthenoff: ['emu/m', 'plain/m'],
+      emuagy: ['emu/m', 'agy/gemini-4-argon-high'],
       brgoogle: ['bridged/m', 'google/gemini-4-argon'],
     },
   };
@@ -172,14 +174,14 @@ const streamedCalls = (text) => {
 
 /* --------------------------------------------------- toolMode absent: as it always was */
 
-test('a CLI without a toolMode never takes a tool request: the plain completion it always was, flattened, with no tool protocol', async () => {
-  const before = runs().length;
+test('a CLI without a toolMode never takes a tool request: for tool_choice none, the plain completion it always was, flattened, with no tool protocol', async () => {
+  let before = runs().length;
   const history = [
     { role: 'user', content: 'Weather in Ankara? SCENARIO=plain' },
     { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Ankara"}' } }] },
     { role: 'tool', tool_call_id: 'call_1', content: 'sunny' },
   ];
-  const r = await post('/v1/chat/completions', { model: 'mixed', messages: history, tools: TOOLS });
+  const r = await post('/v1/chat/completions', { model: 'mixed', messages: history, tools: TOOLS, tool_choice: 'none' });
   assert.equal(r.status, 200, r.text);
   assert.equal(json(r).choices[0].message.content, 'plain answer');
   assert.equal(r.headers.get('x-keysmith-mode'), null, 'no tool engine answered');
@@ -187,8 +189,58 @@ test('a CLI without a toolMode never takes a tool request: the plain completion 
   assert.equal(run.agent, 'keysmith-text');
   assert.match(run.prompt, /^User: Weather in Ankara\? SCENARIO=plain\n\nTool output: sunny$/, 'the prompt protocols.js has always built');
   const row = lastRow();
-  assert.deepEqual(['toolMode', 'toolCalls', 'fallback'].filter((k) => k in row), []);
+  assert.deepEqual(['toolMode', 'toolCalls', 'fallback', 'skippedLegs'].filter((k) => k in row), [], 'tool_choice none: the off leg answered, nothing was passed by');
   assert.ok(log.some((l) => /google\/quota refused \(429\) — the rest of "mixed" runs as a plain completion/.test(l)));
+});
+
+test('tool_choice auto: a leg that cannot carry the tools is passed by and named, never asked for a text answer in their place', async () => {
+  const before = runs().length;
+  // Google takes the tools and refuses (429); the off leg cannot carry them: the 429 is the answer.
+  let r = await post('/v1/chat/completions', { model: 'mixed', messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: TOOLS });
+  assert.equal(r.status, 429, r.text);
+  assert.match(json(r).error.message, /RESOURCE_EXHAUSTED/);
+  assert.match(json(r).error.message, /not asked, as they cannot carry this request's tools: plain\/m \(toolMode off/);
+  assert.doesNotMatch(r.text, /plain answer/);
+  assert.equal(runs().length, before, 'the off leg was not run');
+  let row = lastRow();
+  assert.equal(row.status, 'error');
+  assert.equal(row.skippedLegs.length, 1);
+  assert.deepEqual([row.skippedLegs[0].target, row.skippedLegs[0].reason], ['plain/m', 'tool_mode_off']);
+  assert.match(row.skippedLegs[0].detail, /toolMode off/);
+  // No leg of the route can carry them: a 400 that names each leg and why, on every face.
+  for (const [route, body] of [
+    ['/v1/chat/completions', { model: 'offonly', messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: TOOLS }],
+    ['/v1/chat/completions', { model: 'offonly', stream: true, messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: TOOLS }],
+    ['/v1/messages', { model: 'offonly', max_tokens: 64, messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: A_TOOLS }],
+    ['/v1/messages', { model: 'offonly', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: A_TOOLS }],
+    ['/v1/responses', { model: 'offonly', input: 'SCENARIO=plain', tools: [{ type: 'function', name: 'get_weather', parameters: TOOLS[0].function.parameters }] }],
+  ]) {
+    r = await post(route, body);
+    assert.equal(r.status, 400, `${route}: ${r.text}`);
+    assert.equal(json(r).error.type, 'invalid_request_error');
+    assert.match(json(r).error.message, /no leg of "offonly" can carry this request's tools — plain\/m: toolMode off/);
+    assert.match(json(r).error.message, /A text answer would drop the tools without a word, so the request fails instead/);
+    assert.deepEqual(lastRow().skippedLegs.map((x) => [x.target, x.reason]), [['plain/m', 'tool_mode_off']], route);
+  }
+  // The Messages face says it the Anthropic way.
+  r = await post('/v1/messages', { model: 'offonly', max_tokens: 64, messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: A_TOOLS });
+  assert.equal(json(r).type, 'error');
+  // A request that names the leg: the adapter, and the reason.
+  r = await chat('plain/m', 'SCENARIO=plain');
+  assert.equal(r.status, 400, r.text);
+  assert.match(json(r).error.message, /^keysmith: plain\/m cannot carry this request's tools — toolMode off: it answers in text only \(keysmith tools plain emulate\|auto takes tools\)/);
+  r = await post('/v1/messages', { model: 'google/gemini-4-argon', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }], tools: A_TOOLS });
+  assert.equal(r.status, 400, r.text);
+  assert.match(json(r).error.message, /google\/gemini-4-argon cannot carry this request's tools — an HTTP upstream on the openai wire is handed tools verbatim on \/v1\/chat\/completions only, not on \/v1\/messages/);
+  assert.deepEqual(lastRow().skippedLegs.map((x) => x.reason), ['wire_no_tools']);
+  assert.equal(runs().length, before, 'no leg was asked for text instead');
+  // A request without tools is as it was: the plain completion, and no skip in its row.
+  r = await post('/v1/chat/completions', { model: 'offonly', messages: [{ role: 'user', content: 'SCENARIO=plain' }] });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(json(r).choices[0].message.content, 'plain answer');
+  row = lastRow();
+  assert.equal(row.status, 'ok');
+  assert.equal('skippedLegs' in row, false);
 });
 
 /* ----------------------------------------------------- declared order: agy, then Google */
@@ -288,16 +340,14 @@ test('what failed EMULATE runs spent reaches the usage row: the error\'s row, an
   assert.match(r.text, /"type":"tool_emulation_error"/);
   assert.deepEqual([lastRow().status, lastRow().toolMode, lastRow().retries, lastRow().usage], ['error', 'emulate', 1, both]);
 
-  // Refused twice, then the CLI without a toolMode answers in text: its row counts all three runs,
-  // and names the leg that failed and what it spent.
+  // Refused twice, and the CLI without a toolMode is not asked for text in the tools' place: the
+  // error is EMULATE's, its row carries both runs and names the leg passed by.
   r = await chat('emuthenoff', 'SCENARIO=prose-always');
-  assert.equal(r.status, 200, r.text);
+  assert.equal(r.status, 502, r.text);
+  assert.match(json(r).error.message, /not asked, as they cannot carry this request's tools: plain\/m/);
   let row = lastRow();
-  assert.equal(row.toolMode, undefined, 'no tool engine answered');
-  assert.equal(row.retries, 1);
-  assert.deepEqual(row.usage, { input: 3100, output: 70, cacheRead: 0, cacheWrite: 0 });
-  assert.deepEqual(row.failedLegs, [{ target: 'emu/m', toolMode: 'emulate', status: 502, retries: 1, usage: both }]);
-  assert.equal(json(r).usage.prompt_tokens, 1000, 'the client\'s usage is the answer\'s own');
+  assert.deepEqual([row.status, row.toolMode, row.retries, row.usage, row.failedLegs], ['error', 'emulate', 1, both, undefined]);
+  assert.deepEqual(row.skippedLegs.map((x) => [x.target, x.reason]), [['plain/m', 'tool_mode_off']]);
 
   // Refused twice, then Google answers verbatim: the relay's row carries what agy spent.
   r = await chat('argon', 'SCENARIO=prose-always');
@@ -307,7 +357,7 @@ test('what failed EMULATE runs spent reaches the usage row: the error\'s row, an
   assert.deepEqual(row.failedLegs, [{ target: 'agy/gemini-4-argon-high', toolMode: 'emulate', status: 502, fallback: 'no_bridge', retries: 1, usage: both }]);
 
   // Every leg refused: the error's row has the leg that failed before the last one too.
-  r = await chat('emuthenoff', 'SCENARIO=exit-1');
+  r = await chat('emuagy', 'SCENARIO=exit-1');
   assert.equal(r.status, 502, r.text);
   row = lastRow();
   assert.equal(row.status, 'error');
@@ -315,18 +365,19 @@ test('what failed EMULATE runs spent reaches the usage row: the error\'s row, an
 });
 
 test('on a stream, x-keysmith-mode names the engine running when the headers went out: none for the plain completion after the tool walk', async () => {
-  // Google refuses (429) and the CLI without a toolMode answers in text: nothing passed through.
-  let r = await postHeld('/v1/chat/completions', { model: 'mixed', stream: true, messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: TOOLS });
+  // tool_choice none: Google refuses (429) and the CLI without a toolMode answers in text.
+  let r = await postHeld('/v1/chat/completions', { model: 'mixed', stream: true, messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: TOOLS, tool_choice: 'none' });
   assert.equal(r.status, 200, r.text);
   assert.match(r.text, /plain answer/);
   assert.equal(r.headers.get('x-keysmith-mode'), null, r.text);
   assert.equal(lastRow().toolMode, undefined);
-  // EMULATE refused twice inside the hold, and the off leg answers: EMULATE did not answer.
+  // EMULATE refused twice inside the hold, and the off leg is passed by: the refusal, as an HTTP
+  // status, never the off leg's text in a stream.
   r = await postHeld('/v1/chat/completions', { model: 'emuthenoff', stream: true, messages: [{ role: 'user', content: 'SCENARIO=prose-always' }], tools: TOOLS });
-  assert.equal(r.status, 200, r.text);
-  assert.match(r.text, /I would call get_weather now\./);
-  assert.equal(r.headers.get('x-keysmith-mode'), null);
-  assert.deepEqual([lastRow().toolMode, lastRow().failedLegs?.[0]?.toolMode], [undefined, 'emulate']);
+  assert.equal(r.status, 502, r.text);
+  assert.equal(json(r).error.type, 'tool_emulation_error');
+  assert.doesNotMatch(r.text, /I would call get_weather now\./);
+  assert.deepEqual([lastRow().status, lastRow().toolMode, lastRow().skippedLegs?.[0]?.target], ['error', 'emulate', 'plain/m']);
   // And an engine that answers still says so.
   r = await postHeld('/v1/chat/completions', { model: 'emuthenoff', stream: true, messages: [{ role: 'user', content: 'SCENARIO=one-call' }], tools: TOOLS });
   assert.equal(r.headers.get('x-keysmith-mode'), 'emulate');
@@ -346,14 +397,19 @@ test('a route whose every leg refused the tools answers with the refusal, and th
   assert.ok(!log.slice(before).some((l) => /plain completion/.test(l)), log.slice(before).join('\n'));
 });
 
-test('/v1/messages: an HTTP leg is not handed the tools — no verbatim relay on that wire — and answers in text when agy fails', async () => {
+test('/v1/messages: an HTTP leg is not handed the tools — no verbatim relay on that wire — so when agy fails the route fails out loud, never with Google\'s text in their place', async () => {
   const before = hits.length;
   const r = await post('/v1/messages', { model: 'argon', max_tokens: 64, messages: [{ role: 'user', content: 'SCENARIO=exit-1' }], tools: A_TOOLS });
-  assert.equal(r.status, 200, r.text);
-  assert.equal(json(r).content[0].text, 'google answer');
-  assert.equal(hits.length, before + 1);
-  assert.equal(hits.at(-1).tools, undefined, 'a plain completion: the Anthropic tools never reach the OpenAI wire');
-  assert.ok(log.some((l) => /tools requested but no leg of "argon" takes them|the rest of "argon" runs as a plain completion/.test(l)));
+  assert.equal(r.status, 502, r.text);
+  assert.equal(json(r).type, 'error', 'the Anthropic error shape');
+  assert.match(json(r).error.message, /agy exited 1/);
+  assert.match(json(r).error.message, /not asked, as they cannot carry this request's tools: google\/gemini-4-argon \(an HTTP upstream on the openai wire is handed tools verbatim on \/v1\/chat\/completions only, not on \/v1\/messages\)/);
+  assert.equal(hits.length, before, 'Google was not asked for a tool-less answer');
+  const row = lastRow();
+  assert.equal(row.status, 'error');
+  assert.deepEqual(row.skippedLegs.map((x) => [x.target, x.reason]), [['google/gemini-4-argon', 'wire_no_tools']]);
+  assert.ok(log.some((l) => /google\/gemini-4-argon passed by \(wire_no_tools\)/.test(l)));
+  assert.ok(!log.some((l) => /tools requested but no leg of "argon" takes them/.test(l)));
 });
 
 test('rev: Google refuses (429) and agy answers; the other way round, the first refusal is not asked again', async () => {
@@ -429,9 +485,11 @@ test('tool_choice that asks for a call, on a route with no leg that takes tools:
     assert.doesNotMatch(r.text, /plain answer/);
   }
   assert.equal(runs().length, before, 'the off leg was not asked for text instead');
-  // tool_choice auto on the same route: the text answer it always got.
+  // tool_choice auto on the same route: no text answer in the tools' place either.
   const auto = await chat('offonly', 'SCENARIO=plain');
-  assert.equal(json(auto).choices[0].message.content, 'plain answer');
+  assert.equal(auto.status, 400, auto.text);
+  assert.match(json(auto).error.message, /no leg of "offonly" can carry this request's tools/);
+  assert.equal(runs().length, before);
 });
 
 test('auto: tool_choice none is a text answer with the history rendered as such; required and a named tool are EMULATE, bridge or not', async () => {

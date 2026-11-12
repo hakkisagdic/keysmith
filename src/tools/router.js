@@ -11,14 +11,17 @@ import { emulate, renderPrompt } from './emulate.js';
  *                                         ignores `tools` (e.g. HarnessRouter CE)
  *   an HTTP upstream on the traycer wire  EMULATE across Traycer's multi-provider inference endpoints
  *   a CLI with toolMode other than off    a tool engine answers: EMULATE (emulate.js) or the MCP bridge
- *   anything else                         cannot answer with a tool call: left for the plain completion
+ *   anything else                         cannot carry the tools: passed by, the reason in the usage
+ *                                         row (`skippedLegs`, toolSkipReason)
  *
  * A leg that fails before anything reached the client hands the request to the next one, the
  * gateway's failover rule; a tool call handed to the client counts as an answer. When no leg
- * answered, the route still answers a request whose tool_choice is `auto` or `none` as a plain
- * completion from the legs it did not try (logged, as before); one whose tool_choice asks for a
- * call (`required`, a named tool) is an error — never a text answer in its place — and so is a
- * request offering a tool no CLI can honour (`unsupported`: custom and server tools).
+ * answered, a request whose tool_choice is `none` is answered as a plain completion from the legs
+ * it did not try (the client asked for text); any other is an error — never a text answer in its
+ * place, which would drop the tools without a word and break a client that offered them (Claude
+ * Code): the failure of the last leg that took the tools, or, when none could, a 400 naming each
+ * leg and why it cannot carry them. So is a request offering a tool no CLI can honour
+ * (`unsupported`: custom and server tools).
  *
  * toolMode, per CLI adapter:
  *
@@ -83,6 +86,35 @@ export function toolPath(adapter, spec, face) {
   // to honour them, and dropping them would answer a different request.
   if (spec.unsupported?.length) return 'skip';
   return 'engine';
+}
+
+/** The route a face answers on, for a message that names it. */
+export const FACE_ROUTES = { openai: '/v1/chat/completions', anthropic: '/v1/messages', responses: '/v1/responses' };
+
+/**
+ * Why `adapter` cannot carry a request's tools on `face`, or null when it can (toolPath is
+ * 'engine', or 'passthrough' with a relay): `{ reason, detail }` — a code for the usage row and
+ * doctor (`tool_mode_off`, `wire_no_tools`, `unsupported_tools`, `no_relay`) and the words for an
+ * error and the log. Such a leg is passed by in a route that offers tools, and is never handed
+ * the request as a plain completion in their place (gateway._toolWalk): a text answer to a client
+ * that offered tools (Claude Code) breaks it without a word.
+ */
+export function toolSkipReason(adapter, spec, face, { relay = true } = {}) {
+  const path = toolPath(adapter, spec, face);
+  if (path === 'engine') return null;
+  const route = FACE_ROUTES[face] || face;
+  if (path === 'passthrough') return relay ? null : { reason: 'no_relay', detail: `an HTTP upstream is handed tools verbatim only through a relay, and ${route} has none here` };
+  if (adapter.kind === 'http') {
+    if (adapter.wire === 'uhp' || adapter.wire === 'traycer') {
+      if ((adapter.toolMode || 'auto') === 'off') return { reason: 'tool_mode_off', detail: `toolMode off on this ${adapter.wire} upstream: it answers in text only` };
+      return { reason: 'unsupported_tools', detail: `it takes plain function tools only, not ${describeUnsupported(spec)}` };
+    }
+    const wire = adapter.wire || 'openai';
+    if (wire === 'openai') return { reason: 'wire_no_tools', detail: `an HTTP upstream on the openai wire is handed tools verbatim on /v1/chat/completions only, not on ${route}` };
+    return { reason: 'wire_no_tools', detail: `an HTTP upstream on the ${wire} wire is never handed tools: keysmith has no verbatim relay for that wire` };
+  }
+  if ((adapter.toolMode || 'off') === 'off') return { reason: 'tool_mode_off', detail: `toolMode off: it answers in text only (keysmith tools ${adapter.id} emulate|auto takes tools)` };
+  return { reason: 'unsupported_tools', detail: `a CLI takes plain function tools only, not ${describeUnsupported(spec)}` };
 }
 
 /**

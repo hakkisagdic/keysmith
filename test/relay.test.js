@@ -241,17 +241,19 @@ test('a route whose first leg answered 429 reports that 429, not the refusal of 
   }
 });
 
-test('a route with a CLI leg: the HTTP leg that refused the tools is not asked again, and the log says it refused', async () => {
+test('a route with a CLI leg: the HTTP leg that refused the tools is not asked again, the CLI that cannot carry them is not asked for text, and the log says why', async () => {
   const before = chats().length;
   const logBefore = log.length;
   const r = await post({ model: 'mixed', messages: [{ role: 'user', content: 'hi' }], tools: tools('get_weather') });
-  assert.equal(r.status, 200, r.text);
-  assert.match(r.text, /echo answer/);
+  assert.equal(r.status, 429, r.text);
+  assert.equal(r.headers.get('retry-after'), '38', 'the refusal the client gets is Google\'s own');
+  assert.doesNotMatch(r.text, /echo answer/);
+  assert.match(JSON.parse(r.text).error.message, /not asked, as they cannot carry this request's tools: echo\/x \(toolMode off/);
   const legs = chats().slice(before);
   assert.equal(legs.length, 1, 'google is asked once, with its tools, not again without them');
   assert.ok(legs[0].body.tools);
   const lines = log.slice(logBefore).join('\n');
-  assert.match(lines, /google\/quota refused \(429\)/);
+  assert.match(lines, /google\/quota refused \(429\), and the rest of "mixed" \(echo\/x\) cannot carry them/);
   assert.doesNotMatch(lines, /no HTTP upstream matched/);
 });
 

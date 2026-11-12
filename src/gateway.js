@@ -6,9 +6,10 @@ import { resolveSecret } from './config.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { adapterReach, aliasDecision, globCanStartWith, requestDecision, scopeText, virtualDecision } from './keys.js';
-import { describeUnsupported, toolEvents, toolPath } from './tools/router.js';
+import { describeUnsupported, toolEvents, toolPath, toolSkipReason } from './tools/router.js';
 import { addUsage } from './tools/emulate.js';
 import { McpBridge } from './bridge/index.js';
+import { CreditGuard, creditGuardError } from './credit-guard.js';
 import { DRIVERS } from './bridge/drivers.js';
 import { resolveEffort, suffixedIds } from './effort.js';
 import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExecCredentialAdapter } from './usage.js';
@@ -49,7 +50,7 @@ export {
  * slash-free by construction.
  */
 export class Gateway {
-  constructor(cfg, { log = () => {}, usage = null, deferAdapterChecks = false, loadProbe = null, now = null, adapters = null } = {}) {
+  constructor(cfg, { log = () => {}, usage = null, deferAdapterChecks = false, loadProbe = null, now = null, adapters = null, creditGuard = null } = {}) {
     this.cfg = cfg;
     this.usage = usage;
     this.loadProbe = typeof loadProbe === 'function' ? loadProbe : defaultLoadProbe;
@@ -57,6 +58,10 @@ export class Gateway {
     // Redacted here as well as by the CLI's writer: an embedding's own log function is
     // handed provider errors, and those can quote a key.
     this.log = (m) => log(redactSecrets(m));
+    // Kiro's plan credits (src/credit-guard.js): a leg of an adapter that runs kiro-cli is passed
+    // by while its plan is at or over its threshold. In memory unless the caller keeps the
+    // readings in a file (the CLI does: dataDir()/credit-guard.json).
+    this.creditGuard = creditGuard || new CreditGuard({ log: this.log });
     if (this.usage && !this.usage.log) this.usage.log = this.log;
     this._virtualCache = new Map();
     const rawAdaptersMap = new Map();
@@ -998,6 +1003,7 @@ export class Gateway {
     trace = null,
     holdSpend = null,
     onVirtual = null,
+    onSkip = null,
   }) {
     const t0 = Date.now();
     const callerKey = caller || tools?.caller || (scope ? (scope._fp || JSON.stringify(scopeText(scope))) : '');
@@ -1057,12 +1063,17 @@ export class Gateway {
       holdSpend: hold,
       virtualState,
       onVirtual,
+      // The legs passed by without being asked (`{ target, reason, detail }`: one that cannot
+      // carry the request's tools, one the credit guard holds back), for the usage row.
+      skips: [],
+      onSkip,
     };
     const args = { messages, maxTokens, maxCompletionTokens, maxOutputTokens, temperature, includeReasoning, signal, effort, harnessId, trace };
     try {
       if (tools) return yield* this._toolRoute(model, chain, args, run, tools);
       yield* this._failover(chain, args, run, null);
     } catch (err) {
+      if (run.skips.length && err && typeof err === 'object' && !err.skippedLegs) err.skippedLegs = run.skips.map((x) => ({ ...x }));
       if (virtualState) {
         virtualState.latency = Math.max(0, Date.now() - t0);
         virtualState.status = err?.scopeDenied ? 'denied' : 'error';
@@ -1115,8 +1126,14 @@ export class Gateway {
    */
   async *_failover(chain, args, run, carried) {
     let lastError = carried;
+    let heldBack = null; // a leg the credit guard passed by: the answer only when no other leg had one
     for (const leg of chain) {
       const { adapter, model: upstreamModel } = leg;
+      const held = await this._heldBack(leg, run);
+      if (held) {
+        heldBack ||= held;
+        continue;
+      }
       const canResume = !!run.known && run.known.upstreamSession && adapterOf(run.known.target) === adapter.id && !!adapter.resumable;
       // Outside the try: a leg that throws after part of its answer went out (text, or a tool
       // call the client may already be running) is not restarted on the next leg either.
@@ -1179,7 +1196,76 @@ export class Gateway {
       run.virtualState.chosenModel = null;
       run.onVirtual?.(snapshotVirtual(run.virtualState));
     }
-    throw lastError || new LlmError('no candidate in this route succeeded', { status: 502 });
+    throw lastError || heldBack || new LlmError('no candidate in this route succeeded', { status: 502 });
+  }
+
+  /**
+   * The 400 a tool request gets when no leg of its route can carry the tools (gateway._toolWalk):
+   * each leg named, with why — never a plain-text answer in its place.
+   */
+  _noToolLeg(requested, chain, run) {
+    const skips = run.skips.filter((x) => x.reason !== 'credit_guard');
+    const direct = chain.length === 1 && chain[0].target === requested;
+    const why = skips.map((x) => `${x.target}: ${x.detail || x.reason}`).join('; ') || 'no leg takes tools';
+    const msg = direct
+      ? `${requested} cannot carry this request's tools — ${skips[0]?.detail || 'it has no way to take them'}. A text answer would drop the tools without a word, so the request fails instead`
+      : `no leg of "${requested}" can carry this request's tools — ${why}. A text answer would drop the tools without a word, so the request fails instead: give the route a leg that takes tools (a CLI with a toolMode: keysmith tools <adapter> auto; on /v1/chat/completions, an HTTP upstream on the openai wire)`;
+    const err = new LlmError(msg, { status: 400, type: 'invalid_request_error', provider: direct ? chain[0].adapter.id : null });
+    err.toolsNotCarried = true;
+    return err;
+  }
+
+  /**
+   * `err`, the error that ends a tool route, with the legs passed by because they cannot carry the
+   * tools named in its message (once): a client reading it knows why the route did not go on.
+   */
+  _toolsNotCarried(err, run) {
+    if (!err || typeof err !== 'object' || err.toolsNotCarried || err.toolSkipsNamed) return err;
+    const skips = run.skips.filter((x) => x.reason !== 'credit_guard');
+    if (!skips.length) return err;
+    err.message = `${err.message} — not asked, as they cannot carry this request's tools: ${skips.map((x) => `${x.target} (${truncate(x.detail || x.reason, 120)})`).join('; ')}`;
+    err.toolSkipsNamed = true;
+    return err;
+  }
+
+  /**
+   * A leg passed by without being asked: kept on the request (`run.skips`, once per leg and
+   * reason) for its usage row's `skippedLegs`, and logged.
+   */
+  _skipLeg(run, leg, reason, detail, extra = {}) {
+    const target = leg.target || `${leg.adapter?.id || ''}/${leg.model || ''}`;
+    if (!run.skips.some((x) => x.target === target && x.reason === reason)) {
+      const entry = { target, reason, ...(detail ? { detail: truncate(detail, 240) } : {}), ...extra };
+      run.skips.push(entry);
+      try {
+        run.onSkip?.({ ...entry });
+      } catch {}
+    }
+    this.log(`${target} passed by (${reason}): ${truncate(detail || reason, 240)}`);
+  }
+
+  /**
+   * The credit guard's word on a leg (src/credit-guard.js): null when it may be asked, else the
+   * 429 a request that names it alone gets — the leg is passed by, the reason recorded.
+   */
+  async _heldBack(leg, run) {
+    if (!leg?.adapter?.creditGuard || !this.creditGuard) return null;
+    let verdict;
+    try {
+      verdict = await this.creditGuard.check(leg.adapter);
+    } catch (e) {
+      this.log(`kiro credit guard: ${leg.adapter.id}: ${truncate(e?.message || e, 160)} — not held back`);
+      return null;
+    }
+    if (verdict.ok) return null;
+    const err = creditGuardError(leg.adapter, verdict, this.now());
+    err.leg = legMetaOf(leg.adapter, leg.model);
+    this._skipLeg(run, leg, 'credit_guard', verdict.detail, { ratio: Math.round(verdict.ratio * 1000) / 1000, threshold: verdict.threshold });
+    if (run.virtualState) {
+      recordVirtualFallback(run.virtualState, leg, err);
+      run.onVirtual?.(snapshotVirtual(run.virtualState));
+    }
+    return err;
   }
 
   /**
@@ -1326,8 +1412,12 @@ export class Gateway {
   async *_toolWalk(requested, chain, args, run, tools, failed) {
     const { spec, face, relay = null, state = null, caller = '' } = tools;
     let lastError = null;
+    let heldBack = null; // the credit guard's 429 for a leg it passed by, when no leg failed
     const tried = new Set();
     const refused = [];
+    // tool_choice none asks for text: a leg that cannot carry tools still answers it as a plain
+    // completion after the walk, so it is not "passed by" there.
+    const textAllowed = !!spec?.historyOnly || spec?.choice?.mode === 'none';
     for (let i = 0; i < chain.length; i++) {
       const leg = chain[i];
       if (spec?.historyOnly) {
@@ -1352,6 +1442,11 @@ export class Gateway {
             refused.push({ target: leg.target, status: err.status });
             this.log(`passthrough via ${leg.adapter.id} failed: ${truncate(e.message, 300)}`);
           }
+          continue;
+        }
+        const held = await this._heldBack(leg, run);
+        if (held) {
+          heldBack ||= held;
           continue;
         }
         if (state) state.mode = null;
@@ -1403,8 +1498,19 @@ export class Gateway {
         continue;
       }
       const path = toolPath(leg.adapter, spec, face);
-      if (path === 'skip' || (path === 'passthrough' && !relay)) continue;
+      if (path === 'skip' || (path === 'passthrough' && !relay)) {
+        if (!textAllowed && !spec.unsupported?.length) {
+          const why = toolSkipReason(leg.adapter, spec, face, { relay: !!relay });
+          if (why) this._skipLeg(run, leg, why.reason, why.detail);
+        }
+        continue;
+      }
       tried.add(i);
+      const held = await this._heldBack(leg, run);
+      if (held) {
+        heldBack ||= held;
+        continue;
+      }
       const more = chain.slice(i + 1).some((l) => toolPath(l.adapter, spec, face) !== 'skip') ? 'trying the next leg that takes tools' : 'no other leg takes tools';
       if (path === 'passthrough') {
         let releaseSpend = () => {};
@@ -1504,21 +1610,39 @@ export class Gateway {
     }
     // No leg answered with tools.
     if (spec.unsupported?.length) {
-      throw lastError || new LlmError(`"${requested}" has no leg that can take ${describeUnsupported(spec)}: only an HTTP upstream relays those (on /v1/chat/completions), and a CLI leg takes plain function tools only`, { status: 400, type: 'invalid_request_error' });
+      throw lastError || heldBack || new LlmError(`"${requested}" has no leg that can take ${describeUnsupported(spec)}: only an HTTP upstream relays those (on /v1/chat/completions), and a CLI leg takes plain function tools only`, { status: 400, type: 'invalid_request_error' });
     }
     const choice = spec.choice?.mode;
     if (choice === 'required' || choice === 'named') {
       // A text answer is not what was asked for: say so, never hand one over in its place.
-      throw lastError || new LlmError(`tool_choice ${choice === 'named' ? `names "${String(spec.choice.name).slice(0, 64)}"` : 'is required'}: the request needs a tool call, and no leg of "${requested}" takes tools — an HTTP upstream on the openai wire does, and so does a CLI with a toolMode (keysmith set <adapter> toolMode auto)`, {
-        status: 400,
-        type: 'invalid_request_error',
-      });
+      throw this._toolsNotCarried(
+        lastError ||
+          heldBack ||
+          new LlmError(`tool_choice ${choice === 'named' ? `names "${String(spec.choice.name).slice(0, 64)}"` : 'is required'}: the request needs a tool call, and no leg of "${requested}" takes tools — an HTTP upstream on the openai wire does, and so does a CLI with a toolMode (keysmith set <adapter> toolMode auto)`, {
+            status: 400,
+            type: 'invalid_request_error',
+          }),
+        run,
+      );
     }
     const rest = chain.filter((_, i) => !tried.has(i));
     // Every leg could take the tools, and each one refused. Running the route again as a plain
     // completion would ask the same upstream a second time, drop the tools without a word and turn
     // a 429 into a 502: answer with what the leg said instead.
-    if (!rest.length) throw lastError || new LlmError(`every leg of "${requested}" has already refused this request`, { status: 502 });
+    if (!rest.length) throw lastError || heldBack || new LlmError(`every leg of "${requested}" has already refused this request`, { status: 502 });
+    if (!textAllowed) {
+      // tool_choice auto, and no leg that carries tools answered: the rest cannot carry them. A
+      // plain completion from them would drop the tools without a word, and a client that offered
+      // tools (Claude Code) breaks on a text answer it never asked for: fail out loud instead —
+      // the last failure of a leg that took the tools, or a 400 naming each leg and why not.
+      const passed = rest.map((l) => l.target).join(', ');
+      this.log(
+        refused.length
+          ? `tools requested; ${refused.map((r) => `${r.target} refused (${r.status})`).join(', ')}, and the rest of "${requested}" (${passed}) cannot carry them — the request fails instead of a plain completion without them`
+          : `tools requested but no leg of "${requested}" can carry them (${passed}) — the request fails instead of a plain completion without them`,
+      );
+      throw this._toolsNotCarried(lastError || heldBack || this._noToolLeg(requested, chain, run), run);
+    }
     if (!spec.historyOnly) {
       if (refused.length) {
         // Those legs already said no to this very request: asking them again without the tools
@@ -1560,7 +1684,12 @@ export class Gateway {
     let leg = null;
     let upstreamId = null;
     let virtual = null;
-    for await (const evt of this.complete(opts)) {
+    const skippedLegs = [];
+    const onSkip = (x) => {
+      skippedLegs.push(x);
+      opts.onSkip?.(x);
+    };
+    for await (const evt of this.complete({ ...opts, onSkip })) {
       if (evt.type === 'relayed') relayed = true;
       else if (evt.type === 'leg') leg = evt.leg;
       else if (evt.type === 'virtual') virtual = evt.virtual;
@@ -1584,7 +1713,7 @@ export class Gateway {
       if (virtual) e.virtualRoute = virtual;
       throw e;
     }
-    return { text, reasoning, usage, usageReason, effort, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, ...(virtual ? { virtual } : {}) };
+    return { text, reasoning, usage, usageReason, effort, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, ...(virtual ? { virtual } : {}), ...(skippedLegs.length ? { skippedLegs } : {}) };
   }
 }
 

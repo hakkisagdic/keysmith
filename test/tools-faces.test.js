@@ -101,10 +101,18 @@ const SCRIPTS = {
 };
 
 const calls = []; // [adapter id, model] per run, to see which legs were asked
+/**
+ * An adapter that answers a tool request itself, the way a native-tools upstream does (an HTTP
+ * leg on the uhp wire, toolMode uhp): its events reach the face as they come. It used to be a CLI
+ * without a toolMode, reached through the plain completion a tool request fell back to — which no
+ * longer exists: a leg that cannot carry the tools is passed by, never asked for text.
+ */
 function fakeAdapter(id) {
   return {
     id,
-    kind: 'cli',
+    kind: 'http',
+    wire: 'uhp',
+    toolMode: 'uhp',
     priority: 100,
     resumeArgs: null,
     resumable: false,
@@ -887,7 +895,7 @@ test('a usage row says the engine, the number of calls, the retries and the fall
   assert.ok(!file.includes(RESULT_SENTINEL), 'no tool result in the usage log');
   assert.ok(!log.join('\n').includes(ARG_SENTINEL) && !log.join('\n').includes(RESULT_SENTINEL), 'nor in the gateway log');
   // A row without tools is as it was: no tool fields at all.
-  await chat('fake/text');
+  await post('/v1/chat/completions', { model: 'fake/text', messages: ASK });
   const plain = usageLog.tail(1)[0];
   assert.deepEqual(['toolMode', 'toolCalls', 'fallback'].filter((k) => k in plain), []);
 });
