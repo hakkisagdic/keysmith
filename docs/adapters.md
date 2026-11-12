@@ -893,3 +893,91 @@ Then work out the four facts that matter, in this order:
 
 Write what you learned into the profile's `note` and `provenance` fields — the next
 person to run this against a new version of that CLI is probably you, in six months.
+
+## Virtual Models (`virtualModels`)
+
+A virtual model (such as `auto/text` or `auto/vision`) is a single model identifier that
+keysmith resolves per request to a concrete `<adapter>/<model>` based on prompt complexity,
+machine load, quota/rate-limit health, and the requesting key's scope.
+
+### Configuration
+
+Configure `virtualModels` at the top level of `~/.config/keysmith/config.json`:
+
+```json
+{
+  "virtualModels": {
+    "auto/text": {
+      "classifier": "ollama-local/qwen3.8:8b",
+      "tiers": {
+        "simple": ["ollama-local/qwen3.8:8b", "ollama-local/llama3.3:8b"],
+        "medium": ["ollama-local/qwen3.8:14b", "gemini-cli/gemini-2.5-flash"],
+        "complex": ["claude-cli/claude-sonnet-4-6", "claude-api/claude-opus-4-6"]
+      },
+      "loadGate": {
+        "maxLoadPerCore": 0.8,
+        "maxMemoryPressure": "warn"
+      },
+      "stickySeconds": 120
+    },
+    "auto/vision": {
+      "classifier": "ollama-local/qwen3.8:8b",
+      "tiers": {
+        "simple": ["ollama-local/qwen2.5vl:7b"],
+        "medium": ["gemini-cli/gemini-2.5-flash"],
+        "complex": ["claude-cli/claude-sonnet-4-6", "claude-api/claude-opus-4-6"]
+      },
+      "loadGate": {
+        "maxLoadPerCore": 0.8,
+        "maxMemoryPressure": "warn"
+      },
+      "stickySeconds": 60
+    }
+  }
+}
+```
+
+Every virtual model entry is validated at config load time:
+
+- **`classifier`**: Any configured `<adapter>/<model>` (for example `"ollama-local/qwen3.8:8b"`).
+- **`tiers`**: Ordered `<adapter>/<model>` candidate lists for `simple`, `medium`, and
+  `complex` (plus an optional `congested` tier). Order encodes your quota policy (free and
+  local first, subscription CLIs next, metered API / promo credits last).
+- **`loadGate`** *(optional)*:
+  - `maxLoadPerCore`: positive number compared against `os.loadavg()[0] / os.cpus().length`.
+  - `maxMemoryPressure`: `"normal"`, `"warn"`, `"critical"` (from macOS
+    `kern.memorystatus_vm_pressure_level`) or a numeric threshold `<= 100`.
+- **`stickySeconds`** *(optional)*: non-negative number of seconds to cache the classifier's
+  complexity label for repeated prompts and active sessions.
+
+### Per-Request Routing & Fallthrough
+
+1. **Congestion gate**: If `loadGate` is exceeded (CPU load per core or macOS memory pressure
+   over the threshold), keysmith skips the classifier and routes straight to the first remote
+   candidate of the `medium` tier (or the configured `congested` tier), falling through to
+   remaining remote candidates in `medium` and `complex`.
+2. **Classifier**: Otherwise keysmith asks `classifier` for a one-word label
+   (`simple` | `medium` | `complex`) using a short, cached prompt, tiny `max_tokens` (8), and
+   a low timeout (2.5s default). If the classifier fails, times out, or returns anything else,
+   keysmith defaults to `medium`.
+3. **Tier & cross-tier fallthrough**: Candidates in the selected tier are tried in declared
+   order. On `429` / quota / spend cap / timeout / `5xx`, keysmith falls through to the next
+   candidate in the tier and then escalates to the next tier up (`simple` → `medium` →
+   `complex`) while nothing has been streamed to the client yet.
+4. **Scope enforcement on concrete targets**: A key whose scope allows `auto/*` (or
+   `auto/text`) is also checked against every concrete `<adapter>/<model>` candidate at routing
+   time. Any candidate the key is not permitted to reach (for example `claude-api` under
+   `deny: ["claude-api"]` or omitted from `allow`) is skipped and never called; if no candidate
+   is permitted, keysmith returns `403`.
+
+### Observability & Dry-Run Explain
+
+- **`usage.jsonl`**: Every routed request records `{ virtual, label, tier, chosen, fallbacks, fallbacksTried, reason, latency }`.
+- **`GET /v1/models`**: Lists configured virtual models (`owned_by: "keysmith:virtual"`),
+  filtered by the requesting key's scope.
+- **`keysmith route explain`**: Dry-runs the routing decision without calling the target:
+
+```bash
+keysmith route explain auto/text "Explain the difference between TCP and UDP"
+keysmith route explain auto/text "Design a lock-free ring buffer" --json
+```

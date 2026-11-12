@@ -298,6 +298,30 @@ export function aliasDecision(scope, name) {
 }
 
 /**
+ * May a key with `scope` name virtual model `name` (e.g. `auto/text`, `auto/vision`)?
+ * Concrete targets in the virtual model's tiers are checked separately at routing time.
+ */
+export function virtualDecision(scope, name) {
+  if (!scope) return OK;
+  if (scope.invalid) return no(invalidReason(scope));
+  const slash = String(name).indexOf('/');
+  const head = slash > 0 ? String(name).slice(0, slash) : String(name);
+  const hits = (p) => {
+    if (p.kind === 'glob') return p.re.test(name) || (p.normRe ? p.normRe.test(name) : false);
+    if (p.kind === 'adapter') return p.id === name || p.id === head;
+    if (p.kind === 'alias') return p.re.test(name);
+    return false;
+  };
+  for (const p of scope.deny) {
+    if (hits(p)) return no(`this key may not use virtual model "${name}": its scope denies ${p.text}`);
+  }
+  if (scope.allow && !scope.allow.some(hits)) {
+    return no(`this key may not use virtual model "${name}": ${name} is not in its allow-list`);
+  }
+  return OK;
+}
+
+/**
  * How much of adapter `id` a key with `scope` can reach: 'all', 'some' (a model glob lets part
  * of it through, or keeps part of it out) or 'none'. What `who-can`, the model listing and the
  * routes endpoint go by; a request is decided by targetDecision, model by model.
@@ -390,6 +414,7 @@ const hint = (wrote, near) => (near ? ` — did you mean ${near}? (a pattern is 
 export function unnamedPatterns(cfg, patterns) {
   const adapters = Object.keys(cfg?.adapters || {});
   const aliases = Object.keys(cfg?.aliases || {});
+  const virtuals = Object.keys(cfg?.virtualModels || {});
   const problems = [];
   for (const raw of patterns || []) {
     let p;
@@ -400,10 +425,12 @@ export function unnamedPatterns(cfg, patterns) {
     }
     if (p.kind === 'adapter') {
       if (Object.hasOwn(cfg?.adapters || {}, p.id)) continue;
+      if (virtuals.some((v) => v === p.id || v.startsWith(`${p.id}/`))) continue;
       if (Object.hasOwn(cfg?.aliases || {}, p.id)) problems.push(`"${p.id}" is an alias, not an adapter — alias:${p.id} names it`);
       else problems.push(`"${p.id}" names no configured adapter${hint(p.id, nearName(p.id, adapters))}`);
     } else if (p.kind === 'glob') {
       if (adapters.some((id) => globCanStartWith(p.glob, `${id}/`))) continue;
+      if (virtuals.some((v) => p.re.test(v))) continue;
       const slash = p.glob.indexOf('/');
       const head = slash > 0 ? p.glob.slice(0, slash) : p.glob;
       const near = nearName(head, adapters);

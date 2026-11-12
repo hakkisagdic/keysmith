@@ -179,6 +179,35 @@ before it replaces a working entry (`--force` saves it anyway, and says the adap
 load); credentials are not resolved for that check, so a key only launchd can see is fine.
 What an entry has, and the rest of these commands: [Changing an attached adapter](#changing-an-attached-adapter).
 
+## Virtual models: automatic complexity & congestion routing
+
+`virtualModels` lets clients send one model name such as `auto/text` (or `auto/vision`) while
+keysmith picks a concrete `adapter/model` per request:
+
+```json
+"virtualModels": {
+  "auto/text": {
+    "classifier": "ollama-local/qwen3.8:8b",
+    "tiers": {
+      "simple": ["ollama-local/qwen3.8:8b"],
+      "medium": ["ollama-local/qwen3.8:14b", "gemini-cli/gemini-2.5-flash"],
+      "complex": ["claude-cli/claude-sonnet-4-6", "claude-api/claude-opus-4-6"]
+    },
+    "loadGate": { "maxLoadPerCore": 0.8, "maxMemoryPressure": "warn" },
+    "stickySeconds": 120
+  }
+}
+```
+
+When the machine is congested (`loadGate`), keysmith skips the classifier and routes to the
+first remote candidate of `medium` (or `tiers.congested`). Otherwise it asks `classifier` for
+a one-word label (`simple|medium|complex`, defaulting to `medium` on failure), tries the tier's
+candidates in order, and falls through on `429` / quota / timeout / `5xx` to the next candidate
+and the next tier up. Key scopes allowing `auto/*` are enforced against the concrete target at
+routing time, every routed request logs `{virtual, label, chosen, fallbacks, reason, latency}`
+in `usage.jsonl`, `/v1/models` lists virtual models, and `keysmith route explain auto/text "<prompt>"`
+dry-runs the decision without calling the target. See [docs/adapters.md](docs/adapters.md#virtual-models-virtualmodels).
+
 ## Sessions: multi-turn out of a stateless client
 
 OpenAI clients resend history; CLIs *are* stateful. keysmith hands back an opaque

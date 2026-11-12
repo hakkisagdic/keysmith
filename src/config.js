@@ -4,6 +4,9 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fingerprint, redactKey, registerSecrets } from './redact.js';
+import { checkVirtualModel, validateVirtualModels } from './virtual-models.js';
+
+export { checkVirtualModel, validateVirtualModels };
 
 /**
  * Config & data locations.
@@ -156,6 +159,7 @@ export const DEFAULTS = {
   tunnel: { provider: 'cloudflared', name: null, hostname: null, configFile: null },
   adapters: {},
   aliases: {},
+  virtualModels: {},
 };
 
 function deepMerge(base, extra) {
@@ -179,8 +183,8 @@ export function configExists() {
  * `mint: false` is for commands that only read (`key list`, `key who-can`): they say there
  * is no key rather than writing one into the config.
  */
-export function loadConfig({ path: customPath = null, mint = true } = {}) {
-  const p = customPath || configPath();
+export function loadConfig({ path: customPath = null, file = null, mint = true } = {}) {
+  const p = customPath || file || configPath();
   if (!fs.existsSync(p)) return structuredClone(DEFAULTS);
   let raw;
   try {
@@ -189,6 +193,9 @@ export function loadConfig({ path: customPath = null, mint = true } = {}) {
     throw new Error(`${p}: ${jsonErrorWithoutText(e)}`);
   }
   const cfg = deepMerge(structuredClone(DEFAULTS), raw);
+  if (raw && Object.hasOwn(raw, 'virtualModels')) {
+    validateVirtualModels(cfg);
+  }
   if (!isObj(cfg.auth)) cfg.auth = { enabled: true, keys: [] };
   cfg.auth.enabled = cfg.auth.enabled === false ? false : true;
   cfg._path = p;

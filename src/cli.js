@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { loadConfig, saveConfig, configPath, dataDir, newApiKey, newUniqueApiKey, configExists, expand, resolveSecret } from './config.js';
-import { Gateway, checkAdapter, kindOf, own } from './gateway.js';
+import { Gateway, checkAdapter, formatRouteExplain, kindOf, own } from './gateway.js';
 import { createServer, hasTunnelConfigured, isLoopbackHost, LEGACY_MAX_CONCURRENT_WARNING } from './server.js';
 import { UsageLog, accountHmacKey, execAccountMigrationWarnings, formatUsageCsv, formatUsageTable } from './usage.js';
 import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
@@ -36,6 +36,7 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith vision <adapter> on|off   let an adapter see images: set <adapter> vision true|false
   keysmith tools <adapter> <mode>    how a CLI takes tool requests, off|emulate|mcp|auto: set <adapter> toolMode <mode>
   keysmith alias [<name> <leg>…]     list aliases, or set one; --prepend/--append/--drop <leg>, --delete
+  keysmith route explain <vm> <p>    dry-run virtual model routing decision without calling the target
   keysmith adapters                  list profiles and what is attached
   keysmith models [--refresh]        what this gateway exposes, and from where
   keysmith serve [--port N]          run the gateway  (http://127.0.0.1:<port>/v1)
@@ -115,6 +116,8 @@ export async function main(argv) {
       case 'alias':
       case 'aliases':
         return await cmdAlias(flags);
+      case 'route':
+        return await cmdRoute(flags);
       case 'adapters':
         return await cmdAdapters(flags);
       case 'models':
@@ -173,6 +176,7 @@ function DEFAULT_CONFIG() {
     tunnel: { provider: 'cloudflared', name: null, hostname: null, configFile: null },
     adapters: {},
     aliases: {},
+    virtualModels: {},
   };
 }
 
@@ -1185,6 +1189,22 @@ function noteRestart(what) {
   const rec = readPid();
   if (!rec || !alive(rec.pid)) return;
   out(`! the running gateway (pid ${rec.pid}) still serves the config it started with — ${what} takes effect when it restarts: ${restartCommand(rec)}`);
+}
+
+async function cmdRoute(flags) {
+  const [sub, vmName, ...promptParts] = flags._;
+  if (sub !== 'explain' || !vmName || !promptParts.length) {
+    fail('usage: keysmith route explain <virtual-model> "<prompt>" [--json]');
+  }
+  const prompt = promptParts.join(' ');
+  const cfg = loadOrFail();
+  const { gateway } = buildGateway(cfg, { deferAdapterChecks: true });
+  const explanation = await gateway.explainRoute(vmName, prompt);
+  if (flags.json || flags.format === 'json') {
+    out(JSON.stringify(explanation, null, 2));
+    return;
+  }
+  out(formatRouteExplain(explanation));
 }
 
 /* -------------------------------------------------------------------------- chat */

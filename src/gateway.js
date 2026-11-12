@@ -5,13 +5,40 @@ import { LlmError, routeError, truncate } from './util.js';
 import { resolveSecret } from './config.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
-import { adapterReach, aliasDecision, requestDecision, scopeText } from './keys.js';
+import { adapterReach, aliasDecision, globCanStartWith, requestDecision, scopeText, virtualDecision } from './keys.js';
 import { describeUnsupported, toolEvents, toolPath } from './tools/router.js';
 import { addUsage } from './tools/emulate.js';
 import { McpBridge } from './bridge/index.js';
 import { DRIVERS } from './bridge/drivers.js';
 import { resolveEffort, suffixedIds } from './effort.js';
 import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExecCredentialAdapter } from './usage.js';
+import {
+  TIER_ORDER,
+  buildVirtualCandidateList,
+  checkVirtualModel,
+  classifyPrompt,
+  defaultLoadProbe,
+  evaluateLoadGate,
+  extractClassifierPrompt,
+  formatRouteExplain,
+  isFallthroughError,
+  isLocalAdapter,
+  parseClassifierLabel,
+  validateVirtualModels,
+} from './virtual-models.js';
+
+export {
+  LlmError,
+  checkVirtualModel,
+  validateVirtualModels,
+  formatRouteExplain,
+  evaluateLoadGate,
+  isLocalAdapter,
+  parseClassifierLabel,
+  classifyPrompt,
+  buildVirtualCandidateList,
+  isFallthroughError,
+};
 
 /**
  * The gateway: config in, one model catalogue + one streaming `complete()` out.
@@ -22,14 +49,23 @@ import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExec
  * slash-free by construction.
  */
 export class Gateway {
-  constructor(cfg, { log = () => {}, usage = null, deferAdapterChecks = false } = {}) {
+  constructor(cfg, { log = () => {}, usage = null, deferAdapterChecks = false, loadProbe = null, now = null, adapters = null } = {}) {
     this.cfg = cfg;
     this.usage = usage;
+    this.loadProbe = typeof loadProbe === 'function' ? loadProbe : defaultLoadProbe;
+    this.now = typeof now === 'function' ? now : () => Date.now();
     // Redacted here as well as by the CLI's writer: an embedding's own log function is
     // handed provider errors, and those can quote a key.
     this.log = (m) => log(redactSecrets(m));
     if (this.usage && !this.usage.log) this.usage.log = this.log;
-    this.adapters = new Map();
+    this._virtualCache = new Map();
+    const rawAdaptersMap = new Map();
+    const origSet = rawAdaptersMap.set.bind(rawAdaptersMap);
+    rawAdaptersMap.set = (k, v) => {
+      this._virtualCache.clear();
+      return origSet(k, v);
+    };
+    this.adapters = rawAdaptersMap;
     this.loadErrors = {}; // adapter id -> why it never constructed; doctor and /status must say so
     this.sessions = new Map(); // x-keysmith-session id -> {adapter, upstream session}
     this.inFlight = 0;
@@ -41,8 +77,19 @@ export class Gateway {
     // can use it — set below, once the adapters are loaded. Without it toolMode auto is EMULATE,
     // and toolMode mcp a 503.
     this.toolEngines = { mcp: null };
+    if (adapters) {
+      const entries = adapters instanceof Map ? adapters.entries() : Object.entries(adapters);
+      for (const [id, inst] of entries) {
+        if (inst) this.adapters.set(id, inst);
+      }
+    }
     for (const [id, raw] of Object.entries(cfg.adapters || {})) {
       try {
+        if (raw && typeof raw.complete === 'function') {
+          if (!raw.id) raw.id = id;
+          this.adapters.set(id, raw);
+          continue;
+        }
         const prepared = prepareAdapter(id, raw);
         // From here on every log line, usage row and error message takes this key out, the
         // way it takes out the gateway's own (redact.js).
@@ -66,6 +113,12 @@ export class Gateway {
         this.log(`adapter "${id}" failed to load: ${e.message}`);
       }
     }
+    // Validate virtualModels at load: throws a descriptive Error if virtualModels is invalid.
+    this.virtualModels = validateVirtualModels(cfg, {
+      adapters: this.adapters,
+      loadErrors: new Map(Object.entries(this.loadErrors)),
+      requireAdapter: true,
+    });
     // The bridge exists when a CLI with toolMode mcp or auto has a driver for it (a `bridge.args`,
     // and the driver it names: agy, opencode, codex, qoder). Nothing listens until the first
     // request that takes it, or `serve`'s start().
@@ -210,11 +263,70 @@ export class Gateway {
     return err;
   }
 
+  isVirtualModel(requested) {
+    if (!requested || typeof requested !== 'string') return false;
+    return this.virtualModels?.has?.(requested) || own(this.cfg?.virtualModels, requested);
+  }
+
+  getVirtualSpec(requested) {
+    if (!this.isVirtualModel(requested)) return null;
+    if (this.virtualModels?.has?.(requested)) return this.virtualModels.get(requested);
+    const raw = own(this.cfg?.virtualModels, requested) ? this.cfg.virtualModels[requested] : null;
+    if (!raw) return null;
+    const spec = checkVirtualModel(requested, raw, {
+      cfg: this.cfg,
+      adapters: this.adapters,
+      loadErrors: new Map(Object.entries(this.loadErrors)),
+      requireAdapter: true,
+    });
+    this.virtualModels.set(requested, spec);
+    return spec;
+  }
+
+  /**
+   * Check whether `scope` permits reaching concrete target `adapterId/model` during virtual model routing.
+   */
+  checkVirtualTarget(adapterId, model, scope) {
+    if (!scope) return { ok: true };
+    if (scope.error || scope.invalid) {
+      return { ok: false, reason: `the scope of this key is invalid in the config (${scope.error || 'invalid scope'})` };
+    }
+    const direct = this.checkTarget(adapterId, model, scope);
+    if (direct.ok) return direct;
+    // When a key's allow-list names only virtual models (e.g. `allow: ["auto/*"]`) AND also
+    // defines `deny` or `maxCostBasis` to block specific concrete targets (e.g. `{ allow: ["auto/*"], deny: ["claude-api"] }`),
+    // enforce the concrete target against `deny` and `maxCostBasis`.
+    if (
+      Array.isArray(scope.allow) &&
+      scope.allow.length > 0 &&
+      ((Array.isArray(scope.deny) && scope.deny.length > 0) || scope.maxCostBasis)
+    ) {
+      const vmNames = [
+        ...Object.keys(this.cfg?.virtualModels || {}),
+        ...(this.virtualModels ? this.virtualModels.keys() : []),
+      ];
+      const allVirtualOnly =
+        vmNames.length > 0 &&
+        scope.allow.every((p) => {
+          if (!p || p.kind === 'invalid' || p.kind === 'alias') return false;
+          const raw = p.text || (p.model ? `${p.adapter}/${p.model}` : p.id || '');
+          return vmNames.some((vm) => globCanStartWith(raw, vm.split('/')[0] + '/') || raw === vm);
+        });
+      if (allVirtualOnly) {
+        return this.checkTarget(adapterId, model, { ...scope, allow: null });
+      }
+    }
+    return direct;
+  }
+
   /**
    * Audit metadata for `requested` when a request fails before any leg starts.
    */
   resolveLegMeta(requested) {
     if (!requested || typeof requested !== 'string') return null;
+    if (this.isVirtualModel(requested)) {
+      return { adapter: 'virtual', kind: 'virtual', account: null, model: requested };
+    }
     const aliases = this.cfg?.aliases || {};
     let target = requested;
     if (own(aliases, requested) && Array.isArray(aliases[requested]) && aliases[requested].length) {
@@ -353,10 +465,18 @@ export class Gateway {
     return requestDecision(scope, adapterId, adapter, model);
   }
 
-  /** May a key with `scope` name `requested` at all — an alias it may use, or a target it may reach? */
+  /** May a key with `scope` name `requested` at all — an alias/virtual model it may use, or a target it may reach? */
   mayName(requested, scope) {
     if (!scope) return true;
     if (typeof requested !== 'string' || !requested) return false;
+    if (this.isVirtualModel(requested)) {
+      if (!virtualDecision(scope, requested).ok) return false;
+      const vspec = this.getVirtualSpec(requested);
+      if (!vspec) return false;
+      return Object.values(vspec.tierLegs || {}).some((legs) =>
+        Array.isArray(legs) && legs.some((leg) => this.checkVirtualTarget(leg.adapterId, leg.model, scope).ok),
+      );
+    }
     if (own(this.cfg.aliases, requested)) {
       // An alias it may name, with a leg it may run: what /v1/models lists for it.
       const legs = this.cfg.aliases[requested];
@@ -382,6 +502,98 @@ export class Gateway {
       if (!aliasDecision(scope, alias).ok) continue;
       const usable = (Array.isArray(legs) ? legs : []).filter((leg) => typeof leg === 'string' && leg && this.checkTarget(adapterOf(leg), modelOf(leg), scope).ok);
       if (usable.length) out[alias] = usable;
+    }
+    return out;
+  }
+
+  /**
+   * The virtual models one key may name, each with only the tier candidates it may reach.
+   */
+  virtualModelsFor(scope = null) {
+    const out = {};
+    const names = new Set([
+      ...(this.virtualModels ? this.virtualModels.keys() : []),
+      ...Object.keys(this.cfg?.virtualModels || {}),
+    ]);
+    for (const name of names) {
+      if (scope && !virtualDecision(scope, name).ok) continue;
+      const vspec = this.getVirtualSpec(name);
+      if (!vspec) continue;
+      if (!scope) {
+        out[name] = {
+          classifier: vspec.classifier,
+          tiers: vspec.tiers,
+          ...(vspec.loadGate ? { loadGate: vspec.loadGate } : {}),
+          ...(vspec.stickySeconds != null ? { stickySeconds: vspec.stickySeconds } : {}),
+          ...(vspec.note ? { note: vspec.note } : {}),
+        };
+        continue;
+      }
+      const scopedTiers = {};
+      let anyUsable = false;
+      for (const [tier, legs] of Object.entries(vspec.tierLegs || {})) {
+        const usable = (legs || [])
+          .filter((leg) => this.checkVirtualTarget(leg.adapterId, leg.model, scope).ok)
+          .map((leg) => leg.target);
+        if (usable.length) {
+          scopedTiers[tier] = usable;
+          anyUsable = true;
+        }
+      }
+      if (anyUsable) {
+        out[name] = {
+          classifier: vspec.classifier,
+          tiers: scopedTiers,
+          ...(vspec.loadGate ? { loadGate: vspec.loadGate } : {}),
+          ...(vspec.stickySeconds != null ? { stickySeconds: vspec.stickySeconds } : {}),
+          ...(vspec.note ? { note: vspec.note } : {}),
+        };
+      }
+    }
+    return out;
+  }
+
+  get virtualModelIssues() {
+    return this.virtualModelIssuesFor(null);
+  }
+
+  virtualModelIssuesFor(scope = null) {
+    const out = {};
+    const names = new Set([
+      ...(this.virtualModels ? this.virtualModels.keys() : []),
+      ...Object.keys(this.cfg?.virtualModels || {}),
+    ]);
+    for (const name of names) {
+      if (scope && !virtualDecision(scope, name).ok) continue;
+      const vspec = this.getVirtualSpec(name);
+      if (!vspec) continue;
+      const problems = [];
+      const checkLeg = (label, leg) => {
+        const adapter = this.adapters.get(leg.adapterId);
+        if (!adapter) {
+          const why = this.loadError(leg.adapterId);
+          problems.push(
+            `${label} (${leg.target}): ${why ? `adapter "${leg.adapterId}" is configured but did not load (${why})` : `no adapter named "${leg.adapterId}"`}`,
+          );
+          return;
+        }
+        if (adapter.disabled) {
+          problems.push(`${label} (${leg.target}): adapter "${leg.adapterId}" is disabled`);
+          return;
+        }
+        const known = knownModels(adapter);
+        if (leg.model && known && !known.ids.includes(leg.model)) {
+          problems.push(`${label} (${leg.target}): "${leg.model}" is not among ${leg.adapterId}'s ${known.from}`);
+        }
+      };
+      checkLeg('classifier', vspec.classifierLeg);
+      for (const [tier, legs] of Object.entries(vspec.tierLegs || {})) {
+        for (const leg of legs || []) {
+          if (scope && !this.checkVirtualTarget(leg.adapterId, leg.model, scope).ok) continue;
+          checkLeg(`tiers.${tier}`, leg);
+        }
+      }
+      if (problems.length) out[name] = problems;
     }
     return out;
   }
@@ -460,6 +672,28 @@ export class Gateway {
     for (const [alias, problems] of Object.entries(issues)) {
       for (const p of problems) errors.push(`alias "${alias}" ${p}`);
     }
+    const vmIssues = this.virtualModelIssuesFor(scope);
+    for (const [vmName, vspec] of Object.entries(this.virtualModelsFor(scope))) {
+      models.push({
+        id: vmName,
+        object: 'model',
+        owned_by: 'keysmith:virtual',
+        keysmith: {
+          adapter: 'virtual',
+          kind: 'virtual',
+          classifier: vspec.classifier,
+          tiers: vspec.tiers,
+          ...(vspec.loadGate ? { loadGate: vspec.loadGate } : {}),
+          ...(vspec.stickySeconds != null ? { stickySeconds: vspec.stickySeconds } : {}),
+          priority: -2,
+          ...(vspec.note ? { note: vspec.note } : {}),
+          ...(vmIssues[vmName] ? { warnings: vmIssues[vmName] } : {}),
+        },
+      });
+    }
+    for (const [vmName, problems] of Object.entries(vmIssues)) {
+      for (const p of problems) errors.push(`virtual model "${vmName}" ${p}`);
+    }
     models.sort((x, y) => x.id.localeCompare(y.id));
     return { models, errors };
   }
@@ -486,9 +720,78 @@ export class Gateway {
    * adapter; inside an alias such a leg is skipped — never run — and the alias is a 403 only
    * when no leg is left. The legs skipped that way ride on the result as `skipped`.
    */
-  resolve(requested, { exclude = null, scope = null } = {}) {
+  resolve(requested, { exclude = null, scope = null, label = null, congested = null } = {}) {
     if (!requested) throw new LlmError('missing "model"', { status: 400 });
     if (typeof requested !== 'string') throw new LlmError('"model" must be a string', { status: 400 });
+    if (this.isVirtualModel(requested)) {
+      if (scope) {
+        const d = virtualDecision(scope, requested);
+        if (!d.ok) throw scopeError(d.reason, null);
+      }
+      const vspec = this.getVirtualSpec(requested);
+      const candidates = buildVirtualCandidateList(vspec, {
+        label: label || 'simple',
+        congested: !!congested,
+        adapters: this.adapters,
+        cfgAdapters: this.cfg?.adapters,
+      });
+      const out = [];
+      const skipped = [];
+      let excluded = 0;
+      let firstError = null;
+      for (const cand of candidates) {
+        const { adapterId, model: modelName, target, tier, local } = cand;
+        if (scope) {
+          const d = this.checkVirtualTarget(adapterId, modelName, scope);
+          if (!d.ok) {
+            skipped.push(target);
+            this.log(`virtual model "${requested}" skipped ${target}: outside the requesting key's scope`);
+            continue;
+          }
+        }
+        const adapter = this.adapters.get(adapterId);
+        let err = null;
+        if (!adapter) {
+          const why = this.loadError(adapterId);
+          const live = [...this.adapters.keys()].filter((id) => this.adapterVisible(id, scope));
+          err = new LlmError(
+            why
+              ? `adapter "${adapterId}" is configured but did not load: ${why}`
+              : `no adapter named "${adapterId}" — try one of: ${live.join(', ')}`,
+            { status: why ? 503 : 404, provider: why ? adapterId : null },
+          );
+        } else if (adapter.disabled) {
+          err = new LlmError(`adapter "${adapterId}" is disabled`, { status: 503, provider: adapterId });
+        } else if (adapter.explicitOnly) {
+          err = new LlmError(`virtual model "${requested}": ${keptOutOfAliases(adapterId, adapter)}`, { status: 403, provider: null });
+        }
+        if (err) {
+          firstError ??= err;
+          if (candidates.length > 1) {
+            this.log(`virtual model "${requested}" skipped a dead leg: ${err.message}`);
+            continue;
+          }
+          throw err;
+        }
+        if (exclude?.has(target)) {
+          excluded++;
+          continue;
+        }
+        out.push({ adapter, model: modelName || adapter.defaultModel || '', target, tier, local });
+      }
+      if (!out.length) {
+        if (skipped.length && !excluded) {
+          throw scopeError(
+            `virtual model "${requested}" has no candidate this key may use: ${skipped.join(', ')} ${skipped.length > 1 ? 'are' : 'is'} outside its scope`,
+            adapterOf(skipped[0]),
+          );
+        }
+        throw firstError || new LlmError(`every candidate of "${requested}" has already refused this request`, { status: 502 });
+      }
+      out.skipped = skipped;
+      out.virtual = true;
+      return out;
+    }
     const aliases = this.cfg.aliases || {};
     // Own names only: a model called `constructor` or `toString` is not an alias, and an
     // alias that is not a list of legs is an alias with no legs.
@@ -563,6 +866,111 @@ export class Gateway {
   }
 
   /**
+   * Perform the virtual model routing decision for a single request (`loadGate` -> `classifier` -> tier candidates).
+   */
+  async routeVirtual(requested, { messages = [], prompt = '', session = null, exclude = null, scope = null, signal = null } = {}) {
+    if (!this.isVirtualModel(requested)) {
+      throw new LlmError(`unknown virtual model "${requested}"`, { status: 404 });
+    }
+    if (scope) {
+      const d = virtualDecision(scope, requested);
+      if (!d.ok) throw scopeError(d.reason, null);
+    }
+    const vspec = this.getVirtualSpec(requested);
+    const gate = evaluateLoadGate(vspec.loadGate, this.loadProbe);
+    const promptText = extractClassifierPrompt(messages, prompt);
+
+    let label = 'medium';
+    let baseReason = 'classified';
+    let clf = null;
+
+    if (gate.congested) {
+      label = vspec.tierLegs.congested ? 'congested' : 'medium';
+      baseReason = `congested (${gate.detail})`;
+    } else {
+      const classifierAllowed = !scope || this.checkVirtualTarget(vspec.classifierLeg.adapterId, vspec.classifierLeg.model, scope).ok;
+      const clfAdapter = classifierAllowed ? this.adapters.get(vspec.classifierLeg.adapterId) || null : null;
+      clf = await classifyPrompt({
+        vspec,
+        adapter: clfAdapter,
+        promptText,
+        session,
+        cache: this._virtualCache,
+        now: this.now,
+        signal,
+      });
+      label = clf.label;
+      baseReason =
+        !classifierAllowed
+          ? 'classifier_scope_denied (defaulted to medium)'
+          : clf.reason === 'classified' || clf.reason === 'sticky' || clf.reason === 'cached'
+          ? clf.reason
+          : `${clf.reason} (defaulted to medium)`;
+    }
+
+    const chain = this.resolve(requested, {
+      exclude,
+      scope,
+      label: gate.congested ? 'medium' : label,
+      congested: gate.congested,
+    });
+
+    return {
+      vspec,
+      chain,
+      gate,
+      label,
+      tier: chain[0]?.tier || label,
+      baseReason,
+      clf,
+      skipped: chain.skipped || [],
+      promptText,
+    };
+  }
+
+  /**
+   * Dry-run a virtual model routing decision (`keysmith route explain <virtualModel> "<prompt>"`)
+   * without calling the target adapter/model.
+   */
+  async explainRoute(requested, prompt = '', { messages = null, scope = null, session = null, signal = null } = {}) {
+    const t0 = Date.now();
+    const msgs = Array.isArray(messages) && messages.length ? messages : [{ role: 'user', content: String(prompt || '') }];
+    const routed = await this.routeVirtual(requested, {
+      messages: msgs,
+      prompt: typeof prompt === 'string' ? prompt : '',
+      session,
+      scope,
+      signal,
+    });
+    const latency = Math.max(0, Date.now() - t0);
+    const first = routed.chain[0] || null;
+    const fallbacks = routed.chain.slice(1).map((c) => c.target);
+    return {
+      virtual: requested,
+      prompt: routed.promptText,
+      classifier: routed.vspec.classifier,
+      congested: routed.gate.congested,
+      loadGate: routed.vspec.loadGate,
+      load: routed.gate,
+      label: routed.label,
+      tier: first?.tier || routed.tier,
+      reason: routed.baseReason,
+      classifyError: routed.clf?.error || null,
+      classifyMs: routed.clf?.classifyMs ?? 0,
+      cached: !!routed.clf?.cached,
+      chosen: first?.target || null,
+      adapter: first?.adapter?.id || null,
+      model: first?.model || null,
+      candidates: routed.chain.map((c) => c.target),
+      fallbacks,
+      fallbacksTried: [],
+      skipped: routed.skipped,
+      latency,
+      dryRun: true,
+    };
+  }
+
+  /**
    * Stream one completion. Fails over to the next candidate in the chain only while
    * nothing has reached the client yet — a half-delivered answer is never restarted.
    *
@@ -589,22 +997,113 @@ export class Gateway {
     harnessId = null,
     trace = null,
     holdSpend = null,
+    onVirtual = null,
   }) {
-    const chain = this.resolve(model, { exclude, scope });
+    const t0 = Date.now();
     const callerKey = caller || tools?.caller || (scope ? (scope._fp || JSON.stringify(scopeText(scope))) : '');
     const publicId = session || newSessionId();
     const sessionKey = `${callerKey}:${publicId}`;
     const known = session ? this.sessions.get(sessionKey) : null;
+    const isVirtual = this.isVirtualModel(model);
+
+    let chain;
+    let virtualState = null;
+    if (isVirtual) {
+      const routed = await this.routeVirtual(model, {
+        messages,
+        session: session ? sessionKey : null,
+        exclude,
+        scope,
+        signal,
+      });
+      chain = routed.chain;
+      const first = chain[0] || null;
+      virtualState = {
+        virtual: model,
+        label: routed.label,
+        tier: first?.tier || routed.tier,
+        chosen: first?.target || null,
+        chosenAdapter: first?.adapter?.id || null,
+        chosenModel: first?.model || null,
+        fallbacks: [],
+        fallbacksTried: [],
+        fallbackDetails: [],
+        skipped: routed.skipped || [],
+        baseReason: routed.baseReason,
+        reason: routed.baseReason,
+        classifyMs: routed.clf?.classifyMs ?? 0,
+        congested: routed.gate.congested,
+        t0,
+        latency: Math.max(0, Date.now() - t0),
+        status: 'ok',
+        error: null,
+      };
+      onVirtual?.(snapshotVirtual(virtualState));
+      yield { type: 'virtual', virtual: snapshotVirtual(virtualState) };
+    } else {
+      chain = this.resolve(model, { exclude, scope });
+    }
+
     const localHeld = [];
     const hold = typeof holdSpend === 'function' ? holdSpend : (fn) => { if (typeof fn === 'function') localHeld.push(fn); };
-    const run = { publicId, sessionKey, known, reportedSession: false, includeReasoning, signal, scope, holdSpend: hold };
+    const run = {
+      publicId,
+      sessionKey,
+      known,
+      reportedSession: false,
+      includeReasoning,
+      signal,
+      scope,
+      holdSpend: hold,
+      virtualState,
+      onVirtual,
+    };
     const args = { messages, maxTokens, maxCompletionTokens, maxOutputTokens, temperature, includeReasoning, signal, effort, harnessId, trace };
     try {
       if (tools) return yield* this._toolRoute(model, chain, args, run, tools);
       yield* this._failover(chain, args, run, null);
+    } catch (err) {
+      if (virtualState) {
+        virtualState.latency = Math.max(0, Date.now() - t0);
+        virtualState.status = err?.scopeDenied ? 'denied' : 'error';
+        virtualState.error = err?.message || String(err);
+        if (!virtualState.fallbacks.length && chain.length) {
+          // Record tried candidates if all failed
+        }
+        const snap = snapshotVirtual(virtualState);
+        onVirtual?.(snap);
+        if (err && typeof err === 'object') err.virtualRoute = snap;
+      }
+      throw err;
     } finally {
       for (const fn of localHeld.splice(0)) {
         try { fn(); } catch {}
+      }
+      if (virtualState && !onVirtual && this.usage) {
+        virtualState.latency = Math.max(0, Date.now() - t0);
+        const snap = snapshotVirtual(virtualState);
+        try {
+          this.usage.record({
+            ts: new Date(this.now()).toISOString(),
+            model,
+            virtual: snap.virtual,
+            label: snap.label,
+            tier: snap.tier,
+            chosen: snap.chosen,
+            target: snap.chosen,
+            adapter: snap.chosenAdapter,
+            resolvedModel: snap.chosenModel,
+            fallbacks: snap.fallbacks,
+            fallbacksTried: snap.fallbacksTried,
+            ...(snap.skipped?.length ? { skipped: snap.skipped } : {}),
+            reason: snap.reason,
+            classifyMs: snap.classifyMs,
+            ms: snap.latency,
+            latency: snap.latency,
+            status: snap.status,
+            ...(snap.error ? { error: snap.error } : {}),
+          });
+        } catch {}
       }
     }
   }
@@ -628,7 +1127,9 @@ export class Gateway {
         // CLI's catalogue (src/effort.js) — a 400 there is this leg refusing, like any other.
         const planned = await effortPlan(leg, args.effort);
         if (run.scope && planned.model !== leg.model) {
-          const d = this.checkTarget(adapter.id, planned.model, run.scope);
+          const d = run.virtualState
+            ? this.checkVirtualTarget(adapter.id, planned.model, run.scope)
+            : this.checkTarget(adapter.id, planned.model, run.scope);
           if (!d.ok) throw scopeError(d.reason, adapter.id);
         }
         const legEffort = planned.effort || (adapter.wire === 'uhp' || adapter.wire === 'traycer' ? args.effort : null);
@@ -663,9 +1164,20 @@ export class Gateway {
           throw e;
         }
         const err = this._legFailed(leg, e, state, args.signal, chain.length > 1 ? 'trying next candidate' : 'giving up');
+        if (run.virtualState) {
+          recordVirtualFallback(run.virtualState, leg, err);
+          run.onVirtual?.(snapshotVirtual(run.virtualState));
+          if (!isFallthroughError(err)) throw err;
+        }
         if (chain.length === 1) throw lastError ? routeError(lastError, err) : err;
         lastError = routeError(lastError, err);
       }
+    }
+    if (run.virtualState) {
+      run.virtualState.chosen = null;
+      run.virtualState.chosenAdapter = null;
+      run.virtualState.chosenModel = null;
+      run.onVirtual?.(snapshotVirtual(run.virtualState));
     }
     throw lastError || new LlmError('no candidate in this route succeeded', { status: 502 });
   }
@@ -675,10 +1187,20 @@ export class Gateway {
    * its answer went out (`state.emitted` says whether one did). `sessions`: a tool leg resumes no
    * CLI session and maps none.
    */
-  async *_leg({ adapter, model: upstreamModel }, events, run, state, { canResume = false, sessions = true } = {}) {
+  async *_leg({ adapter, model: upstreamModel, target, tier }, events, run, state, { canResume = false, sessions = true } = {}) {
     // Which effort the leg ran at is said once its answer is: a leg that fails before answering
     // takes its `effort` event with it.
     let effort = null;
+    if (run.virtualState) {
+      run.virtualState.chosen = target || `${adapter.id}/${upstreamModel}`;
+      run.virtualState.chosenAdapter = adapter.id;
+      run.virtualState.chosenModel = upstreamModel;
+      if (tier) run.virtualState.tier = tier;
+      run.virtualState.latency = Math.max(0, Date.now() - run.virtualState.t0);
+      const snap = snapshotVirtual(run.virtualState);
+      run.onVirtual?.(snap);
+      yield { type: 'virtual', virtual: snap };
+    }
     yield { type: 'leg', leg: legMetaOf(adapter, upstreamModel) };
     for await (const evt of events) {
       if (evt.type === 'effort') {
@@ -690,6 +1212,12 @@ export class Gateway {
         effort = null;
       }
       if (evt.type === 'done') {
+        if (run.virtualState) {
+          run.virtualState.latency = Math.max(0, Date.now() - run.virtualState.t0);
+          const snap = snapshotVirtual(run.virtualState);
+          run.onVirtual?.(snap);
+          yield { type: 'virtual', virtual: snap };
+        }
         yield { type: 'leg', leg: legMetaOf(adapter, upstreamModel) };
       }
       // One rule for both adapter kinds: chain-of-thought is only ever forwarded to
@@ -722,7 +1250,7 @@ export class Gateway {
           yield { ...evt, message };
           return;
         }
-        throw new LlmError(message, { status: 502, provider: adapter.id });
+        throw new LlmError(message, { status: evt.status || 502, provider: adapter.id });
       }
       if (evt.type === 'session') {
         if (!sessions) continue;
@@ -747,7 +1275,15 @@ export class Gateway {
   /** A leg's failure as the LlmError the route keeps, logged; rethrown when it must end the route. */
   _legFailed({ adapter, model: upstreamModel }, e, state, signal, next) {
     // Wrapped, a failure keeps what a tool engine marked it with: which engine, and what it spent.
-    const err = e instanceof LlmError ? e : Object.assign(new LlmError(e.message, { status: 502, provider: adapter.id }), engineMarks(e));
+    const inferredStatus =
+      typeof e?.status === 'number' && e.status >= 400
+        ? e.status
+        : e?.code === 'ETIMEDOUT' || /timed?\s*out|timeout/i.test(e?.message || '')
+          ? 504
+          : /\b429\b|rate[_\s-]?limit|quota|too many requests/i.test(e?.message || '')
+            ? 429
+            : 502;
+    const err = e instanceof LlmError ? e : Object.assign(new LlmError(e.message, { status: inferredStatus, provider: adapter.id }), engineMarks(e));
     err.leg = e?.leg || legMetaOf(adapter, upstreamModel);
     if (e?.upstreamId && !err.upstreamId) err.upstreamId = e.upstreamId;
     if (signal?.aborted) throw err;
@@ -871,7 +1407,21 @@ export class Gateway {
         try {
           releaseSpend = this.reserveSpend(leg.adapter, leg.model, run.scope, this.estimateTokens(leg.adapter, leg.model, args, tools));
           run.holdSpend(releaseSpend);
+          if (run.virtualState) {
+            run.virtualState.chosen = leg.target;
+            run.virtualState.chosenAdapter = leg.adapter.id;
+            run.virtualState.chosenModel = leg.model;
+            if (leg.tier) run.virtualState.tier = leg.tier;
+            run.virtualState.latency = Math.max(0, Date.now() - run.virtualState.t0);
+            run.onVirtual?.(snapshotVirtual(run.virtualState));
+          }
           if (await relay(leg)) {
+            if (run.virtualState) {
+              run.virtualState.latency = Math.max(0, Date.now() - run.virtualState.t0);
+              const snap = snapshotVirtual(run.virtualState);
+              run.onVirtual?.(snap);
+              yield { type: 'virtual', virtual: snap };
+            }
             yield { type: 'relayed', target: leg.target };
             return;
           }
@@ -882,6 +1432,10 @@ export class Gateway {
           err.leg = e?.leg || legMetaOf(leg.adapter, leg.model);
           if (e?.upstreamId && !err.upstreamId) err.upstreamId = e.upstreamId;
           if (args.signal?.aborted) throw err;
+          if (run.virtualState) {
+            recordVirtualFallback(run.virtualState, leg, err);
+            run.onVirtual?.(snapshotVirtual(run.virtualState));
+          }
           lastError = routeError(lastError, err);
           refused.push({ target: leg.target, status: err.status });
           this.log(`passthrough via ${leg.adapter.id} failed: ${truncate(e.message, 300)}`);
@@ -893,7 +1447,9 @@ export class Gateway {
       try {
         const planned = await effortPlan(leg, args.effort);
         if (run.scope && planned.model !== leg.model) {
-          const d = this.checkTarget(leg.adapter.id, planned.model, run.scope);
+          const d = run.virtualState
+            ? this.checkVirtualTarget(leg.adapter.id, planned.model, run.scope)
+            : this.checkTarget(leg.adapter.id, planned.model, run.scope);
           if (!d.ok) throw scopeError(d.reason, leg.adapter.id);
         }
         const legEffort = planned.effort || (leg.adapter.wire === 'uhp' || leg.adapter.wire === 'traycer' ? args.effort : null);
@@ -933,6 +1489,10 @@ export class Gateway {
         // (a CLI that reached for a tool of its own is a security event: the request is not moved
         // to another engine, an HTTP upstream included).
         if (err.routeEnd) throw err;
+        if (run.virtualState) {
+          recordVirtualFallback(run.virtualState, leg, err);
+          run.onVirtual?.(snapshotVirtual(run.virtualState));
+        }
         if (err.toolMode) failed.push(failedLeg(leg, err));
         lastError = routeError(lastError, err);
         refused.push({ target: leg.target, status: err.status });
@@ -995,9 +1555,11 @@ export class Gateway {
     let relayed = false;
     let leg = null;
     let upstreamId = null;
+    let virtual = null;
     for await (const evt of this.complete(opts)) {
       if (evt.type === 'relayed') relayed = true;
       else if (evt.type === 'leg') leg = evt.leg;
+      else if (evt.type === 'virtual') virtual = evt.virtual;
       else if (evt.type === 'upstream' && evt.upstreamId) upstreamId = evt.upstreamId;
       else if (evt.type === 'retry') retries++;
       else if (evt.type === 'cut') cutAt = evt.tool;
@@ -1015,10 +1577,52 @@ export class Gateway {
       const e = new LlmError(err, { status: 502, provider: leg?.adapter || null });
       if (leg) e.leg = leg;
       if (upstreamId) e.upstreamId = upstreamId;
+      if (virtual) e.virtualRoute = virtual;
       throw e;
     }
-    return { text, reasoning, usage, usageReason, effort, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId };
+    return { text, reasoning, usage, usageReason, effort, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, ...(virtual ? { virtual } : {}) };
   }
+}
+
+function snapshotVirtual(v) {
+  if (!v) return null;
+  return {
+    virtual: v.virtual,
+    label: v.label,
+    tier: v.tier,
+    chosen: v.chosen,
+    target: v.chosen,
+    chosenAdapter: v.chosenAdapter,
+    chosenModel: v.chosenModel,
+    fallbacks: [...v.fallbacks],
+    fallbacksTried: [...v.fallbacks],
+    fallbackDetails: v.fallbackDetails.map((d) => ({ ...d })),
+    skipped: [...(v.skipped || [])],
+    reason: v.reason,
+    classifyMs: v.classifyMs,
+    congested: v.congested,
+    latency: v.latency,
+    status: v.status,
+    ...(v.error ? { error: v.error } : {}),
+  };
+}
+
+function recordVirtualFallback(virtualState, leg, err) {
+  if (!virtualState || !leg) return;
+  const target = leg.target || `${leg.adapter?.id || ''}/${leg.model || ''}`;
+  if (!virtualState.fallbacks.includes(target)) {
+    virtualState.fallbacks.push(target);
+  }
+  const status = err?.status || 502;
+  const detail = {
+    target,
+    tier: leg.tier || null,
+    status,
+    error: redactSecrets(err?.message || String(err)),
+  };
+  virtualState.fallbackDetails.push(detail);
+  const summary = virtualState.fallbackDetails.map((d) => `${d.target}:${d.status}`).join(', ');
+  virtualState.reason = `${virtualState.baseReason}; fallthrough (${summary})`;
 }
 
 /**
