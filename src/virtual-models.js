@@ -655,10 +655,17 @@ export async function classifyPrompt({
 
     const runClassifier = async () => {
       let out = '';
+      // The instruction travels as a system message: the HTTP and CLI adapters read the system
+      // prompt from `messages` only, so a bare `system` field never reached the model, which then
+      // answered the request itself (`classifier_invalid`, always `medium`). `system` stays for
+      // adapters that look there.
       const iter = adapter.complete({
         model: vspec.classifierLeg.model,
         system: CLASSIFIER_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: promptText || 'hello' }],
+        messages: [
+          { role: 'system', content: CLASSIFIER_SYSTEM_PROMPT },
+          { role: 'user', content: promptText || 'hello' },
+        ],
         maxTokens,
         temperature: 0,
         signal: ac.signal,

@@ -1015,3 +1015,38 @@ test('observability & explain: records {virtual, label, chosen, fallbacks, reaso
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('classifier instruction reaches adapters that read the system prompt from messages (as the HTTP and CLI adapters do)', async () => {
+  const { flattenMessages } = await import('../src/util.js');
+  // Like the real adapters: the system prompt comes from `messages`; a bare `system` field is ignored.
+  const realistic = makeStubAdapter('agy', {
+    kind: 'cli',
+    local: false,
+    models: ['gemini-flash'],
+    handler: async (opts) => {
+      const { system } = flattenMessages(opts.messages);
+      if (system.includes('Classify the complexity')) return 'complex';
+      return 'Here is a long answer to your question instead of a label.';
+    },
+  });
+  const target = makeStubAdapter('copilot', { models: ['gpt-4.1'] });
+  const gw = new Gateway(
+    {
+      adapters: { agy: realistic, copilot: target },
+      virtualModels: {
+        'auto/text': {
+          classifier: 'agy/gemini-flash',
+          tiers: { simple: ['copilot/gpt-4.1'], medium: ['copilot/gpt-4.1'], complex: ['copilot/gpt-4.1'] },
+        },
+      },
+    },
+    { loadProbe: () => ({ loadPerCore: 0.1, cores: 8, memoryPressure: 'normal' }) },
+  );
+  const r = await gw.explainRoute('auto/text', 'Design a lock-free ring buffer');
+  assert.equal(r.reason, 'classified');
+  assert.equal(r.label, 'complex');
+  const clfCall = realistic.calls[0];
+  assert.equal(clfCall.messages[0].role, 'system');
+  assert.match(clfCall.messages[0].content, /Classify the complexity/);
+  assert.equal(clfCall.messages.at(-1).role, 'user');
+});
