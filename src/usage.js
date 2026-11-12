@@ -872,20 +872,52 @@ export function nextMonthStartUtc(month) {
   return `${String(y).padStart(4, '0')}-${String(mo).padStart(2, '0')}-01T00:00:00Z`;
 }
 
+const SPEND_WINDOW_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
 /**
- * Normalize `limits.spend` from config into `[{ kind: 'adapter'|'account'|'any', target, cap }]`.
- * Accepts flat `{ anthropic: 20, ANTHROPIC_API_KEY: 50 }`, prefixed `adapter:id` / `account:name`,
- * or nested `{ adapters: { ... }, accounts: { ... } }`. `null`, `false`, and `""` mean no cap.
+ * A spend cap's window: `since` and `until`, UTC days (`YYYY-MM-DD`). The cap is then one total
+ * over [since 00:00Z, until 00:00Z) — `until` is the first day it no longer covers — instead of a
+ * monthly one, and it refuses outside that window: before `since` it has not opened, from `until`
+ * on it has closed (a promotional grant that expires, whose spend would fall on paid credit after
+ * it). `{ since, until, sinceMs, untilMs }`, or `{ invalid }` saying what is wrong — a cap with an
+ * invalid window refuses every request (it never turns into no cap at all).
+ */
+export function parseSpendWindow(since, until) {
+  const day = (v) => {
+    const t = typeof v === 'string' ? v.trim() : '';
+    if (!SPEND_WINDOW_DAY_RE.test(t)) return NaN;
+    const ms = Date.parse(`${t}T00:00:00Z`);
+    return Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 10) === t ? ms : NaN;
+  };
+  const sinceMs = day(since);
+  const untilMs = day(until);
+  const said = (v) => (v === undefined ? 'none' : String(JSON.stringify(v)).slice(0, 40));
+  if (!Number.isFinite(sinceMs) || !Number.isFinite(untilMs)) {
+    return { invalid: `a windowed cap takes both since and until as UTC days (YYYY-MM-DD) — got since ${said(since)}, until ${said(until)}` };
+  }
+  if (untilMs <= sinceMs) return { invalid: `until (${until.trim()}) must be a day after since (${since.trim()})` };
+  return { since: since.trim(), until: until.trim(), sinceMs, untilMs };
+}
+
+/**
+ * Normalize `limits.spend` from config into `[{ kind: 'adapter'|'account'|'any', target, cap,
+ * window? }]`. Accepts flat `{ anthropic: 20, ANTHROPIC_API_KEY: 50 }`, prefixed `adapter:id` /
+ * `account:name`, or nested `{ adapters: { ... }, accounts: { ... } }`; a cap is a number or
+ * `{ usd }`, monthly, or `{ usd, since, until }`, one total over that window (parseSpendWindow).
+ * `null`, `false`, and `""` mean no cap.
  */
 export function parseSpendCaps(spendCfg, adaptersCfg = null) {
   if (!spendCfg || typeof spendCfg !== 'object' || Array.isArray(spendCfg)) return [];
   const out = [];
   const addCap = (kind, target, raw) => {
-    const val = typeof raw === 'object' && raw !== null ? (raw.usd ?? raw.cap ?? raw.limit) : raw;
+    const obj = typeof raw === 'object' && raw !== null;
+    const val = obj ? (raw.usd ?? raw.cap ?? raw.limit) : raw;
     if (val == null || typeof val === 'boolean' || (typeof val === 'string' && !val.trim())) return;
     const cap = Number(val);
     if (!target || !Number.isFinite(cap) || cap < 0) return;
-    out.push({ kind, target: String(target), cap });
+    const entry = { kind, target: String(target), cap };
+    if (obj && (raw.since != null || raw.until != null)) entry.window = parseSpendWindow(raw.since, raw.until);
+    out.push(entry);
   };
   for (const [k, v] of Object.entries(spendCfg)) {
     if ((k === 'adapters' || k === 'adapter' || k === 'byAdapter') && v && typeof v === 'object' && !Array.isArray(v)) {
@@ -903,6 +935,42 @@ export function parseSpendCaps(spendCfg, adaptersCfg = null) {
     }
   }
   return out;
+}
+
+/** What a windowed cap says of its window, for the usage table and the status page. */
+function windowOf(c) {
+  return c.window.invalid ? { invalid: c.window.invalid } : { since: c.window.since, until: c.window.until };
+}
+
+/** A windowed cap's state in a word or two, with its window: `ok (total 2026-11-12 … 2026-12-09, until excluded)`. */
+export function windowCapLabel(s) {
+  const w = s.window || {};
+  if (w.invalid) return `INVALID WINDOW (${w.invalid})`;
+  const span = `total ${w.since} … ${w.until}, until excluded`;
+  const word = { open: 'ok', spent: 'CAPPED', 'not open': 'NOT OPEN', closed: 'CLOSED', unreadable: `UNREADABLE (${s.error})` }[s.windowStatus] || (s.exceeded ? 'CAPPED' : 'ok');
+  return `${word} (${span})`;
+}
+
+function emptySpendBuckets() {
+  return { byAdapter: new Map(), byAccount: new Map(), byKeyAdapter: new Map(), byKeyAccount: new Map() };
+}
+
+/** `usd` of metered spend onto `b`'s per-adapter, per-account and per-key maps. */
+function addSpendTo(b, { adapter, account, key, usd }) {
+  if (adapter) b.byAdapter.set(adapter, roundUsd((b.byAdapter.get(adapter) || 0) + usd));
+  if (account) b.byAccount.set(account, roundUsd((b.byAccount.get(account) || 0) + usd));
+  if (typeof key === 'string' && key) {
+    if (adapter) {
+      let ka = b.byKeyAdapter.get(key);
+      if (!ka) b.byKeyAdapter.set(key, (ka = new Map()));
+      ka.set(adapter, roundUsd((ka.get(adapter) || 0) + usd));
+    }
+    if (account) {
+      let kac = b.byKeyAccount.get(key);
+      if (!kac) b.byKeyAccount.set(key, (kac = new Map()));
+      kac.set(account, roundUsd((kac.get(account) || 0) + usd));
+    }
+  }
 }
 
 function redactDeep(v) {
@@ -1156,6 +1224,7 @@ export class UsageLog {
     this.log = typeof log === 'function' ? log : null;
     this._currentMonth = null;
     this._spendState = null;
+    this._pastSpend = new Map(); // month -> spend state of a month before the current one (windowed caps)
     this._dailyState = null;
     this._readErrors = new Map(); // file -> public message (no directory path or username)
     this._fileRanges = new Map(); // file -> { ino, size, firstMs, lastMs }
@@ -1319,16 +1388,16 @@ export class UsageLog {
     this._fileRanges.delete(this.file);
     this._dayFiles.delete(this.file);
     this._currentMonth = nextMonth;
+    // The closed month's spend stays known to a windowed cap that spans the turn, unread again.
+    if (this._spendState?.month === prevMonth && !this._spendState.readError) this._keepPastSpend(this._spendState);
     this._spendState = this._emptySpendState(nextMonth);
   }
 
   _emptySpendState(month) {
     return {
       month,
-      byAdapter: new Map(),
-      byAccount: new Map(),
-      byKeyAdapter: new Map(),
-      byKeyAccount: new Map(),
+      ...emptySpendBuckets(),
+      byDay: new Map(), // YYYY-MM-DD -> emptySpendBuckets(): what a windowed cap sums
       reservedByAdapter: new Map(),
       reservedByAccount: new Map(),
       adaptersSeen: new Set(),
@@ -1418,29 +1487,19 @@ export class UsageLog {
     return found;
   }
 
-  _addMeteredSpend(state, { adapter, account, key, usd }) {
+  _addMeteredSpend(state, { adapter, account, key, usd, day = null }) {
     if (!(usd > 0)) return;
     if (adapter) {
       const seenAdapter = typeof adapter === 'string' ? capDim(adapter) : null;
       if (seenAdapter && (state.adaptersSeen.has(seenAdapter) || state.adaptersSeen.size < MAX_ADAPTERS_SEEN)) {
         state.adaptersSeen.add(seenAdapter);
       }
-      state.byAdapter.set(adapter, roundUsd((state.byAdapter.get(adapter) || 0) + usd));
     }
-    if (account) {
-      state.byAccount.set(account, roundUsd((state.byAccount.get(account) || 0) + usd));
-    }
-    if (typeof key === 'string' && key) {
-      if (adapter) {
-        let ka = state.byKeyAdapter.get(key);
-        if (!ka) state.byKeyAdapter.set(key, (ka = new Map()));
-        ka.set(adapter, roundUsd((ka.get(adapter) || 0) + usd));
-      }
-      if (account) {
-        let kac = state.byKeyAccount.get(key);
-        if (!kac) state.byKeyAccount.set(key, (kac = new Map()));
-        kac.set(account, roundUsd((kac.get(account) || 0) + usd));
-      }
+    addSpendTo(state, { adapter, account, key, usd });
+    if (typeof day === 'string' && day && state.byDay) {
+      let b = state.byDay.get(day);
+      if (!b) state.byDay.set(day, (b = emptySpendBuckets()));
+      addSpendTo(b, { adapter, account, key, usd });
     }
   }
 
@@ -1469,6 +1528,7 @@ export class UsageLog {
             account: f.account || null,
             key: e.key,
             usd: fUsd,
+            day: e.ts.slice(0, 10),
           });
         }
       }
@@ -1480,6 +1540,7 @@ export class UsageLog {
       account: e.account || null,
       key: e.key,
       usd: ownUsd,
+      day: e.ts.slice(0, 10),
     });
   }
 
@@ -1497,6 +1558,37 @@ export class UsageLog {
         return this._spendState;
       }
     }
+    // An earlier month's state (no row since the month turned, so no rollover yet) stays known.
+    if (this._spendState && this._spendState.month < m && !this._spendState.readError) this._keepPastSpend(this._spendState);
+    this._spendState = this._buildSpendState(m, nowMs);
+    return this._spendState;
+  }
+
+  /**
+   * The spend state of `month` for a windowed cap, leaving the current month's (`_spendState`)
+   * alone: the current month's is `_ensureSpendMonth`'s; an earlier one is read once from its
+   * files and kept (a closed month only changes by a late row record() adds to it), a failed read
+   * tried again after SPEND_RETRY_BACKOFF_MS.
+   */
+  _spendStateOf(month) {
+    const nowMs = this._nowDate().getTime();
+    if (month === utcMonth(nowMs)) return this._ensureSpendMonth(month);
+    if (this._spendState && this._spendState.month === month && !this._spendState.readError) return this._spendState;
+    const kept = this._pastSpend.get(month);
+    if (kept && (!kept.readError || nowMs < (kept.retryAt || 0))) return kept;
+    const state = this._buildSpendState(month, nowMs);
+    this._keepPastSpend(state);
+    return state;
+  }
+
+  _keepPastSpend(state) {
+    this._pastSpend.delete(state.month);
+    this._pastSpend.set(state.month, state);
+    while (this._pastSpend.size > 24) this._pastSpend.delete(this._pastSpend.keys().next().value);
+  }
+
+  /** `month`'s metered spend, read from its archive and the active file. */
+  _buildSpendState(m, nowMs) {
     const state = this._emptySpendState(m);
     const candidates = [];
     const archived = this.monthFile(m);
@@ -1544,9 +1636,58 @@ export class UsageLog {
         }
       }
     }
-
-    this._spendState = state;
     return state;
+  }
+
+  /**
+   * Metered spend of `target` (`kind` 'adapter' or 'account') inside windowed cap `c`'s window,
+   * now: `{ spent, reserved, own, error, retryAfter }` — `spent` from the rows of the window's days
+   * (in every month it spans), `reserved` what requests in flight hold while the window is open,
+   * `own` the part of `spent` that `key` made. `error` when a month's log is unreadable.
+   */
+  _windowSpend(c, kind, { key = null } = {}) {
+    const w = c.window;
+    const nowMs = this._nowDate().getTime();
+    let spent = 0;
+    let own = 0;
+    const last = Math.min(w.untilMs - 1, nowMs);
+    if (last >= w.sinceMs) {
+      const lastMonth = utcMonth(last);
+      for (let m = utcMonth(w.sinceMs); m <= lastMonth; m = nextMonthStartUtc(m).slice(0, 7)) {
+        const state = this._spendStateOf(m);
+        if (state.readError) return { spent: null, reserved: 0, own: null, error: state.readError, retryAfter: Math.max(1, Math.ceil(SPEND_RETRY_BACKOFF_MS / 1000)) };
+        for (const [day, b] of state.byDay) {
+          if (day < w.since || day >= w.until) continue;
+          spent += (kind === 'adapter' ? b.byAdapter : b.byAccount).get(c.target) || 0;
+          if (key) own += (kind === 'adapter' ? b.byKeyAdapter : b.byKeyAccount).get(key)?.get(c.target) || 0;
+        }
+      }
+    }
+    let reserved = 0;
+    if (nowMs >= w.sinceMs && nowMs < w.untilMs) {
+      const state = this._spendStateOf(utcMonth(nowMs));
+      if (!state.readError) reserved = (kind === 'adapter' ? state.reservedByAdapter : state.reservedByAccount).get(c.target) || 0;
+    }
+    return { spent: roundUsd(spent), reserved: roundUsd(reserved), own: roundUsd(own), error: null };
+  }
+
+  /**
+   * Where windowed cap `c` stands for `target` now: `{ status, spent, effective, … }` — status
+   * 'invalid' (its window is not one), 'unreadable', 'not open' (before since), 'closed' (from
+   * until on), 'spent' (the window's spend, in flight included, at or over the cap) or 'open'.
+   */
+  _windowCapStatus(c, kind, { key = null } = {}) {
+    const w = c.window;
+    if (w.invalid) return { status: 'invalid', spent: null, effective: null, error: w.invalid, retryAfter: 60 };
+    const nowMs = this._nowDate().getTime();
+    const r = this._windowSpend(c, kind, { key });
+    if (r.error) return { status: 'unreadable', spent: null, effective: null, error: r.error, retryAfter: r.retryAfter };
+    const effective = roundUsd(r.spent + r.reserved);
+    const base = { spent: r.spent, own: r.own, effective, reserved: r.reserved };
+    if (nowMs < w.sinceMs) return { ...base, status: 'not open', retryAfter: Math.max(1, Math.ceil((w.sinceMs - nowMs) / 1000)) };
+    if (nowMs >= w.untilMs) return { ...base, status: 'closed', retryAfter: 3600 };
+    if (Math.round(effective * 1e9) >= Math.round(c.cap * 1e9)) return { ...base, status: 'spent', retryAfter: 3600 };
+    return { ...base, status: 'open' };
   }
 
   _dailySidecarFile() {
@@ -1883,6 +2024,8 @@ export class UsageLog {
 
       if (this._spendState && this._spendState.month === month && !this._spendState.readError) {
         this._addRowToSpendState(this._spendState, clean);
+      } else if (this._pastSpend.has(month) && !this._pastSpend.get(month).readError) {
+        this._addRowToSpendState(this._pastSpend.get(month), clean);
       }
       if (this._dailyState && Number.isFinite(rowMs) && dayOf(rowMs) === this._dailyState.day) {
         this._addRowToDailyState(this._dailyState, clean);
@@ -2188,6 +2331,22 @@ export class UsageLog {
         }
       }
       if (!matches) continue;
+      if (c.window) {
+        const w = this._windowCapStatus(c, kind);
+        if (w.status === 'open') continue;
+        return {
+          kind,
+          target: c.target,
+          cap: c.cap,
+          spent: w.effective,
+          window: windowOf(c),
+          windowStatus: w.status,
+          ...(w.error ? { error: w.error } : {}),
+          retryAfter: w.retryAfter,
+          month: null,
+          resetAt: null,
+        };
+      }
       if (state.readError) {
         return {
           kind,
@@ -2282,6 +2441,21 @@ export class UsageLog {
       if (kind === 'any') {
         const isAdapter = (adapters && Object.hasOwn(adapters, c.target)) || state.adaptersSeen.has(capDim(c.target));
         kind = isAdapter ? 'adapter' : 'account';
+      }
+      if (c.window) {
+        const w = this._windowCapStatus(c, kind, { key: callerKey });
+        const exceeded = w.status !== 'open';
+        const out = { kind, target: c.target, spent: callerKey ? w.own ?? null : w.spent, cap: c.cap };
+        if (!callerKey) out.remaining = w.spent == null ? 0 : roundUsd(Math.max(0, c.cap - w.spent));
+        return {
+          ...out,
+          exceeded,
+          ...(w.error ? { error: w.error } : {}),
+          window: windowOf(c),
+          windowStatus: w.status,
+          month: null,
+          resetAt: null,
+        };
       }
       if (state.readError) {
         if (callerKey) {
@@ -3300,11 +3474,12 @@ export function formatUsageTable(report, { spend = [], daily = [] } = {}) {
   }
   if (spend && spend.length) {
     lines.push('');
-    lines.push(`spend caps (${spend[0].month}, resets ${spend[0].resetAt}):`);
+    const monthly = spend.find((s) => !s.window);
+    lines.push(monthly ? `spend caps (${monthly.month}, resets ${monthly.resetAt}):` : 'spend caps:');
     const w = maxWidth(spend, (s) => `${s.kind} ${s.target}`.length, 8);
     for (const s of spend) {
-      const status = s.error ? `UNREADABLE (${s.error})` : s.exceeded ? 'CAPPED' : 'ok';
-      lines.push(`  ${`${s.kind} ${s.target}`.padEnd(w)}  ${fmtUsd(s.spent)} / ${fmtUsd(s.cap)}  ${status}`);
+      const status = s.window ? windowCapLabel(s) : s.error ? `UNREADABLE (${s.error})` : s.exceeded ? 'CAPPED' : 'ok';
+      lines.push(`  ${`${s.kind} ${s.target}`.padEnd(w)}  ${s.spent == null ? '?' : fmtUsd(s.spent)} / ${fmtUsd(s.cap)}  ${status}`);
     }
   }
   if (daily && daily.length) {

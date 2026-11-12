@@ -1108,6 +1108,17 @@ cap):
 }
 ```
 
+A cap may instead be one total over a window of UTC days — a promotional grant that expires,
+whose spend would fall on paid credit after it: `{ "usd": 25, "since": "2026-11-12", "until":
+"2026-12-09" }` counts the metered spend of every row from `since` 00:00Z up to `until` 00:00Z
+(`until` is the first day it no longer covers), across the month turn, with what requests in
+flight hold. It refuses once that total reaches the cap, and outside its window: before `since`
+it has not opened (`retry-after` until it does), from `until` on it has closed — it never resets,
+so its `retry-after` is an hour and a config change is what lifts it. A window that is not two
+UTC days with `until` after `since` refuses every request instead of capping nothing. `keysmith
+usage` and the status page show the window beside the spend (`total 2026-11-12 … 2026-12-09,
+until excluded`).
+
 Each cap's month-to-date `metered` spend is kept in memory — seeded lazily once from the current
 UTC month's file on first use and again when the UTC month turns, and incremented as each
 new row is written, with `adaptersSeen` bounded to 200 characters per name (cut with

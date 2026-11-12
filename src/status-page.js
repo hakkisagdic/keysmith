@@ -1,6 +1,6 @@
 import { rel } from './util.js';
 import { configPath } from './config.js';
-import { fmtUsd } from './usage.js';
+import { fmtUsd, windowCapLabel } from './usage.js';
 
 /**
  * A one-screen status page at `/`. Not a product — a place to see, in a browser,
@@ -15,11 +15,13 @@ export function statusPage({ cfg, models, usage, usageFilter = null, spend = nul
   const spendCaps = spend ?? (usage?.spendSummary?.(cfg?.limits?.spend, { adapters: cfg?.adapters, filter: usageFilter }) || []);
   const spendRows = spendCaps
     .map((s) => {
-      const spentCell = s.error
+      const spentCell = s.error || s.spent == null
         ? `unreadable / ${esc(fmtUsd(s.cap))}`
         : `${esc(fmtUsd(s.spent))} / ${esc(fmtUsd(s.cap))}`;
-      const statusCell = s.error ? `unreadable (${esc(s.error)})` : s.exceeded ? 'capped' : 'ok';
-      return `<tr><td>${esc(s.target)}</td><td class="muted">${esc(s.kind)}</td><td class="n ${s.exceeded ? 'bad' : ''}">${spentCell}</td><td class="${s.exceeded ? 'bad' : 'ok'}">${statusCell}</td><td class="muted">${esc(s.resetAt)}</td></tr>`;
+      const statusCell = s.window ? esc(windowCapLabel(s)) : s.error ? `unreadable (${esc(s.error)})` : s.exceeded ? 'capped' : 'ok';
+      // A windowed cap never resets: its window instead (until excluded).
+      const resetsCell = s.window ? (s.window.invalid ? 'never' : `total ${esc(s.window.since)} … ${esc(s.window.until)}`) : esc(s.resetAt);
+      return `<tr><td>${esc(s.target)}</td><td class="muted">${esc(s.kind)}</td><td class="n ${s.exceeded ? 'bad' : ''}">${spentCell}</td><td class="${s.exceeded ? 'bad' : 'ok'}">${statusCell}</td><td class="muted">${resetsCell}</td></tr>`;
     })
     .join('');
   // Per key: the fingerprint, never the key. Shown to an unscoped key only; a scoped one sees
@@ -66,7 +68,7 @@ ${models.map((m) => `<tr><td${m.keysmith?.kind === 'alias' && aliasIssues[m.id] 
 </tbody></table>
 ${keys ? `<h2>Keys</h2><table><thead><tr><th>key</th><th>label</th><th>scope</th><th class="n">today / cap</th><th class="n">req 24h (UTC hour)</th><th class="n">denied</th></tr></thead><tbody>${keyRows}</tbody></table>${keyIssues.length ? `<p class="bad">${keyIssues.map(esc).join('<br>')}</p>` : ''}<p class="muted">A key is named by its fingerprint. <code>keysmith key scope fp:&lt;hex&gt; --deny &lt;adapter&gt;</code> narrows one, <code>--per-day N</code> caps its requests per local day; <code>keysmith key who-can &lt;adapter&gt;</code> lists the keys that reach an adapter.</p>` : ''}
 ${failover ? failoverSection(failover) : ''}
-${spendRows ? `<h2>Spend caps (${esc(spendCaps[0].month)})</h2><table><thead><tr><th>target</th><th>kind</th><th class="n">spent / cap</th><th>status</th><th>resets</th></tr></thead><tbody>${spendRows}</tbody></table>` : ''}
+${spendRows ? `<h2>Spend caps${spendCaps.find((s) => s.month) ? ` (${esc(spendCaps.find((s) => s.month).month)})` : ''}</h2><table><thead><tr><th>target</th><th>kind</th><th class="n">spent / cap</th><th>status</th><th>resets</th></tr></thead><tbody>${spendRows}</tbody></table>` : ''}
 ${rows ? `<h2>Last 24h by model (rounded to the UTC hour)</h2><table><thead><tr><th>model</th><th class="n">req</th><th class="n">err</th><th class="n">in</th><th class="n">out</th><th class="n">p50 / p95</th><th class="n">avg</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
 <p class="muted">Keys never leave this machine's config. <code>Authorization: Bearer &lt;key&gt;</code> is required on /v1. This page takes the key once, through its form, and keeps a cookie that opens this page alone for an hour.</p>
 </body></html>`;

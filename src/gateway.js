@@ -246,17 +246,22 @@ export class Gateway {
     const capped = this.usage.checkSpendCap(spendCfg, adapter, { adaptersCfg: this.cfg?.adapters });
     this._warnExecMigrationOnce({ checkDisk: false });
     if (!capped) return null;
-    const msg = capped.error
-      ? `spend cap for ${capped.kind} "${capped.target}" (${fmtUsd(capped.cap)} monthly cap in ${capped.month}, resets ${capped.resetAt}): refusing request because the usage log is unreadable (${capped.error})`
-      : scope
-        ? `spend cap reached for ${capped.kind} "${capped.target}" (${fmtUsd(capped.cap)} monthly cap in ${capped.month}, resets ${capped.resetAt})`
-        : `spend cap reached for ${capped.kind} "${capped.target}": spent ${fmtUsd(capped.spent)} of ${fmtUsd(capped.cap)} monthly cap in ${capped.month} (resets ${capped.resetAt})`;
+    const msg = capped.window
+      ? windowCapMessage(capped, scope)
+      : capped.error
+        ? `spend cap for ${capped.kind} "${capped.target}" (${fmtUsd(capped.cap)} monthly cap in ${capped.month}, resets ${capped.resetAt}): refusing request because the usage log is unreadable (${capped.error})`
+        : scope
+          ? `spend cap reached for ${capped.kind} "${capped.target}" (${fmtUsd(capped.cap)} monthly cap in ${capped.month}, resets ${capped.resetAt})`
+          : `spend cap reached for ${capped.kind} "${capped.target}": spent ${fmtUsd(capped.spent)} of ${fmtUsd(capped.cap)} monthly cap in ${capped.month} (resets ${capped.resetAt})`;
     const err = new LlmError(msg, {
       status: 429,
       type: 'rate_limit_error',
       provider: adapter.id,
     });
-    if (capped.error) {
+    if (capped.window) {
+      // A windowed cap never resets: closed, spent or invalid, only a config change lifts it.
+      err.retryAfter = capped.retryAfter || 3600;
+    } else if (capped.error) {
       err.retryAfter = capped.retryAfter || 5;
     } else {
       const nowMs = this.usage?._nowDate ? this.usage._nowDate().getTime() : Date.now();
@@ -2013,4 +2018,22 @@ function countPromptChars(val) {
     return n;
   }
   return 0;
+}
+
+/** The 429's message of a windowed spend cap (limits.spend `{ usd, since, until }`) that refuses. */
+function windowCapMessage(capped, scope) {
+  const who = `${capped.kind} "${capped.target}"`;
+  const w = capped.window || {};
+  if (w.invalid) return `spend cap for ${who} has an invalid window (limits.spend: ${w.invalid}): refusing every request until it is fixed`;
+  const span = `${fmtUsd(capped.cap)} in total from ${w.since} until ${w.until}`;
+  switch (capped.windowStatus) {
+    case 'unreadable':
+      return `spend cap for ${who} (${span}): refusing request because the usage log is unreadable (${capped.error})`;
+    case 'not open':
+      return `spend cap for ${who} (${span}) has not opened yet: refusing requests before ${w.since}`;
+    case 'closed':
+      return `spend cap for ${who} (${span}) closed on ${w.until}: refusing requests after its window`;
+    default:
+      return scope ? `spend cap reached for ${who} (${span})` : `spend cap reached for ${who}: spent ${fmtUsd(capped.spent)} of ${span}`;
+  }
 }
