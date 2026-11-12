@@ -7,9 +7,13 @@
  *   2. Check `loadGate` (`maxLoadPerCore`, `maxMemoryPressure`). If the machine is congested,
  *      skip the classifier and route to the configured `congested` tier or the first remote
  *      candidate of the `medium` tier (falling through to `complex`).
- *   3. Otherwise ask the configured `classifier` (`adapter/model`) for a one-word complexity
- *      label (`simple` | `medium` | `complex`) with a short, cached prompt, tiny `max_tokens`,
- *      and low timeout; on classifier failure, timeout, or invalid reply, default to `medium`.
+ *   3. Otherwise a session's sticky label wins, then the first matching `rules` entry (a fast
+ *      path: no classifier call at all), then the prompt cache; else ask the configured
+ *      `classifier` (`adapter/model`) for a one-word complexity label (`simple` | `medium` |
+ *      `complex`) with a short instruction (`classifierPrompt`, else CLASSIFIER_SYSTEM_PROMPT),
+ *      tiny `max_tokens`, and a low timeout; on classifier failure, timeout, or invalid reply,
+ *      default to `medium`. A classifier call is metered like a leg: it is held to the
+ *      classifier adapter's spend cap and writes its own usage row (`purpose: "classifier"`).
  *   4. Try the chosen tier's candidates in declared order, enforcing key scope on every concrete
  *      target before calling it, and falling through on 429 / quota / spend cap / timeout / 5xx
  *      to the next candidate in the tier and then to the next tier up (`simple` -> `medium` -> `complex`).
@@ -37,6 +41,11 @@ export const DEFAULT_CLASSIFIER_MAX_TOKENS = 8;
 export const DEFAULT_CLASSIFIER_TIMEOUT_MS = 2500;
 export const DEFAULT_PROMPT_CACHE_SECONDS = 60;
 const MAX_CLASSIFIER_PROMPT_CHARS = 1200;
+const MAX_CLASSIFIER_INSTRUCTION_CHARS = 4000;
+const MAX_RULES = 32;
+const MAX_RULE_PATTERNS = 64;
+const MAX_RULE_PATTERN_CHARS = 300;
+const RULE_FIELDS = new Set(['name', 'label', 'match', 'unless', 'maxChars', 'noTools', 'noMedia', 'noCode']);
 const MAX_CACHE_ENTRIES = 512;
 
 const FORBIDDEN_NAMES = new Set(['__proto__', 'constructor', 'prototype', 'toString', 'valueOf', 'hasOwnProperty']);
@@ -49,6 +58,8 @@ const ALLOWED_VIRTUAL_FIELDS = new Set([
   'classifierTimeoutMs',
   'maxTokens',
   'classifierMaxTokens',
+  'classifierPrompt',
+  'rules',
   'note',
   'description',
   'media',
@@ -227,6 +238,7 @@ export function checkVirtualModel(name, raw, { cfg = {}, adapters = null, loadEr
   let classifierStr = null;
   let classifierTimeoutMs = raw.classifierTimeoutMs ?? raw.timeoutMs ?? DEFAULT_CLASSIFIER_TIMEOUT_MS;
   let classifierMaxTokens = raw.classifierMaxTokens ?? raw.maxTokens ?? DEFAULT_CLASSIFIER_MAX_TOKENS;
+  let classifierPrompt = raw.classifierPrompt;
 
   if (typeof raw.classifier === 'string') {
     classifierStr = raw.classifier;
@@ -234,6 +246,7 @@ export function checkVirtualModel(name, raw, { cfg = {}, adapters = null, loadEr
     classifierStr = raw.classifier.model;
     if (raw.classifier.timeoutMs !== undefined) classifierTimeoutMs = raw.classifier.timeoutMs;
     if (raw.classifier.maxTokens !== undefined) classifierMaxTokens = raw.classifier.maxTokens;
+    if (raw.classifier.prompt !== undefined) classifierPrompt = raw.classifier.prompt;
   }
   if (typeof classifierStr !== 'string' || !classifierStr.trim()) {
     throw new Error(`virtual model "${name}": classifier must be a non-empty "<adapter>/<model>" string`);
@@ -250,6 +263,19 @@ export function checkVirtualModel(name, raw, { cfg = {}, adapters = null, loadEr
   }
   if (typeof classifierMaxTokens !== 'number' || !Number.isInteger(classifierMaxTokens) || classifierMaxTokens <= 0) {
     throw new Error(`virtual model "${name}": classifierMaxTokens must be a positive integer`);
+  }
+  // The classifier's instruction: the system message it is asked under. Its reply is still read
+  // for one of simple, medium or complex, so the instruction should ask for exactly that.
+  if (classifierPrompt !== undefined && classifierPrompt !== null) {
+    if (typeof classifierPrompt !== 'string' || !classifierPrompt.trim()) {
+      throw new Error(`virtual model "${name}": classifierPrompt must be a non-empty string`);
+    }
+    if (classifierPrompt.length > MAX_CLASSIFIER_INSTRUCTION_CHARS) {
+      throw new Error(`virtual model "${name}": classifierPrompt is ${classifierPrompt.length} characters, over ${MAX_CLASSIFIER_INSTRUCTION_CHARS}`);
+    }
+    classifierPrompt = classifierPrompt.trim();
+  } else {
+    classifierPrompt = null;
   }
 
   // 2. Validate tiers
@@ -347,6 +373,9 @@ export function checkVirtualModel(name, raw, { cfg = {}, adapters = null, loadEr
     stickySeconds = raw.stickySeconds;
   }
 
+  // 5. Validate rules (the fast path)
+  const rules = checkRules(name, raw.rules);
+
   return {
     name,
     classifier: classifierLeg.target,
@@ -357,8 +386,113 @@ export function checkVirtualModel(name, raw, { cfg = {}, adapters = null, loadEr
     stickySeconds,
     classifierTimeoutMs,
     classifierMaxTokens,
+    classifierPrompt,
+    rules,
     note: typeof raw.note === 'string' ? raw.note : null,
   };
+}
+
+/**
+ * `rules`: the fast path, tried in order before the prompt cache and the classifier; the first
+ * rule whose every condition holds gives the label and the classifier is not asked. A condition:
+ *   - `match`: a pattern (or a list, any one of them) that must be found in the prompt;
+ *   - `unless`: a pattern (or a list) none of which may be found;
+ *   - `maxChars`: the prompt is at most this many characters (up to 1200, what the classifier reads);
+ *   - `noTools` / `noMedia` / `noCode`: the request carries no tools / no image, audio or file part /
+ *     no ``` code block.
+ * Patterns are JavaScript regular expressions, matched case-insensitively against the prompt the
+ * classifier would read (the last user message). A rule needs a `label` and at least one condition.
+ */
+function checkRules(name, raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error(`virtual model "${name}": rules must be an array of rule objects`);
+  if (raw.length > MAX_RULES) throw new Error(`virtual model "${name}": at most ${MAX_RULES} rules`);
+  let patterns = 0;
+  return raw.map((r, i) => {
+    const where = `virtual model "${name}" rules[${i}]`;
+    if (!r || typeof r !== 'object' || Array.isArray(r)) throw new Error(`${where} must be an object`);
+    for (const k of Object.keys(r)) {
+      if (!RULE_FIELDS.has(k)) throw new Error(`${where}: unknown field "${k}" (expected ${[...RULE_FIELDS].join(', ')})`);
+    }
+    if (!TIER_ORDER.includes(r.label)) throw new Error(`${where}: label must be simple, medium, or complex`);
+    if (r.name !== undefined && (typeof r.name !== 'string' || !r.name.trim() || r.name.length > 60)) {
+      throw new Error(`${where}: name must be a non-empty string of at most 60 characters`);
+    }
+    const compile = (field) => {
+      if (r[field] === undefined) return [];
+      const list = typeof r[field] === 'string' ? [r[field]] : r[field];
+      if (!Array.isArray(list) || !list.length || list.some((p) => typeof p !== 'string' || !p)) {
+        throw new Error(`${where}: ${field} must be a pattern or a non-empty list of patterns`);
+      }
+      patterns += list.length;
+      if (patterns > MAX_RULE_PATTERNS) throw new Error(`virtual model "${name}": at most ${MAX_RULE_PATTERNS} rule patterns in all`);
+      return list.map((p, j) => {
+        if (p.length > MAX_RULE_PATTERN_CHARS) throw new Error(`${where}: ${field}[${j}] is over ${MAX_RULE_PATTERN_CHARS} characters`);
+        try {
+          return new RegExp(p, 'iu');
+        } catch (e) {
+          throw new Error(`${where}: ${field}[${j}] is not a valid regular expression (${e.message})`);
+        }
+      });
+    };
+    const match = compile('match');
+    const unless = compile('unless');
+    let maxChars = null;
+    if (r.maxChars !== undefined) {
+      if (!Number.isInteger(r.maxChars) || r.maxChars <= 0 || r.maxChars > MAX_CLASSIFIER_PROMPT_CHARS) {
+        throw new Error(`${where}: maxChars must be a whole number from 1 to ${MAX_CLASSIFIER_PROMPT_CHARS}`);
+      }
+      maxChars = r.maxChars;
+    }
+    for (const k of ['noTools', 'noMedia', 'noCode']) {
+      if (r[k] !== undefined && typeof r[k] !== 'boolean') throw new Error(`${where}: ${k} must be true or false`);
+    }
+    const rule = {
+      name: r.name ? r.name.trim() : `rules[${i}]`,
+      label: r.label,
+      match,
+      unless,
+      maxChars,
+      noTools: r.noTools === true,
+      noMedia: r.noMedia === true,
+      noCode: r.noCode === true,
+    };
+    if (!match.length && !unless.length && maxChars === null && !rule.noTools && !rule.noMedia && !rule.noCode) {
+      throw new Error(`${where}: a rule needs at least one condition (match, unless, maxChars, noTools, noMedia or noCode)`);
+    }
+    return rule;
+  });
+}
+
+/** Does any message carry an image, audio, video or file part (the gateway's `parts`, or raw content parts)? */
+export function messagesCarryMedia(messages) {
+  if (!Array.isArray(messages)) return false;
+  return messages.some(
+    (m) =>
+      (Array.isArray(m?.parts) && m.parts.length > 0) ||
+      (Array.isArray(m?.content) && m.content.some((p) => p && typeof p === 'object' && !['text', 'input_text', 'output_text'].includes(p.type))),
+  );
+}
+
+/**
+ * The first of `vspec.rules` that holds for this request, as `{ label, rule }` (the rule's name),
+ * or null. `promptText` is what the classifier would read; `hasTools` and `hasMedia` describe
+ * the request itself.
+ */
+export function matchVirtualRule(vspec, { promptText = '', hasTools = false, hasMedia = false } = {}) {
+  const rules = vspec?.rules;
+  if (!Array.isArray(rules) || !rules.length) return null;
+  const text = String(promptText || '');
+  for (const r of rules) {
+    if (r.noTools && hasTools) continue;
+    if (r.noMedia && hasMedia) continue;
+    if (r.noCode && text.includes('```')) continue;
+    if (r.maxChars !== null && text.length > r.maxChars) continue;
+    if (r.match.length && !r.match.some((re) => re.test(text))) continue;
+    if (r.unless.some((re) => re.test(text))) continue;
+    return { label: r.label, rule: r.name };
+  }
+  return null;
 }
 
 /**
@@ -550,9 +684,9 @@ export function extractClassifierPrompt(messages, fallbackPrompt = '') {
   return String(prompt || '').trim().slice(0, MAX_CLASSIFIER_PROMPT_CHARS);
 }
 
-export function hashClassifierPrompt(promptText) {
+export function hashClassifierPrompt(promptText, instruction = CLASSIFIER_SYSTEM_PROMPT) {
   const norm = String(promptText || '').trim().replace(/\s+/g, ' ');
-  return crypto.createHash('sha256').update(`${CLASSIFIER_SYSTEM_PROMPT}\0${norm}`).digest('hex').slice(0, 24);
+  return crypto.createHash('sha256').update(`${instruction || CLASSIFIER_SYSTEM_PROMPT}\0${norm}`).digest('hex').slice(0, 24);
 }
 
 /**
@@ -570,10 +704,31 @@ export function parseClassifierLabel(rawText) {
   return word ? word[1] : null;
 }
 
+/** Token counts from several `usage` events of one call: the largest of each. */
+function mergeClassifierUsage(a, b) {
+  if (!b || typeof b !== 'object') return a;
+  if (!a) return { input: b.input ?? 0, output: b.output ?? 0, cacheRead: b.cacheRead ?? 0, cacheWrite: b.cacheWrite ?? 0 };
+  return {
+    input: Math.max(a.input || 0, b.input || 0),
+    output: Math.max(a.output || 0, b.output || 0),
+    cacheRead: Math.max(a.cacheRead || 0, b.cacheRead || 0),
+    cacheWrite: Math.max(a.cacheWrite || 0, b.cacheWrite || 0),
+  };
+}
+
+const SETTLED = Promise.resolve();
+
 /**
- * Ask the classifier adapter/model for a one-word label (`simple` | `medium` | `complex`),
- * using a short cached prompt, tiny `max_tokens`, and low timeout.
- * Defaults to `medium` on any failure, timeout, or unparseable output.
+ * Label a prompt `simple` | `medium` | `complex`. In order: a session's sticky label, the rule
+ * the gateway found (`rule`, from matchVirtualRule), the prompt cache, else the classifier —
+ * asked under `vspec.classifierPrompt` (or CLASSIFIER_SYSTEM_PROMPT) with a tiny `max_tokens`
+ * and a low timeout. Defaults to `medium` on any failure, timeout, or unparseable output.
+ *
+ * `meter` makes a classifier call count like any leg: `meter.reserve({ inputTokens, outputTokens })`
+ * holds its estimated spend first (and throws when the adapter's spend cap refuses, which labels
+ * the request `medium` unasked), and `meter.record(row)` writes what the call cost once it ends.
+ * The label is returned as soon as the reply holds one; the rest of the reply (its token counts)
+ * is read after that, within the same timeout, and `settled` resolves once the row is written.
  */
 export async function classifyPrompt({
   vspec,
@@ -584,31 +739,31 @@ export async function classifyPrompt({
   now = () => Date.now(),
   signal = null,
   unavailable = null,
+  rule = null,
+  meter = null,
 }) {
   const t0 = Date.now();
   const nowMs = now();
-  const promptHash = hashClassifierPrompt(promptText);
+  const instruction = vspec.classifierPrompt || CLASSIFIER_SYSTEM_PROMPT;
+  const promptHash = hashClassifierPrompt(promptText, instruction);
   const ttlMs =
     vspec.stickySeconds != null
       ? vspec.stickySeconds * 1000
       : DEFAULT_PROMPT_CACHE_SECONDS * 1000;
 
-  if (cache && ttlMs > 0) {
-    if (session) {
-      const sKey = `${vspec.name}\0session:${session}`;
-      const hit = cache.get(sKey);
-      if (hit && nowMs - hit.at <= ttlMs) {
-        return {
-          label: hit.label,
-          reason: 'sticky',
-          cached: true,
-          classifyMs: 0,
-          promptHash,
-        };
-      }
+  if (cache && ttlMs > 0 && session) {
+    const hit = cache.get(`${vspec.name}\0session:${session}`);
+    if (hit && nowMs - hit.at <= ttlMs) {
+      return { label: hit.label, reason: 'sticky', cached: true, classifyMs: 0, promptHash, settled: SETTLED };
     }
-    const pKey = `${vspec.name}\0prompt:${promptHash}`;
-    const hit = cache.get(pKey);
+  }
+  // A rule hit labels the request without asking, and is never cached or made sticky: rules are
+  // for one-off obvious prompts, and the next prompt in the session is judged on its own.
+  if (rule && TIER_ORDER.includes(rule.label)) {
+    return { label: rule.label, reason: 'rule', rule: rule.rule || null, cached: false, classifyMs: 0, promptHash, settled: SETTLED };
+  }
+  if (cache && ttlMs > 0) {
+    const hit = cache.get(`${vspec.name}\0prompt:${promptHash}`);
     if (hit && nowMs - hit.at <= ttlMs) {
       return {
         label: hit.label,
@@ -616,6 +771,7 @@ export async function classifyPrompt({
         cached: true,
         classifyMs: 0,
         promptHash,
+        settled: SETTLED,
       };
     }
   }
@@ -629,76 +785,142 @@ export async function classifyPrompt({
       cached: false,
       classifyMs: Math.max(0, Date.now() - t0),
       promptHash,
+      settled: SETTLED,
     };
   }
 
   const timeoutMs = vspec.classifierTimeoutMs || DEFAULT_CLASSIFIER_TIMEOUT_MS;
   const maxTokens = vspec.classifierMaxTokens || DEFAULT_CLASSIFIER_MAX_TOKENS;
+  const userText = promptText || 'hello';
+
+  // The spend cap first, as for a leg: a refusal labels the request medium without asking.
+  let release = () => {};
+  if (meter?.reserve) {
+    try {
+      release = meter.reserve({ inputTokens: Math.max(1, Math.ceil((instruction.length + userText.length) / 4)), outputTokens: maxTokens }) || release;
+    } catch (err) {
+      const error = err?.message || String(err);
+      try {
+        meter.record?.({ status: 'limited', reason: 'classifier_unavailable', label: null, error, usage: null, classifyMs: 0, ms: 0 });
+      } catch {}
+      return { label: 'medium', reason: 'classifier_unavailable', error, cached: false, classifyMs: Math.max(0, Date.now() - t0), promptHash, settled: SETTLED };
+    }
+  }
+
   const ac = new AbortController();
   const onAbort = () => ac.abort();
   if (signal) {
     if (signal.aborted) ac.abort();
     else signal.addEventListener('abort', onAbort, { once: true });
   }
-  let timer = null;
   let timedOut = false;
+  let rejectDeadline = () => {};
+  const deadline = new Promise((_, reject) => (rejectDeadline = reject));
+  deadline.catch(() => {});
+  // `finish` is a function declaration below: the timer can only fire after this call has returned.
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ac.abort();
+    rejectDeadline(Object.assign(new Error(`classifier timed out after ${timeoutMs}ms`), { code: 'ETIMEDOUT', status: 504 }));
+    // An adapter that does not stop on abort still gets its row (without token counts) at the deadline.
+    finish();
+  }, timeoutMs);
+  timer.unref?.();
 
-  try {
-    const timeoutPromise = new Promise((_, reject) => {
-      timer = setTimeout(() => {
-        timedOut = true;
-        ac.abort();
-        reject(Object.assign(new Error(`classifier timed out after ${timeoutMs}ms`), { code: 'ETIMEDOUT', status: 504 }));
-      }, timeoutMs);
-      timer.unref?.();
-    });
-
-    const runClassifier = async () => {
-      let out = '';
-      // The instruction travels as a system message: the HTTP and CLI adapters read the system
-      // prompt from `messages` only, so a bare `system` field never reached the model, which then
-      // answered the request itself (`classifier_invalid`, always `medium`). `system` stays for
-      // adapters that look there.
-      const iter = adapter.complete({
-        model: vspec.classifierLeg.model,
-        system: CLASSIFIER_SYSTEM_PROMPT,
-        messages: [
-          { role: 'system', content: CLASSIFIER_SYSTEM_PROMPT },
-          { role: 'user', content: promptText || 'hello' },
-        ],
-        maxTokens,
-        temperature: 0,
-        signal: ac.signal,
-      });
-      for await (const ev of iter) {
-        if (ev.type === 'delta' && typeof ev.text === 'string') {
-          out += ev.text;
-          const early = parseClassifierLabel(out);
-          if (early && out.length >= early.length) {
+  // One read of the reply, to its end: `decided` resolves with the text as soon as it holds a
+  // label (or at its end), and the read goes on for the token counts. The row is written once.
+  const call = { out: '', usage: null, error: null, decidedMs: null };
+  let resolveSettled;
+  const settled = new Promise((r) => (resolveSettled = r));
+  let result = null; // what was returned: its label and reason go in the row
+  let ended = false;
+  let recorded = false;
+  function finish() {
+    if (recorded || !result || !(ended || timedOut)) return;
+    recorded = true;
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+    try {
+      if (meter?.record) {
+        const failed = result.reason === 'classifier_timeout' || result.reason === 'classifier_error';
+        meter.record({
+          status: failed ? 'error' : 'ok',
+          reason: result.reason,
+          label: failed || result.reason === 'classifier_invalid' ? null : result.label,
+          error: failed ? result.error : call.error && !timedOut ? call.error?.message || String(call.error) : null,
+          usage: call.usage,
+          classifyMs: result.classifyMs,
+          ms: Math.max(0, Date.now() - t0),
+        });
+      }
+    } catch {}
+    try { release(); } catch {}
+    resolveSettled();
+  }
+  const decided = new Promise((resolve, reject) => {
+    let done = false;
+    const decide = (fn, v) => {
+      if (done) return;
+      done = true;
+      call.decidedMs = Date.now() - t0;
+      fn(v);
+    };
+    (async () => {
+      try {
+        const iter = adapter.complete({
+          model: vspec.classifierLeg.model,
+          // The instruction travels as a system message: the HTTP and CLI adapters read the system
+          // prompt from `messages` only, so a bare `system` field never reached the model, which then
+          // answered the request itself (`classifier_invalid`, always `medium`). `system` stays for
+          // adapters that look there.
+          system: instruction,
+          messages: [
+            { role: 'system', content: instruction },
+            { role: 'user', content: userText },
+          ],
+          maxTokens,
+          temperature: 0,
+          signal: ac.signal,
+        });
+        for await (const ev of iter) {
+          if (ev.type === 'delta' && typeof ev.text === 'string') {
+            call.out += ev.text;
+            if (parseClassifierLabel(call.out)) decide(resolve, call.out);
+          } else if (ev.type === 'usage') {
+            call.usage = mergeClassifierUsage(call.usage, ev.usage);
+          } else if (ev.type === 'error') {
+            throw new Error(ev.message || 'classifier error');
+          } else if (ev.type === 'done') {
             break;
           }
-        } else if (ev.type === 'error') {
-          throw new Error(ev.message || 'classifier error');
-        } else if (ev.type === 'done') {
-          break;
         }
+        decide(resolve, call.out);
+      } catch (err) {
+        call.error = err;
+        decide(reject, err);
+      } finally {
+        ended = true;
+        finish();
       }
-      return out;
-    };
+    })();
+  });
 
-    const rawReply = await Promise.race([runClassifier(), timeoutPromise]);
+  try {
+    const rawReply = await Promise.race([decided, deadline]);
     const classifyMs = Math.max(0, Date.now() - t0);
     const label = parseClassifierLabel(rawReply);
 
     if (!label) {
-      return {
+      result = {
         label: 'medium',
         reason: 'classifier_invalid',
         rawReply: String(rawReply || '').slice(0, 80),
         cached: false,
         classifyMs,
         promptHash,
+        settled,
       };
+      return result;
     }
 
     if (cache && ttlMs > 0) {
@@ -711,27 +933,23 @@ export async function classifyPrompt({
       if (session) cache.set(`${vspec.name}\0session:${session}`, entry);
     }
 
-    return {
-      label,
-      reason: 'classified',
-      cached: false,
-      classifyMs,
-      promptHash,
-    };
+    result = { label, reason: 'classified', cached: false, classifyMs, promptHash, settled };
+    return result;
   } catch (err) {
     const classifyMs = Math.max(0, Date.now() - t0);
     const isTimeout = timedOut || err?.code === 'ETIMEDOUT' || err?.status === 504 || /timed?\s*out|timeout/i.test(String(err?.message || ''));
-    return {
+    result = {
       label: 'medium',
       reason: isTimeout ? 'classifier_timeout' : 'classifier_error',
       error: err?.message || String(err),
       cached: false,
       classifyMs,
       promptHash,
+      settled,
     };
+    return result;
   } finally {
-    if (timer) clearTimeout(timer);
-    if (signal) signal.removeEventListener('abort', onAbort);
+    finish();
   }
 }
 

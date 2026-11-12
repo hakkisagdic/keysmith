@@ -200,8 +200,10 @@ keysmith picks a concrete `adapter/model` per request:
 ```
 
 When the machine is congested (`loadGate`), keysmith skips the classifier and routes to the
-first remote candidate of `medium` (or `tiers.congested`). Otherwise it asks `classifier` for
-a one-word label (`simple|medium|complex`, defaulting to `medium` on failure), tries the tier's
+first remote candidate of `medium` (or `tiers.congested`). Otherwise a matching `rules` entry
+labels an obvious prompt without asking, else it asks `classifier` for a one-word label
+(`simple|medium|complex`, under `classifierPrompt` when set; defaulting to `medium` on failure;
+the call is held to the classifier adapter's spend cap and gets its own usage row), tries the tier's
 candidates in order, and falls through on `429` / quota / timeout / `5xx` to the next candidate
 and the next tier up. Key scopes allowing `auto/*` are enforced against the concrete target at
 routing time, every routed request logs `{virtual, label, chosen, fallbacks, reason, latency}`

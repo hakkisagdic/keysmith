@@ -950,6 +950,30 @@ Every virtual model entry is validated at config load time:
     `kern.memorystatus_vm_pressure_level`) or a numeric threshold `<= 100`.
 - **`stickySeconds`** *(optional)*: non-negative number of seconds to cache the classifier's
   complexity label for repeated prompts and active sessions.
+- **`classifierPrompt`** *(optional, also `classifier.prompt`)*: the instruction the classifier is
+  asked under, sent as its system message (at most 4000 characters). The default is one line
+  (`Classify the complexity of the user request. Reply with one word only: simple, medium, or
+  complex.`); a rubric saying what each label means is what lets a small local model classify
+  well. The reply is still read for one of `simple`, `medium` or `complex`, and the instruction is
+  part of the prompt cache key.
+- **`rules`** *(optional)*: a fast path tried before the prompt cache and the classifier. The first
+  rule whose every condition holds labels the request and the classifier is not asked:
+
+  ```json
+  "rules": [
+    { "name": "utility", "label": "simple", "maxChars": 160, "noTools": true, "noMedia": true, "noCode": true,
+      "match": ["\\btranslate\\b", "çevir", "\\bcommit (message|mesajı)", "what('s| is) the difference"],
+      "unless": ["\\brepo", "\\bPR\\b", "deploy", "review"] }
+  ]
+  ```
+
+  `label` (`simple`, `medium` or `complex`) and at least one condition: `match` (a pattern or a
+  list, one of which must be found), `unless` (none of which may be), `maxChars` (1–1200),
+  `noTools`, `noMedia` (no image, audio or file part), `noCode` (no ```` ``` ```` block). Patterns
+  are JavaScript regular expressions matched case-insensitively against the last user message (at
+  most 32 rules, 64 patterns, 300 characters each). In JavaScript `\b` is an ASCII word boundary
+  (it never holds before `ç`), and case folding is Unicode's, not Turkish (`İ` does not match `i`).
+  A session already sticky to a label keeps it; a rule hit is neither cached nor made sticky.
 
 ### Per-Request Routing & Fallthrough
 
@@ -957,10 +981,14 @@ Every virtual model entry is validated at config load time:
    over the threshold), keysmith skips the classifier and routes straight to the first remote
    candidate of the `medium` tier (or the configured `congested` tier), falling through to
    remaining remote candidates in `medium` and `complex`.
-2. **Classifier**: Otherwise keysmith asks `classifier` for a one-word label
-   (`simple` | `medium` | `complex`) using a short, cached prompt, tiny `max_tokens` (8), and
-   a low timeout (2.5s default). If the classifier fails, times out, or returns anything else,
-   keysmith defaults to `medium`.
+2. **Rules, then the classifier**: Otherwise a session's sticky label wins, then the first
+   matching `rules` entry, then the prompt cache; else keysmith asks `classifier` for a one-word
+   label (`simple` | `medium` | `complex`) under `classifierPrompt`, with tiny `max_tokens` (8)
+   and a low timeout (2.5s default). If the classifier fails, times out, or returns anything
+   else, keysmith defaults to `medium`. A classifier call is metered like a leg: it is held to
+   the classifier adapter's spend cap first (a cap that refuses labels the request `medium`
+   unasked), and it writes its own usage row once its reply ends (the label is used as soon as
+   it arrives).
 3. **Tier & cross-tier fallthrough**: Candidates in the selected tier are tried in declared
    order. On `429` / quota / spend cap / timeout / `5xx`, keysmith falls through to the next
    candidate in the tier and then escalates to the next tier up (`simple` → `medium` →
@@ -973,7 +1001,10 @@ Every virtual model entry is validated at config load time:
 
 ### Observability & Dry-Run Explain
 
-- **`usage.jsonl`**: Every routed request records `{ virtual, label, tier, chosen, fallbacks, fallbacksTried, reason, latency }`.
+- **`usage.jsonl`**: Every routed request records `{ virtual, label, tier, chosen, fallbacks, fallbacksTried, reason, latency }`
+  (`reason` is `rule:<name>` for a rule hit). Every classifier call records its own row,
+  `{ purpose: "classifier", virtual, model, adapter, status, reason, label, classifyMs, ms, usage, cost }`,
+  which counts toward the classifier adapter's spend like any metered row.
 - **`GET /v1/models`**: Lists configured virtual models (`owned_by: "keysmith:virtual"`),
   filtered by the requesting key's scope.
 - **`keysmith route explain`**: Dry-runs the routing decision without calling the target:

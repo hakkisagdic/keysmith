@@ -1227,6 +1227,8 @@ async function cmdRoute(flags) {
   const cfg = loadOrFail();
   const { gateway } = buildGateway(cfg, { deferAdapterChecks: true });
   const explanation = await gateway.explainRoute(vmName, prompt);
+  // The classifier call writes its usage row once its reply has ended.
+  await gateway.settleClassifierCalls();
   if (flags.json || flags.format === 'json') {
     out(JSON.stringify(explanation, null, 2));
     return;
@@ -1246,6 +1248,7 @@ async function cmdChat(flags) {
   if (!flags.stream) {
     const { text } = await gateway.collect({ model, messages });
     out(`${text.trim()}\n\n— ${model}, ${((Date.now() - started) / 1000).toFixed(1)}s`);
+    await gateway.settleClassifierCalls();
     return;
   }
   // A delta is a token or two, so a key is never inside one: each is redacted as part of
@@ -1259,6 +1262,7 @@ async function cmdChat(flags) {
     }
   }
   process.stdout.write(`${redactor.end()}\n\n— ${model}, ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
+  await gateway.settleClassifierCalls();
 }
 
 /* ------------------------------------------------------------------------ doctor */

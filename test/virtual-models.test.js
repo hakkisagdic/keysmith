@@ -912,13 +912,23 @@ test('observability & explain: records {virtual, label, chosen, fallbacks, reaso
     const chatBody = chatRes.json();
     assert.equal(chatBody.choices[0].message.content, 'ollama-answered:llama3.3:8b');
 
+    await gw.settleClassifierCalls();
     const rows = fs
       .readFileSync(usageFile, 'utf8')
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l));
-    assert.equal(rows.length, 1);
-    const row = rows[0];
+    // The request's row, and the classifier call's own (metered like a leg).
+    assert.equal(rows.length, 2);
+    const clfRow = rows.find((r) => r.purpose === 'classifier');
+    assert.ok(clfRow, 'the classifier call has a usage row');
+    assert.equal(clfRow.adapter, 'ollama-local');
+    assert.equal(clfRow.model, 'ollama-local/qwen3.8:8b');
+    assert.equal(clfRow.virtual, 'auto/text');
+    assert.equal(clfRow.label, 'simple');
+    assert.equal(clfRow.status, 'ok');
+    assert.deepEqual(clfRow.usage, { input: 10, output: 4, cacheRead: 0, cacheWrite: 0 });
+    const row = rows.find((r) => r.purpose !== 'classifier');
     assert.equal(row.virtual, 'auto/text');
     assert.equal(row.label, 'simple');
     assert.equal(row.chosen, 'ollama-local/llama3.3:8b');
@@ -1049,4 +1059,253 @@ test('classifier instruction reaches adapters that read the system prompt from m
   assert.equal(clfCall.messages[0].role, 'system');
   assert.match(clfCall.messages[0].content, /Classify the complexity/);
   assert.equal(clfCall.messages.at(-1).role, 'user');
+});
+
+/* ------------------------------------------------ classifierPrompt, rules, classifier metering */
+
+const RUBRIC = 'Classify the complexity of the user request for routing. Reply with one word only: simple, medium, or complex.\nsimple = a self-contained question.';
+
+function clfGateway({ vm = {}, reply = 'complex', usage = null, pricing = null, spend = null, tierAdapter = null } = {}) {
+  const clf = makeStubAdapter('clf', {
+    models: ['tiny'],
+    handler: async (opts) => (opts.messages?.[0]?.role === 'system' ? (typeof reply === 'function' ? reply(opts) : reply) : 'answer'),
+  });
+  const target = tierAdapter || makeStubAdapter('copilot', { kind: 'cli', models: ['s', 'm', 'c'] });
+  const gw = new Gateway(
+    {
+      adapters: { clf, copilot: target },
+      ...(pricing ? { pricing } : {}),
+      ...(spend ? { limits: { spend } } : {}),
+      virtualModels: {
+        'auto/text': {
+          classifier: 'clf/tiny',
+          tiers: { simple: ['copilot/s'], medium: ['copilot/m'], complex: ['copilot/c'] },
+          ...vm,
+        },
+      },
+    },
+    { usage, loadProbe: () => ({ loadPerCore: 0.1, cores: 8, memoryPressure: 'normal' }) },
+  );
+  return { gw, clf, target };
+}
+
+test('classifierPrompt: validated at load, sent as the classifier system message, and part of the prompt cache key', async () => {
+  const adapters = { clf: { kind: 'http', baseUrl: 'http://127.0.0.1:9/v1', apiKey: false, models: ['tiny'] }, copilot: { kind: 'http', baseUrl: 'http://127.0.0.1:9/v1', apiKey: false, models: ['m'] } };
+  const tiers = { simple: ['copilot/m'], medium: ['copilot/m'], complex: ['copilot/m'] };
+  const check = (vm) => validateVirtualModels({ adapters, virtualModels: { 'auto/text': { classifier: 'clf/tiny', tiers, ...vm } } }).get('auto/text');
+  assert.equal(check({}).classifierPrompt, null);
+  assert.equal(check({ classifierPrompt: `  ${RUBRIC}  ` }).classifierPrompt, RUBRIC);
+  assert.equal(check({ classifier: { model: 'clf/tiny', prompt: RUBRIC } }).classifierPrompt, RUBRIC);
+  assert.throws(() => check({ classifierPrompt: '   ' }), /classifierPrompt must be a non-empty string/);
+  assert.throws(() => check({ classifierPrompt: 42 }), /classifierPrompt must be a non-empty string/);
+  assert.throws(() => check({ classifierPrompt: 'x'.repeat(4001) }), /over 4000/);
+
+  const { gw, clf } = clfGateway({ vm: { classifierPrompt: RUBRIC } });
+  const r = await gw.explainRoute('auto/text', 'Design a lock-free ring buffer');
+  assert.equal(r.label, 'complex');
+  assert.equal(r.reason, 'classified');
+  assert.equal(clf.calls[0].messages[0].role, 'system');
+  assert.equal(clf.calls[0].messages[0].content, RUBRIC);
+  assert.equal(clf.calls[0].system, RUBRIC);
+
+  // The default instruction stays when none is set.
+  const plain = clfGateway({});
+  await plain.gw.explainRoute('auto/text', 'Design a lock-free ring buffer');
+  assert.match(plain.clf.calls[0].messages[0].content, /^Classify the complexity of the user request\. Reply with one word only/);
+
+  // A different instruction is a different cache entry: the same prompt is asked again under it.
+  const { hashClassifierPrompt } = await import('../src/virtual-models.js');
+  assert.notEqual(hashClassifierPrompt('same prompt'), hashClassifierPrompt('same prompt', RUBRIC));
+});
+
+test('rules: validated at load (label, known fields, at least one condition, valid patterns, maxChars range)', () => {
+  const adapters = { clf: { kind: 'http', baseUrl: 'http://127.0.0.1:9/v1', apiKey: false, models: ['tiny'] }, copilot: { kind: 'http', baseUrl: 'http://127.0.0.1:9/v1', apiKey: false, models: ['m'] } };
+  const tiers = { simple: ['copilot/m'], medium: ['copilot/m'], complex: ['copilot/m'] };
+  const check = (rules) => validateVirtualModels({ adapters, virtualModels: { 'auto/text': { classifier: 'clf/tiny', tiers, rules } } }).get('auto/text');
+  const ok = check([{ name: 'utility', label: 'simple', match: ['\\btranslate\\b'], unless: 'repo', maxChars: 160, noTools: true, noMedia: true, noCode: true }]);
+  assert.equal(ok.rules.length, 1);
+  assert.equal(ok.rules[0].name, 'utility');
+  assert.equal(ok.rules[0].match.length, 1);
+  assert.equal(check([{ label: 'complex', match: 'threat model' }]).rules[0].name, 'rules[0]');
+  assert.deepEqual(check(undefined).rules, []);
+  assert.throws(() => check({ label: 'simple' }), /rules must be an array/);
+  assert.throws(() => check([{ label: 'trivial', match: 'x' }]), /label must be simple, medium, or complex/);
+  assert.throws(() => check([{ label: 'simple' }]), /at least one condition/);
+  assert.throws(() => check([{ label: 'simple', match: 'x', when: 'y' }]), /unknown field "when"/);
+  assert.throws(() => check([{ label: 'simple', match: '(' }]), /match\[0\] is not a valid regular expression/);
+  assert.throws(() => check([{ label: 'simple', match: [] }]), /match must be a pattern or a non-empty list/);
+  assert.throws(() => check([{ label: 'simple', maxChars: 0 }]), /maxChars must be a whole number from 1 to 1200/);
+  assert.throws(() => check([{ label: 'simple', maxChars: 5000 }]), /maxChars must be a whole number from 1 to 1200/);
+  assert.throws(() => check([{ label: 'simple', noTools: 'yes' }]), /noTools must be true or false/);
+  assert.throws(() => check([{ label: 'simple', match: 'x'.repeat(301) }]), /over 300 characters/);
+});
+
+test('rules: the first matching rule labels the request without asking the classifier; tools, media, code, unless and length keep it off', async () => {
+  const rules = [
+    // `\\b` is an ASCII word boundary in JavaScript, even with the `u` flag: before a letter like `ç` it never
+    // holds. Case folding is Unicode's (Ç matches ç) but not Turkish (İ does not match i, nor I ı).
+    { name: 'utility', label: 'simple', match: ['\\btranslate\\b', 'ÇEVIR\\b'], unless: ['\\brepo\\b'], maxChars: 120, noTools: true, noMedia: true, noCode: true },
+    { name: 'threat-model', label: 'complex', match: 'threat model' },
+  ];
+  const { gw, clf, target } = clfGateway({ vm: { rules }, reply: 'medium' });
+
+  const hit = await gw.explainRoute('auto/text', 'Translate to English: "Toplantı ertelendi."');
+  assert.equal(hit.label, 'simple');
+  assert.equal(hit.reason, 'rule:utility');
+  assert.equal(hit.chosen, 'copilot/s');
+  assert.equal(clf.calls.length, 0, 'a rule hit never asks the classifier');
+  assert.equal((await gw.explainRoute('auto/text', 'Şu cümleyi İngilizceye çevir: merhaba')).reason, 'rule:utility', 'case-insensitive, Unicode');
+  assert.equal((await gw.explainRoute('auto/text', 'Write a threat model for the gateway')).reason, 'rule:threat-model');
+  assert.equal(clf.calls.length, 0);
+
+  // Each condition that fails sends the request to the classifier instead.
+  const asked = async (prompt, opts = {}) => {
+    const before = clf.calls.length;
+    const r = await gw.explainRoute('auto/text', prompt, opts);
+    assert.equal(clf.calls.length, before + 1, `classifier asked for: ${prompt.slice(0, 40)}`);
+    assert.equal(r.reason, 'classified');
+    return r;
+  };
+  await asked('Translate the README of this repo into Turkish'); // unless
+  await asked('Translate this:\n```\nconst a = 1;\n```'); // noCode
+  await asked(`Translate ${'very '.repeat(30)}long text`); // maxChars
+  await asked('Translate to English: "ok" please', { hasTools: true }); // noTools
+  await asked('Translate the text in this image', {
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'Translate the text in this image' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }] }],
+  }); // noMedia
+  await asked('What is the capital of France?'); // no rule matches
+
+  // Through a completion: the rule picks the tier and the route answers from it.
+  const r = await gw.collect({ model: 'auto/text', messages: [{ role: 'user', content: 'Translate to English: "Sunucu yarın kapanacak."' }] });
+  assert.equal(r.virtual.label, 'simple');
+  assert.equal(r.virtual.reason, 'rule:utility');
+  assert.equal(target.calls.at(-1).model, 's');
+});
+
+test('rules: a session already sticky to a label keeps it, and a rule hit is never cached or made sticky', async () => {
+  let reply = 'complex';
+  const rules = [{ name: 'utility', label: 'simple', match: '\\btranslate\\b' }];
+  const { gw, clf } = clfGateway({ vm: { rules, stickySeconds: 600 }, reply: () => reply });
+  const first = await gw.explainRoute('auto/text', 'Design the sync protocol for an offline-first app', { session: 's1' });
+  assert.equal(first.label, 'complex');
+  const sticky = await gw.explainRoute('auto/text', 'Translate to English: "tamam"', { session: 's1' });
+  assert.equal(sticky.label, 'complex');
+  assert.equal(sticky.reason, 'sticky');
+  // A fresh session starting on a rule hit is not stuck at simple.
+  const r1 = await gw.explainRoute('auto/text', 'Translate to English: "tamam"', { session: 's2' });
+  assert.equal(r1.reason, 'rule:utility');
+  reply = 'medium';
+  const r2 = await gw.explainRoute('auto/text', 'Fix the off-by-one in my loop', { session: 's2' });
+  assert.equal(r2.label, 'medium');
+  assert.equal(r2.reason, 'classified');
+  assert.equal(clf.calls.length, 2);
+});
+
+test('classifier metering: each classifier call writes a usage row with its token counts and cost, and the adapter spend cap holds it back', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-vm-meter-'));
+  try {
+    const pricing = { 'clf/*': { input: 1000, output: 1000 } };
+    const usage = new UsageLog(path.join(tmpDir, 'usage.jsonl'), { pricing });
+    const { gw, clf } = clfGateway({ usage, pricing, spend: { clf: 0.001 } });
+
+    const r = await gw.explainRoute('auto/text', 'Design a lock-free ring buffer');
+    assert.equal(r.label, 'complex');
+    await gw.settleClassifierCalls();
+    const rows = () => fs.readFileSync(path.join(tmpDir, 'usage.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    const [row] = rows();
+    assert.equal(row.purpose, 'classifier');
+    assert.equal(row.virtual, 'auto/text');
+    assert.equal(row.adapter, 'clf');
+    assert.equal(row.model, 'clf/tiny');
+    assert.equal(row.resolvedModel, 'tiny');
+    assert.equal(row.status, 'ok');
+    assert.equal(row.reason, 'classified');
+    assert.equal(row.label, 'complex');
+    assert.deepEqual(row.usage, { input: 10, output: 4, cacheRead: 0, cacheWrite: 0 });
+    assert.deepEqual(row.cost, { usd: 0.014, basis: 'metered' });
+    assert.equal(typeof row.classifyMs, 'number');
+    assert.equal(usage.spendSummary({ clf: 0.001 }, { adapters: { clf: {} } })[0].spent, 0.014);
+
+    // Over its cap now: the next prompt is labelled medium without asking, and the refusal has a row.
+    const capped = await gw.explainRoute('auto/text', 'Another prompt entirely');
+    assert.equal(capped.label, 'medium');
+    assert.match(capped.reason, /^classifier_unavailable \(defaulted to medium\)$/);
+    assert.match(capped.classifyError, /spend cap/i);
+    assert.equal(clf.calls.length, 1, 'the capped classifier was not asked');
+    await gw.settleClassifierCalls();
+    const limited = rows()[1];
+    assert.equal(limited.purpose, 'classifier');
+    assert.equal(limited.status, 'limited');
+    assert.match(limited.error, /spend cap/i);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('classifier metering: the label returns at once, the reply is read on for its token counts, and a timeout or error still writes one row', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-vm-meter2-'));
+  try {
+    const usage = new UsageLog(path.join(tmpDir, 'usage.jsonl'));
+    let mode = 'slow-tail';
+    // A classifier whose reply the test shapes: the label at once and its token counts 150 ms
+    // later (as a stream ends), a reply that never comes, or a refusal.
+    const clf = {
+      ...makeStubAdapter('clf', { models: ['tiny'] }),
+      async *complete(opts) {
+        clf.calls.push(opts);
+        if (mode === 'error') throw new Error('connection refused');
+        if (mode === 'slow-tail') {
+          yield { type: 'delta', text: 'simple' };
+          await new Promise((r) => setTimeout(r, 150));
+          yield { type: 'usage', usage: { input: 30, output: 1, cacheRead: 0, cacheWrite: 0 } };
+          yield { type: 'done', finishReason: 'stop' };
+          return;
+        }
+        await new Promise((r) => {
+          const t = setTimeout(r, 5000);
+          opts.signal?.addEventListener('abort', () => { clearTimeout(t); r(); }, { once: true });
+        });
+        throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+      },
+    };
+    const copilot = makeStubAdapter('copilot', { kind: 'cli', models: ['s', 'm', 'c'] });
+    const gw = new Gateway(
+      {
+        adapters: { clf, copilot },
+        virtualModels: {
+          'auto/text': { classifier: 'clf/tiny', classifierTimeoutMs: 300, tiers: { simple: ['copilot/s'], medium: ['copilot/m'], complex: ['copilot/c'] } },
+        },
+      },
+      { usage, loadProbe: () => ({ loadPerCore: 0.1, cores: 8, memoryPressure: 'normal' }) },
+    );
+    const rows = () => fs.readFileSync(path.join(tmpDir, 'usage.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+
+    const t0 = Date.now();
+    const fast = await gw.explainRoute('auto/text', 'What is a mebibyte?');
+    assert.equal(fast.label, 'simple');
+    assert.ok(Date.now() - t0 < 140, 'the label did not wait for the rest of the reply');
+    assert.equal(fs.existsSync(path.join(tmpDir, 'usage.jsonl')) ? rows().length : 0, 0, 'the row waits for the token counts');
+    await gw.settleClassifierCalls();
+    assert.equal(rows().length, 1);
+    assert.deepEqual(rows()[0].usage, { input: 30, output: 1, cacheRead: 0, cacheWrite: 0 });
+
+    mode = 'hang';
+    const slow = await gw.explainRoute('auto/text', 'A prompt the classifier never answers');
+    assert.match(slow.reason, /^classifier_timeout/);
+    await gw.settleClassifierCalls();
+    assert.equal(rows().length, 2);
+    assert.equal(rows()[1].status, 'error');
+    assert.equal(rows()[1].reason, 'classifier_timeout');
+    assert.equal(rows()[1].usage, null);
+
+    mode = 'error';
+    const failed = await gw.explainRoute('auto/text', 'A prompt the classifier refuses');
+    assert.match(failed.reason, /^classifier_error/);
+    await gw.settleClassifierCalls();
+    assert.equal(rows().length, 3);
+    assert.equal(rows()[2].status, 'error');
+    assert.match(rows()[2].error, /connection refused/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

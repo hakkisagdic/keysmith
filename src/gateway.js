@@ -24,6 +24,8 @@ import {
   formatRouteExplain,
   isFallthroughError,
   isLocalAdapter,
+  matchVirtualRule,
+  messagesCarryMedia,
   parseClassifierLabel,
   validateVirtualModels,
 } from './virtual-models.js';
@@ -145,6 +147,8 @@ export class Gateway {
   /** Stop what the gateway runs on its own: the MCP bridge's sessions (each CLI stopped) and its socket. */
   async close() {
     await this.toolEngines.mcp?.close?.();
+    // A classifier call still reading its reply writes its usage row first (bounded by its timeout).
+    await this.settleClassifierCalls();
   }
 
   /**
@@ -887,7 +891,7 @@ export class Gateway {
   /**
    * Perform the virtual model routing decision for a single request (`loadGate` -> `classifier` -> tier candidates).
    */
-  async routeVirtual(requested, { messages = [], prompt = '', session = null, exclude = null, scope = null, signal = null } = {}) {
+  async routeVirtual(requested, { messages = [], prompt = '', session = null, exclude = null, scope = null, signal = null, hasTools = false } = {}) {
     if (!this.isVirtualModel(requested)) {
       throw new LlmError(`unknown virtual model "${requested}"`, { status: 404 });
     }
@@ -918,6 +922,8 @@ export class Gateway {
           if (!v.ok) unavailable = `classifier adapter "${clfAdapter.id}" is held back by the kiro credit guard — ${v.detail}`;
         } catch {}
       }
+      // The fast path: a rule labels an obvious prompt without asking the classifier.
+      const rule = matchVirtualRule(vspec, { promptText, hasTools, hasMedia: messagesCarryMedia(messages) });
       clf = await classifyPrompt({
         vspec,
         adapter: clfAdapter,
@@ -927,10 +933,15 @@ export class Gateway {
         now: this.now,
         signal,
         unavailable,
+        rule,
+        meter: clfAdapter ? this._classifierMeter(vspec, clfAdapter, scope) : null,
       });
+      this._trackClassifierCall(clf.settled);
       label = clf.label;
       baseReason =
-        !classifierAllowed
+        clf.reason === 'rule'
+          ? `rule:${clf.rule}`
+          : !classifierAllowed
           ? 'classifier_scope_denied (defaulted to medium)'
           : clf.reason === 'classified' || clf.reason === 'sticky' || clf.reason === 'cached'
           ? clf.reason
@@ -958,10 +969,60 @@ export class Gateway {
   }
 
   /**
+   * A classifier call metered like a leg (src/virtual-models.js classifyPrompt): its estimated spend
+   * is held against the classifier adapter's spend cap before it is asked (a refusal labels the
+   * request medium unasked), and once the call ends it writes its own usage row, `purpose:
+   * "classifier"`, whose cost counts toward that cap like any other metered row.
+   */
+  _classifierMeter(vspec, adapter, scope) {
+    const leg = vspec.classifierLeg;
+    return {
+      reserve: (est) => this.reserveSpend(adapter, leg.model, scope, est),
+      record: (r) => {
+        if (!this.usage) return;
+        const upstream = typeof adapter.upstreamModel === 'function' ? adapter.upstreamModel(leg.model) : leg.model;
+        this.usage.record({
+          ts: new Date(this.now()).toISOString(),
+          purpose: 'classifier',
+          virtual: vspec.name,
+          model: vspec.classifier,
+          adapter: adapter.id,
+          resolvedModel: leg.model,
+          kind: adapter.kind,
+          ...(adapter.host ? { host: adapter.host } : {}),
+          ...(adapter.account ? { account: adapter.account } : {}),
+          status: r.status,
+          reason: r.reason,
+          ...(r.label ? { label: r.label } : {}),
+          classifyMs: r.classifyMs,
+          ms: r.ms,
+          usage: r.usage || null,
+          ...(r.usage || r.status === 'limited' ? {} : { usageReason: 'the classifier reported no token counts' }),
+          ...(r.error ? { error: String(r.error).slice(0, 300) } : {}),
+          _leg: { upstreamModel: upstream, costBasis: adapter.costBasis || null },
+        });
+      },
+    };
+  }
+
+  /** A classifier call's row is written after its label is returned: kept here until it is. */
+  _trackClassifierCall(settled) {
+    if (!settled || typeof settled.then !== 'function') return;
+    if (!this._classifierCalls) this._classifierCalls = new Set();
+    this._classifierCalls.add(settled);
+    settled.then(() => this._classifierCalls.delete(settled));
+  }
+
+  /** Resolves once every classifier call asked so far has written its usage row. */
+  async settleClassifierCalls() {
+    while (this._classifierCalls?.size) await Promise.all([...this._classifierCalls]);
+  }
+
+  /**
    * Dry-run a virtual model routing decision (`keysmith route explain <virtualModel> "<prompt>"`)
    * without calling the target adapter/model.
    */
-  async explainRoute(requested, prompt = '', { messages = null, scope = null, session = null, signal = null } = {}) {
+  async explainRoute(requested, prompt = '', { messages = null, scope = null, session = null, signal = null, hasTools = false } = {}) {
     const t0 = Date.now();
     const msgs = Array.isArray(messages) && messages.length ? messages : [{ role: 'user', content: String(prompt || '') }];
     const routed = await this.routeVirtual(requested, {
@@ -970,6 +1031,7 @@ export class Gateway {
       session,
       scope,
       signal,
+      hasTools,
     });
     const latency = Math.max(0, Date.now() - t0);
     const first = routed.chain[0] || null;
@@ -1045,6 +1107,7 @@ export class Gateway {
         exclude,
         scope,
         signal,
+        hasTools: !!tools && tools.spec !== null,
       });
       chain = routed.chain;
       const first = chain[0] || null;
