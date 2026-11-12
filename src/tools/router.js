@@ -7,6 +7,8 @@ import { emulate, renderPrompt } from './emulate.js';
  * A route is walked in the order it was declared, as it always is:
  *
  *   an HTTP upstream on the openai wire   the body goes up verbatim (`passthrough`), on the chat face
+ *   an HTTP upstream on the anthropic wire the body goes up verbatim (`passthrough`), on the Messages
+ *                                         face (/v1/messages: Claude Code's) — server tools included
  *   an HTTP upstream on the uhp wire      native UHP `/responses` tools, or EMULATE when the upstream
  *                                         ignores `tools` (e.g. HarnessRouter CE)
  *   an HTTP upstream on the traycer wire  EMULATE across Traycer's multi-provider inference endpoints
@@ -76,9 +78,10 @@ export function toolPath(adapter, spec, face) {
       if (mode === 'off' || spec.unsupported?.length) return 'skip';
       return 'engine';
     }
-    // Verbatim is the only way an OpenAI-wire HTTP leg takes tools, and only the chat face has a
-    // body an OpenAI-wire upstream reads as it is.
-    return face === 'openai' && (adapter.wire || 'openai') === 'openai' ? 'passthrough' : 'skip';
+    // Verbatim is the only way an openai- or anthropic-wire HTTP leg takes tools, and only on the
+    // face whose body that upstream reads as it is: the chat face's for the openai wire, the
+    // Messages face's for the anthropic wire.
+    return relaysVerbatim(adapter, face) ? 'passthrough' : 'skip';
   }
   const mode = adapter.toolMode || 'off';
   if (mode === 'off') return 'skip';
@@ -86,6 +89,13 @@ export function toolPath(adapter, spec, face) {
   // to honour them, and dropping them would answer a different request.
   if (spec.unsupported?.length) return 'skip';
   return 'engine';
+}
+
+/** Whether `face`'s body goes up to the HTTP `adapter` as it is: the face speaks its wire. */
+export function relaysVerbatim(adapter, face) {
+  if (adapter?.kind !== 'http') return false;
+  const wire = adapter.wire || 'openai';
+  return (face === 'openai' && wire === 'openai') || (face === 'anthropic' && wire === 'anthropic');
 }
 
 /** The route a face answers on, for a message that names it. */
@@ -111,6 +121,7 @@ export function toolSkipReason(adapter, spec, face, { relay = true } = {}) {
     }
     const wire = adapter.wire || 'openai';
     if (wire === 'openai') return { reason: 'wire_no_tools', detail: `an HTTP upstream on the openai wire is handed tools verbatim on /v1/chat/completions only, not on ${route}` };
+    if (wire === 'anthropic') return { reason: 'wire_no_tools', detail: `an HTTP upstream on the anthropic wire is handed tools verbatim on /v1/messages only, not on ${route}` };
     return { reason: 'wire_no_tools', detail: `an HTTP upstream on the ${wire} wire is never handed tools: keysmith has no verbatim relay for that wire` };
   }
   if ((adapter.toolMode || 'off') === 'off') return { reason: 'tool_mode_off', detail: `toolMode off: it answers in text only (keysmith tools ${adapter.id} emulate|auto takes tools)` };

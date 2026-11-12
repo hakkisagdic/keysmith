@@ -61,6 +61,12 @@ export class HttpAdapter {
       }
       this.toolMode = 'off';
     }
+    // The Kiro credit guard reads a Kiro plan through kiro-cli (src/credit-guard.js): on an HTTP
+    // upstream the key would guard nothing, and say nothing about it.
+    if (cfg.creditGuardThreshold !== undefined && cfg.creditGuardThreshold !== null) {
+      throw new Error(`adapter "${id}": creditGuardThreshold guards a Kiro plan, read through kiro-cli — an HTTP upstream has none (its spend is capped by limits.spend)`);
+    }
+    this.creditGuard = null;
     // Request fields sent with one upstream model unless the client set them itself:
     // `{ "gemini-4-argon": { "reasoning_effort": "high" } }`, `"*"` for every model.
     this.modelParams = checkModelParams(id, cfg.modelParams);
@@ -407,6 +413,42 @@ export class HttpAdapter {
     return new Response(tapped, { status: res.status, statusText: res.statusText, headers: res.headers });
   }
 
+  /**
+   * Verbatim relay on the Messages face (server.js relayMessagesLeg): a request that offers tools,
+   * reaching an upstream on the anthropic wire as the client wrote it — its fields of the Messages
+   * API only (pickMessagesRelayFields), the upstream's model id, this adapter's own credential.
+   * `beta`: the client's `anthropic-beta` header, its feature tokens passed on (an OAuth one is
+   * not: the credential here is this adapter's), after any this adapter's `headers` set.
+   * `signal`: the client's — one that goes away (Claude Code's Esc) stops the upstream's answer,
+   * which would otherwise run on, and be paid for, to its end.
+   */
+  async rawMessages(body, { beta = null, signal = null } = {}) {
+    if (this.wire !== 'anthropic') {
+      throw new LlmError(`adapter "${this.id}" cannot relay a Messages request on the ${this.wire} wire`, { status: 400, provider: this.id });
+    }
+    const allowed = pickMessagesRelayFields(body);
+    const upstream = this.upstreamModel(body.model);
+    const headers = { 'content-type': 'application/json', ...this.authHeaders(), ...this.headers };
+    const named = (h) => Object.keys(headers).find((k) => k.toLowerCase() === h);
+    if (!named('anthropic-version')) headers['anthropic-version'] = '2023-06-01';
+    const betas = anthropicBetas([named('anthropic-beta') ? headers[named('anthropic-beta')] : null, beta]);
+    if (named('anthropic-beta')) delete headers[named('anthropic-beta')];
+    if (betas) headers['anthropic-beta'] = betas;
+    // The adapter's budget (a typed timeout) or the client leaving, whichever comes first.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(Object.assign(new Error(`timeout after ${this.timeoutMs}ms`), { name: 'TimeoutError', code: 'ETIMEDOUT' })), this.timeoutMs);
+    timer.unref?.();
+    if (signal?.aborted) ctrl.abort(signal.reason);
+    else signal?.addEventListener('abort', () => ctrl.abort(signal.reason), { once: true });
+    return fetch(this.route('/messages'), {
+      method: 'POST',
+      headers,
+      // The client's own fields win over `modelParams`, as on the chat relay.
+      body: JSON.stringify({ ...this.paramsFor(upstream), ...allowed, model: upstream }),
+      signal: ctrl.signal,
+    });
+  }
+
   async *complete({
     model,
     messages,
@@ -457,7 +499,14 @@ export class HttpAdapter {
     const onAbort = () => controller.abort(new Error('client disconnected'));
     signal?.addEventListener('abort', onAbort, { once: true });
     const budgetMs = timeoutMs || this.timeoutMs;
-    const timer = setTimeout(() => controller.abort(new Error(`timeout after ${budgetMs}ms`)), budgetMs);
+    // The budget's end is a typed timeout (a 504), whether it comes before the upstream's headers
+    // or while its body is read: the reason the abort carries is what a body read throws.
+    let timedOut = false;
+    const timeoutError = () => Object.assign(new Error(`timeout after ${budgetMs}ms`), { name: 'TimeoutError', code: 'ETIMEDOUT' });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(timeoutError());
+    }, budgetMs);
     // `modelParams` go first, so the fields keysmith builds (model, messages, stream…) win;
     // on the Anthropic wire `max_tokens` is the client's (`max_tokens`, `max_completion_tokens`
     // or `max_output_tokens`), else `modelParams`, else 4096; on the OpenAI wire the client's
@@ -539,7 +588,7 @@ export class HttpAdapter {
     } catch (e) {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
-      const timeout = /abort|timeout/i.test(e.message ?? '');
+      const timeout = timedOut || /abort|timeout/i.test(e.message ?? '');
       throw new LlmError(`${this.id}: ${e.message}`, { status: timeout ? 504 : 502, provider: this.id, retriable: true });
     }
     if (!res.ok) {
@@ -570,6 +619,11 @@ export class HttpAdapter {
         }
         yield evt;
       }
+    } catch (e) {
+      // An upstream that sent its headers and then went quiet past the budget: keysmith's own
+      // timeout, a 504 that names the adapter — the same as one that never answered at all.
+      if (timedOut && !(e instanceof LlmError)) throw new LlmError(`${this.id}: timeout after ${budgetMs}ms`, { status: 504, provider: this.id, retriable: true });
+      throw e;
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
@@ -1357,6 +1411,56 @@ export const OPENAI_CHAT_RELAY_FIELDS = new Set([
   'google',
   'thinking',
 ]);
+
+/**
+ * The Messages API's request fields a verbatim relay passes on (POST /v1/messages): what a client
+ * such as Claude Code sends — its tools, tool_choice, thinking, context_management, output_config
+ * (effort) — and the sampling fields. `mcp_servers` and `container` are not: they have the
+ * upstream reach out to servers, or keep a sandbox, on this gateway's credential.
+ */
+const ANTHROPIC_MESSAGES_RELAY_FIELDS = new Set([
+  'model',
+  'messages',
+  'system',
+  'max_tokens',
+  'metadata',
+  'stop_sequences',
+  'stream',
+  'temperature',
+  'top_p',
+  'top_k',
+  'tools',
+  'tool_choice',
+  'thinking',
+  'service_tier',
+  'context_management',
+  'output_config',
+  'output_format',
+]);
+
+export function pickMessagesRelayFields(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return {};
+  const out = {};
+  for (const k of Object.keys(body)) if (ANTHROPIC_MESSAGES_RELAY_FIELDS.has(k)) out[k] = body[k];
+  return out;
+}
+
+/**
+ * The `anthropic-beta` value a relay sends: the feature tokens of `values` (header strings, comma
+ * separated), deduplicated, at most 32 — never an `oauth-*` one (the credential is an API key) or
+ * anything that is not a token. null when none is left.
+ */
+export function anthropicBetas(values) {
+  const out = [];
+  for (const v of [values].flat()) {
+    if (typeof v !== 'string') continue;
+    for (const t of v.split(',').map((x) => x.trim())) {
+      if (!/^[a-z0-9][a-z0-9._-]{0,79}$/i.test(t) || /^oauth-/i.test(t) || out.includes(t)) continue;
+      if (out.length < 32) out.push(t);
+    }
+  }
+  return out.length ? out.join(',') : null;
+}
 
 export function pickChatRelayFields(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return {};

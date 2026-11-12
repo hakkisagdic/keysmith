@@ -1,5 +1,6 @@
 import { FACE_ROUTES, toolSkipReason } from './tools/router.js';
 import { checkCreditGuard, describeReading, evaluateCredits, pct } from './credit-guard.js';
+import { parseSpendCaps } from './usage.js';
 
 /**
  * Why a route did not go where its owner expected, for `keysmith doctor`, `keysmith status` and
@@ -14,11 +15,14 @@ const PROBE_SPEC = { tools: [{ name: 'probe' }], choice: { mode: 'auto' }, paral
 
 /**
  * Per alias and face (`anthropic`: /v1/messages, Claude Code's; `openai`: /v1/chat/completions):
- * `{ alias, face, route, legs: [{ target, adapter, carries, reason?, detail? }], carried, total }`,
- * or `{ alias, error }` for an alias that does not resolve.
+ * `{ alias, face, route, legs: [{ target, adapter, carries, reason?, detail?, guarded?, heldBack? }],
+ * carried, total }`, or `{ alias, error }` for an alias that does not resolve. A leg the Kiro
+ * credit guard holds back now (its last reading, gateway.creditGuard) carries nothing until the
+ * plan resets: it counts as not carrying, reason `credit_guard`.
  */
 export function toolCarriage(gateway, { faces = ['anthropic', 'openai'], aliases = Object.keys(gateway?.cfg?.aliases || {}) } = {}) {
   const out = [];
+  const held = heldBackNow(gateway);
   for (const alias of aliases) {
     let chain;
     try {
@@ -29,14 +33,62 @@ export function toolCarriage(gateway, { faces = ['anthropic', 'openai'], aliases
     }
     for (const face of faces) {
       const legs = chain.map((leg) => {
-        // The chat face hands an HTTP leg on the openai wire the body verbatim (its relay).
-        const why = toolSkipReason(leg.adapter, PROBE_SPEC, face, { relay: face === 'openai' });
-        return { target: leg.target, adapter: leg.adapter.id, carries: !why, ...(why || {}), ...(leg.adapter.creditGuard ? { guarded: true } : {}) };
+        // A face hands an HTTP leg on its own wire the body verbatim (its relay): the chat face an
+        // openai-wire leg, the Messages face an anthropic-wire one.
+        const why = toolSkipReason(leg.adapter, PROBE_SPEC, face, { relay: face === 'openai' || face === 'anthropic' });
+        const h = !why && held.get(leg.adapter.id);
+        const guarded = leg.adapter.creditGuard ? { guarded: true } : {};
+        if (h) return { target: leg.target, adapter: leg.adapter.id, carries: false, reason: 'credit_guard', detail: `held back by the Kiro credit guard — ${h}`, heldBack: true, ...guarded };
+        return { target: leg.target, adapter: leg.adapter.id, carries: !why, ...(why || {}), ...guarded };
       });
       out.push({ alias, face, route: FACE_ROUTES[face], legs, carried: legs.filter((l) => l.carries).length, total: legs.length });
     }
   }
   return out;
+}
+
+/** The adapters the credit guard holds back now, by its last readings: id -> what it read. */
+function heldBackNow(gateway) {
+  const held = new Map();
+  let snap = [];
+  try {
+    snap = gateway?.creditGuard?.snapshot?.() || [];
+  } catch {}
+  for (const r of creditGuardRows(snap, { adapters: gateway?.adapters })) {
+    for (const a of r.adapters) {
+      if (a.state === 'held back') held.set(a.id, `${describeReading(r.reading)}, at or over ${pct(a.threshold)}${r.stale ? ' (the newest reading failed)' : ''}`);
+    }
+  }
+  return held;
+}
+
+/**
+ * Routes where a leg under the Kiro credit guard comes before a metered HTTP leg no spend cap
+ * covers: once the plan reaches the threshold the guarded leg is passed by, its traffic goes to
+ * that paid leg, and nothing caps what it spends there. One `!` line per such alias.
+ */
+export function guardShiftLines(gateway, { aliases = Object.keys(gateway?.cfg?.aliases || {}) } = {}) {
+  const caps = parseSpendCaps(gateway?.cfg?.limits?.spend, gateway?.cfg?.adapters);
+  const capped = (a) => caps.some((c) => c.target === a.id || (typeof a.account === 'string' && c.target === a.account));
+  const lines = [];
+  for (const alias of aliases) {
+    let chain;
+    try {
+      chain = gateway.resolve(alias);
+    } catch {
+      continue;
+    }
+    const i = chain.findIndex((l) => l.adapter.creditGuard && !l.adapter.disabled);
+    if (i < 0) continue;
+    const paid = chain.slice(i + 1).filter((l) => l.adapter.kind === 'http' && (l.adapter.costBasis || 'metered') === 'metered' && !capped(l.adapter));
+    if (!paid.length) continue;
+    const g = chain[i];
+    lines.push({
+      mark: '!',
+      text: `${alias}: ${g.target} is held back at ${pct(g.adapter.creditGuard.threshold)} of its Kiro plan, and from then on its requests go to ${paid.map((l) => l.target).join(', ')} — metered, and no spend cap covers ${paid.length > 1 ? 'them' : 'it'} (limits.spend.${paid[0].adapter.id})`,
+    });
+  }
+  return lines;
 }
 
 /** The credit guard per login, with each adapter's threshold and state: `cfg` gives the thresholds of a process that holds no adapters (status). */
@@ -55,9 +107,11 @@ export function creditGuardRows(snapshot, { adapters = null, cfg = null } = {}) 
     ...s,
     adapters: s.adapters.map((id) => {
       const threshold = thresholdOf(id);
-      const stale = s.error && s.lastAttemptAt && (!s.readAt || Date.parse(s.lastAttemptAt) > Date.parse(s.readAt));
-      const v = threshold != null && !stale ? evaluateCredits(s.reading, threshold) : { blocked: false };
-      return { id, threshold, state: !s.reading || stale ? 'unknown' : v.blocked ? 'held back' : 'ok' };
+      // check()'s rule (credit-guard.js guardState): a reading of this period holds an adapter at
+      // or over its threshold back however many readings after it failed; none, or one from
+      // before the plan reset, is unknown.
+      const state = !s.reading || s.currentPeriod === false ? 'unknown' : threshold != null && evaluateCredits(s.reading, threshold).blocked ? 'held back' : 'ok';
+      return { id, threshold, state, ...(s.stale && s.reading ? { stale: true } : {}) };
     }),
   }));
 }
@@ -105,11 +159,13 @@ export function creditGuardLines(rows) {
       continue;
     }
     const held = r.adapters.filter((a) => a.state === 'held back').map((a) => a.id);
-    const unknown = r.adapters.some((a) => a.state === 'unknown');
-    const state = held.length ? `HELD BACK: ${held.join(', ')}` : unknown ? 'not held back (the newest reading failed)' : 'ok';
+    const previous = r.currentPeriod === false;
+    const state = held.length ? `HELD BACK: ${held.join(', ')}` : previous ? 'not held back (the reading is from before the plan reset)' : 'ok';
+    // A failed newest reading: the one before it is gone by (the meter only climbs until the plan resets).
+    const stale = r.stale ? ` · the newest reading failed, so this one is gone by until one succeeds: ${r.error}` : '';
     lines.push({
-      mark: held.length ? '✗' : unknown ? '!' : '✓',
-      text: `${who}: ${describeReading(r.reading)} · ${state} · read ${ago(r.ageMs)}${r.reading.resetsOn ? ` · plan resets ${r.reading.resetsOn}` : ''}${r.error && unknown ? ` · last error: ${r.error}` : ''}`,
+      mark: held.length ? '✗' : previous || r.stale ? '!' : '✓',
+      text: `${who}: ${describeReading(r.reading)} · ${state} · read ${ago(r.ageMs)}${r.reading.resetsOn ? ` · plan resets ${r.reading.resetsOn}` : ''}${stale}`,
     });
   }
   return lines;

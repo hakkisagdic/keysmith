@@ -6,7 +6,7 @@ import { resolveSecret } from './config.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { adapterReach, aliasDecision, globCanStartWith, requestDecision, scopeText, virtualDecision } from './keys.js';
-import { describeUnsupported, toolEvents, toolPath, toolSkipReason } from './tools/router.js';
+import { describeUnsupported, relaysVerbatim, toolEvents, toolPath, toolSkipReason } from './tools/router.js';
 import { addUsage } from './tools/emulate.js';
 import { McpBridge } from './bridge/index.js';
 import { CreditGuard, creditGuardError } from './credit-guard.js';
@@ -895,6 +895,15 @@ export class Gateway {
     } else {
       const classifierAllowed = !scope || this.checkVirtualTarget(vspec.classifierLeg.adapterId, vspec.classifierLeg.model, scope).ok;
       const clfAdapter = classifierAllowed ? this.adapters.get(vspec.classifierLeg.adapterId) || null : null;
+      // A classifier under the Kiro credit guard is asked only while its plan is under the
+      // threshold, like any leg: held back, the request is labelled medium unasked.
+      let unavailable = null;
+      if (clfAdapter?.creditGuard && this.creditGuard) {
+        try {
+          const v = await this.creditGuard.check(clfAdapter);
+          if (!v.ok) unavailable = `classifier adapter "${clfAdapter.id}" is held back by the kiro credit guard — ${v.detail}`;
+        } catch {}
+      }
       clf = await classifyPrompt({
         vspec,
         adapter: clfAdapter,
@@ -903,6 +912,7 @@ export class Gateway {
         cache: this._virtualCache,
         now: this.now,
         signal,
+        unavailable,
       });
       label = clf.label;
       baseReason =
@@ -1387,11 +1397,14 @@ export class Gateway {
 
   /**
    * A request that offers tools (src/tools/router.js): the route's legs in declared order, each
-   * taking the tools the way it can — an HTTP upstream verbatim through `tools.relay` (the face's,
-   * which writes the upstream's answer itself), a CLI with a toolMode through a tool engine — and
-   * failing over while nothing went out. When none answered: a plain completion from the legs not
-   * tried, for tool_choice auto or none; an error for one that asks for a call, or for tools no
-   * CLI can honour. `tools`: `{ spec, messages (canonical), face, relay, state }`.
+   * taking the tools the way it can — an HTTP upstream on the face's own wire verbatim through
+   * `tools.relay` (the face's, which writes the upstream's answer itself: openai on the chat face,
+   * anthropic on the Messages face), a CLI with a toolMode through a tool engine — and failing
+   * over while nothing went out; a leg that cannot carry the tools is passed by, never asked for
+   * text in their place. When none answered: a plain completion from the legs not tried only for
+   * tool_choice none (the client asked for text); for any other an error — the last refusal of a
+   * leg that took the tools, or a 400 naming each leg and why it cannot carry them — and so for
+   * tools no CLI can honour. `tools`: `{ spec, messages (canonical), face, relay, state }`.
    *
    * `state.mode` names the engine running now, for a stream's headers: each leg sets its own as it
    * starts, and the plain completion after the walk none, so its stream opens without one. `state.failed`
@@ -1422,7 +1435,7 @@ export class Gateway {
       const leg = chain[i];
       if (spec?.historyOnly) {
         tried.add(i);
-        if (leg.adapter.kind === 'http' && (leg.adapter.wire || 'openai') === 'openai' && relay) {
+        if (leg.adapter.kind === 'http' && relaysVerbatim(leg.adapter, face) && relay) {
           let releaseSpend = () => {};
           try {
             releaseSpend = this.reserveSpend(leg.adapter, leg.model, run.scope, this.estimateTokens(leg.adapter, leg.model, args, tools));
@@ -1610,7 +1623,7 @@ export class Gateway {
     }
     // No leg answered with tools.
     if (spec.unsupported?.length) {
-      throw lastError || heldBack || new LlmError(`"${requested}" has no leg that can take ${describeUnsupported(spec)}: only an HTTP upstream relays those (on /v1/chat/completions), and a CLI leg takes plain function tools only`, { status: 400, type: 'invalid_request_error' });
+      throw lastError || heldBack || new LlmError(`"${requested}" has no leg that can take ${describeUnsupported(spec)}: only an HTTP upstream relays those (the openai wire on /v1/chat/completions, the anthropic wire on /v1/messages), and a CLI leg takes plain function tools only`, { status: 400, type: 'invalid_request_error' });
     }
     const choice = spec.choice?.mode;
     if (choice === 'required' || choice === 'named') {

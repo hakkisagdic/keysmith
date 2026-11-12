@@ -222,9 +222,14 @@ A request that offers tools — `tools` (or the older `functions`) on `/v1/chat/
 `tools` on `/v1/messages` and on `/v1/responses` — walks its route in the order the route was
 declared, and each leg takes the tools the way it can:
 
-- **An HTTP upstream** on the openai wire gets the client's body verbatim (`passthrough`), on
-  `/v1/chat/completions`; its answer comes back byte for byte. `/v1/messages` and
-  `/v1/responses` have no verbatim relay, so there its HTTP legs are passed by.
+- **An HTTP upstream** on the face's own wire gets the client's body verbatim (`passthrough`):
+  the openai wire on `/v1/chat/completions`, the anthropic wire on `/v1/messages` — so Claude
+  Code's tool requests reach an Anthropic API key (`claude-api`) as Claude Code wrote them, server
+  tools, `thinking` and its `anthropic-beta` features (an OAuth one aside) included, with the
+  adapter's own key and model id. Its answer comes back byte for byte, its usage read into the
+  row; a refusal before anything went out (a 429, a 529) hands the request to the next leg. Any
+  other pairing — an openai-wire leg on `/v1/messages`, every HTTP leg on `/v1/responses` — has no
+  verbatim relay, so there the leg is passed by.
 - **A CLI with a `toolMode`** answers through a tool engine. The CLI runs without tools of its
   own, as it does for text; the model writes its calls, and keysmith hands them to the client
   as `tool_calls` (`tool_use` blocks on `/v1/messages`, `function_call` items on
@@ -1119,20 +1124,32 @@ caps fail closed; `keysmith usage` and the status page show each cap beside its 
 
 **The Kiro credit guard.** Kiro reports no token counts, so a spend cap never sees what a kiro
 leg spends. Every adapter that runs `kiro-cli` (`kiro`, `kiro-emu`, whatever its id) is guarded
-by the plan's own meter instead: keysmith runs `kiro-cli chat --no-interactive /usage`, reads
+by the plan's own meter instead: keysmith runs `kiro-cli chat --no-interactive --trust-tools=
+--agent <the adapter's agent> /usage` (no tool trusted, the adapter's tool-less agent), reads
 `Credits (X of Y covered in plan)`, and holds the adapter back while X/Y is at or over its
 `creditGuardThreshold` (a fraction of the plan, `0.9` by default; `keysmith set kiro
-creditGuardThreshold 0.95`, `1` to hold it back only once the plan is spent). Held back, a route
-passes the leg by (`skippedLegs` in the row: `credit_guard`, the share of the plan and the
-threshold) and the next leg answers; a request that names it gets a `429` `rate_limit_error`
-that says why, with `retry-after` until the plan resets. The reading is cached for ten minutes,
-and `/usage` runs at most once per ten minutes per Kiro login (adapters with the same binary and
-environment share one plan and one reading), kept in `credit-guard.json` beside the usage log,
-so a restarted gateway and `keysmith doctor` do not read it again inside them. A reading that
-fails (not logged in, a timeout, output without that line) never holds anything back: it is
-logged to the gateway's stderr, and doctor and `keysmith status` show it. `serve` reads the plan
-at start; `doctor` shows each guarded adapter's state and the last reading, `status` the reading
-the gateway last kept (it runs no kiro-cli), and `/v1/keysmith/routes` has it as `credit_guards`.
+creditGuardThreshold 0.95`, `1` to hold it back only once the plan is spent; on any other entry
+the key is a load error). Held back, a route passes the leg by (`skippedLegs` in the row:
+`credit_guard`, the share of the plan and the threshold) and the next leg answers; a request
+that names it gets a `429` `rate_limit_error` that says why, with `retry-after` until the plan
+resets; a virtual model whose classifier it is labels the request `medium` without asking it.
+The reading is cached for ten minutes, and `/usage` runs at most once per ten minutes per Kiro
+login (adapters with the same binary and environment share one plan and one reading) across
+processes: an attempt is written to `credit-guard.json` (beside the usage log) before it runs,
+and the file is read again before the next one is decided, so the gateway and `keysmith doctor`
+never both read the plan inside the ten minutes. `serve` reads the plan at start and keeps it
+fresh in the background, so no request — a failover leg least of all — waits for a reading;
+only the very first reading of a login nothing is known of is waited for (at most 10 s). A
+reading that does not exit in 30 s is stopped (SIGTERM, then SIGKILL) and counts as failed. The
+meter only climbs until the plan resets, so a reading at or over the threshold keeps the
+adapter held back when the readings after it fail (a timeout, a login prompt, a new wording) —
+until one succeeds or the plan resets; a failure with no reading of this period never holds
+anything back. Every failure is logged to the gateway's stderr, and doctor and `keysmith status`
+show it (`the newest reading failed`). `doctor` shows each guarded adapter's state and the last
+reading, counts a held-back leg as not carrying tools, and warns of an alias where a guarded leg
+comes before a metered HTTP leg no `limits.spend` cap covers (from the threshold on, that leg
+pays for the kiro traffic); `status` shows the reading the gateway last kept (it runs no
+kiro-cli), and `/v1/keysmith/routes` has it as `credit_guards`.
 
 ## Publishing it safely
 

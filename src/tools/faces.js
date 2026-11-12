@@ -232,30 +232,55 @@ export function anthropicMessage({ id, model, text, usage, toolCalls = [] }) {
  * delta, a tool_use block per call (closing the text block before it). The first block is
  * followed by a `ping`, as the API sends it; an answer that had no content at all still gets its
  * empty text block, as it always did.
+ *
+ * `lazy`: message_start waits for the first thing the answer has, and the keepalives are SSE
+ * comments, so until then the client has had comments only. A tool request's route can still
+ * hand such a stream to an anthropic-wire HTTP leg further on, whose own SSE (its own
+ * message_start first) carries on from there (server.js, the Messages relay): `wroteData` says
+ * whether that is still possible, `detach()` hands it over.
  */
 export class AnthropicStream {
-  constructor(res, { id, model, keepaliveMs = KEEPALIVE_MS, timers } = {}) {
-    Object.assign(this, { res, id, model, keepaliveMs, timers });
+  constructor(res, { id, model, keepaliveMs = KEEPALIVE_MS, timers, lazy = false } = {}) {
+    Object.assign(this, { res, id, model, keepaliveMs, timers, lazy });
     this.blocks = 0; // blocks opened so far: the next one's index
     this.textOpen = false;
     this.calls = 0;
     this.ka = null;
+    this.opened = false; // message_start went out
+    this.wroteData = false;
+    this.detached = false;
   }
 
   _event(name, data) {
+    if (this.detached) return;
     this.ka?.touch();
+    this.wroteData = true;
     this.res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
   }
 
-  open() {
+  _open() {
+    if (this.opened) return;
+    this.opened = true;
     this._event('message_start', {
       type: 'message_start',
       message: { id: `msg_${this.id}`, type: 'message', role: 'assistant', model: this.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } },
     });
-    this.ka = keepalive(this.res, `event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`, { intervalMs: this.keepaliveMs, timers: this.timers });
+  }
+
+  open() {
+    if (!this.lazy) this._open();
+    const frame = this.lazy ? ': keepalive\n\n' : `event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`;
+    this.ka = keepalive(this.res, frame, { intervalMs: this.keepaliveMs, timers: this.timers });
+  }
+
+  /** The stream is someone else's from here (an anthropic-wire leg's verbatim SSE): no keepalive, no event of this face's. */
+  detach() {
+    this.detached = true;
+    this.ka?.stop();
   }
 
   _start(block) {
+    this._open();
     const index = this.blocks++;
     this._event('content_block_start', { type: 'content_block_start', index, content_block: block });
     if (index === 0) this._event('ping', { type: 'ping' });
@@ -286,6 +311,7 @@ export class AnthropicStream {
 
   /** Close what is open; an error event (when the answer broke after it started); message_delta with the stop reason; message_stop. */
   finish({ usage = null, error = null } = {}) {
+    if (this.detached) return;
     if (!this.blocks) {
       this._start({ type: 'text', text: '' });
       this.textOpen = true;
@@ -305,6 +331,7 @@ export class AnthropicStream {
 
   /** A stream that failed after it started: an `error` event, the one an Anthropic SDK raises on. */
   fail(message, type = 'api_error') {
+    if (this.detached) return;
     this._event('error', { type: 'error', error: { type, message: `keysmith: ${message}` } });
     this.ka?.stop();
     this.res.end();

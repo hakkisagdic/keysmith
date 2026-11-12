@@ -2741,7 +2741,9 @@ test('Round 5 New 4: ?tail answers from the 2,000-row in-memory ring with 0 file
       const elapsed = performance.now() - t0;
       assert.equal(second.entries.length, 3);
       assert.equal(openCount, 0, '?tail=50 served from in-memory ring with 0 log file opens');
-      assert.ok(elapsed < 100, `?tail=50 took ${elapsed.toFixed(1)}ms`);
+      // The open count is the check: wall time on a loaded machine (a full suite beside other
+      // work) runs past 100 ms with no file read at all, so the bound only catches a pathology.
+      assert.ok(elapsed < 1000, `?tail=50 took ${elapsed.toFixed(1)}ms`);
     } finally {
       fs.openSync = origOpenSync;
     }

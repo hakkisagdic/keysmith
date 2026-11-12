@@ -19,6 +19,7 @@ import { addUsage } from './tools/emulate.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { pickChatRelayFields, upstreamError, upstreamIdFromHeaders } from './http-adapter.js';
+import { toolPath } from './tools/router.js';
 import { failureOf, legMetaOf, scopeError } from './gateway.js';
 import { authEnabled, describeScope, hashKey, parseKeys, scopeWarnings, targetDecision } from './keys.js';
 import { DailyQuota, overCapMessage } from './quota.js';
@@ -1006,19 +1007,35 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   if (offered > MAX_TOOLS) throw new LlmError(`this request offers ${offered} tools; at most ${MAX_TOOLS} are taken`, { status: 400, type: 'invalid_request_error' });
   // The Messages API's effort: output_config.effort.
   const effort = requestEffort(body, 'anthropic');
-  // Tools on this face reach a CLI leg with a toolMode; an HTTP leg is not handed them (there is
-  // no verbatim relay for the Messages wire), so a route of those answers in text — or, when
-  // tool_choice asks for a call, with an error.
-  const out = { mode: null };
-  const tools = offered ? { spec: anthropicToolSpec(body), messages: anthropicToolMessages(body), face: 'anthropic', state: out, caller, relay: null } : null;
+  // Tools on this face reach a CLI leg with a toolMode through a tool engine, and an HTTP leg on
+  // the anthropic wire verbatim (relayMessagesLeg below writes its answer: Claude Code's tools,
+  // server tools and all, reach the Messages API as the client wrote them). A leg that can carry
+  // neither is passed by; when no leg answered, only tool_choice none is answered in text, any
+  // other with an error (gateway._toolWalk). `out` is what the relay and the stream share.
+  const out = { mode: null, face: null };
+  const spec = offered ? anthropicToolSpec(body) : null;
+  const tools = offered ? { spec, messages: anthropicToolMessages(body), face: 'anthropic', state: out, caller, relay: (leg) => relayMessagesLeg(leg, { body, req, res, out, usage, log, t0, requested }) } : null;
+  // A stream whose route has a leg that may relay opens lazily: until the answer has something,
+  // the client has had SSE comments only, so the relay can still carry on in it.
+  let relayable = false;
+  if (tools) {
+    try {
+      relayable = gateway.resolve(requested, { scope }).some((l) => toolPath(l.adapter, spec, 'anthropic') === 'passthrough');
+    } catch {}
+  }
   const onVirtual = (v) => {
     meta.virtual = v;
     if (v?.skipped?.length) meta.skipped = v.skipped;
   };
   // The Messages API defaults to a single JSON reply; SSE only when asked.
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
+    if (relayed) {
+      // An anthropic-wire leg's answer went out verbatim, with its own usage row.
+      meta.done = true;
+      return;
+    }
     const calls = toolCalls.map((c) => faceCall(c, 'anthropic'));
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
     meta.done = true;
@@ -1040,9 +1057,17 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
     return;
   }
   const events = await held(gateway.complete({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
+  if (res.headersSent) {
+    // An anthropic-wire leg is answering verbatim — its status, its headers, its bytes — and
+    // writes its own usage row: what is left here is waiting for it to finish.
+    meta.done = true;
+    for await (const evt of events) void evt;
+    return;
+  }
   startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
-  const face = new AnthropicStream(res, { id, model: requested, keepaliveMs });
+  const face = new AnthropicStream(res, { id, model: requested, keepaliveMs, lazy: relayable });
   meta.face = face;
+  out.face = face;
   face.open();
   // Headers are on the wire by now, so a streamed response cannot advertise the session
   // id — use stream=false (or /v1/chat/completions) when you need to continue a CLI thread.
@@ -1058,6 +1083,11 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   let leg = null;
   let upstreamId = null;
   for await (const evt of events) {
+    if (evt.type === 'relayed') {
+      // An anthropic-wire leg took the open stream over (relayMessagesLeg) and finished it, row and all.
+      meta.done = true;
+      return;
+    }
     if (evt.type === 'leg') leg = evt.leg;
     else if (evt.type === 'upstream' && evt.upstreamId) upstreamId = evt.upstreamId;
     else if (evt.type === 'retry') retries++;
@@ -1609,6 +1639,80 @@ async function relayLeg({ adapter, model }, { body, req, res, out, usage, log, t
     ...marks({ retries }),
   };
   record(usage, { ...row, status: 'ok' });
+  return true;
+}
+
+/**
+ * The Messages face's verbatim relay: a request that offers tools, on a leg on the anthropic wire
+ * (an Anthropic API key, its clones). The client's body goes up as it is (the Messages API's
+ * fields, the leg's model id, the adapter's credential, the client's `anthropic-beta` features),
+ * and the upstream's answer comes back as it is — its status, its SSE or JSON, its usage, which
+ * the usage row is read from. Like relayLeg: a refusal before anything went out (a 429, a 529, a
+ * 400) hands the request to the next leg; once bytes went out, the answer is this leg's, broken
+ * or not. A stream whose headers already went out (held(): a slower leg before it) carries on
+ * only while the face wrote SSE comments alone (AnthropicStream lazy), never after a frame of its own.
+ */
+async function relayMessagesLeg({ adapter, model }, { body, req, res, out, usage, log, t0, requested }) {
+  if (res.headersSent && (!out.face || out.face.wroteData)) throw cannotRelay(adapter.id, 'with another leg\'s frames in it');
+  out.mode = 'passthrough';
+  // A client that goes away mid-answer stops the upstream's too: on an API key, an answer nobody
+  // reads is still paid for to its last token.
+  const gone = new AbortController();
+  res.once('close', () => {
+    if (!res.writableEnded) gone.abort(new Error('client disconnected'));
+  });
+  const upstream = await adapter.rawMessages({ ...body, model }, { beta: req.headers['anthropic-beta'], signal: gone.signal });
+  if (!upstream.ok) {
+    const t = await upstream.text().catch(() => '');
+    throw upstreamError(adapter.id, upstream, t, { keepStatus: true });
+  }
+  const sse = /text\/event-stream/i.test(upstream.headers.get('content-type') || '');
+  if (res.headersSent) {
+    if (!sse || !out.face || out.face.wroteData) {
+      await upstream.body?.cancel?.().catch(() => {});
+      throw cannotRelay(adapter.id, sse ? 'with another leg\'s frames in it' : 'and the upstream answered without SSE');
+    }
+    out.face.detach();
+  } else {
+    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') || (body?.stream ? 'text/event-stream' : 'application/json'), 'x-keysmith-mode': 'passthrough' });
+  }
+  const retries = (out.failed || []).reduce((n, f) => n + (f.retries || 0), 0);
+  const upstreamId = upstreamIdFromHeaders(upstream.headers);
+  const leg = legMetaOf(adapter, model);
+  const decoder = new TextDecoder();
+  let rawText = '';
+  const row = (status, extra = {}) => {
+    const u = extractRelayedUsage(rawText);
+    record(usage, {
+      model: requested,
+      status,
+      ms: Date.now() - t0,
+      stream: !!body?.stream,
+      via: 'passthrough',
+      client: req.headers['user-agent'] || 'anthropic',
+      toolMode: 'passthrough',
+      _leg: leg,
+      ...(upstreamId ? { upstreamId } : {}),
+      ...usageMarks(out.failed, u?.unknown ? null : u, u?.unknown || null),
+      ...marks({ retries }),
+      ...extra,
+    });
+  };
+  try {
+    for await (const chunk of upstream.body) {
+      rawText += decoder.decode(chunk, { stream: true });
+      res.write(chunk);
+    }
+    rawText += decoder.decode();
+  } catch (e) {
+    // Part of the answer is out: it is the answer, broken, and no other leg is asked.
+    log(`passthrough via ${adapter.id} failed after it had started answering: ${e.message}`);
+    res.end();
+    row('error', { error: redactSecrets(e.message || String(e)) });
+    return true;
+  }
+  res.end();
+  row('ok');
   return true;
 }
 

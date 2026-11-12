@@ -583,6 +583,7 @@ export async function classifyPrompt({
   cache = null,
   now = () => Date.now(),
   signal = null,
+  unavailable = null,
 }) {
   const t0 = Date.now();
   const nowMs = now();
@@ -619,11 +620,12 @@ export async function classifyPrompt({
     }
   }
 
-  if (!adapter || adapter.disabled) {
+  // `unavailable`: why the gateway will not have it asked now (the Kiro credit guard holds it back).
+  if (!adapter || adapter.disabled || unavailable) {
     return {
       label: 'medium',
       reason: 'classifier_unavailable',
-      error: adapter ? `classifier adapter "${vspec.classifierLeg.adapterId}" is disabled` : `classifier adapter "${vspec.classifierLeg.adapterId}" is not loaded`,
+      error: unavailable ? String(unavailable) : adapter ? `classifier adapter "${vspec.classifierLeg.adapterId}" is disabled` : `classifier adapter "${vspec.classifierLeg.adapterId}" is not loaded`,
       cached: false,
       classifyMs: Math.max(0, Date.now() - t0),
       promptHash,

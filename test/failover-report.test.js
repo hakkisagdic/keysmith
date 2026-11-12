@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { Gateway } from '../src/gateway.js';
 import { CreditGuard } from '../src/credit-guard.js';
 import { createServer } from '../src/server.js';
-import { carriageLines, creditGuardLines, creditGuardRows, recentSkips, skipLines, toolCarriage } from '../src/failover-report.js';
+import { carriageLines, creditGuardLines, creditGuardRows, guardShiftLines, recentSkips, skipLines, toolCarriage } from '../src/failover-report.js';
 
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const KEY = 'ks_' + crypto.randomBytes(24).toString('base64url');
@@ -48,13 +48,52 @@ test('toolCarriage and carriageLines: per alias and face, the legs that carry a 
     assert.equal(chatMsgs.legs[2].guarded, true, 'the kiro leg is under the credit guard');
     const chatOai = c.find((x) => x.alias === 'chat' && x.face === 'openai');
     assert.equal(chatOai.carried, 2, 'on /v1/chat/completions the openai-wire leg is relayed verbatim');
+    // On /v1/messages the anthropic-wire leg is relayed verbatim; on the chat face it is not.
     const cheapMsgs = c.find((x) => x.alias === 'cheap' && x.face === 'anthropic');
-    assert.equal(cheapMsgs.carried, 0);
+    assert.deepEqual(cheapMsgs.legs.map((l) => [l.target, l.carries]), [['copilot/gpt-4.1', false], ['claude/sonnet', true]]);
     const lines = carriageLines(c).map((l) => `${l.mark} ${l.text}`);
     assert.ok(lines.includes('! chat: legs that carry tools — /v1/messages 1/3 (agy/m) · /v1/chat/completions 2/3 (agy/m, copilot/gpt-4.1)'), lines.join('\n'));
-    assert.ok(lines.some((l) => /^✗ cheap: legs that carry tools — \/v1\/messages 0\/2 · \/v1\/chat\/completions 1\/2 \(copilot\/gpt-4\.1\) — a tool request on \/v1\/messages \(Claude Code\) to it is a 400$/.test(l)), lines.join('\n'));
+    assert.ok(lines.includes('! cheap: legs that carry tools — /v1/messages 1/2 (claude/sonnet) · /v1/chat/completions 1/2 (copilot/gpt-4.1)'), lines.join('\n'));
     assert.ok(lines.some((l) => /^· kiro on \/v1\/messages: toolMode off: it answers in text only/.test(l)));
-    assert.ok(lines.some((l) => /^· claude on \/v1\/messages: an HTTP upstream on the anthropic wire is never handed tools/.test(l)));
+    assert.ok(lines.some((l) => /^· claude on \/v1\/chat\/completions: an HTTP upstream on the anthropic wire is handed tools verbatim on \/v1\/messages only/.test(l)), lines.join('\n'));
+    // A route with no leg that carries tools on /v1/messages says so.
+    const none = new Gateway({ ...config(dir, '/opt/kiro/bin/kiro-cli'), aliases: { bare: ['copilot/gpt-4.1', 'kiro/m'] } }, { log: () => {}, deferAdapterChecks: true });
+    assert.ok(carriageLines(toolCarriage(none)).some((l) => l.mark === '✗' && /^bare: .*\/v1\/messages 0\/2 .* a tool request on \/v1\/messages \(Claude Code\) to it is a 400$/.test(l.text)));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('toolCarriage: a leg the credit guard holds back carries nothing until the plan resets; guardShiftLines warns of a guarded leg before a metered one no spend cap covers', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-fr-held-'));
+  try {
+    const cfg = config(dir, '/opt/kiro/bin/kiro-cli');
+    cfg.adapters['kiro-emu'] = { kind: 'cli', bin: '/opt/kiro/bin/kiro-cli', args: ['{prompt}'], parser: 'raw', models: ['m'], cwd: path.join(dir, 'ws-emu'), toolMode: 'emulate' };
+    cfg.aliases = { tools: ['kiro-emu/m', 'agy/m'], shift: ['kiro/m', 'claude/sonnet', 'agy/m'] };
+    let out = 'Credits (9600 of 10000 covered in plan)';
+    const guard = new CreditGuard({ run: async () => out });
+    const gateway = new Gateway(cfg, { log: () => {}, deferAdapterChecks: true, creditGuard: guard });
+    // No reading yet: kiro-emu carries tools.
+    let msgs = toolCarriage(gateway).find((x) => x.alias === 'tools' && x.face === 'anthropic');
+    assert.equal(msgs.carried, 2);
+    await guard.check(gateway.adapters.get('kiro-emu'));
+    msgs = toolCarriage(gateway).find((x) => x.alias === 'tools' && x.face === 'anthropic');
+    assert.equal(msgs.carried, 1);
+    assert.deepEqual(msgs.legs[0], { target: 'kiro-emu/m', adapter: 'kiro-emu', carries: false, reason: 'credit_guard', detail: 'held back by the Kiro credit guard — 9,600 of 10,000 credits (96%), at or over 90%', heldBack: true, guarded: true });
+    const lines = carriageLines(toolCarriage(gateway)).map((l) => `${l.mark} ${l.text}`);
+    assert.ok(lines.includes('! tools: legs that carry tools — /v1/messages 1/2 (agy/m) · /v1/chat/completions 1/2 (agy/m)'), lines.join('\n'));
+    assert.ok(lines.includes('· kiro-emu on /v1/messages: held back by the Kiro credit guard — 9,600 of 10,000 credits (96%), at or over 90%'), lines.join('\n'));
+    // Under the threshold again: it carries.
+    out = 'Credits (100 of 10000 covered in plan)';
+    guard.ttlMs = 0;
+    await guard.refresh(gateway.adapters.get('kiro-emu'));
+    assert.equal(toolCarriage(gateway).find((x) => x.alias === 'tools' && x.face === 'anthropic').carried, 2);
+    // A guarded leg before a metered HTTP leg with no cap: warned of; a cap on it, or none after, is not.
+    assert.deepEqual(guardShiftLines(gateway), [{ mark: '!', text: 'shift: kiro/m is held back at 90% of its Kiro plan, and from then on its requests go to claude/sonnet — metered, and no spend cap covers it (limits.spend.claude)' }]);
+    const capped = new Gateway({ ...cfg, limits: { spend: { claude: 25 } } }, { log: () => {}, deferAdapterChecks: true });
+    assert.deepEqual(guardShiftLines(capped), []);
+    const subscription = new Gateway({ ...cfg, adapters: { ...cfg.adapters, claude: { ...cfg.adapters.claude, costBasis: 'subscription' } } }, { log: () => {}, deferAdapterChecks: true });
+    assert.deepEqual(guardShiftLines(subscription), []);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -97,13 +136,31 @@ test('creditGuardRows and creditGuardLines: each adapter with its threshold and 
   // The thresholds of a process that holds no adapters (status) come from the config.
   rows = creditGuardRows(guard.snapshot(), { cfg: { adapters: { kiro: { kind: 'cli', bin: 'kiro-cli' }, 'kiro-emu': { kind: 'cli', bin: 'kiro-cli', creditGuardThreshold: 0.95 } } } });
   assert.deepEqual(rows[0].adapters.map((x) => [x.id, x.threshold, x.state]), [['kiro', 0.9, 'held back'], ['kiro-emu', 0.95, 'ok']]);
-  // The next reading fails: nothing is held back, and the line says why.
+  // The next reading fails: the 92% before it is gone by — kiro stays held back, kiro-emu ok —
+  // and the line says the newest reading failed.
   out = new Error('exited 1: not logged in');
   t += 10 * 60_000;
   await guard.refresh(adapters.get('kiro'));
-  [line] = creditGuardLines(creditGuardRows(guard.snapshot(), { adapters }));
+  rows = creditGuardRows(guard.snapshot(), { adapters });
+  assert.deepEqual(rows[0].adapters, [{ id: 'kiro', threshold: 0.9, state: 'held back', stale: true }, { id: 'kiro-emu', threshold: 0.95, state: 'ok', stale: true }]);
+  [line] = creditGuardLines(rows);
+  assert.equal(line.mark, '✗');
+  assert.match(line.text, /9,200 of 10,000 credits \(92%\) · HELD BACK: kiro · read 12 min ago · plan resets 2026-12-01 · the newest reading failed, so this one is gone by until one succeeds: exited 1: not logged in$/);
+  // Under every threshold, a failed newest reading is a '!' that says the same.
+  const low = new CreditGuard({ now: () => t, run: async () => (out instanceof Error ? Promise.reject(out) : out) });
+  out = 'Credits (100 of 10000 covered in plan)';
+  await low.check(adapters.get('kiro'));
+  out = new Error('timed out after 30000 ms');
+  t += 10 * 60_000;
+  await low.refresh(adapters.get('kiro'));
+  [line] = creditGuardLines(creditGuardRows(low.snapshot(), { adapters }));
   assert.equal(line.mark, '!');
-  assert.match(line.text, /not held back \(the newest reading failed\).*last error: exited 1: not logged in/);
+  assert.match(line.text, /100 of 10,000 credits \(1%\) · ok · read 10 min ago · the newest reading failed, so this one is gone by until one succeeds: timed out/);
+  // From before the plan reset: nothing held back, and said.
+  t = Date.parse('2026-12-01T08:00:00Z');
+  rows = creditGuardRows(guard.snapshot(), { adapters });
+  assert.deepEqual(rows[0].adapters.map((x) => x.state), ['unknown', 'unknown']);
+  assert.match(creditGuardLines(rows)[0].text, /not held back \(the reading is from before the plan reset\)/);
   // No reading at all.
   const blind = new CreditGuard({ run: async () => 'no credits line' });
   await blind.check(a('kiro', 0.9));
@@ -148,7 +205,7 @@ test('keysmith doctor and status: the tool carriage, the credit guard and the le
     // A stand-in named kiro-cli: `/usage` prints a fixture, and every run is counted.
     fs.writeFileSync(
       kiroBin,
-      `#!${process.execPath}\nrequire('fs').appendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(' ') + '\\n');\nif (process.argv.slice(2).join(' ') === 'chat --no-interactive /usage') process.stdout.write('\\u001b[1mEstimated Usage\\u001b[0m | resets on 2026-12-01 | KIRO POWER\\nCredits (9,500 of 10,000 covered in plan), 95.0%\\n');\n`,
+      `#!${process.execPath}\nrequire('fs').appendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(' ') + '\\n');\nif (process.argv.slice(2).join(' ') === 'chat --no-interactive --trust-tools= /usage') process.stdout.write('\\u001b[1mEstimated Usage\\u001b[0m | resets on 2026-12-01 | KIRO POWER\\nCredits (9,500 of 10,000 covered in plan), 95.0%\\n');\n`,
       { mode: 0o755 },
     );
     const data = path.join(dir, 'data');
@@ -169,13 +226,15 @@ test('keysmith doctor and status: the tool carriage, the credit guard and the le
     const env = { ...process.env, PATH: '/usr/bin:/bin:/usr/sbin:/sbin', KEYSMITH_DATA: data, KEYSMITH_CONFIG: cfgPath };
     delete env.KEYSMITH_VERBOSE;
     const run = (cmd) => spawnSync(process.execPath, [CLI, cmd], { env, encoding: 'utf8', timeout: 60_000 });
-    const usageRuns = () => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').split('\n').filter((l) => l === 'chat --no-interactive /usage').length : 0);
+    const usageRuns = () => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').split('\n').filter((l) => l === 'chat --no-interactive --trust-tools= /usage').length : 0);
 
     const doc = run('doctor');
     assert.equal(doc.status, 0, doc.stderr);
     assert.match(doc.stdout, /failover {3}tool requests \(a leg that cannot carry them is passed by, never asked for text\):/);
     assert.match(doc.stdout, /! chat: legs that carry tools — \/v1\/messages 1\/3 \(agy\/m\)/);
-    assert.match(doc.stdout, /✗ cheap: legs that carry tools — \/v1\/messages 0\/2 .* a tool request on \/v1\/messages \(Claude Code\) to it is a 400/);
+    assert.match(doc.stdout, /! cheap: legs that carry tools — \/v1\/messages 1\/2 \(claude\/sonnet\)/);
+    // kiro (held back at 95%) carries no tools anyway; chat's kiro leg comes last, after no metered leg.
+    assert.doesNotMatch(doc.stdout, /is held back at 90% of its Kiro plan, and from then on/);
     assert.match(doc.stdout, /credits {4}the Kiro credit guard/);
     assert.match(doc.stdout, /✗ kiro \(held back at 90%\): 9,500 of 10,000 credits \(95%\) · HELD BACK: kiro · read \d+ s ago · plan resets 2026-12-01/);
     assert.match(doc.stdout, /skipped {4}legs requests were passed by in the last 24 h, and why:/);

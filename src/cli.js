@@ -9,7 +9,7 @@ import { UsageLog, accountHmacKey, execAccountMigrationWarnings, formatUsageCsv,
 import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
 import { autoApproveFlag, which } from './cli-adapter.js';
 import { CreditGuard, readCreditState } from './credit-guard.js';
-import { carriageLines, creditGuardLines, creditGuardRows, recentSkips, skipLines, toolCarriage } from './failover-report.js';
+import { carriageLines, creditGuardLines, creditGuardRows, guardShiftLines, recentSkips, skipLines, toolCarriage } from './failover-report.js';
 import * as tunnel from './tunnel.js';
 import * as service from './service.js';
 import { rel, truncate } from './util.js';
@@ -880,12 +880,14 @@ async function cmdServe(flags) {
     for (const w of execAccountMigrationWarnings(cfg, usage, { checkDisk: true })) warn(`! ${w}`);
   }
   await gateway.checkAdapters({ log: (w) => warn(`! ${w}`) });
-  // Kiro's plan, read now (in the background), so the first kiro request has a reading to go by.
+  // Kiro's plan, read now and kept fresh in the background (every ten minutes per login), so no
+  // kiro request — a failover leg least of all — waits for a reading. The adapters are looked up
+  // on each tick: a config reload that adds or drops a kiro entry is followed.
   const guarded = [...gateway.adapters.values()].filter((a) => a.creditGuard && !a.disabled);
   if (guarded.length) {
     out(`  credits : ${guarded.map((a) => `${a.id} held back at ${Math.round(a.creditGuard.threshold * 1000) / 10}% of its Kiro plan`).join(', ')} (read every 10 min)`);
-    gateway.creditGuard.prime(guarded);
   }
+  gateway.creditGuard.keepFresh(() => [...gateway.adapters.values()]);
   if (secured.changed.length) out(`  logs    : tightened ${secured.changed.length} file(s)/dir(s) to 0600/0700`);
   for (const f of secured.failed) warn(`! could not tighten ${f}`);
   // The MCP bridge (agy's toolMode auto/mcp): its socket, and what a gateway killed before it
@@ -1315,8 +1317,10 @@ async function cmdDoctor(flags) {
   for (const [alias, problems] of Object.entries(gateway.aliasIssues)) {
     for (const p of problems) rows.push([alias, 'alias warning', truncate(p, 70)]);
   }
-  // The Kiro credit guard: a reading now, unless one ran in the last ten minutes (it is shared
-  // with the gateway through its file, so doctor never reads the plan more often than it does).
+  // The Kiro credit guard: a reading now, unless one ran or started in the last ten minutes, here
+  // or in the gateway (their state file: an attempt is written there before it runs, and read
+  // again before the next is decided), so doctor and the gateway never both read the plan inside
+  // them. A reading that hangs is given up on (the guard's deadline), never doctor with it.
   const guarded = [...gateway.adapters.values()].filter((a) => a.creditGuard && !a.disabled);
   for (const a of guarded) await gateway.creditGuard.refresh(a);
   for (const err of new UsageLog(undefined, { pricing: cfg?.pricing }).checkReadable()) {
@@ -1337,7 +1341,7 @@ async function cmdDoctor(flags) {
 
   // Failover: which legs carry a tool request (one that cannot is passed by; a route with none
   // fails a tool request out loud), what the credit guard holds back, what was passed by lately.
-  const carriage = carriageLines(toolCarriage(gateway));
+  const carriage = [...carriageLines(toolCarriage(gateway)), ...guardShiftLines(gateway)];
   if (carriage.length) {
     out('');
     out('  failover   tool requests (a leg that cannot carry them is passed by, never asked for text):');
@@ -1345,7 +1349,7 @@ async function cmdDoctor(flags) {
   }
   if (guarded.length) {
     out('');
-    out('  credits    the Kiro credit guard (kiro-cli chat --no-interactive /usage, at most every 10 min):');
+    out('  credits    the Kiro credit guard (kiro-cli chat --no-interactive --trust-tools= /usage, at most every 10 min):');
     for (const l of creditGuardLines(creditGuardRows(gateway.creditGuard.snapshot(), { adapters: gateway.adapters }))) out(`             ${l.mark} ${l.text}`);
   }
   out('');
