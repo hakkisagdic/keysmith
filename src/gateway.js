@@ -1275,10 +1275,14 @@ export class Gateway {
   /** A leg's failure as the LlmError the route keeps, logged; rethrown when it must end the route. */
   _legFailed({ adapter, model: upstreamModel }, e, state, signal, next) {
     // Wrapped, a failure keeps what a tool engine marked it with: which engine, and what it spent.
+    // The status of an untyped failure: its own when it carries one, 504 only for a failure that
+    // is typed as a timeout (`ETIMEDOUT`, a `TimeoutError`), 502 for any other upstream error.
+    // Never 504 off the word "timeout" in a message: the bridge's `ready_timeout` (a CLI that did
+    // not list its tools in time) is an upstream error the bridge itself reports as a 502.
     const inferredStatus =
       typeof e?.status === 'number' && e.status >= 400
         ? e.status
-        : e?.code === 'ETIMEDOUT' || /timed?\s*out|timeout/i.test(e?.message || '')
+        : isTimeoutError(e)
           ? 504
           : /\b429\b|rate[_\s-]?limit|quota|too many requests/i.test(e?.message || '')
             ? 429
@@ -1685,6 +1689,14 @@ function engineMarks(e) {
   const out = {};
   for (const k of ['toolMode', 'fallback', 'usage', 'retries', 'fallbackReason', 'noFallback', 'routeEnd']) if (e && typeof e === 'object' && e[k] != null) out[k] = e[k];
   return out;
+}
+
+/**
+ * Whether an untyped failure says, by its type, that it timed out: `ETIMEDOUT`, or the
+ * `TimeoutError` an `AbortSignal.timeout()` rejects with. Not a guess from its message.
+ */
+export function isTimeoutError(e) {
+  return !!e && typeof e === 'object' && (e.code === 'ETIMEDOUT' || e.name === 'TimeoutError');
 }
 
 /** Why a tool engine failed, as a usage row says it: the bridge's reason code (`foreign_tool`, `ready_timeout`, …), or null. */

@@ -482,7 +482,8 @@ export class CliAdapter {
         const run = await this._spawnStream({
           args: argvFor(text),
           stdin: stdinFor(text),
-          timeoutMs: Math.max(1_000, deadline - Date.now()),
+          // The first run has the whole budget, to the millisecond its timeout error names.
+          timeoutMs: attempt === 0 ? this.timeoutMs : Math.max(1_000, deadline - Date.now()),
           signal,
           scratchDir,
           model,
@@ -540,6 +541,14 @@ export class CliAdapter {
             continue;
           }
           if (cut && (evt.type === 'delta' || evt.type === 'error')) continue;
+          // An error the parser reports once the stream ended because keysmith's own timeout
+          // stopped the run (codex's held `Reconnecting... 1/5`, said at the stream's end) is
+          // that timeout: a 504 that names it, with the CLI's last error after it — never a 502
+          // that reads as if the CLI had failed on its own.
+          const timedOut = evt.type === 'error' && !emitted ? run.timedOut?.() : null;
+          if (timedOut) {
+            evt = { ...evt, status: 504, message: `${this.id} was stopped by keysmith (${timedOut}); the last error it reported: ${truncate(evt.message || 'none', 300)}` };
+          }
           if (evt.type === 'usage' && carried && !carriedSent) {
             evt = { ...evt, usage: addUsage(carried, evt.usage) };
             carriedSent = true;
@@ -811,6 +820,7 @@ export class CliAdapter {
       }
     });
     let sawFirstEvent = false;
+    let timedOut = null; // keysmith's own clock stopped the run: why, as its error says it
     const applyFirstEventTimeout =
       !this._firstEventTimeoutScopedToFreeTier || !model || String(model).startsWith('opencode/');
     const firstEventMs =
@@ -821,7 +831,9 @@ export class CliAdapter {
       firstEventMs && firstEventMs < timeoutMs
         ? setTimeout(() => {
             if (!sawFirstEvent) {
-              stop(`no first event after ${firstEventMs}ms (opencode produced no output — possible silent 429 / Retry-After sleep)`);
+              const why = `no first event after ${firstEventMs}ms (opencode produced no output — possible silent 429 / Retry-After sleep)`;
+              if (!killed) timedOut = why;
+              stop(why);
             }
           }, firstEventMs)
         : null;
@@ -831,7 +843,10 @@ export class CliAdapter {
         if (firstEventTimer) clearTimeout(firstEventTimer);
       }
     });
-    const timer = setTimeout(() => stop(`timeout after ${timeoutMs}ms`), timeoutMs);
+    const timer = setTimeout(() => {
+      if (!killed) timedOut = `timeout after ${timeoutMs}ms`;
+      stop(`timeout after ${timeoutMs}ms`);
+    }, timeoutMs);
     const onAbort = () => stop('client disconnected');
     signal?.addEventListener('abort', onAbort, { once: true });
 
@@ -850,7 +865,7 @@ export class CliAdapter {
         resolve({ code: killed ? -1 : code, stderr: killed ? `${stderr}\n(${killed})`.trim() : stderr, killed: !!killed, abortError });
       });
     });
-    return { stdout: child.stdout, done, stop, cwd: runCwd };
+    return { stdout: child.stdout, done, stop, cwd: runCwd, timedOut: () => timedOut };
   }
 }
 
