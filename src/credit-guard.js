@@ -10,8 +10,9 @@ import { LlmError, truncate } from './util.js';
  * what a kiro leg spends: the plan's own meter is read instead — `kiro-cli chat --no-interactive
  * --trust-tools= [--agent <the adapter's>] /usage` prints `Credits (X of Y covered in plan)` — and
  * an adapter whose plan is at or over its threshold (`creditGuardThreshold` on the adapter, 0.90
- * by default) is unavailable: a route passes it by (the reason in the usage row's
- * `skippedLegs`), a request that names it is a 429.
+ * by default, up to 1.25: past 1 it runs into Kiro's overage) is unavailable: a route passes it
+ * by (the reason in the usage row's `skippedLegs`), a request that names it is a 429 whose
+ * retry-after is at most five minutes.
  *
  * The reading is cached for ten minutes and `/usage` runs at most once per ten minutes per Kiro
  * login (the adapter's binary and environment: `kiro` and `kiro-emu` share one plan, and one
@@ -30,6 +31,19 @@ import { LlmError, truncate } from './util.js';
 
 export const CREDIT_GUARD_TTL_MS = 10 * 60_000;
 export const DEFAULT_CREDIT_THRESHOLD = 0.9;
+/**
+ * The highest threshold: 1.25 of the plan. Past 1 the adapter runs into Kiro's overage (credits
+ * billed beyond the plan, `Credits (11200 of 10000 covered in plan)`), which a plan may allow up to
+ * a share of its own: 1.12 holds the adapter back at 112%.
+ */
+export const MAX_CREDIT_THRESHOLD = 1.25;
+/**
+ * The longest retry-after (seconds) of a request that names a held-back adapter. The plan's reset
+ * can be weeks away, and a client that honours a retry-after that long stops for weeks: the
+ * threshold may be raised, the plan topped up or reset in the meantime, and the guard reads the
+ * plan every ten minutes, so the client is told to look again in five.
+ */
+export const CREDIT_GUARD_MAX_RETRY_AFTER_S = 300;
 /** The argv of a reading, before the adapter's agent: headless, trusting no tool. */
 export const KIRO_USAGE_ARGS = ['chat', '--no-interactive', '--trust-tools=', '/usage'];
 const FIRST_WAIT_MS = 10_000;
@@ -88,16 +102,16 @@ export function isKiroBin(bin) {
 /**
  * A CLI entry's credit guard, at load: `{ kind: 'kiro', threshold }` for an entry that runs
  * kiro-cli (whatever its id: `kiro`, `kiro-emu`), null otherwise. `creditGuardThreshold` is a
- * fraction of the plan, above 0 and at most 1 (1: held back only once the plan is spent); any
- * other value is a load error, and so is the key on an entry that does not run kiro-cli (it would
- * guard nothing, and say nothing about it).
+ * share of the plan, above 0 and at most MAX_CREDIT_THRESHOLD (1: held back once the plan is
+ * spent; 1.12: at 112%, into the overage); any other value is a load error, and so is the key on
+ * an entry that does not run kiro-cli (it would guard nothing, and say nothing about it).
  */
 export function checkCreditGuard(id, cfg, bin) {
   const raw = cfg?.creditGuardThreshold;
   const kiro = isKiroBin(bin);
   if (raw !== undefined && raw !== null) {
-    if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0 || raw > 1) {
-      throw new Error(`adapter "${id}": creditGuardThreshold must be a fraction of the plan above 0 and at most 1 (0.9 holds the adapter back at 90% of its credits) — got ${JSON.stringify(raw)?.slice(0, 40)}`);
+    if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0 || raw > MAX_CREDIT_THRESHOLD) {
+      throw new Error(`adapter "${id}": creditGuardThreshold must be a share of the plan above 0 and at most ${MAX_CREDIT_THRESHOLD} (0.9 holds the adapter back at 90% of its credits, 1.12 at 112%, into Kiro's overage) — got ${JSON.stringify(raw)?.slice(0, 40)}`);
     }
     if (!kiro) throw new Error(`adapter "${id}": creditGuardThreshold guards a Kiro plan, and this entry does not run kiro-cli (bin ${JSON.stringify(String(bin)).slice(0, 80)})`);
   }
@@ -462,14 +476,19 @@ export function readCreditState(statePath, { now = Date.now(), ttlMs = CREDIT_GU
   return g.snapshot();
 }
 
-/** The 429 a request that names a held-back adapter gets (the spend cap's status and type). */
+/**
+ * The 429 a request that names a held-back adapter gets (the spend cap's status and type). Its
+ * retry-after is the time to the plan's reset, at most CREDIT_GUARD_MAX_RETRY_AFTER_S: the message
+ * still names the reset date.
+ */
 export function creditGuardError(adapter, verdict, now = Date.now()) {
   const reset = verdict.reading?.resetsOn ? Date.parse(`${verdict.reading.resetsOn}T00:00:00Z`) : NaN;
   const err = new LlmError(
     `${adapter.id}: held back by the kiro credit guard — ${verdict.detail}${verdict.reading?.resetsOn ? ` (the plan resets on ${verdict.reading.resetsOn})` : ''}. Another leg answers inside a route; raise creditGuardThreshold on "${adapter.id}" to use it anyway`,
     { status: 429, type: 'rate_limit_error', provider: adapter.id },
   );
-  err.retryAfter = Number.isFinite(reset) && reset > now ? Math.ceil((reset - now) / 1000) : Math.ceil(CREDIT_GUARD_TTL_MS / 1000);
+  const untilReset = Number.isFinite(reset) && reset > now ? Math.ceil((reset - now) / 1000) : Math.ceil(CREDIT_GUARD_TTL_MS / 1000);
+  err.retryAfter = Math.max(1, Math.min(CREDIT_GUARD_MAX_RETRY_AFTER_S, untilReset));
   err.creditGuard = true;
   return err;
 }

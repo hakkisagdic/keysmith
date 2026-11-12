@@ -124,7 +124,8 @@ export class CliAdapter {
     this.effortGap = lacking.length && lacking.length < present.length ? `${id}'s ${lacking.join(', ')} take${lacking.length > 1 ? '' : 's'} no {effort} — keysmith upgrade ${id} --take ${this.takeFor(lacking).join(',')} --apply brings the profile's` : null;
     this.env = cfg.env || {};
     // Kiro's plan credits, which its runs report no token counts of (src/credit-guard.js): held
-    // back at creditGuardThreshold of the plan (0.9 by default) on every entry that runs kiro-cli.
+    // back at creditGuardThreshold of the plan (0.9 by default, up to 1.25 into the overage) on
+    // every entry that runs kiro-cli.
     this.creditGuard = checkCreditGuard(id, cfg, this.bin);
     this.timeoutMs = cfg.timeoutMs ?? 300_000;
     const defaultFirstEventMs = this._isOpencode ? CLI_PROFILES.opencode?.firstEventTimeoutMs ?? 45_000 : null;

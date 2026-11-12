@@ -16,9 +16,11 @@ import { CliAdapter } from '../src/cli-adapter.js';
 import { createServer } from '../src/server.js';
 import { UsageLog } from '../src/usage.js';
 import {
+  CREDIT_GUARD_MAX_RETRY_AFTER_S,
   CREDIT_GUARD_TTL_MS,
   CreditGuard,
   DEFAULT_CREDIT_THRESHOLD,
+  MAX_CREDIT_THRESHOLD,
   checkCreditGuard,
   creditGuardError,
   evaluateCredits,
@@ -71,6 +73,11 @@ test('evaluateCredits: at or over the threshold is held back, under it is not; n
   assert.equal(evaluateCredits(parseKiroUsage(usageOf(9500)), 0.9).blocked, true);
   assert.equal(evaluateCredits(parseKiroUsage(usageOf(9500)), 0.97).blocked, false, 'the adapter\'s own threshold');
   assert.equal(evaluateCredits(parseKiroUsage(usageOf(10000)), 1).blocked, true, '1: only once the plan is spent');
+  // Past 1, into Kiro's overage: 1.12 holds the adapter back at 112% of the plan, not before.
+  assert.equal(evaluateCredits(parseKiroUsage(usageOf(10000)), 1.12).blocked, false, 'the plan spent, the overage allowed');
+  assert.equal(evaluateCredits(parseKiroUsage(usageOf(11199)), 1.12).blocked, false);
+  assert.equal(evaluateCredits(parseKiroUsage(usageOf(11200)), 1.12).blocked, true, 'at 112%');
+  assert.equal(evaluateCredits(parseKiroUsage(usageOf(12000)), 1.12).blocked, true);
   assert.deepEqual(evaluateCredits(null, 0.9), { blocked: false, ratio: null, threshold: 0.9 });
 });
 
@@ -78,9 +85,13 @@ test('checkCreditGuard: every kiro-cli entry is guarded at 0.9 unless it says ot
   assert.deepEqual(checkCreditGuard('kiro', {}, '/Users/x/.local/bin/kiro-cli'), { kind: 'kiro', threshold: 0.9 });
   assert.deepEqual(checkCreditGuard('kiro-emu', { creditGuardThreshold: 0.75 }, 'kiro-cli'), { kind: 'kiro', threshold: 0.75 });
   assert.deepEqual(checkCreditGuard('k', { creditGuardThreshold: 1 }, 'kiro-cli'), { kind: 'kiro', threshold: 1 });
+  // Into the overage, up to 1.25 of the plan.
+  assert.equal(MAX_CREDIT_THRESHOLD, 1.25);
+  assert.deepEqual(checkCreditGuard('kiro', { creditGuardThreshold: 1.12 }, 'kiro-cli'), { kind: 'kiro', threshold: 1.12 });
+  assert.deepEqual(checkCreditGuard('kiro', { creditGuardThreshold: 1.25 }, 'kiro-cli'), { kind: 'kiro', threshold: 1.25 });
   assert.equal(checkCreditGuard('agy', {}, '/usr/local/bin/agy'), null);
-  for (const bad of [0, -0.1, 1.5, '0.9', NaN, true]) {
-    assert.throws(() => checkCreditGuard('kiro', { creditGuardThreshold: bad }, 'kiro-cli'), /creditGuardThreshold must be a fraction of the plan above 0 and at most 1/, String(bad));
+  for (const bad of [0, -0.1, 1.2501, 1.5, 2, Infinity, '0.9', '1.12', NaN, true]) {
+    assert.throws(() => checkCreditGuard('kiro', { creditGuardThreshold: bad }, 'kiro-cli'), /creditGuardThreshold must be a share of the plan above 0 and at most 1\.25 \(0\.9 holds the adapter back at 90% of its credits, 1\.12 at 112%/, String(bad));
   }
   assert.throws(() => checkCreditGuard('agy', { creditGuardThreshold: 0.9 }, 'agy'), /does not run kiro-cli/);
   assert.equal(isKiroBin('C:\\tools\\kiro-cli.exe'), true);
@@ -434,7 +445,24 @@ test('creditGuardError: a 429 rate_limit_error that names the adapter, the plan 
   assert.equal(err.type, 'rate_limit_error');
   assert.equal(err.provider, 'kiro');
   assert.match(err.message, /^kiro: held back by the kiro credit guard — Kiro plan at 9,500 of 10,000 credits \(95%\).*\(the plan resets on 2026-12-01\)/);
-  assert.equal(err.retryAfter, (Date.parse('2026-12-01T00:00:00Z') - now) / 1000);
+  // The reset is 19 days away: a client is told to look again in five minutes, never in 19 days.
+  assert.equal(CREDIT_GUARD_MAX_RETRY_AFTER_S, 300);
+  assert.equal(err.retryAfter, 300);
+});
+
+test('creditGuardError: retry-after is the time to the reset when that is under five minutes, five minutes when no reset is named', () => {
+  const reset = Date.parse('2026-12-01T00:00:00Z');
+  const reading = parseKiroUsage(usageOf(11300));
+  const verdict = { reading, ratio: reading.ratio, threshold: 1.12, detail: 'Kiro plan at 11,300 of 10,000 credits (113%), at or over this adapter\'s creditGuardThreshold of 112%' };
+  assert.equal(creditGuardError({ id: 'kiro' }, verdict, reset - 42_000).retryAfter, 42, 'resets in 42 s');
+  assert.equal(creditGuardError({ id: 'kiro' }, verdict, reset - 300_000).retryAfter, 300);
+  assert.equal(creditGuardError({ id: 'kiro' }, verdict, reset - 301_000).retryAfter, 300);
+  assert.equal(creditGuardError({ id: 'kiro' }, verdict, reset - 400).retryAfter, 1, 'never 0');
+  // No reset date read (or one already past): the next reading, capped the same way.
+  const noDate = { ...verdict, reading: { ...reading, resetsOn: null } };
+  assert.equal(creditGuardError({ id: 'kiro' }, noDate, reset).retryAfter, 300);
+  assert.equal(creditGuardError({ id: 'kiro' }, verdict, reset + 1000).retryAfter, 300, 'a reset already past');
+  assert.match(creditGuardError({ id: 'kiro' }, verdict, reset - 42_000).message, /11,300 of 10,000 credits \(113%\).*creditGuardThreshold of 112%/);
 });
 
 /* ---------------------------------------------------------------- through the gateway */
@@ -539,7 +567,8 @@ test('a request that names a held-back kiro leg is a 429 that says why; under th
   assert.equal(body.type, 'error', 'the Anthropic error shape');
   assert.equal(body.error.type, 'rate_limit_error');
   assert.match(body.error.message, /kiro: held back by the kiro credit guard — Kiro plan at 9,600 of 10,000 credits \(96%\), at or over this adapter's creditGuardThreshold of 90%/);
-  assert.ok(Number(r.headers.get('retry-after')) > 0);
+  const retryAfter = Number(r.headers.get('retry-after'));
+  assert.ok(retryAfter > 0 && retryAfter <= 300, `retry-after ${retryAfter}: at most five minutes, however far the plan's reset is`);
   assert.deepEqual(lastRow().skippedLegs.map((x) => x.reason), ['credit_guard']);
   // An alias of kiro alone: the same 429.
   r = await post('/v1/chat/completions', { model: 'kiroonly', messages: [{ role: 'user', content: 'hi' }] });

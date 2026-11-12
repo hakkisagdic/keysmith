@@ -1127,12 +1127,14 @@ leg spends. Every adapter that runs `kiro-cli` (`kiro`, `kiro-emu`, whatever its
 by the plan's own meter instead: keysmith runs `kiro-cli chat --no-interactive --trust-tools=
 --agent <the adapter's agent> /usage` (no tool trusted, the adapter's tool-less agent), reads
 `Credits (X of Y covered in plan)`, and holds the adapter back while X/Y is at or over its
-`creditGuardThreshold` (a fraction of the plan, `0.9` by default; `keysmith set kiro
-creditGuardThreshold 0.95`, `1` to hold it back only once the plan is spent; on any other entry
-the key is a load error). Held back, a route passes the leg by (`skippedLegs` in the row:
-`credit_guard`, the share of the plan and the threshold) and the next leg answers; a request
-that names it gets a `429` `rate_limit_error` that says why, with `retry-after` until the plan
-resets; a virtual model whose classifier it is labels the request `medium` without asking it.
+`creditGuardThreshold` (a share of the plan, `0.9` by default, above 0 and at most `1.25`;
+`keysmith set kiro creditGuardThreshold 0.95`, `1` to hold it back only once the plan is spent,
+`1.12` to let it run into Kiro's overage up to 112% of the plan; on any other entry the key is a
+load error). Held back, a route passes the leg by (`skippedLegs` in the row: `credit_guard`, the
+share of the plan and the threshold) and the next leg answers; a request that names it gets a
+`429` `rate_limit_error` that says why and names the plan's reset date, with a `retry-after` of
+the time to that reset but at most 300 s (a reset weeks away would stop a client that honours it
+for weeks, while the threshold may be raised or the plan topped up in the meantime); a virtual model whose classifier it is labels the request `medium` without asking it.
 The reading is cached for ten minutes, and `/usage` runs at most once per ten minutes per Kiro
 login (adapters with the same binary and environment share one plan and one reading) across
 processes: an attempt is written to `credit-guard.json` (beside the usage log) before it runs,
