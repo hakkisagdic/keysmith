@@ -190,7 +190,9 @@ setTimeout(() => {}, 20_000);`),
         parser: 'codex-json-final',
         models: ['m'],
         cwd: path.join(dir, 'ws-cxhang'),
-        timeoutMs: 1500,
+        // Long enough for the stub to print its lines on a loaded machine (the full suite runs
+        // files side by side): the case is a timeout while codex retries, not one before it starts.
+        timeoutMs: 3000,
       },
     },
   };
@@ -321,7 +323,7 @@ test('codex: a stream error it retried, then a completed turn, is the answer on 
 test('codex: a run the timeout ends while codex retries its stream is a 504 that names the timeout, and the retried error with it', async () => {
   const r = await post('/v1/chat/completions', { model: 'cxhang/m', messages: [{ role: 'user', content: 'hi' }] });
   assert.equal(r.status, 504, r.text);
-  assert.match(JSON.parse(r.text).error.message, /timeout after 1500ms/);
+  assert.match(JSON.parse(r.text).error.message, /timeout after 3000ms/);
   assert.match(JSON.parse(r.text).error.message, /Reconnecting\.\.\. 1\/5/, 'the retried error rides with it');
   assert.match(lastRow().error, /timeout/);
 });
