@@ -556,6 +556,9 @@ export class HttpAdapter {
         ...(temperature != null ? { temperature } : {}),
         ...(effort && !payload.reasoning_effort && !payload.reasoning ? { reasoning_effort: effort } : {}),
       });
+      // A word or two asked of a model that would spend them thinking (tinyOutputEffort).
+      const tiny = effort || effortIn(payload) ? null : tinyOutputEffort(this.host, effectiveModel, maxTokens || maxCompletionTokens);
+      if (tiny) payload.reasoning_effort = tiny;
     }
 
     const endpoint = isTraycer
@@ -1019,6 +1022,25 @@ function extractUhpUsage(u, adapterId = 'uhp') {
     type: 'usage',
     usage,
   };
+}
+
+/**
+ * Gemini 3.8 Flash on Google's OpenAI-compatible endpoint thinks by default, and its thinking is
+ * counted against `max_tokens`: asked for one word with `max_tokens: 8` (a virtual model's
+ * classifier), it spent them thinking and answered nothing, while `reasoning_effort: "minimal"` is
+ * refused for it (400 "Thinking level MINIMAL is not supported for this model", 2026-11-13) and
+ * `"none"` answers. A request for at most TINY_OUTPUT_MAX_TOKENS tokens that chose no effort of its
+ * own (nor in `modelParams`) is sent with the effort below; any other request is left as it is.
+ */
+export const TINY_OUTPUT_MAX_TOKENS = 16;
+const TINY_OUTPUT_EFFORT = [{ host: 'generativelanguage.googleapis.com', model: /^gemini-3\.8-flash(?!-lite)/, effort: 'none' }];
+
+/** The reasoning effort a tiny-output request to `model` on `host` is sent with, or null. */
+export function tinyOutputEffort(host, model, maxTokens) {
+  const n = Number(maxTokens);
+  if (!Number.isFinite(n) || n <= 0 || n > TINY_OUTPUT_MAX_TOKENS) return null;
+  const rule = TINY_OUTPUT_EFFORT.find((r) => r.host === host && r.model.test(String(model || '')));
+  return rule ? rule.effort : null;
 }
 
 /**
