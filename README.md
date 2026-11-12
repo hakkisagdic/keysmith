@@ -252,6 +252,11 @@ with openai 2.54.0). A failure after the stream started is an `error` event and
 - **A CLI without one** (`toolMode` absent or `off`: `kiro` and the profiles marked
   `unsafeTools`) is passed by.
 
+A leg passed by is named in the request's usage row (`skippedLegs`: target, a reason code —
+`tool_mode_off`, `wire_no_tools`, `unsupported_tools`, `credit_guard` — and why in words), and
+`keysmith doctor` lists, per alias, how many legs carry a tool request on `/v1/messages` and on
+`/v1/chat/completions`, and which legs requests were passed by in the last 24 h.
+
 Which built-in profile answers how: `agy`, `opencode`, `codex`, `qoder` and `claude` with
 `auto` — the MCP bridge, and EMULATE where the bridge cannot, through the same tool-less agent
 and argv as their text runs. Each answered a two-turn round trip live (2026-10-20, both ways:
@@ -435,10 +440,15 @@ The usage row of a bridge turn says which session answered and how it was reache
 the request to the next one; a call handed to the client is an answer, never retried
 elsewhere. If every leg could take the tools and each one refused (a 429, a 400), the client
 gets the refusal with the provider's status and message — not the same request again without
-its tools. Otherwise, for `tool_choice` `auto` or `none`, the legs that were not tried answer
-as a plain completion, without tools, and the log names each leg that refused and its status;
-for `required` or a named tool the client gets an error — the last leg's refusal, or a 400
-saying no leg takes tools — never text in place of the call it asked for. A tool no CLI can
+its tools. A leg that cannot carry the tools is never asked for a text answer in their place:
+a client that offered tools (Claude Code) breaks on one without a word. So for `tool_choice`
+`auto`, `required` or a named tool the client gets an error — the last refusal of a leg that
+took the tools (its status kept: a 429 stays a 429), its message naming the legs passed by and
+why, or, when no leg of the route can carry them, a 400 `invalid_request_error` that names each
+leg and the reason (`kiro/… cannot carry this request's tools — toolMode off …`; on
+`/v1/messages`, in the Anthropic error shape). Only `tool_choice` `none` — the client asked for
+text — is answered as a plain completion by the legs not tried. A request without tools is
+answered as it always was. A tool no CLI can
 honour (an OpenAI `custom` tool, an Anthropic server tool such as `web_search_*`) passes every
 CLI leg by and is a 400 naming it when no HTTP leg relays it. A request that offers more than
 128 tools (`tools` and the older `functions` together; OpenAI's own limit) is a 400 before any
@@ -453,7 +463,8 @@ inside the hold is an HTTP 502, streamed or not; after the stream opened it is t
 error frame (an error chunk and `[DONE]`; an `error` event on `/v1/messages`), which the
 `openai` SDK raises as an `APIError` with no status and does not retry on its own.
 `x-keysmith-mode` says `passthrough`, `emulate` or `mcp` — on a stream, the engine that was
-running when the headers went out, and none when the route fell back to a plain completion.
+running when the headers went out, and none when the route fell back to a plain completion
+(`tool_choice` `none`).
 The usage row says which engine answered (`toolMode`), how many calls it handed over
 (`toolCalls`), `retries`, and why the engine is not the one `auto` picks first (`fallback`);
 never an argument or a result. What a tool engine spent is in the row even when it failed: a
@@ -1105,6 +1116,23 @@ and when the month resets (`YYYY-MM-01T00:00:00Z`), in each face's error shape
 its own. A request already in flight when the cap is crossed finishes. An unreadable month file is
 logged and surfaced on the status page, `keysmith doctor` and `keysmith status`, and makes its
 caps fail closed; `keysmith usage` and the status page show each cap beside its current spend.
+
+**The Kiro credit guard.** Kiro reports no token counts, so a spend cap never sees what a kiro
+leg spends. Every adapter that runs `kiro-cli` (`kiro`, `kiro-emu`, whatever its id) is guarded
+by the plan's own meter instead: keysmith runs `kiro-cli chat --no-interactive /usage`, reads
+`Credits (X of Y covered in plan)`, and holds the adapter back while X/Y is at or over its
+`creditGuardThreshold` (a fraction of the plan, `0.9` by default; `keysmith set kiro
+creditGuardThreshold 0.95`, `1` to hold it back only once the plan is spent). Held back, a route
+passes the leg by (`skippedLegs` in the row: `credit_guard`, the share of the plan and the
+threshold) and the next leg answers; a request that names it gets a `429` `rate_limit_error`
+that says why, with `retry-after` until the plan resets. The reading is cached for ten minutes,
+and `/usage` runs at most once per ten minutes per Kiro login (adapters with the same binary and
+environment share one plan and one reading), kept in `credit-guard.json` beside the usage log,
+so a restarted gateway and `keysmith doctor` do not read it again inside them. A reading that
+fails (not logged in, a timeout, output without that line) never holds anything back: it is
+logged to the gateway's stderr, and doctor and `keysmith status` show it. `serve` reads the plan
+at start; `doctor` shows each guarded adapter's state and the last reading, `status` the reading
+the gateway last kept (it runs no kiro-cli), and `/v1/keysmith/routes` has it as `credit_guards`.
 
 ## Publishing it safely
 

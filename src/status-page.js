@@ -6,7 +6,7 @@ import { fmtUsd } from './usage.js';
  * A one-screen status page at `/`. Not a product — a place to see, in a browser,
  * which adapters loaded and what the last requests cost, without opening a terminal.
  */
-export function statusPage({ cfg, models, usage, usageFilter = null, spend = null, usageErrors = [], startedAt, loadErrors = {}, aliasIssues = {}, viewer = null, keys = null, keyIssues = [] }) {
+export function statusPage({ cfg, models, usage, usageFilter = null, spend = null, usageErrors = [], startedAt, loadErrors = {}, aliasIssues = {}, viewer = null, keys = null, keyIssues = [], failover = null }) {
   const adapters = Object.entries(cfg.adapters || {});
   const failed = Object.entries(loadErrors);
   const aliasList = Object.entries(aliasIssues);
@@ -65,6 +65,7 @@ ${aliasList.length ? `<h2>Alias legs that can never work</h2><table><thead><tr><
 ${models.map((m) => `<tr><td${m.keysmith?.kind === 'alias' && aliasIssues[m.id] ? ' class="bad"' : ''}>${esc(m.id)}</td><td class="muted">${esc(m.keysmith?.adapter || '')}</td><td class="muted">${esc(m.keysmith?.upstream || '')}</td><td class="n">${m.keysmith?.contextWindow || ''}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">no models listed — check <code>keysmith doctor</code></td></tr>'}
 </tbody></table>
 ${keys ? `<h2>Keys</h2><table><thead><tr><th>key</th><th>label</th><th>scope</th><th class="n">today / cap</th><th class="n">req 24h (UTC hour)</th><th class="n">denied</th></tr></thead><tbody>${keyRows}</tbody></table>${keyIssues.length ? `<p class="bad">${keyIssues.map(esc).join('<br>')}</p>` : ''}<p class="muted">A key is named by its fingerprint. <code>keysmith key scope fp:&lt;hex&gt; --deny &lt;adapter&gt;</code> narrows one, <code>--per-day N</code> caps its requests per local day; <code>keysmith key who-can &lt;adapter&gt;</code> lists the keys that reach an adapter.</p>` : ''}
+${failover ? failoverSection(failover) : ''}
 ${spendRows ? `<h2>Spend caps (${esc(spendCaps[0].month)})</h2><table><thead><tr><th>target</th><th>kind</th><th class="n">spent / cap</th><th>status</th><th>resets</th></tr></thead><tbody>${spendRows}</tbody></table>` : ''}
 ${rows ? `<h2>Last 24h by model (rounded to the UTC hour)</h2><table><thead><tr><th>model</th><th class="n">req</th><th class="n">err</th><th class="n">in</th><th class="n">out</th><th class="n">p50 / p95</th><th class="n">avg</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
 <p class="muted">Keys never leave this machine's config. <code>Authorization: Bearer &lt;key&gt;</code> is required on /v1. This page takes the key once, through its form, and keeps a cookie that opens this page alone for an hour.</p>
@@ -106,6 +107,15 @@ const HEAD = `<!doctype html>
  input,button{font:inherit;color:inherit;background:#151a26;border:1px solid #2e3a52;border-radius:6px;padding:6px 10px}
  input{width:min(28em,100%)} button{cursor:pointer}
 </style></head>`;
+
+/**
+ * The Kiro credit guard and the legs requests were passed by (src/failover-report.js), for an
+ * unscoped viewer: `{ guards: [{ mark, text }], skips: [{ mark, text }] }`.
+ */
+function failoverSection({ guards = [], skips = [] }) {
+  const row = (l) => `<tr><td class="${l.mark === '✗' ? 'bad' : l.mark === '✓' ? 'ok' : 'muted'}">${esc(l.mark)}</td><td>${esc(l.text)}</td></tr>`;
+  return `${guards.length ? `<h2>Kiro credit guard</h2><table><tbody>${guards.map(row).join('')}</tbody></table>` : ''}<h2>Legs passed by (24h)</h2><table><tbody>${skips.map(row).join('')}</tbody></table><p class="muted">A leg that cannot carry a request's tools, or that the credit guard holds back, is passed by and named in the usage row (<code>skippedLegs</code>). <code>keysmith doctor</code> lists which legs of each alias carry tools.</p>`;
+}
 
 /** A key's requests today, with its daily cap and the refusals over it when it has one. */
 function todayCell(k) {

@@ -23,6 +23,7 @@ import { failureOf, legMetaOf, scopeError } from './gateway.js';
 import { authEnabled, describeScope, hashKey, parseKeys, scopeWarnings, targetDecision } from './keys.js';
 import { DailyQuota, overCapMessage } from './quota.js';
 import { requestEffort } from './effort.js';
+import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
 
 export function isLoopbackHost(host) {
@@ -292,6 +293,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           viewer: viewer.entry ? { fp: viewer.entry.fp, label: viewer.entry.label, scope: describeScope(scope), perDay: viewer.entry.perDay ?? null, today: quota.today(viewer.entry.fp) } : null,
           keys: authOn && !scope ? keys.map((k) => ({ fp: k.fp, label: k.label, scope: describeScope(k.scope), perDay: k.perDay ?? null, today: quota.today(k.fp), warnings: keyWarnings.filter((w) => w.fp === k.fp).map((w) => `${w.field} ${w.problem}`) })) : null,
           keyIssues: scope ? [] : keyIssues,
+          failover: scope ? null : failoverOverview(gateway, usage),
         }));
       }
     }
@@ -398,6 +400,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           ...(Object.keys(vms).length ? { virtual_models: vms, virtualModels: vms } : {}),
           ...(Object.keys(vmIssues).length ? { virtual_model_warnings: vmIssues } : {}),
           limits: visibleLimits(cfg, gateway, scope),
+          ...visibleCreditGuards(gateway, scope),
         });
       }
       if (route === '/v1/keysmith/usage' && req.method === 'GET') {
@@ -670,6 +673,32 @@ function reachableAccounts(cfg, gateway, scope) {
     if (acct) out.add(acct);
   }
   return out;
+}
+
+/** The status page's failover section (unscoped viewers): the credit guard, and the legs passed by in 24 h. */
+function failoverOverview(gateway, usage) {
+  let skips = [];
+  try {
+    skips = recentSkips(usage?.tail?.(TAIL_RING_MAX) || []);
+  } catch {}
+  return {
+    guards: creditGuardLines(creditGuardRows(gateway.creditGuard?.snapshot?.() || [], { adapters: gateway.adapters })),
+    skips: skipLines(skips),
+  };
+}
+
+/**
+ * The Kiro credit guard on /v1/keysmith/routes (src/credit-guard.js): per Kiro login, the last
+ * reading of its plan and each adapter's threshold and state — the adapters a caller's scope
+ * reaches only. Nothing when no adapter is guarded.
+ */
+function visibleCreditGuards(gateway, scope) {
+  const snap = gateway.creditGuard?.snapshot?.() || [];
+  const rows = creditGuardRows(snap, { adapters: gateway.adapters })
+    .map((r) => ({ ...r, adapters: r.adapters.filter((a) => gateway.adapterVisible(a.id, scope)) }))
+    .filter((r) => r.adapters.length)
+    .map(({ bin: _bin, ...r }) => r);
+  return rows.length ? { credit_guards: rows } : {};
 }
 
 /**

@@ -8,6 +8,8 @@ import { createServer, hasTunnelConfigured, isLoopbackHost, LEGACY_MAX_CONCURREN
 import { UsageLog, accountHmacKey, execAccountMigrationWarnings, formatUsageCsv, formatUsageTable } from './usage.js';
 import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
 import { autoApproveFlag, which } from './cli-adapter.js';
+import { CreditGuard, readCreditState } from './credit-guard.js';
+import { carriageLines, creditGuardLines, creditGuardRows, recentSkips, skipLines, toolCarriage } from './failover-report.js';
 import * as tunnel from './tunnel.js';
 import * as service from './service.js';
 import { rel, truncate } from './util.js';
@@ -813,12 +815,20 @@ function maskRef(ref) {
 
 /* ------------------------------------------------------------------------ models */
 
+/** Where the Kiro credit guard keeps its readings between processes (src/credit-guard.js). */
+function creditStatePath() {
+  return path.join(dataDir(), 'credit-guard.json');
+}
+
 function buildGateway(cfg, { deferAdapterChecks = false } = {}) {
   const usage = new UsageLog(undefined, { pricing: cfg?.pricing });
   // Under launchd this stderr is a log file. Adapter errors quote whatever a CLI printed,
   // which can be a prompt that held the key, so every line is redacted on the way out.
   const log = process.env.KEYSMITH_VERBOSE ? (m) => process.stderr.write(`[keysmith] ${redactSecrets(m)}\n`) : () => {};
-  return { gateway: new Gateway(cfg, { log, usage, deferAdapterChecks }), usage, log };
+  // The credit guard says a failed reading, or an adapter it holds back, whether or not the rest
+  // is verbose: at most a line per ten minutes, and the one sign that a guard is blind.
+  const creditGuard = new CreditGuard({ statePath: creditStatePath(), log: (m) => process.stderr.write(`[keysmith] ${redactSecrets(m)}\n`) });
+  return { gateway: new Gateway(cfg, { log, usage, deferAdapterChecks, creditGuard }), usage, log };
 }
 
 async function cmdModels(flags) {
@@ -870,6 +880,12 @@ async function cmdServe(flags) {
     for (const w of execAccountMigrationWarnings(cfg, usage, { checkDisk: true })) warn(`! ${w}`);
   }
   await gateway.checkAdapters({ log: (w) => warn(`! ${w}`) });
+  // Kiro's plan, read now (in the background), so the first kiro request has a reading to go by.
+  const guarded = [...gateway.adapters.values()].filter((a) => a.creditGuard && !a.disabled);
+  if (guarded.length) {
+    out(`  credits : ${guarded.map((a) => `${a.id} held back at ${Math.round(a.creditGuard.threshold * 1000) / 10}% of its Kiro plan`).join(', ')} (read every 10 min)`);
+    gateway.creditGuard.prime(guarded);
+  }
   if (secured.changed.length) out(`  logs    : tightened ${secured.changed.length} file(s)/dir(s) to 0600/0700`);
   for (const f of secured.failed) warn(`! could not tighten ${f}`);
   // The MCP bridge (agy's toolMode auto/mcp): its socket, and what a gateway killed before it
@@ -1110,6 +1126,15 @@ async function cmdStatus() {
     }
     const t = tunnel.tunnelStatus(cfg);
     lines.push(`tunnel  : cloudflared ${t.installed ? 'installed' : 'MISSING'}${t.logged_in ? ', cloudflare login ok' : ', not logged in'}${t.configured ? `, named "${t.configured.name}" → ${t.configured.hostname}` : ', no named tunnel'}`);
+    // What the gateway's credit guard last read (its file: status runs no kiro-cli), and the legs
+    // requests were passed by lately, with why.
+    for (const l of creditGuardLines(creditGuardRows(readCreditState(creditStatePath()), { cfg }))) lines.push(`credits : ${l.mark} ${l.text}`);
+    try {
+      const skips = recentSkips(new UsageLog(undefined, { pricing: cfg?.pricing }).rowsSince(Date.now() - 24 * 3_600_000));
+      for (const l of skipLines(skips, { limit: 5 })) lines.push(`skipped : ${l.mark} ${l.text}`);
+    } catch (e) {
+      lines.push(`skipped : ! the usage log could not be read (${truncate(e.message, 80)})`);
+    }
     if (rec && alive(rec.pid)) {
       const stale = staleCode(rec);
       if (stale) lines.push(`code    : ${stale}`);
@@ -1290,6 +1315,10 @@ async function cmdDoctor(flags) {
   for (const [alias, problems] of Object.entries(gateway.aliasIssues)) {
     for (const p of problems) rows.push([alias, 'alias warning', truncate(p, 70)]);
   }
+  // The Kiro credit guard: a reading now, unless one ran in the last ten minutes (it is shared
+  // with the gateway through its file, so doctor never reads the plan more often than it does).
+  const guarded = [...gateway.adapters.values()].filter((a) => a.creditGuard && !a.disabled);
+  for (const a of guarded) await gateway.creditGuard.refresh(a);
   for (const err of new UsageLog(undefined, { pricing: cfg?.pricing }).checkReadable()) {
     rows.push(['usage log', 'unreadable', truncate(err, 70)]);
   }
@@ -1304,6 +1333,27 @@ async function cmdDoctor(flags) {
     // '!' rather than '✗': the route still answers, because the next leg in the chain picks it
     // up. What is broken is the ordering you asked for, and the money you think you are saving.
     out(`  ${state === 'ok' ? '✓' : state === 'alias warning' || state === 'version warning' || state === 'workspace warning' ? '!' : state === 'disabled' ? '·' : '✗'} ${id.padEnd(w)}  ${state.padEnd(16)} ${detail}`);
+  }
+
+  // Failover: which legs carry a tool request (one that cannot is passed by; a route with none
+  // fails a tool request out loud), what the credit guard holds back, what was passed by lately.
+  const carriage = carriageLines(toolCarriage(gateway));
+  if (carriage.length) {
+    out('');
+    out('  failover   tool requests (a leg that cannot carry them is passed by, never asked for text):');
+    for (const l of carriage) out(`             ${l.mark} ${l.text}`);
+  }
+  if (guarded.length) {
+    out('');
+    out('  credits    the Kiro credit guard (kiro-cli chat --no-interactive /usage, at most every 10 min):');
+    for (const l of creditGuardLines(creditGuardRows(gateway.creditGuard.snapshot(), { adapters: gateway.adapters }))) out(`             ${l.mark} ${l.text}`);
+  }
+  out('');
+  out('  skipped    legs requests were passed by in the last 24 h, and why:');
+  try {
+    for (const l of skipLines(recentSkips(usage.rowsSince(Date.now() - 24 * 3_600_000)))) out(`             ${l.mark} ${l.text}`);
+  } catch (e) {
+    out(`             ! the usage log could not be read (${truncate(e.message, 80)})`);
   }
 
   const t = tunnel.tunnelStatus(cfg);
