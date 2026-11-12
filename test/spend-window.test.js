@@ -134,7 +134,8 @@ test('through the gateway: a spent windowed cap is a 429 that names its window, 
     },
   });
   const cfg = { adapters: {}, limits: { spend: { 'claude-api': WINDOW } }, aliases: { failover: ['claude-api/m', 'other/m'] } };
-  const gateway = new Gateway(cfg, { usage, now: () => now });
+  const logs = [];
+  const gateway = new Gateway(cfg, { usage, now: () => now, log: (m) => logs.push(m) });
   gateway.adapters.set('claude-api', stub('claude-api'));
   gateway.adapters.set('other', stub('other'));
   await assert.rejects(gateway.collect({ model: 'claude-api/m', messages: [{ role: 'user', content: 'hi' }] }), (e) => {
@@ -145,4 +146,15 @@ test('through the gateway: a spent windowed cap is a 429 that names its window, 
   });
   const res = await gateway.collect({ model: 'failover', messages: [{ role: 'user', content: 'hi' }] });
   assert.match(res.text, /other answer/);
+  // One error line in the log when the cap starts refusing, with the spend; not one per request.
+  const hit = logs.filter((l) => /spend cap hit/.test(l));
+  assert.equal(hit.length, 1, logs.join('\n'));
+  assert.match(hit[0], /^! spend cap hit — spend cap reached for adapter "claude-api": spent \$25\.00 of \$25\.00 in total from 2026-11-12 until 2026-12-09; its requests get 429 rate_limit_error and a route passes it by \(limits\.spend\.claude-api\)$/);
+  // A scoped caller is not told the spend; the log still says it, once.
+  assert.throws(() => gateway.checkSpend(gateway.adapters.get('claude-api'), 'm', { allow: ['claude-api/*'] }), (e) => !/spent/.test(e.message) && /spend cap reached for adapter "claude-api" \(\$25\.00 in total/.test(e.message));
+  assert.equal(logs.filter((l) => /spend cap hit/.test(l)).length, 1);
+  // Another cap (raised, then spent again) is a new line.
+  cfg.limits.spend['claude-api'] = { ...WINDOW, usd: 20 };
+  assert.throws(() => gateway.checkSpend(gateway.adapters.get('claude-api'), 'm'));
+  assert.equal(logs.filter((l) => /spend cap hit/.test(l)).length, 2);
 });

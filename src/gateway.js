@@ -246,13 +246,8 @@ export class Gateway {
     const capped = this.usage.checkSpendCap(spendCfg, adapter, { adaptersCfg: this.cfg?.adapters });
     this._warnExecMigrationOnce({ checkDisk: false });
     if (!capped) return null;
-    const msg = capped.window
-      ? windowCapMessage(capped, scope)
-      : capped.error
-        ? `spend cap for ${capped.kind} "${capped.target}" (${fmtUsd(capped.cap)} monthly cap in ${capped.month}, resets ${capped.resetAt}): refusing request because the usage log is unreadable (${capped.error})`
-        : scope
-          ? `spend cap reached for ${capped.kind} "${capped.target}" (${fmtUsd(capped.cap)} monthly cap in ${capped.month}, resets ${capped.resetAt})`
-          : `spend cap reached for ${capped.kind} "${capped.target}": spent ${fmtUsd(capped.spent)} of ${fmtUsd(capped.cap)} monthly cap in ${capped.month} (resets ${capped.resetAt})`;
+    const msg = spendCapMessage(capped, scope);
+    this._noteSpendCap(capped);
     const err = new LlmError(msg, {
       status: 429,
       type: 'rate_limit_error',
@@ -271,6 +266,20 @@ export class Gateway {
     err.spendCap = capped;
     err.leg = legMetaOf(adapter, upstreamModel);
     return err;
+  }
+
+  /**
+   * One error line in the gateway's log when a spend cap starts refusing — with the spend, whoever
+   * asked — and again when what it says changes (another month, the window closed, another cap),
+   * never one per refused request.
+   */
+  _noteSpendCap(capped) {
+    const state = [capped.window ? `${capped.windowStatus}|${capped.window.since}|${capped.window.until}` : capped.error ? `unreadable|${capped.month}` : `spent|${capped.month}`, capped.cap].join('|');
+    const who = `${capped.kind}:${capped.target}`;
+    if (!this._spendCapSaid) this._spendCapSaid = new Map();
+    if (this._spendCapSaid.get(who) === state) return;
+    this._spendCapSaid.set(who, state);
+    this.log(`! spend cap hit — ${spendCapMessage(capped, null)}; its requests get 429 rate_limit_error and a route passes it by (limits.spend.${capped.target})`);
   }
 
   isVirtualModel(requested) {
@@ -2018,6 +2027,15 @@ function countPromptChars(val) {
     return n;
   }
   return 0;
+}
+
+/** The 429's message of a spend cap that refuses: a scoped key (`scope`) is not told the spend. */
+function spendCapMessage(capped, scope) {
+  if (capped.window) return windowCapMessage(capped, scope);
+  if (capped.error) return `spend cap for ${capped.kind} "${capped.target}" (${fmtUsd(capped.cap)} monthly cap in ${capped.month}, resets ${capped.resetAt}): refusing request because the usage log is unreadable (${capped.error})`;
+  return scope
+    ? `spend cap reached for ${capped.kind} "${capped.target}" (${fmtUsd(capped.cap)} monthly cap in ${capped.month}, resets ${capped.resetAt})`
+    : `spend cap reached for ${capped.kind} "${capped.target}": spent ${fmtUsd(capped.spent)} of ${fmtUsd(capped.cap)} monthly cap in ${capped.month} (resets ${capped.resetAt})`;
 }
 
 /** The 429's message of a windowed spend cap (limits.spend `{ usd, since, until }`) that refuses. */

@@ -1129,7 +1129,9 @@ and a `retry-after` header in seconds until the UTC month turns, naming the cap,
 spend (for an unscoped key; a scoped key sees the cap and reset time without totals across keys),
 and when the month resets (`YYYY-MM-01T00:00:00Z`), in each face's error shape
 (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), and records the refusal as a line of
-its own. A request already in flight when the cap is crossed finishes. An unreadable month file is
+its own; the gateway's log gets one `! spend cap hit — …` line with the spend when a cap starts
+refusing, and another when what it says changes (another month, its window closed, another cap),
+not one per refused request. A request already in flight when the cap is crossed finishes. An unreadable month file is
 logged and surfaced on the status page, `keysmith doctor` and `keysmith status`, and makes its
 caps fail closed; `keysmith usage` and the status page show each cap beside its current spend.
 
