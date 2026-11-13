@@ -24,6 +24,7 @@ import { failureOf, legMetaOf, scopeError } from './gateway.js';
 import { authEnabled, describeScope, hashKey, parseKeys, scopeWarnings, targetDecision } from './keys.js';
 import { DailyQuota, MinuteRateLimiter, overCapMessage, overRateLimitMessage } from './quota.js';
 import { ResponseCache } from './cache.js';
+import { GuardrailEngine } from './guardrails.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
@@ -177,6 +178,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const responseStore = createResponseStore({ now });
   const idempotencyStore = createIdempotencyStore({ now });
   const responseCache = new ResponseCache(cfg, { now });
+  const guardrails = new GuardrailEngine(cfg);
   let inFlight = 0;
   // How long a streamed answer's headers wait for its first event (see `held`).
   const holdMs = Number.isFinite(cfg.limits?.streamHoldMs) && cfg.limits.streamHoldMs >= 0 ? cfg.limits.streamHoldMs : STREAM_HOLD_MS;
@@ -205,6 +207,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   };
   server.reloadKeys = () => reloadKeys(true);
   server.cache = responseCache;
+  server.guardrails = guardrails;
 
   async function handle(req, res) {
     reloadKeys(false);
@@ -220,7 +223,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     }
     const route = url.pathname.replace(/\/+$/, '') || '/';
 
-    res.setHeader('access-control-allow-headers', 'authorization,content-type,x-keysmith-session,x-keysmith-tag,x-keysmith-cache,cache-control,x-api-key,anthropic-version,uhp-version,idempotency-key,x-harness-id,traceparent,tracestate');
+    res.setHeader('access-control-allow-headers', 'authorization,content-type,x-keysmith-session,x-keysmith-tag,x-keysmith-cache,x-keysmith-guardrails,cache-control,x-api-key,anthropic-version,uhp-version,idempotency-key,x-harness-id,traceparent,tracestate');
     res.setHeader('access-control-allow-methods', 'GET,POST,DELETE,OPTIONS');
 
     // UHP-Version header negotiation (UHP 2026-10-19).
@@ -463,10 +466,13 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
         const cleared = responseCache.clear();
         return json(res, 200, { ok: true, cleared, ...responseCache.stats() });
       }
-      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, cfg });
-      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, cfg });
-      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend, responseCache, cfg });
-      if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend, responseCache, cfg });
+      if ((route === '/v1/keysmith/guardrails' || route === '/keysmith/guardrails') && req.method === 'GET') {
+        return json(res, 200, guardrails.stats());
+      }
+      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, guardrails, cfg });
+      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, guardrails, cfg });
+      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend, responseCache, guardrails, cfg });
+      if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend, responseCache, guardrails, cfg });
       return json(res, 404, errorBody(`no route for ${req.method}`, 'invalid_request_error', 404));
     } catch (e) {
       const status = e instanceof LlmError ? e.status : 500;
@@ -494,7 +500,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       } else {
         // A provider's "retry after N s" is for the client's backoff: pass it on.
         if (e?.retryAfter) res.setHeader('retry-after', String(e.retryAfter));
-        pendingErrBody = JSON.stringify(errorBody(message, e instanceof LlmError ? e.type : 'internal_error', status, errProvider, faceName));
+        pendingErrBody = JSON.stringify(errorBody(message, e instanceof LlmError ? e.type : 'internal_error', status, errProvider, faceName, e?.code || null));
       }
       if (meta && !meta.done) {
         // A tool engine that failed still spent its runs: the error says what, and which engine.
@@ -881,8 +887,21 @@ function describeHarness(a) {
 
 /* ---------------------------------------------------------------------- handlers */
 
-async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, responseCache = null, cfg = null }) {
+function applyGuardrails(req, res, body, guardrails) {
+  if (!guardrails) return null;
+  const gr = guardrails.inspectRequest(req, body);
+  if (gr?.active) {
+    res.setHeader('X-Keysmith-Guardrails', gr.hits > 0 ? `${gr.mode}:${gr.types.join(',')}` : `${gr.mode}:clean`);
+    if (gr.hits > 0) res._keysmithGuardrailHits = gr.hits;
+  }
+  return gr;
+}
+
+
+
+async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, responseCache = null, guardrails = null, cfg = null }) {
   const body = await readJson(req);
+  applyGuardrails(req, res, body, guardrails);
   const messages = openaiMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
   const harnessId = extractHarnessId(req, body);
@@ -1126,8 +1145,9 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   });
 }
 
-async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, responseCache = null, cfg = null }) {
+async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, responseCache = null, guardrails = null, cfg = null }) {
   const body = await readJson(req);
+  applyGuardrails(req, res, body, guardrails);
   const messages = anthropicMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
   const t0 = Date.now();
@@ -1329,8 +1349,9 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   void log;
 }
 
-async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null, holdSpend = null, responseCache = null, cfg = null }) {
+async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null, holdSpend = null, responseCache = null, guardrails = null, cfg = null }) {
   const body = await readJson(req);
+  applyGuardrails(req, res, body, guardrails);
   const trace = extractW3cTrace(req, res);
 
   // UHP Idempotency-Key deduplication & conflict detection (409 on payload mismatch).
@@ -1688,8 +1709,9 @@ function noResponsesToolCalls() {
   return new LlmError('this answer is a tool call, and the request offered no tools', { status: 502 });
 }
 
-async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSpend = null, responseCache = null, cfg = null } = {}) {
+async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSpend = null, responseCache = null, guardrails = null, cfg = null } = {}) {
   const body = await readJson(req);
+  applyGuardrails(req, res, body, guardrails);
   const t0 = Date.now();
   const meta = track(res, body.model, false, t0, '/v1/embeddings');
   const slash = String(body.model || '').indexOf('/');
@@ -2436,6 +2458,7 @@ function stamp(entry, { who, req, res, route, gateway, cfg } = {}) {
     ...(face ? { face } : {}),
     bytesIn,
     bytesOut,
+    ...(res?._keysmithGuardrailHits ? { guardrailHits: res._keysmithGuardrailHits } : {}),
     ...(tag ? { tag } : {}),
     cost,
   };

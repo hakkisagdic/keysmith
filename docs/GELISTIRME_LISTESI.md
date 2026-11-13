@@ -12,7 +12,7 @@
 |---|---|---|---|---|---|---|---|---|---|
 | **P0-1** | #8 | Deterministik Yanıt Önbellekleme (`Response Cache`, TTL, `X-Keysmith-Cache`, Tasarruf Ölçümü) | Yok | 9 | 10 | 2,0 | **45,0** | **P0** | [x] |
 | **P0-2** | #9 | Kısa Süreli Hız Sınırlama (`RPM` / `TPM` Rate Limiting) ve `X-RateLimit-*` / `Retry-After` Başlıkları | Kısmi | 9 | 9 | 2,0 | **40,5** | **P0** | [x] |
-| **P0-3** | #11 | KVKK / GDPR Kişisel Veri (PII) Maskeleme/Engelleme & Prompt Injection Güvenlik Duvarı (`Guardrails`) | Kısmi | 10 | 9 | 2,5 | **36,0** | **P0** | [ ] |
+| **P0-3** | #11 | KVKK / GDPR Kişisel Veri (PII) Maskeleme/Engelleme & Prompt Injection Güvenlik Duvarı (`Guardrails`) | Kısmi | 10 | 9 | 2,5 | **36,0** | **P0** | [x] |
 | **P0-4** | #13 | Müşteri/Kiracı Faturalandırma, Ön Ödemeli Kredi Cüzdanı, Paket Yönetimi ve `iyzico` Ödeme Soyutlaması | Yok | 10 | 9 | 3,0 | **30,0** | **P0** | [ ] |
 | **P1-1** | #10 | Ağırlıklı Yük Dengeleme & En Düşük Gecikme / Maliyet Yönlendirmesi (`weighted`, `least-latency`, `least-cost`) | Kısmi | 8 | 9 | 2,5 | **28,8** | **P1** | [ ] |
 | **P1-2** | #12 | Prometheus `/metrics` Uç Noktası & İmzalı Bütçe/Hata Webhook Bildirimleri (`Alerts`) | Kısmi | 8 | 8 | 2,5 | **25,6** | **P1** | [ ] |
@@ -42,7 +42,7 @@
   2. Her API yanıtında (hem `200 OK` hem `429 Too Many Requests`) standart hız sınırı başlıkları (`X-RateLimit-Limit-Requests`, `X-RateLimit-Remaining-Requests`, `X-RateLimit-Reset-Requests`, ve `tpm` tanımlıysa `-Tokens` karşılıkları) gönderilmeli.
   3. `rpm` veya `tpm` aşıldığında `429 Too Many Requests` ve kalan saniyeyi gösteren `Retry-After` başlığı dönmeli; yanlış yapılandırılmış negatif/geçersiz `perMinute`/`tokensPerMinute` değerlerinde `keys.js` fail-closed davranmalı.
 
-### [ ] P0-3 (Matris #11): KVKK / GDPR Kişisel Veri (PII) Maskeleme & Prompt Injection Güvenlik Duvarı (`Guardrails`)
+### [x] P0-3 (Matris #11): KVKK / GDPR Kişisel Veri (PII) Maskeleme & Prompt Injection Güvenlik Duvarı (`Guardrails`)
 - **Durum (Matris):** Kısmi (yalnızca logda API anahtarı gizleme) → Var
 - **Tahmini Efor:** 2,5 birim (~2 saat; `src/guardrails.js` + `src/server.js` + `src/config.js` + testler)
 - **Bağımlılık:** Yok.

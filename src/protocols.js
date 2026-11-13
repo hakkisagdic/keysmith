@@ -234,8 +234,8 @@ export function responsesResult({ id, model, text, usage, created }) {
   };
 }
 
-export function errorBody(message, type = 'invalid_request_error', status = 400, provider = null, face = null) {
-  const err = { message: `keysmith: ${message}`, type, param: null, code: null, ...(provider ? { provider } : {}) };
+export function errorBody(message, type = 'invalid_request_error', status = 400, provider = null, face = null, code = null) {
+  const err = { message: `keysmith: ${message}`, type, param: null, code: code ?? null, ...(provider ? { provider } : {}) };
   if (face === 'messages') return { type: 'error', error: err, status };
   return { error: err, status };
 }
