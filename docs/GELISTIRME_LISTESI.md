@@ -16,7 +16,7 @@
 | **P0-4** | #13 | Müşteri/Kiracı Faturalandırma, Ön Ödemeli Kredi Cüzdanı, Paket Yönetimi ve `iyzico` Ödeme Soyutlaması | Yok | 10 | 9 | 3,0 | **30,0** | **P0** | [x] |
 | **P1-1** | #10 | Ağırlıklı Yük Dengeleme & En Düşük Gecikme / Maliyet Yönlendirmesi (`weighted`, `least-latency`, `least-cost`) | Kısmi | 8 | 9 | 2,5 | **28,8** | **P1** | [x] |
 | **P1-2** | #12 | Prometheus `/metrics` Uç Noktası & İmzalı Bütçe/Hata Webhook Bildirimleri (`Alerts`) | Kısmi | 8 | 8 | 2,5 | **25,6** | **P1** | [x] |
-| **P1-3** | #15 | Operasyonel Web Kontrol Paneli (TR/EN, Mobil Uyumlu, `ui-quality` Standardında Durum/Fatura/Önbellek Konsolu) | Kısmi | 9 | 9 | 3,5 | **23,1** | **P1** | [ ] |
+| **P1-3** | #15 | Operasyonel Web Kontrol Paneli (TR/EN, Mobil Uyumlu, `ui-quality` Standardında Durum/Fatura/Önbellek Konsolu) | Kısmi | 9 | 9 | 3,5 | **23,1** | **P1** | [x] |
 | **P2-1** | #14 | Merkezi Prompt Şablonları & Sürümleme (`Prompt Registry`, `{{değişken}}` Yerleştirme) | Yok | 7 | 8 | 2,5 | **22,4** | **P2** | [ ] |
 
 ---
@@ -87,7 +87,7 @@
   2. `config.webhooks` (`[{ url, secret, events: ["spend_cap.exceeded", "spend_cap.warning", "budget.low_balance", "adapter.error"] }]`) yapılandırması desteklenmeli.
   3. Harcama tavanı aşıldığında, kiracı bakiyesi kritik eşiğin altına düştüğünde veya adaptör hatası oluştuğunda `X-Keysmith-Signature-256: sha256=<hmac>` imzalı JSON yükü (`eventId`, `type`, `createdAt`, `data`) ilgili webhook URL'sine asenkron ve tekrar denemeli (retry) olarak gönderilmeli.
 
-### [ ] P1-3 (Matris #15): Operasyonel Web Kontrol Paneli (TR/EN, Mobil Uyumlu, `ui-quality` Standardında)
+### [x] P1-3 (Matris #15): Operasyonel Web Kontrol Paneli (TR/EN, Mobil Uyumlu, `ui-quality` Standardında)
 - **Durum (Matris):** Kısmi (tek dilli basit tablo) → Var
 - **Tahmini Efor:** 3,5 birim (~2,5 saat; `DESIGN.md` + `src/status-page.js` + `src/server.js` + görsel doğrulama + testler)
 - **Bağımlılık:** P0-1, P0-2, P0-3, P0-4, P1-1, P1-2.

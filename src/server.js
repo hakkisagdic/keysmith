@@ -16,7 +16,7 @@ import {
 import { AnthropicStream, KEEPALIVE_MS, OpenaiChatStream, ResponsesStream, anthropicMessage, faceCall, openaiCompletion, responsesBody } from './tools/faces.js';
 import { MAX_TOOLS, anthropicToolMessages, anthropicToolSpec, openaiLegacy, openaiToolCount, openaiToolMessages, openaiToolSpec, responsesStateRefusal, responsesToolCount, responsesToolMessages, responsesToolSpec } from './tools/model.js';
 import { addUsage } from './tools/emulate.js';
-import { loginPage, statusPage } from './status-page.js';
+import { loginPage, resolvePageLang, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 import { pickChatRelayFields, upstreamError, upstreamIdFromHeaders } from './http-adapter.js';
 import { toolPath } from './tools/router.js';
@@ -291,12 +291,23 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     if (route === '/' || route === '/status') {
       if (req.method === 'POST') return pageLogin(req, res, route);
       if (req.method === 'GET') {
+        const pageLang = resolvePageLang(url, req.headers);
         const byHeader = authOn ? headerEntry(req, keys) : null;
         const viewer = !authOn ? { entry: null } : byHeader ? { entry: byHeader } : pages.session(cookieFrom(req, PAGE_COOKIE), keys);
-        if (!viewer) return send(res, 401, PAGE_HEADERS, loginPage({ action: route }));
+        if (!viewer) return send(res, 401, PAGE_HEADERS, loginPage({ action: route, lang: pageLang }));
         const scope = viewer.entry?.scope || null;
         const { models } = await safeList(gateway, scope);
         const uFilter = usageFilterFor(gateway, viewer.entry);
+        const billingSummary = scope
+          ? null
+          : {
+              tenants: [...billing.tenants.values()],
+              invoices: billing.invoices,
+            };
+        const promptList = scope
+          ? null
+          : server.prompts?.list?.() ||
+            (cfg?.prompts && typeof cfg.prompts === 'object' ? Object.values(cfg.prompts) : []);
         return send(res, 200, PAGE_HEADERS, statusPage({
           cfg: scope ? { ...cfg, adapters: visibleEntries(cfg.adapters, (id) => gateway.adapterVisible(id, scope)) } : cfg,
           models,
@@ -311,6 +322,11 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           keys: authOn && !scope ? keys.map((k) => ({ fp: k.fp, label: k.label, scope: describeScope(k.scope), perDay: k.perDay ?? null, today: quota.today(k.fp), warnings: keyWarnings.filter((w) => w.fp === k.fp).map((w) => `${w.field} ${w.problem}`) })) : null,
           keyIssues: scope ? [] : keyIssues,
           failover: scope ? null : failoverOverview(gateway, usage),
+          lang: pageLang,
+          cacheStats: responseCache.stats(),
+          guardrailStats: guardrails.stats(),
+          billingSummary,
+          prompts: promptList,
         }));
       }
     }
