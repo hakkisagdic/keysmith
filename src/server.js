@@ -25,6 +25,7 @@ import { authEnabled, describeScope, hashKey, parseKeys, scopeWarnings, targetDe
 import { DailyQuota, MinuteRateLimiter, overCapMessage, overRateLimitMessage } from './quota.js';
 import { ResponseCache } from './cache.js';
 import { GuardrailEngine } from './guardrails.js';
+import { BillingManager } from './billing.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
@@ -179,6 +180,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const idempotencyStore = createIdempotencyStore({ now });
   const responseCache = new ResponseCache(cfg, { now });
   const guardrails = new GuardrailEngine(cfg);
+  const billing = new BillingManager(cfg, { now });
   let inFlight = 0;
   // How long a streamed answer's headers wait for its first event (see `held`).
   const holdMs = Number.isFinite(cfg.limits?.streamHoldMs) && cfg.limits.streamHoldMs >= 0 ? cfg.limits.streamHoldMs : STREAM_HOLD_MS;
@@ -208,6 +210,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   server.reloadKeys = () => reloadKeys(true);
   server.cache = responseCache;
   server.guardrails = guardrails;
+  server.billing = billing;
 
   async function handle(req, res) {
     reloadKeys(false);
@@ -306,6 +309,18 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       }
     }
 
+    if ((route === '/v1/keysmith/billing/webhooks/iyzico' || route === '/keysmith/billing/webhooks/iyzico') && req.method === 'POST') {
+      try {
+        const rawBody = await readRawBody(req);
+        const body = rawBody ? JSON.parse(rawBody) : {};
+        const out = billing.handleIyzicoWebhook({ headers: req.headers, rawBody, body });
+        return json(res, 200, out);
+      } catch (e) {
+        const st = e instanceof LlmError ? e.status : 400;
+        return json(res, st, errorBody(e.message || 'webhook error', e.type || 'invalid_request_error', st, null, null, e?.code || null));
+      }
+    }
+
     const who = identify(req, keys, url, authOn, cfg);
     if (who === null) {
       return json(res, 401, errorBody('missing or invalid API key — send `Authorization: Bearer <key>`', 'authentication_error', 401));
@@ -328,8 +343,20 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
             const totalTok = (Number(entry.usage.input) || 0) + (Number(entry.usage.output) || 0);
             if (totalTok > 0) minuteLimiter.recordTokens(who?.fp || '__global__', totalTok);
           }
+          const stampedRow = stamp({ ts: new Date(now()).toISOString(), ...entry }, { who, req, res, route, gateway, cfg });
+          const settlement = billing.settleUsage(who, stampedRow);
+          if (settlement) {
+            stampedRow.tenantId = settlement.tenantId;
+            stampedRow.billedCost = {
+              usd: settlement.billedUsd,
+              try: settlement.billedTry,
+              markupPct: settlement.markupPct,
+            };
+          } else if (who?.tenantId) {
+            stampedRow.tenantId = who.tenantId;
+          }
           if (usage) {
-            usage.record(stamp({ ts: new Date(now()).toISOString(), ...entry }, { who, req, res, route, gateway, cfg }));
+            usage.record(stampedRow);
           }
         } finally {
           releaseHeldSpend();
@@ -360,6 +387,9 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       // cap before anything is read: one per client request, whatever alias, failover or retry happens under it.
       if ((req.method === 'POST' && METERED.has(route)) || (req.method === 'GET' && route === '/v1/keysmith/usage')) {
         meter(who, route, stamped, req, res);
+        if (req.method === 'POST' && METERED.has(route)) {
+          billing.admitRequest(who);
+        }
         meteredRequest = true;
       }
       if (route === '/v1/models' || route === '/models') {
@@ -465,6 +495,51 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
         }
         const cleared = responseCache.clear();
         return json(res, 200, { ok: true, cleared, ...responseCache.stats() });
+      }
+      if ((route === '/v1/keysmith/billing/plans' || route === '/keysmith/billing/plans') && req.method === 'GET') {
+        return json(res, 200, { object: 'list', data: Object.values(billing.plans) });
+      }
+      if ((route === '/v1/keysmith/billing/tenants' || route === '/keysmith/billing/tenants') && req.method === 'GET') {
+        if (scope) {
+          const own = billing.tenantForCaller(who);
+          return json(res, 200, { object: 'list', data: own ? [own] : [] });
+        }
+        return json(res, 200, { object: 'list', data: [...billing.tenants.values()] });
+      }
+      if ((route === '/v1/keysmith/billing/tenants' || route === '/keysmith/billing/tenants') && req.method === 'POST') {
+        if (scope) throw new LlmError('managing tenants requires an unscoped key', { status: 403, type: 'permission_error' });
+        const body = await readJson(req);
+        const t = billing._putTenant(body.id || body.tenantId, body);
+        return json(res, 200, t);
+      }
+      if ((route === '/v1/keysmith/billing/topup' || route === '/keysmith/billing/topup') && req.method === 'POST') {
+        if (scope) throw new LlmError('manual wallet top-up requires an unscoped key', { status: 403, type: 'permission_error' });
+        const body = await readJson(req);
+        const resTopup = billing.topup(body);
+        return json(res, 200, resTopup);
+      }
+      if ((route === '/v1/keysmith/billing/checkout' || route === '/keysmith/billing/checkout') && req.method === 'POST') {
+        const body = await readJson(req);
+        if (scope) {
+          const own = billing.tenantForCaller(who);
+          if (!own || (body.tenantId && body.tenantId !== own.id)) {
+            throw new LlmError('scoped key may only initiate checkout for its own tenant', { status: 403, type: 'permission_error' });
+          }
+          body.tenantId = own.id;
+        }
+        const chk = billing.createCheckout(body);
+        return json(res, 200, chk);
+      }
+      if ((route === '/v1/keysmith/billing/invoices' || route === '/keysmith/billing/invoices') && req.method === 'GET') {
+        const filterTenant = url.searchParams.get('tenantId');
+        let list = billing.invoices;
+        if (scope) {
+          const own = billing.tenantForCaller(who);
+          list = own ? list.filter((inv) => inv.tenantId === own.id) : [];
+        } else if (filterTenant) {
+          list = list.filter((inv) => inv.tenantId === filterTenant);
+        }
+        return json(res, 200, { object: 'list', data: list });
       }
       if ((route === '/v1/keysmith/guardrails' || route === '/keysmith/guardrails') && req.method === 'GET') {
         return json(res, 200, guardrails.stats());
@@ -2723,6 +2798,18 @@ function abortSignal(req, res) {
     if (!res.writableEnded) done();
   });
   return c.signal;
+}
+
+async function readRawBody(req) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const c of req) {
+    bytes += c.length;
+    req._bytesIn = bytes;
+    if (bytes > MAX_BODY) throw new LlmError('request body too large', { status: 413 });
+    chunks.push(c);
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 async function readJson(req) {

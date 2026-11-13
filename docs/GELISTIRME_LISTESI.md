@@ -13,7 +13,7 @@
 | **P0-1** | #8 | Deterministik Yanıt Önbellekleme (`Response Cache`, TTL, `X-Keysmith-Cache`, Tasarruf Ölçümü) | Yok | 9 | 10 | 2,0 | **45,0** | **P0** | [x] |
 | **P0-2** | #9 | Kısa Süreli Hız Sınırlama (`RPM` / `TPM` Rate Limiting) ve `X-RateLimit-*` / `Retry-After` Başlıkları | Kısmi | 9 | 9 | 2,0 | **40,5** | **P0** | [x] |
 | **P0-3** | #11 | KVKK / GDPR Kişisel Veri (PII) Maskeleme/Engelleme & Prompt Injection Güvenlik Duvarı (`Guardrails`) | Kısmi | 10 | 9 | 2,5 | **36,0** | **P0** | [x] |
-| **P0-4** | #13 | Müşteri/Kiracı Faturalandırma, Ön Ödemeli Kredi Cüzdanı, Paket Yönetimi ve `iyzico` Ödeme Soyutlaması | Yok | 10 | 9 | 3,0 | **30,0** | **P0** | [ ] |
+| **P0-4** | #13 | Müşteri/Kiracı Faturalandırma, Ön Ödemeli Kredi Cüzdanı, Paket Yönetimi ve `iyzico` Ödeme Soyutlaması | Yok | 10 | 9 | 3,0 | **30,0** | **P0** | [x] |
 | **P1-1** | #10 | Ağırlıklı Yük Dengeleme & En Düşük Gecikme / Maliyet Yönlendirmesi (`weighted`, `least-latency`, `least-cost`) | Kısmi | 8 | 9 | 2,5 | **28,8** | **P1** | [ ] |
 | **P1-2** | #12 | Prometheus `/metrics` Uç Noktası & İmzalı Bütçe/Hata Webhook Bildirimleri (`Alerts`) | Kısmi | 8 | 8 | 2,5 | **25,6** | **P1** | [ ] |
 | **P1-3** | #15 | Operasyonel Web Kontrol Paneli (TR/EN, Mobil Uyumlu, `ui-quality` Standardında Durum/Fatura/Önbellek Konsolu) | Kısmi | 9 | 9 | 3,5 | **23,1** | **P1** | [ ] |
@@ -52,7 +52,7 @@
   3. `mode: "mask"` seçildiğinde LLM'e gitmeden önce girdi metinlerindeki (ve `scanOutput: true` ise model yanıtındaki) PII verileri `[REDACTED_TCKN]`, `[REDACTED_IBAN]`, `[REDACTED_CARD]`, `[REDACTED_EMAIL]`, `[REDACTED_PHONE]` ile maskelenmeli; `mode: "block"` seçildiğinde istek `400 Bad Request` (`code: "guardrail_blocked"`) ile reddedilmeli ve yukarı akışa hiçbir veri gönderilmemeli.
   4. `blockPromptInjection: true` etkin olduğunda bilinen sistem komutu ezme / jailbreak kalıpları tespit edilip `400 Bad Request` (`code: "prompt_injection_detected"`) ile engellenmeli; tespit istatistikleri `X-Keysmith-Guardrails` başlığında ve durum/kullanım raporunda görünmeli.
 
-### [ ] P0-4 (Matris #13): Müşteri/Kiracı Faturalandırma, Ön Ödemeli Kredi Cüzdanı, Paket Yönetimi ve `iyzico` Ödeme Soyutlaması
+### [x] P0-4 (Matris #13): Müşteri/Kiracı Faturalandırma, Ön Ödemeli Kredi Cüzdanı, Paket Yönetimi ve `iyzico` Ödeme Soyutlaması
 - **Durum (Matris):** Yok → Var
 - **Tahmini Efor:** 3 birim (~2,5 saat; `src/billing.js` + `src/server.js` + `src/usage.js` + testler)
 - **Bağımlılık:** P0-1, P0-2.
