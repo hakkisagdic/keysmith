@@ -26,6 +26,8 @@ import { DailyQuota, MinuteRateLimiter, overCapMessage, overRateLimitMessage } f
 import { ResponseCache } from './cache.js';
 import { GuardrailEngine } from './guardrails.js';
 import { BillingManager } from './billing.js';
+import { MetricsCollector } from './metrics.js';
+import { WebhookDispatcher } from './webhooks.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
@@ -181,6 +183,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const responseCache = new ResponseCache(cfg, { now });
   const guardrails = new GuardrailEngine(cfg);
   const billing = new BillingManager(cfg, { now });
+  const metrics = new MetricsCollector();
+  const webhooks = new WebhookDispatcher(cfg?.webhooks, { now, log });
   let inFlight = 0;
   // How long a streamed answer's headers wait for its first event (see `held`).
   const holdMs = Number.isFinite(cfg.limits?.streamHoldMs) && cfg.limits.streamHoldMs >= 0 ? cfg.limits.streamHoldMs : STREAM_HOLD_MS;
@@ -211,6 +215,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   server.cache = responseCache;
   server.guardrails = guardrails;
   server.billing = billing;
+  server.metrics = metrics;
+  server.webhooks = webhooks;
 
   async function handle(req, res) {
     reloadKeys(false);
@@ -344,6 +350,13 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
             if (totalTok > 0) minuteLimiter.recordTokens(who?.fp || '__global__', totalTok);
           }
           const stampedRow = stamp({ ts: new Date(now()).toISOString(), ...entry }, { who, req, res, route, gateway, cfg });
+          if (!stampedRow.cost && stampedRow.usage && !stampedRow.cacheHit) {
+            const c = computeCost(cfg?.pricing, stampedRow.adapter, stampedRow.resolvedModel || stampedRow.model, stampedRow.usage, {
+              costBasis: stampedRow._leg?.costBasis,
+              upstreamModel: stampedRow._leg?.upstreamModel,
+            });
+            if (c) stampedRow.cost = c;
+          }
           const settlement = billing.settleUsage(who, stampedRow);
           if (settlement) {
             stampedRow.tenantId = settlement.tenantId;
@@ -357,6 +370,71 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           }
           if (usage) {
             usage.record(stampedRow);
+          }
+          const rowCostUsd =
+            stampedRow.cost?.usd ??
+            (stampedRow.usage && !stampedRow.cacheHit
+              ? computeCost(cfg?.pricing, stampedRow.adapter, stampedRow.resolvedModel || stampedRow.model, stampedRow.usage, {
+                  costBasis: stampedRow._leg?.costBasis,
+                  upstreamModel: stampedRow._leg?.upstreamModel,
+                })?.usd || 0
+              : 0);
+          const metricModel = String(stampedRow._leg?.model || stampedRow.resolvedModel || stampedRow.model || 'unknown').replace(
+            new RegExp(`^${stampedRow.adapter}/`),
+            '',
+          );
+          metrics.recordRequest({
+            adapter: stampedRow.adapter || 'unknown',
+            model: metricModel || 'unknown',
+            face: stampedRow.face || faceFromRoute(route) || 'chat',
+            status: stampedRow.status || 'ok',
+            ms: stampedRow.ms || 0,
+            inputTokens: stampedRow.cacheHit ? 0 : (stampedRow.usage?.input || 0),
+            outputTokens: stampedRow.cacheHit ? 0 : (stampedRow.usage?.output || 0),
+            costUsd: stampedRow.cacheHit ? 0 : rowCostUsd,
+          });
+          if (settlement && settlement.billingMode === 'prepaid') {
+            const lowThresh = Number(settlement.lowBalanceThresholdUsd ?? cfg?.billing?.lowBalanceThresholdUsd ?? 2.0);
+            if (settlement.balanceUsd <= lowThresh) {
+              webhooks.emit(
+                'budget.low_balance',
+                {
+                  tenantId: settlement.tenantId,
+                  balanceUsd: settlement.balanceUsd,
+                  thresholdUsd: lowThresh,
+                  plan: settlement.plan,
+                },
+                { dedupeKey: settlement.tenantId },
+              );
+            }
+          }
+          if (stampedRow.status === 'error' && stampedRow.adapter && stampedRow.adapter !== 'virtual') {
+            webhooks.emit('adapter.error', {
+              adapter: stampedRow.adapter,
+              model: stampedRow.resolvedModel || stampedRow.model || null,
+              face: stampedRow.face || faceFromRoute(route) || null,
+              error: stampedRow.error || 'upstream error',
+            });
+          }
+          if (usage && cfg?.limits?.spend && stampedRow.status === 'ok') {
+            try {
+              const caps = usage.spendSummary(cfg.limits.spend, { adapters: cfg.adapters }) || [];
+              for (const s of caps) {
+                if (!s.exceeded && s.cap > 0 && s.spent != null && s.spent >= s.cap * 0.8) {
+                  webhooks.emit(
+                    'spend_cap.warning',
+                    {
+                      target: s.target,
+                      kind: s.kind,
+                      spent: s.spent,
+                      cap: s.cap,
+                      ratio: Math.round((s.spent / s.cap) * 1000) / 1000,
+                    },
+                    { dedupeKey: `${s.kind}:${s.target}:${s.month || 'window'}` },
+                  );
+                }
+              }
+            } catch {}
           }
         } finally {
           releaseHeldSpend();
@@ -544,6 +622,22 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       if ((route === '/v1/keysmith/guardrails' || route === '/keysmith/guardrails') && req.method === 'GET') {
         return json(res, 200, guardrails.stats());
       }
+      if ((route === '/metrics' || route === '/v1/keysmith/metrics' || route === '/keysmith/metrics') && req.method === 'GET') {
+        if (scope) {
+          throw new LlmError('prometheus metrics require an unscoped key', { status: 403, type: 'permission_error' });
+        }
+        const body = metrics.render({ cache: responseCache, guardrails, gateway });
+        return send(res, 200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' }, body);
+      }
+      if ((route === '/v1/keysmith/webhooks' || route === '/keysmith/webhooks') && req.method === 'GET') {
+        if (scope) {
+          throw new LlmError('webhook delivery logs require an unscoped key', { status: 403, type: 'permission_error' });
+        }
+        return json(res, 200, {
+          endpoints: webhooks.endpoints.map((ep) => ({ url: ep.url, events: ep.events, signed: Boolean(ep.secret) })),
+          deliveries: webhooks.deliveries,
+        });
+      }
       if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, guardrails, cfg });
       if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, guardrails, cfg });
       if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend, responseCache, guardrails, cfg });
@@ -551,6 +645,22 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       return json(res, 404, errorBody(`no route for ${req.method}`, 'invalid_request_error', 404));
     } catch (e) {
       const status = e instanceof LlmError ? e.status : 500;
+      if (e?.spendCap) {
+        metrics.recordSpendCapBlocked(e.spendCap.target || 'unknown');
+        webhooks.emit(
+          'spend_cap.exceeded',
+          {
+            target: e.spendCap.target,
+            kind: e.spendCap.kind,
+            cap: e.spendCap.cap,
+            spent: e.spendCap.spent ?? null,
+            resetAt: e.spendCap.resetAt ?? null,
+          },
+          { dedupeKey: `${e.spendCap.kind}:${e.spendCap.target}` },
+        );
+      } else if (e?.code === 'insufficient_balance' || e?.code === 'plan_quota_exceeded') {
+        metrics.recordSpendCapBlocked(who?.tenantId || 'tenant');
+      }
       if (status >= 500) log(`${route} crashed: ${e.stack || e.message}`);
       // The client gets the error the way a log line does: an upstream message can quote
       // a provider key, and a client of this gateway was never given that key.

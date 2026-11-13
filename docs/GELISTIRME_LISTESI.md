@@ -15,7 +15,7 @@
 | **P0-3** | #11 | KVKK / GDPR Kişisel Veri (PII) Maskeleme/Engelleme & Prompt Injection Güvenlik Duvarı (`Guardrails`) | Kısmi | 10 | 9 | 2,5 | **36,0** | **P0** | [x] |
 | **P0-4** | #13 | Müşteri/Kiracı Faturalandırma, Ön Ödemeli Kredi Cüzdanı, Paket Yönetimi ve `iyzico` Ödeme Soyutlaması | Yok | 10 | 9 | 3,0 | **30,0** | **P0** | [x] |
 | **P1-1** | #10 | Ağırlıklı Yük Dengeleme & En Düşük Gecikme / Maliyet Yönlendirmesi (`weighted`, `least-latency`, `least-cost`) | Kısmi | 8 | 9 | 2,5 | **28,8** | **P1** | [x] |
-| **P1-2** | #12 | Prometheus `/metrics` Uç Noktası & İmzalı Bütçe/Hata Webhook Bildirimleri (`Alerts`) | Kısmi | 8 | 8 | 2,5 | **25,6** | **P1** | [ ] |
+| **P1-2** | #12 | Prometheus `/metrics` Uç Noktası & İmzalı Bütçe/Hata Webhook Bildirimleri (`Alerts`) | Kısmi | 8 | 8 | 2,5 | **25,6** | **P1** | [x] |
 | **P1-3** | #15 | Operasyonel Web Kontrol Paneli (TR/EN, Mobil Uyumlu, `ui-quality` Standardında Durum/Fatura/Önbellek Konsolu) | Kısmi | 9 | 9 | 3,5 | **23,1** | **P1** | [ ] |
 | **P2-1** | #14 | Merkezi Prompt Şablonları & Sürümleme (`Prompt Registry`, `{{değişken}}` Yerleştirme) | Yok | 7 | 8 | 2,5 | **22,4** | **P2** | [ ] |
 
@@ -78,7 +78,7 @@
   3. `least-latency`: Her `adapter/model` bacağının hareketli ortalama (EWMA) yanıt süresini izleyerek en hızlı bacağı ilk sıraya almalı (henüz ölçümü olmayan bacakları keşfederek).
   4. `least-cost`: `pricing` tablosuna göre girdi+çıktı birim maliyeti en düşük olan uygun bacağı ilk sıraya koymalı.
 
-### [ ] P1-2 (Matris #12): Prometheus `/metrics` Uç Noktası & İmzalı Bütçe/Hata Webhook Bildirimleri
+### [x] P1-2 (Matris #12): Prometheus `/metrics` Uç Noktası & İmzalı Bütçe/Hata Webhook Bildirimleri
 - **Durum (Matris):** Kısmi (`/v1/keysmith/usage` JSON var, `/metrics` ve webhook yok) → Var
 - **Tahmini Efor:** 2,5 birim (~2 saat; `src/metrics.js` + `src/webhooks.js` + `src/server.js` + testler)
 - **Bağımlılık:** P0-1, P0-4.

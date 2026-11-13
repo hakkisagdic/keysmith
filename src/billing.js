@@ -322,6 +322,8 @@ export class BillingManager {
     return {
       tenantId: tenant.id,
       plan: tenant.plan,
+      billingMode: tenant.billingMode,
+      lowBalanceThresholdUsd: tenant.lowBalanceThresholdUsd,
       markupPct: tenant.markupPct,
       billedUsd,
       billedTry,
