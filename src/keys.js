@@ -34,7 +34,7 @@ import { fingerprint } from './redact.js';
  * fingerprint.
  */
 
-const ENTRY_FIELDS = new Set(['key', 'keyHash', 'label', 'allow', 'deny', 'perDay']);
+const ENTRY_FIELDS = new Set(['key', 'keyHash', 'label', 'allow', 'deny', 'perDay', 'perMinute', 'rpm', 'tokensPerMinute', 'tpm', 'tenantId']);
 
 /** A key string out of an `auth.keys` entry, or null. */
 export function keyOf(entry) {
@@ -141,7 +141,10 @@ export function compileScope(entry) {
     if (!ENTRY_FIELDS.has(field)) throw new Error(`unknown field "${field}" (a key entry has key, label, allow, deny, perDay)`);
   }
   if (entry.label != null && typeof entry.label !== 'string') throw new Error('"label" must be a string');
+  if (entry.tenantId != null && (typeof entry.tenantId !== 'string' || !entry.tenantId.trim())) throw new Error('"tenantId" must be a non-empty string');
   perDayOf(entry);
+  perMinuteOf(entry);
+  tokensPerMinuteOf(entry);
   const allow = entry.allow === undefined ? null : patternList(entry.allow, 'allow');
   const deny = entry.deny === undefined ? [] : patternList(entry.deny, 'deny');
   if (!allow && !deny.length) return null;
@@ -163,6 +166,34 @@ export function perDayOf(entry) {
 }
 
 /** One line for a cap: `300 requests/day`, or '' for none. */
+export function perMinuteOf(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const hasPm = entry.perMinute !== undefined;
+  const hasRpm = entry.rpm !== undefined;
+  if (!hasPm && !hasRpm) return null;
+  if (hasPm && hasRpm && entry.perMinute !== entry.rpm) {
+    throw new Error(`"perMinute" (${JSON.stringify(entry.perMinute)}) and "rpm" (${JSON.stringify(entry.rpm)}) do not match`);
+  }
+  const n = hasPm ? entry.perMinute : entry.rpm;
+  const field = hasPm ? 'perMinute' : 'rpm';
+  if (!Number.isSafeInteger(n) || n < 0) throw new Error(`"${field}" must be a whole number of requests per minute, e.g. 60 (got ${JSON.stringify(n)})`);
+  return n;
+}
+
+export function tokensPerMinuteOf(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const hasTpmLong = entry.tokensPerMinute !== undefined;
+  const hasTpmShort = entry.tpm !== undefined;
+  if (!hasTpmLong && !hasTpmShort) return null;
+  if (hasTpmLong && hasTpmShort && entry.tokensPerMinute !== entry.tpm) {
+    throw new Error(`"tokensPerMinute" (${JSON.stringify(entry.tokensPerMinute)}) and "tpm" (${JSON.stringify(entry.tpm)}) do not match`);
+  }
+  const n = hasTpmLong ? entry.tokensPerMinute : entry.tpm;
+  const field = hasTpmLong ? 'tokensPerMinute' : 'tpm';
+  if (!Number.isSafeInteger(n) || n < 0) throw new Error(`"${field}" must be a whole number of tokens per minute, e.g. 50000 (got ${JSON.stringify(n)})`);
+  return n;
+}
+
 export function describePerDay(perDay) {
   return perDay == null ? '' : `${perDay} request${perDay === 1 ? '' : 's'}/day`;
 }
@@ -192,6 +223,9 @@ export function parseKeys(list) {
     const label = item && typeof item === 'object' && typeof item.label === 'string' ? item.label : null;
     let scope;
     let perDay = null;
+    let perMinute = null;
+    let tokensPerMinute = null;
+    const tenantId = item && typeof item === 'object' && typeof item.tenantId === 'string' && item.tenantId.trim() ? item.tenantId.trim() : null;
     try {
       if (item && typeof item === 'object' && item.key != null && item.keyHash != null) {
         const h = keyHashOf(item);
@@ -199,6 +233,8 @@ export function parseKeys(list) {
       }
       scope = compileScope(item);
       perDay = perDayOf(item);
+      perMinute = perMinuteOf(item);
+      tokensPerMinute = tokensPerMinuteOf(item);
     } catch (e) {
       scope = NOTHING(e.message);
       issues.push(`key fp:${fp}${label ? ` (${label})` : ''}: ${e.message} — it reaches nothing until that is fixed`);
@@ -206,7 +242,7 @@ export function parseKeys(list) {
     if (scope && typeof scope === 'object') {
       Object.defineProperty(scope, '_fp', { value: fp, enumerable: false, configurable: true });
     }
-    entries.push({ key: key || null, keyHash: keyHash || null, hashed, label, fp, scope, perDay });
+    entries.push({ key: key || null, keyHash: keyHash || null, hashed, label, fp, scope, perDay, perMinute, tokensPerMinute, tenantId });
   }
   // The same key twice: the gateway would match the first entry, and a hand edit that adds an
   // unscoped (or uncapped) copy above a scoped (or capped) one would quietly widen it. Two
@@ -219,7 +255,7 @@ export function parseKeys(list) {
   for (const [, same] of byKey) {
     if (same.length < 2) continue;
     const scopes = new Set(same.map((e) => JSON.stringify(scopeText(e.scope))));
-    const caps = new Set(same.map((e) => e.perDay));
+    const caps = new Set(same.map((e) => `${e.perDay ?? ''}:${e.perMinute ?? ''}:${e.tokensPerMinute ?? ''}`));
     if (scopes.size < 2 && caps.size < 2) continue;
     const what = scopes.size > 1 ? 'different scopes' : 'different daily caps';
     for (const e of same) e.scope = NOTHING(`listed ${same.length} times with ${what}`);

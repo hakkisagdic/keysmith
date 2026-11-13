@@ -11,7 +11,7 @@
 | Kod | Matris # | İş Kalemi | Matrosteki Durum | Gelir Etkisi | Kullanıcı Değeri | Efor | Puan | Öncelik | Durum |
 |---|---|---|---|---|---|---|---|---|---|
 | **P0-1** | #8 | Deterministik Yanıt Önbellekleme (`Response Cache`, TTL, `X-Keysmith-Cache`, Tasarruf Ölçümü) | Yok | 9 | 10 | 2,0 | **45,0** | **P0** | [x] |
-| **P0-2** | #9 | Kısa Süreli Hız Sınırlama (`RPM` / `TPM` Rate Limiting) ve `X-RateLimit-*` / `Retry-After` Başlıkları | Kısmi | 9 | 9 | 2,0 | **40,5** | **P0** | [ ] |
+| **P0-2** | #9 | Kısa Süreli Hız Sınırlama (`RPM` / `TPM` Rate Limiting) ve `X-RateLimit-*` / `Retry-After` Başlıkları | Kısmi | 9 | 9 | 2,0 | **40,5** | **P0** | [x] |
 | **P0-3** | #11 | KVKK / GDPR Kişisel Veri (PII) Maskeleme/Engelleme & Prompt Injection Güvenlik Duvarı (`Guardrails`) | Kısmi | 10 | 9 | 2,5 | **36,0** | **P0** | [ ] |
 | **P0-4** | #13 | Müşteri/Kiracı Faturalandırma, Ön Ödemeli Kredi Cüzdanı, Paket Yönetimi ve `iyzico` Ödeme Soyutlaması | Yok | 10 | 9 | 3,0 | **30,0** | **P0** | [ ] |
 | **P1-1** | #10 | Ağırlıklı Yük Dengeleme & En Düşük Gecikme / Maliyet Yönlendirmesi (`weighted`, `least-latency`, `least-cost`) | Kısmi | 8 | 9 | 2,5 | **28,8** | **P1** | [ ] |
@@ -33,7 +33,7 @@
   3. İstemci `Cache-Control: no-cache` veya `x-keysmith-cache: bypass` gönderdiğinde önbellek atlanmalı; normal çağrılarda yanıt başlığında `X-Keysmith-Cache: HIT` veya `X-Keysmith-Cache: MISS` dönmeli.
   4. `HIT` durumunda yukarı akışa (CLI veya HTTP sağlayıcıya) çağrı yapılmamalı, kullanım kaydında `cacheHit: true`, `cost: 0` ve `savedCost` (tasarruf edilen USD) izlenmeli; `GET /v1/keysmith/cache` ve `DELETE /v1/keysmith/cache` ile önbellek istatistikleri ve temizleme desteklenmeli.
 
-### [ ] P0-2 (Matris #9): Kısa Süreli Hız Sınırlama (`RPM` / `TPM` Rate Limiting) ve `X-RateLimit-*` Başlıkları
+### [x] P0-2 (Matris #9): Kısa Süreli Hız Sınırlama (`RPM` / `TPM` Rate Limiting) ve `X-RateLimit-*` Başlıkları
 - **Durum (Matris):** Kısmi (yalnızca günlük `perDay` var) → Var
 - **Tahmini Efor:** 2 birim (~1,5 saat; `src/quota.js` + `src/keys.js` + `src/server.js` + testler)
 - **Bağımlılık:** Yok.

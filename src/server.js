@@ -22,7 +22,7 @@ import { pickChatRelayFields, upstreamError, upstreamIdFromHeaders } from './htt
 import { toolPath } from './tools/router.js';
 import { failureOf, legMetaOf, scopeError } from './gateway.js';
 import { authEnabled, describeScope, hashKey, parseKeys, scopeWarnings, targetDecision } from './keys.js';
-import { DailyQuota, overCapMessage } from './quota.js';
+import { DailyQuota, MinuteRateLimiter, overCapMessage, overRateLimitMessage } from './quota.js';
 import { ResponseCache } from './cache.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
@@ -171,6 +171,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   // key a fresh day (quota.js).
   const quota = new DailyQuota({ now });
   if (authOn) quota.seed(usage);
+  const minuteLimiter = new MinuteRateLimiter({ now });
   const startedAt = Date.now();
   const pages = pageSessions();
   const responseStore = createResponseStore({ now });
@@ -320,6 +321,10 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     const stamped = {
       record: (entry) => {
         try {
+          if (entry?.usage && typeof entry.usage === 'object' && !entry.cacheHit) {
+            const totalTok = (Number(entry.usage.input) || 0) + (Number(entry.usage.output) || 0);
+            if (totalTok > 0) minuteLimiter.recordTokens(who?.fp || '__global__', totalTok);
+          }
           if (usage) {
             usage.record(stamp({ ts: new Date(now()).toISOString(), ...entry }, { who, req, res, route, gateway, cfg }));
           }
@@ -351,7 +356,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       // A request that asks a model (or queries /v1/keysmith/usage) counts against its key's daily
       // cap before anything is read: one per client request, whatever alias, failover or retry happens under it.
       if ((req.method === 'POST' && METERED.has(route)) || (req.method === 'GET' && route === '/v1/keysmith/usage')) {
-        meter(who, route, stamped, req);
+        meter(who, route, stamped, req, res);
         meteredRequest = true;
       }
       if (route === '/v1/models' || route === '/models') {
@@ -535,9 +540,51 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
    * and a log line; the ones after it are counted (the status page shows them) but write
    * nothing, so a client that keeps asking cannot fill the disk.
    */
-  function meter(who, route, stamped, req = null) {
+  function meter(who, route, stamped, req = null, res = null) {
+    const globalRl = cfg?.limits?.rateLimit && typeof cfg.limits.rateLimit === 'object' ? cfg.limits.rateLimit : null;
+    const effPerMinute = who.perMinute ?? globalRl?.perMinute ?? globalRl?.rpm ?? null;
+    const effTokensPerMinute = who.tokensPerMinute ?? globalRl?.tokensPerMinute ?? globalRl?.tpm ?? null;
+    if (effPerMinute != null || effTokensPerMinute != null) {
+      const m = minuteLimiter.admit(who.fp || '__global__', { perMinute: effPerMinute, tokensPerMinute: effTokensPerMinute });
+      if (res && !res.headersSent) {
+        if (m.requests) {
+          res.setHeader('X-RateLimit-Limit-Requests', String(m.requests.limit));
+          res.setHeader('X-RateLimit-Remaining-Requests', String(m.requests.remaining));
+          res.setHeader('X-RateLimit-Reset-Requests', `${m.requests.resetSeconds}s`);
+        }
+        if (m.tokens) {
+          res.setHeader('X-RateLimit-Limit-Tokens', String(m.tokens.limit));
+          res.setHeader('X-RateLimit-Remaining-Tokens', String(m.tokens.remaining));
+          res.setHeader('X-RateLimit-Reset-Tokens', `${m.tokens.resetSeconds}s`);
+        }
+      }
+      if (!m.ok) {
+        const message = overRateLimitMessage(m);
+        if (m.first) {
+          log(`key fp:${who.fp || 'global'}${who.label ? ` (${who.label})` : ''} reached its minute rate limit (${m.kind}=${m.limit}/min): refused for ${m.retryAfter}s`);
+          const errJson = JSON.stringify(errorBody(message, 'rate_limit_error', 429, null, faceFromRoute(route)));
+          record(stamped, {
+            model: null,
+            status: 'limited',
+            ms: 0,
+            stream: false,
+            via: route,
+            error: message,
+            client: req?.headers?.['user-agent'],
+            bytesOut: Buffer.byteLength(errJson, 'utf8'),
+          });
+        }
+        const e = new LlmError(message, { status: 429, type: 'rate_limit_error' });
+        e.retryAfter = m.retryAfter;
+        throw e;
+      }
+    }
     if (!who.fp) return; // auth off: there is no key to count against
     const d = quota.admit(who.fp, who.perDay ?? null);
+    if (res && !res.headersSent && who.perDay != null) {
+      res.setHeader('X-RateLimit-Limit-Day', String(who.perDay));
+      res.setHeader('X-RateLimit-Remaining-Day', String(Math.max(0, who.perDay - (d.ok ? d.count : d.perDay))));
+    }
     if (d.ok) {
       usage?.noteDaily?.(who.fp, quota.today(who.fp), now(), { label: who.label, route });
       return;
@@ -2725,7 +2772,7 @@ function isDirectLoopback(req) {
  * `perDay` its daily cap (null: none).
  */
 function identify(req, entries, url, authOn, cfg = null) {
-  if (!authOn) return { caller: '', fp: null, label: null, scope: null, perDay: null };
+  if (!authOn) return { caller: '', fp: null, label: null, scope: null, perDay: null, perMinute: null, tokensPerMinute: null, tenantId: null };
   let entry = headerEntry(req, entries);
   if (!entry && req.headers.authorization === undefined && req.headers['x-api-key'] === undefined) {
     const queryAllowed = cfg?.auth?.allowQueryApiKey === true || cfg?.auth?.queryKey === true;
@@ -2738,7 +2785,7 @@ function identify(req, entries, url, authOn, cfg = null) {
   const caller = hex
     ? Buffer.from(hex, 'hex').toString('base64url').slice(0, 22)
     : createHash('sha256').update(String(entry.fp || '')).digest('base64url').slice(0, 22);
-  return { caller, fp: entry.fp, label: entry.label, scope: entry.scope, perDay: entry.perDay ?? null };
+  return { caller, fp: entry.fp, label: entry.label, scope: entry.scope, perDay: entry.perDay ?? null, perMinute: entry.perMinute ?? null, tokensPerMinute: entry.tokensPerMinute ?? null, tenantId: entry.tenantId ?? null };
 }
 
 function safeEqual(a, b) {

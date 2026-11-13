@@ -101,3 +101,113 @@ export function overCapMessage({ perDay, retryAfter }) {
   const wait = h ? `${h} h${m ? ` ${m} min` : ''}` : `${m} min`;
   return `this key's daily cap of ${perDay} request${perDay === 1 ? '' : 's'} is used up for today; it resets at local midnight, in ${wait} (retry-after: ${retryAfter} s)`;
 }
+
+const WINDOW_MS = 60_000;
+
+/**
+ * Sliding 60-second rate limiter for requests per minute (`perMinute` / `rpm`) and tokens per
+ * minute (`tokensPerMinute` / `tpm`).
+ */
+export class MinuteRateLimiter {
+  constructor({ now = () => Date.now() } = {}) {
+    this.now = now;
+    this.reqWindows = new Map(); // fp -> number[] (timestamps in ms)
+    this.tokWindows = new Map(); // fp -> { ts: number, tokens: number }[]
+    this.refusedMinute = new Map(); // fp -> { minuteBucket, count }
+  }
+
+  _prune(fp, t) {
+    const cutoff = t - WINDOW_MS;
+    const reqs = this.reqWindows.get(fp);
+    if (reqs) {
+      while (reqs.length && reqs[0] <= cutoff) reqs.shift();
+      if (!reqs.length) this.reqWindows.delete(fp);
+    }
+    const toks = this.tokWindows.get(fp);
+    if (toks) {
+      while (toks.length && toks[0].ts <= cutoff) toks.shift();
+      if (!toks.length) this.tokWindows.delete(fp);
+    }
+  }
+
+  admit(fp, { perMinute = null, tokensPerMinute = null } = {}) {
+    const key = fp || '__global__';
+    const t = this.now();
+    this._prune(key, t);
+
+    const reqs = this.reqWindows.get(key) || [];
+    const toks = this.tokWindows.get(key) || [];
+    const usedRequests = reqs.length;
+    const usedTokens = toks.reduce((sum, x) => sum + x.tokens, 0);
+
+    const reqResetSec = reqs.length ? Math.max(1, Math.ceil((reqs[0] + WINDOW_MS - t) / 1000)) : 60;
+    const tokResetSec = toks.length ? Math.max(1, Math.ceil((toks[0].ts + WINDOW_MS - t) / 1000)) : 60;
+
+    if (perMinute != null && usedRequests >= perMinute) {
+      const first = this._markRefused(key, t);
+      return {
+        ok: false,
+        kind: 'requests',
+        limit: perMinute,
+        used: usedRequests,
+        retryAfter: reqResetSec,
+        first,
+        requests: { limit: perMinute, remaining: 0, resetSeconds: reqResetSec },
+        tokens: tokensPerMinute != null ? { limit: tokensPerMinute, remaining: Math.max(0, tokensPerMinute - usedTokens), resetSeconds: tokResetSec } : null,
+      };
+    }
+
+    if (tokensPerMinute != null && (tokensPerMinute === 0 || usedTokens >= tokensPerMinute)) {
+      const first = this._markRefused(key, t);
+      return {
+        ok: false,
+        kind: 'tokens',
+        limit: tokensPerMinute,
+        used: usedTokens,
+        retryAfter: tokResetSec,
+        first,
+        requests: perMinute != null ? { limit: perMinute, remaining: Math.max(0, perMinute - usedRequests), resetSeconds: reqResetSec } : null,
+        tokens: { limit: tokensPerMinute, remaining: 0, resetSeconds: tokResetSec },
+      };
+    }
+
+    reqs.push(t);
+    this.reqWindows.set(key, reqs);
+    const nextReqResetSec = Math.max(1, Math.ceil((reqs[0] + WINDOW_MS - t) / 1000));
+
+    return {
+      ok: true,
+      requests: perMinute != null ? { limit: perMinute, remaining: Math.max(0, perMinute - reqs.length), resetSeconds: nextReqResetSec } : null,
+      tokens: tokensPerMinute != null ? { limit: tokensPerMinute, remaining: Math.max(0, tokensPerMinute - usedTokens), resetSeconds: tokResetSec } : null,
+    };
+  }
+
+  recordTokens(fp, tokens) {
+    const n = Number(tokens) || 0;
+    if (n <= 0) return;
+    const key = fp || '__global__';
+    const t = this.now();
+    this._prune(key, t);
+    const toks = this.tokWindows.get(key) || [];
+    toks.push({ ts: t, tokens: n });
+    this.tokWindows.set(key, toks);
+  }
+
+  _markRefused(key, t) {
+    const bucket = Math.floor(t / WINDOW_MS);
+    const prev = this.refusedMinute.get(key);
+    if (!prev || prev.bucket !== bucket) {
+      this.refusedMinute.set(key, { bucket, count: 1 });
+      return true;
+    }
+    prev.count++;
+    return false;
+  }
+}
+
+export function overRateLimitMessage({ kind, limit, retryAfter }) {
+  if (kind === 'tokens') {
+    return `this key's token rate limit of ${limit} token${limit === 1 ? '' : 's'}/min is exceeded; retry in ${retryAfter} s`;
+  }
+  return `this key's request rate limit of ${limit} request${limit === 1 ? '' : 's'}/min is exceeded; retry in ${retryAfter} s`;
+}
