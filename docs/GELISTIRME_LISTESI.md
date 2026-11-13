@@ -14,7 +14,7 @@
 | **P0-2** | #9 | Kısa Süreli Hız Sınırlama (`RPM` / `TPM` Rate Limiting) ve `X-RateLimit-*` / `Retry-After` Başlıkları | Kısmi | 9 | 9 | 2,0 | **40,5** | **P0** | [x] |
 | **P0-3** | #11 | KVKK / GDPR Kişisel Veri (PII) Maskeleme/Engelleme & Prompt Injection Güvenlik Duvarı (`Guardrails`) | Kısmi | 10 | 9 | 2,5 | **36,0** | **P0** | [x] |
 | **P0-4** | #13 | Müşteri/Kiracı Faturalandırma, Ön Ödemeli Kredi Cüzdanı, Paket Yönetimi ve `iyzico` Ödeme Soyutlaması | Yok | 10 | 9 | 3,0 | **30,0** | **P0** | [x] |
-| **P1-1** | #10 | Ağırlıklı Yük Dengeleme & En Düşük Gecikme / Maliyet Yönlendirmesi (`weighted`, `least-latency`, `least-cost`) | Kısmi | 8 | 9 | 2,5 | **28,8** | **P1** | [ ] |
+| **P1-1** | #10 | Ağırlıklı Yük Dengeleme & En Düşük Gecikme / Maliyet Yönlendirmesi (`weighted`, `least-latency`, `least-cost`) | Kısmi | 8 | 9 | 2,5 | **28,8** | **P1** | [x] |
 | **P1-2** | #12 | Prometheus `/metrics` Uç Noktası & İmzalı Bütçe/Hata Webhook Bildirimleri (`Alerts`) | Kısmi | 8 | 8 | 2,5 | **25,6** | **P1** | [ ] |
 | **P1-3** | #15 | Operasyonel Web Kontrol Paneli (TR/EN, Mobil Uyumlu, `ui-quality` Standardında Durum/Fatura/Önbellek Konsolu) | Kısmi | 9 | 9 | 3,5 | **23,1** | **P1** | [ ] |
 | **P2-1** | #14 | Merkezi Prompt Şablonları & Sürümleme (`Prompt Registry`, `{{değişken}}` Yerleştirme) | Yok | 7 | 8 | 2,5 | **22,4** | **P2** | [ ] |
@@ -68,7 +68,7 @@
 
 ## P1 — Kurumsal Rekabet ve Büyüme Kaldıraçları
 
-### [ ] P1-1 (Matris #10): Ağırlıklı Yük Dengeleme & En Düşük Gecikme / Maliyet Yönlendirmesi (`weighted`, `least-latency`, `least-cost`)
+### [x] P1-1 (Matris #10): Ağırlıklı Yük Dengeleme & En Düşük Gecikme / Maliyet Yönlendirmesi (`weighted`, `least-latency`, `least-cost`)
 - **Durum (Matris):** Kısmi (yalnızca sıralı failover ve kural/sınıflandırıcı sanal model) → Var
 - **Tahmini Efor:** 2,5 birim (~2 saat; `src/gateway.js` + `src/config.js` + testler)
 - **Bağımlılık:** P0-1.

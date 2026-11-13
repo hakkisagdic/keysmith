@@ -12,7 +12,7 @@ import { McpBridge } from './bridge/index.js';
 import { CreditGuard, creditGuardError } from './credit-guard.js';
 import { DRIVERS } from './bridge/drivers.js';
 import { resolveEffort, suffixedIds } from './effort.js';
-import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExecCredentialAdapter } from './usage.js';
+import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExecCredentialAdapter, matchPrice } from './usage.js';
 import {
   TIER_ORDER,
   buildVirtualCandidateList,
@@ -52,11 +52,13 @@ export {
  * slash-free by construction.
  */
 export class Gateway {
-  constructor(cfg, { log = () => {}, usage = null, deferAdapterChecks = false, loadProbe = null, now = null, adapters = null, creditGuard = null } = {}) {
+  constructor(cfg, { log = () => {}, usage = null, deferAdapterChecks = false, loadProbe = null, now = null, rng = null, adapters = null, creditGuard = null } = {}) {
     this.cfg = cfg;
     this.usage = usage;
     this.loadProbe = typeof loadProbe === 'function' ? loadProbe : defaultLoadProbe;
     this.now = typeof now === 'function' ? now : () => Date.now();
+    this.rng = typeof rng === 'function' ? rng : Math.random;
+    this._latencyEwma = new Map();
     // Redacted here as well as by the CLI's writer: an embedding's own log function is
     // handed provider errors, and those can quote a key.
     this.log = (m) => log(redactSecrets(m));
@@ -352,8 +354,9 @@ export class Gateway {
     }
     const aliases = this.cfg?.aliases || {};
     let target = requested;
-    if (own(aliases, requested) && Array.isArray(aliases[requested]) && aliases[requested].length) {
-      target = String(aliases[requested][0] || '');
+    if (own(aliases, requested)) {
+      const spec = normalizeAliasSpec(aliases[requested]);
+      if (spec.legs.length) target = String(spec.legs[0].target || '');
     }
     const slash = target.indexOf('/');
     const adapterId = slash < 0 ? target : target.slice(0, slash);
@@ -413,13 +416,18 @@ export class Gateway {
    */
   aliasIssuesFor(scope = null) {
     const out = {};
-    for (const [alias, targets] of Object.entries(this.cfg.aliases || {})) {
+    for (const [alias, rawTargets] of Object.entries(this.cfg.aliases || {})) {
       if (scope && !aliasDecision(scope, alias).ok) continue;
+      const spec = normalizeAliasSpec(rawTargets);
       const problems = [];
-      if (!Array.isArray(targets) || targets.length === 0) {
+      if (spec.invalidStrategy) {
+        problems.push(`has an unknown strategy (${JSON.stringify(spec.invalidStrategy)}) — valid strategies are failover, weighted, least-latency, least-cost`);
+      }
+      if (!spec.legs.length) {
         problems.push('has no targets, so requesting it can only fail');
       } else {
-        for (const leg of targets) {
+        for (const legObj of spec.legs) {
+          const leg = legObj.valid ? legObj.target : legObj.raw;
           if (typeof leg !== 'string' || !leg) {
             problems.push(`has an empty leg (${JSON.stringify(leg)})`);
             continue;
@@ -502,8 +510,8 @@ export class Gateway {
     }
     if (own(this.cfg.aliases, requested)) {
       // An alias it may name, with a leg it may run: what /v1/models lists for it.
-      const legs = this.cfg.aliases[requested];
-      return aliasDecision(scope, requested).ok && Array.isArray(legs) && legs.some((leg) => typeof leg === 'string' && leg && this.checkTarget(adapterOf(leg), modelOf(leg), scope).ok);
+      const spec = normalizeAliasSpec(this.cfg.aliases[requested]);
+      return aliasDecision(scope, requested).ok && spec.legs.some((l) => l.valid && this.checkTarget(adapterOf(l.target), modelOf(l.target), scope).ok);
     }
     return this.checkTarget(adapterOf(requested), modelOf(requested), scope).ok;
   }
@@ -521,10 +529,19 @@ export class Gateway {
     const aliases = this.cfg.aliases || {};
     if (!scope) return aliases;
     const out = {};
-    for (const [alias, legs] of Object.entries(aliases)) {
+    for (const [alias, rawSpec] of Object.entries(aliases)) {
       if (!aliasDecision(scope, alias).ok) continue;
-      const usable = (Array.isArray(legs) ? legs : []).filter((leg) => typeof leg === 'string' && leg && this.checkTarget(adapterOf(leg), modelOf(leg), scope).ok);
-      if (usable.length) out[alias] = usable;
+      const spec = normalizeAliasSpec(rawSpec);
+      const usableLegs = spec.legs.filter((l) => l.valid && this.checkTarget(adapterOf(l.target), modelOf(l.target), scope).ok);
+      if (!usableLegs.length) continue;
+      if (spec.isObject) {
+        out[alias] = {
+          strategy: spec.strategy,
+          targets: usableLegs.map((l) => (l.hasExplicitWeight ? { target: l.target, weight: l.weight } : l.target)),
+        };
+      } else {
+        out[alias] = usableLegs.map((l) => (l.hasExplicitWeight ? { target: l.target, weight: l.weight } : l.target));
+      }
     }
     return out;
   }
@@ -681,12 +698,21 @@ export class Gateway {
       }),
     );
     const issues = this.aliasIssuesFor(scope);
-    for (const [alias, targets] of Object.entries(this.aliasesFor(scope))) {
+    for (const [alias, rawSpec] of Object.entries(this.aliasesFor(scope))) {
+      const spec = normalizeAliasSpec(rawSpec);
+      const routeTargets = spec.legs.filter((l) => l.valid).map((l) => l.target);
       models.push({
         id: alias,
         object: 'model',
         owned_by: 'keysmith:alias',
-        keysmith: { adapter: 'alias', kind: 'alias', routes: targets, priority: -1, ...(issues[alias] ? { warnings: issues[alias] } : {}) },
+        keysmith: {
+          adapter: 'alias',
+          kind: 'alias',
+          routes: routeTargets,
+          ...(spec.strategy !== 'failover' ? { strategy: spec.strategy } : {}),
+          priority: -1,
+          ...(issues[alias] ? { warnings: issues[alias] } : {}),
+        },
       });
     }
     // After the fetches above: `knownModels` can only check a dynamic catalogue once the
@@ -823,13 +849,15 @@ export class Gateway {
       const d = aliasDecision(scope, requested);
       if (!d.ok) throw scopeError(d.reason, null);
     }
-    const chain = isAlias ? (Array.isArray(aliases[requested]) ? [...aliases[requested]] : []) : [requested];
+    const aliasSpec = isAlias ? normalizeAliasSpec(aliases[requested]) : { strategy: 'failover', legs: [{ target: requested, weight: 1, valid: true, raw: requested }] };
+    const chain = aliasSpec.legs;
     if (isAlias && !chain.length) throw new LlmError(`alias "${requested}" has no legs`, { status: 503 });
-    const out = [];
+    const rawOut = [];
     const skipped = [];
     let excluded = 0;
     let firstError = null;
-    for (const entry of chain) {
+    for (const legObj of chain) {
+      const entry = legObj.valid ? legObj.target : legObj.raw;
       if (typeof entry !== 'string' || !entry) {
         // A hand-edited leg that is not `adapter/model` at all; aliasIssues names it.
         firstError ??= new LlmError(`alias "${requested}" has an empty leg (${JSON.stringify(entry)})`, { status: 503 });
@@ -874,19 +902,136 @@ export class Gateway {
         excluded++;
         continue;
       }
-      out.push({ adapter, model: modelName || adapter.defaultModel || '', target: entry });
+      rawOut.push({
+        adapter,
+        model: modelName || adapter.defaultModel || '',
+        target: entry,
+        ...(legObj.hasExplicitWeight || aliasSpec.strategy === 'weighted' ? { weight: legObj.weight } : {}),
+      });
     }
-    if (!out.length) {
+    if (!rawOut.length) {
       if (skipped.length && !excluded) {
         throw scopeError(`alias "${requested}" has no leg this key may use: ${skipped.join(', ')} ${skipped.length > 1 ? 'are' : 'is'} outside its scope`, adapterOf(skipped[0]));
       }
       throw firstError || new LlmError(`every leg of "${requested}" has already refused this request`, { status: 502 });
     }
-    // Declared order wins in an alias: you wrote the chain, you know which leg should
-    // be tried first. `priority` only orders the flat model listing.
+    const out = isAlias ? this._orderAliasCandidates(rawOut, aliasSpec.strategy) : rawOut;
     out.skipped = skipped;
+    if (isAlias) out.strategy = aliasSpec.strategy;
     return out;
   }
+
+  /**
+   * Record EWMA latency (in ms) for a concrete `adapter/model` target leg.
+   */
+  recordLatency(target, ms, alpha = 0.3) {
+    if (!target || typeof target !== 'string') return;
+    const val = Number(ms);
+    if (!Number.isFinite(val) || val < 0) return;
+    const a = Number.isFinite(alpha) && alpha > 0 && alpha <= 1 ? alpha : 0.3;
+    const prev = this._latencyEwma.get(target);
+    const ewmaMs = prev ? prev.ewmaMs * (1 - a) + val * a : val;
+    this._latencyEwma.set(target, {
+      ewmaMs,
+      samples: (prev?.samples || 0) + 1,
+      updatedAt: this.now(),
+    });
+  }
+
+  /**
+   * Current EWMA latency (in ms) for `target`, or null when not yet measured.
+   */
+  getLatency(target) {
+    const rec = this._latencyEwma.get(target);
+    return rec ? rec.ewmaMs : null;
+  }
+
+  /**
+   * Estimate combined input + output unit cost (USD per 1M tokens) for `least-cost` ordering.
+   */
+  _estimateLegUnitCost(adapter, model) {
+    if (!adapter) return Infinity;
+    const upstream = typeof adapter.upstreamModel === 'function' ? adapter.upstreamModel(model) : model;
+    const direct = matchPrice(this.cfg?.pricing, adapter.id, model, { upstreamModel: upstream, anyAdapter: false });
+    if (direct && typeof direct === 'object') {
+      return (Number(direct.input) || 0) + (Number(direct.output) || 0);
+    }
+    if (adapter.costBasis === 'subscription' || adapter.costBasis === 'free') {
+      return 0;
+    }
+    const fallback = matchPrice(this.cfg?.pricing, adapter.id, model, { upstreamModel: upstream, anyAdapter: true });
+    if (fallback && typeof fallback === 'object') {
+      return (Number(fallback.input) || 0) + (Number(fallback.output) || 0);
+    }
+    return Infinity;
+  }
+
+  /**
+   * Order alias candidate legs according to `strategy` (`failover` | `weighted` | `least-latency` | `least-cost`).
+   */
+  _orderAliasCandidates(candidates, strategy = 'failover') {
+    if (!Array.isArray(candidates) || candidates.length <= 1) return [...(candidates || [])];
+    if (strategy === 'weighted') {
+      const remaining = candidates.map((c) => ({ ...c, _w: Number.isFinite(c.weight) && c.weight > 0 ? c.weight : 1 }));
+      const ordered = [];
+      while (remaining.length > 0) {
+        if (remaining.length === 1) {
+          const [last] = remaining.splice(0, 1);
+          delete last._w;
+          ordered.push(last);
+          break;
+        }
+        const totalWeight = remaining.reduce((sum, item) => sum + item._w, 0);
+        let r = Math.max(0, Math.min(0.999999999, Number(this.rng()) || 0)) * totalWeight;
+        let pickedIdx = 0;
+        for (let i = 0; i < remaining.length; i++) {
+          r -= remaining[i]._w;
+          if (r <= 0) {
+            pickedIdx = i;
+            break;
+          }
+        }
+        const [picked] = remaining.splice(pickedIdx, 1);
+        delete picked._w;
+        ordered.push(picked);
+      }
+      return ordered;
+    }
+    if (strategy === 'least-latency') {
+      const indexed = candidates.map((c, idx) => ({
+        cand: c,
+        idx,
+        ewma: this.getLatency(c.target),
+      }));
+      const anyMeasured = indexed.some((x) => x.ewma !== null);
+      indexed.sort((a, b) => {
+        // Explore unmeasured legs first when at least one leg already has measurements
+        if (anyMeasured) {
+          if (a.ewma === null && b.ewma !== null) return -1;
+          if (a.ewma !== null && b.ewma === null) return 1;
+        }
+        if (a.ewma !== null && b.ewma !== null && a.ewma !== b.ewma) {
+          return a.ewma - b.ewma;
+        }
+        return a.idx - b.idx;
+      });
+      return indexed.map((x) => x.cand);
+    }
+    if (strategy === 'least-cost') {
+      const indexed = candidates.map((c, idx) => ({
+        cand: c,
+        idx,
+        cost: this._estimateLegUnitCost(c.adapter, c.model),
+      }));
+      indexed.sort((a, b) => {
+        if (a.cost !== b.cost) return a.cost - b.cost;
+        return a.idx - b.idx;
+      });
+      return indexed.map((x) => x.cand);
+    }
+    return [...candidates];
+  }
+
 
   /**
    * Perform the virtual model routing decision for a single request (`loadGate` -> `classifier` -> tier candidates).
@@ -1361,6 +1506,9 @@ export class Gateway {
    * CLI session and maps none.
    */
   async *_leg({ adapter, model: upstreamModel, target, tier }, events, run, state, { canResume = false, sessions = true } = {}) {
+    const legStartMs = this.now();
+    const legTarget = target || `${adapter.id}/${upstreamModel}`;
+    let latencyRecorded = false;
     // Which effort the leg ran at is said once its answer is: a leg that fails before answering
     // takes its `effort` event with it.
     let effort = null;
@@ -1447,6 +1595,10 @@ export class Gateway {
         }
       }
       yield evt;
+    }
+    if (!latencyRecorded) {
+      latencyRecorded = true;
+      this.recordLatency(legTarget, Math.max(0, this.now() - legStartMs));
     }
     if (effort) yield effort;
     if (heldUsage.length) yield* heldUsage.splice(0);
@@ -2128,4 +2280,71 @@ function windowCapMessage(capped, scope) {
     default:
       return scope ? `spend cap reached for ${who} (${span})` : `spend cap reached for ${who}: spent ${fmtUsd(capped.spent)} of ${span}`;
   }
+}
+
+/**
+ * Normalize an alias config value (array of legs or `{ strategy, targets }` object).
+ */
+export function normalizeAliasSpec(raw) {
+  const validStrategies = new Set(['failover', 'weighted', 'least-latency', 'least-cost']);
+  if (Array.isArray(raw)) {
+    const legs = raw.map(normalizeAliasLegEntry);
+    const hasWeights = legs.some((l) => l.hasExplicitWeight);
+    return {
+      strategy: hasWeights ? 'weighted' : 'failover',
+      legs,
+      isObject: false,
+      invalidStrategy: null,
+    };
+  }
+  if (raw && typeof raw === 'object') {
+    const rawStrat = raw.strategy == null ? 'failover' : String(raw.strategy);
+    const isValidStrat = validStrategies.has(rawStrat);
+    const strategy = isValidStrat ? rawStrat : 'failover';
+    const list = Array.isArray(raw.targets) ? raw.targets : Array.isArray(raw.routes) ? raw.routes : [];
+    return {
+      strategy,
+      legs: list.map(normalizeAliasLegEntry),
+      isObject: true,
+      invalidStrategy: isValidStrat ? null : raw.strategy,
+    };
+  }
+  return {
+    strategy: 'failover',
+    legs: [],
+    isObject: false,
+    invalidStrategy: null,
+  };
+}
+
+function normalizeAliasLegEntry(entry) {
+  if (typeof entry === 'string') {
+    const trimmed = entry.trim();
+    return {
+      target: trimmed,
+      weight: 1,
+      hasExplicitWeight: false,
+      valid: trimmed.length > 0,
+      raw: entry,
+    };
+  }
+  if (entry && typeof entry === 'object' && typeof entry.target === 'string') {
+    const trimmed = entry.target.trim();
+    const rawW = Number(entry.weight);
+    const hasExplicitWeight = entry.weight !== undefined && Number.isFinite(rawW) && rawW > 0;
+    return {
+      target: trimmed,
+      weight: hasExplicitWeight ? rawW : 1,
+      hasExplicitWeight,
+      valid: trimmed.length > 0,
+      raw: entry,
+    };
+  }
+  return {
+    target: '',
+    weight: 1,
+    hasExplicitWeight: false,
+    valid: false,
+    raw: entry,
+  };
 }
