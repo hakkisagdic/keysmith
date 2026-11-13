@@ -28,6 +28,7 @@ import { GuardrailEngine } from './guardrails.js';
 import { BillingManager } from './billing.js';
 import { MetricsCollector } from './metrics.js';
 import { WebhookDispatcher } from './webhooks.js';
+import { PromptRegistry } from './prompts.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
@@ -185,6 +186,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const billing = new BillingManager(cfg, { now });
   const metrics = new MetricsCollector();
   const webhooks = new WebhookDispatcher(cfg?.webhooks, { now, log });
+  const prompts = new PromptRegistry(cfg, { now });
   let inFlight = 0;
   // How long a streamed answer's headers wait for its first event (see `held`).
   const holdMs = Number.isFinite(cfg.limits?.streamHoldMs) && cfg.limits.streamHoldMs >= 0 ? cfg.limits.streamHoldMs : STREAM_HOLD_MS;
@@ -217,6 +219,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   server.billing = billing;
   server.metrics = metrics;
   server.webhooks = webhooks;
+  server.prompts = prompts;
 
   async function handle(req, res) {
     reloadKeys(false);
@@ -654,9 +657,41 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           deliveries: webhooks.deliveries,
         });
       }
-      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, guardrails, cfg });
-      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, guardrails, cfg });
-      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend, responseCache, guardrails, cfg });
+            if ((route === '/v1/keysmith/prompts' || route === '/keysmith/prompts') && req.method === 'GET') {
+        return json(res, 200, { object: 'list', data: prompts.list() });
+      }
+      if ((route === '/v1/keysmith/prompts' || route === '/keysmith/prompts') && req.method === 'POST') {
+        if (scope) {
+          throw new LlmError('managing prompt templates requires an unscoped key', { status: 403, type: 'permission_error' });
+        }
+        const body = await readJson(req);
+        const created = prompts.upsert(body);
+        return json(res, 200, created);
+      }
+      const promptIdMatch = route.match(/^\/(?:v1\/)?keysmith\/prompts\/([^/]+)$/);
+      if (promptIdMatch && req.method === 'GET') {
+        const pid = decodeURIComponent(promptIdMatch[1]);
+        const verParam = url.searchParams.get('version');
+        const found = prompts.get(pid, verParam);
+        if (!found) {
+          throw new LlmError(verParam ? `prompt "${pid}" version ${verParam} not found` : `prompt "${pid}" not found`, { status: 404, type: 'not_found_error' });
+        }
+        return json(res, 200, found);
+      }
+      if (promptIdMatch && req.method === 'DELETE') {
+        if (scope) {
+          throw new LlmError('deleting prompt templates requires an unscoped key', { status: 403, type: 'permission_error' });
+        }
+        const pid = decodeURIComponent(promptIdMatch[1]);
+        const deleted = prompts.delete(pid);
+        if (!deleted) {
+          throw new LlmError(`prompt "${pid}" not found`, { status: 404, type: 'not_found_error' });
+        }
+        return json(res, 200, { ok: true, id: pid, deleted: true });
+      }
+      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, guardrails, prompts, cfg });
+      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, guardrails, prompts, cfg });
+      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend, responseCache, guardrails, prompts, cfg });
       if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend, responseCache, guardrails, cfg });
       return json(res, 404, errorBody(`no route for ${req.method}`, 'invalid_request_error', 404));
     } catch (e) {
@@ -1088,6 +1123,15 @@ function describeHarness(a) {
 
 /* ---------------------------------------------------------------------- handlers */
 
+function applyPromptTemplate(res, body, prompts, face) {
+  if (!prompts) return null;
+  const resolved = prompts.applyToRequest(body, { face });
+  if (resolved) {
+    res.setHeader('X-Keysmith-Prompt', `${resolved.id}@v${resolved.version}`);
+  }
+  return resolved;
+}
+
 function applyGuardrails(req, res, body, guardrails) {
   if (!guardrails) return null;
   const gr = guardrails.inspectRequest(req, body);
@@ -1100,8 +1144,9 @@ function applyGuardrails(req, res, body, guardrails) {
 
 
 
-async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, responseCache = null, guardrails = null, cfg = null }) {
+async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, responseCache = null, guardrails = null, prompts = null, cfg = null }) {
   const body = await readJson(req);
+  applyPromptTemplate(res, body, prompts, 'openai-chat');
   applyGuardrails(req, res, body, guardrails);
   const messages = openaiMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -1346,8 +1391,9 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   });
 }
 
-async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, responseCache = null, guardrails = null, cfg = null }) {
+async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, responseCache = null, guardrails = null, prompts = null, cfg = null }) {
   const body = await readJson(req);
+  applyPromptTemplate(res, body, prompts, 'anthropic');
   applyGuardrails(req, res, body, guardrails);
   const messages = anthropicMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -1550,8 +1596,9 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   void log;
 }
 
-async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null, holdSpend = null, responseCache = null, guardrails = null, cfg = null }) {
+async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null, holdSpend = null, responseCache = null, guardrails = null, prompts = null, cfg = null }) {
   const body = await readJson(req);
+  applyPromptTemplate(res, body, prompts, 'responses');
   applyGuardrails(req, res, body, guardrails);
   const trace = extractW3cTrace(req, res);
 

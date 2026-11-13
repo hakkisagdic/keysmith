@@ -17,7 +17,7 @@
 | **P1-1** | #10 | Ağırlıklı Yük Dengeleme & En Düşük Gecikme / Maliyet Yönlendirmesi (`weighted`, `least-latency`, `least-cost`) | Kısmi | 8 | 9 | 2,5 | **28,8** | **P1** | [x] |
 | **P1-2** | #12 | Prometheus `/metrics` Uç Noktası & İmzalı Bütçe/Hata Webhook Bildirimleri (`Alerts`) | Kısmi | 8 | 8 | 2,5 | **25,6** | **P1** | [x] |
 | **P1-3** | #15 | Operasyonel Web Kontrol Paneli (TR/EN, Mobil Uyumlu, `ui-quality` Standardında Durum/Fatura/Önbellek Konsolu) | Kısmi | 9 | 9 | 3,5 | **23,1** | **P1** | [x] |
-| **P2-1** | #14 | Merkezi Prompt Şablonları & Sürümleme (`Prompt Registry`, `{{değişken}}` Yerleştirme) | Yok | 7 | 8 | 2,5 | **22,4** | **P2** | [ ] |
+| **P2-1** | #14 | Merkezi Prompt Şablonları & Sürümleme (`Prompt Registry`, `{{değişken}}` Yerleştirme) | Yok | 7 | 8 | 2,5 | **22,4** | **P2** | [x] |
 
 ---
 
@@ -101,7 +101,7 @@
 
 ## P2 — Ekip Üretkenliği ve Platform Yapışkanlığı
 
-### [ ] P2-1 (Matris #14): Merkezi Prompt Şablonları & Sürümleme (`Prompt Registry`)
+### [x] P2-1 (Matris #14): Merkezi Prompt Şablonları & Sürümleme (`Prompt Registry`)
 - **Durum (Matris):** Yok → Var
 - **Tahmini Efor:** 2,5 birim (~1,5 saat; `src/prompts.js` + `src/server.js` + testler)
 - **Bağımlılık:** Yok.
