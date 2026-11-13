@@ -10,7 +10,7 @@
 
 | Kod | Matris # | İş Kalemi | Matrosteki Durum | Gelir Etkisi | Kullanıcı Değeri | Efor | Puan | Öncelik | Durum |
 |---|---|---|---|---|---|---|---|---|---|
-| **P0-1** | #8 | Deterministik Yanıt Önbellekleme (`Response Cache`, TTL, `X-Keysmith-Cache`, Tasarruf Ölçümü) | Yok | 9 | 10 | 2,0 | **45,0** | **P0** | [ ] |
+| **P0-1** | #8 | Deterministik Yanıt Önbellekleme (`Response Cache`, TTL, `X-Keysmith-Cache`, Tasarruf Ölçümü) | Yok | 9 | 10 | 2,0 | **45,0** | **P0** | [x] |
 | **P0-2** | #9 | Kısa Süreli Hız Sınırlama (`RPM` / `TPM` Rate Limiting) ve `X-RateLimit-*` / `Retry-After` Başlıkları | Kısmi | 9 | 9 | 2,0 | **40,5** | **P0** | [ ] |
 | **P0-3** | #11 | KVKK / GDPR Kişisel Veri (PII) Maskeleme/Engelleme & Prompt Injection Güvenlik Duvarı (`Guardrails`) | Kısmi | 10 | 9 | 2,5 | **36,0** | **P0** | [ ] |
 | **P0-4** | #13 | Müşteri/Kiracı Faturalandırma, Ön Ödemeli Kredi Cüzdanı, Paket Yönetimi ve `iyzico` Ödeme Soyutlaması | Yok | 10 | 9 | 3,0 | **30,0** | **P0** | [ ] |
@@ -23,7 +23,7 @@
 
 ## P0 — Satılabilir Olmak İçin Şart Olan Kalemler
 
-### [ ] P0-1 (Matris #8): Deterministik Yanıt Önbellekleme (`Response Cache`)
+### [x] P0-1 (Matris #8): Deterministik Yanıt Önbellekleme (`Response Cache`)
 - **Durum (Matris):** Yok → Var
 - **Tahmini Efor:** 2 birim (~1,5 saat; `src/cache.js` + `src/server.js` + `src/usage.js` + testler)
 - **Bağımlılık:** Yok.

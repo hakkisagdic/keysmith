@@ -23,6 +23,7 @@ import { toolPath } from './tools/router.js';
 import { failureOf, legMetaOf, scopeError } from './gateway.js';
 import { authEnabled, describeScope, hashKey, parseKeys, scopeWarnings, targetDecision } from './keys.js';
 import { DailyQuota, overCapMessage } from './quota.js';
+import { ResponseCache } from './cache.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
@@ -174,6 +175,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const pages = pageSessions();
   const responseStore = createResponseStore({ now });
   const idempotencyStore = createIdempotencyStore({ now });
+  const responseCache = new ResponseCache(cfg, { now });
   let inFlight = 0;
   // How long a streamed answer's headers wait for its first event (see `held`).
   const holdMs = Number.isFinite(cfg.limits?.streamHoldMs) && cfg.limits.streamHoldMs >= 0 ? cfg.limits.streamHoldMs : STREAM_HOLD_MS;
@@ -201,6 +203,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     return origClose(...args);
   };
   server.reloadKeys = () => reloadKeys(true);
+  server.cache = responseCache;
 
   async function handle(req, res) {
     reloadKeys(false);
@@ -216,8 +219,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     }
     const route = url.pathname.replace(/\/+$/, '') || '/';
 
-    res.setHeader('access-control-allow-headers', 'authorization,content-type,x-keysmith-session,x-keysmith-tag,x-api-key,anthropic-version,uhp-version,idempotency-key,x-harness-id,traceparent,tracestate');
-    res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
+    res.setHeader('access-control-allow-headers', 'authorization,content-type,x-keysmith-session,x-keysmith-tag,x-keysmith-cache,cache-control,x-api-key,anthropic-version,uhp-version,idempotency-key,x-harness-id,traceparent,tracestate');
+    res.setHeader('access-control-allow-methods', 'GET,POST,DELETE,OPTIONS');
 
     // UHP-Version header negotiation (UHP 2026-10-19).
     const requestedUhpVersion = typeof req.headers['uhp-version'] === 'string' ? req.headers['uhp-version'].trim() : '';
@@ -445,10 +448,20 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           ...(n ? { entries: usage.tail(n, filter) } : {}),
         });
       }
-      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend });
-      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend });
-      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend });
-      if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend });
+      if ((route === '/v1/keysmith/cache' || route === '/keysmith/cache') && req.method === 'GET') {
+        return json(res, 200, responseCache.stats());
+      }
+      if ((route === '/v1/keysmith/cache' || route === '/keysmith/cache') && (req.method === 'DELETE' || req.method === 'POST')) {
+        if (scope) {
+          throw new LlmError('clearing the gateway cache requires an unscoped key', { status: 403, type: 'permission_error' });
+        }
+        const cleared = responseCache.clear();
+        return json(res, 200, { ok: true, cleared, ...responseCache.stats() });
+      }
+      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, cfg });
+      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, responseCache, cfg });
+      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend, responseCache, cfg });
+      if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend, responseCache, cfg });
       return json(res, 404, errorBody(`no route for ${req.method}`, 'invalid_request_error', 404));
     } catch (e) {
       const status = e instanceof LlmError ? e.status : 500;
@@ -821,7 +834,7 @@ function describeHarness(a) {
 
 /* ---------------------------------------------------------------------- handlers */
 
-async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null }) {
+async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, responseCache = null, cfg = null }) {
   const body = await readJson(req);
   const messages = openaiMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -873,6 +886,55 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   };
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
+  const cachePol = responseCache ? responseCache.policy(req, body) : { active: false };
+  let cacheKey = null;
+  if (cachePol.active) {
+    if (cachePol.bypass) {
+      res.setHeader('X-Keysmith-Cache', 'BYPASS');
+    } else {
+      cacheKey = responseCache.buildKey({ route: '/v1/chat/completions', model: requested, targets: chain.map((c) => c.target), body, effort });
+      const cached = responseCache.get(cacheKey);
+      if (cached) {
+        const cv = cached.value;
+        res.setHeader('X-Keysmith-Cache', 'HIT');
+        res.setHeader('X-Keysmith-Cache-Key', cacheKey);
+        if (cv.toolMode) res.setHeader('x-keysmith-mode', cv.toolMode);
+        const calls = (cv.toolCalls || []).map((c) => faceCall(c, 'openai'));
+        if (!stream) {
+          const payload = openaiCompletion({ id, model: requested, created, text: cv.text || '', usage: faceUsage(cv.usage, cv.usageReason), reasoning: body.include_reasoning ? cv.reasoning || null : null, toolCalls: calls, legacy });
+          meta.done = true;
+          json(res, 200, payload);
+        } else {
+          startSse(res, 'text/event-stream', cv.toolMode ? { 'x-keysmith-mode': cv.toolMode } : {});
+          const face = new OpenaiChatStream(res, { id, model: requested, created, includeUsage: !!body.stream_options?.include_usage, legacy, keepaliveMs });
+          meta.face = face;
+          face.open();
+          if (body.include_reasoning && cv.reasoning) face.reasoning(cv.reasoning);
+          if (cv.text) face.text(cv.text);
+          for (const c of calls) face.toolCall(c);
+          face.finish({ usage: faceUsage(cv.usage, cv.usageReason) });
+          meta.done = true;
+        }
+        record(usage, {
+          model: requested,
+          status: 'ok',
+          ms: Date.now() - t0,
+          ...usageMarks(null, cv.usage, cv.usageReason),
+          stream,
+          cacheHit: true,
+          cost: { usd: 0, basis: 'cached', ...(cached.costUsd > 0 ? { savedUsd: cached.costUsd } : {}) },
+          client: req.headers['user-agent'],
+          ...(cv.leg ? { _leg: cv.leg } : {}),
+          ...marks({ toolMode: cv.toolMode, toolCalls: calls.length }),
+          ...effortMarks(cv.effort),
+        });
+        return;
+      }
+      res.setHeader('X-Keysmith-Cache', 'MISS');
+      res.setHeader('X-Keysmith-Cache-Key', cacheKey);
+    }
+  }
+
   if (!stream) {
     const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
@@ -889,6 +951,17 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     if (sid) payload.keysmith = { session: sid, resumed: !!publicId };
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
     if (meta.virtual?.chosen) res.setHeader('x-keysmith-route', meta.virtual.chosen);
+    if (cacheKey && responseCache) {
+      const costUsd = estimateCachedCostUsd(gateway, cfg, leg, requested, u, usageReason);
+      responseCache.set(cacheKey, {
+        route: '/v1/chat/completions',
+        model: requested,
+        value: { text, reasoning, toolCalls, usage: u, usageReason, leg, effort: ran, toolMode },
+        costUsd,
+        usage: u,
+        ttlMs: cachePol.ttlMs,
+      });
+    }
     meta.done = true;
     json(res, 200, payload, sid);
     record(usage, {
@@ -933,6 +1006,9 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   let bridge = null;
   let leg = null;
   let upstreamId = null;
+  let fullText = '';
+  let fullReasoning = '';
+  const rawToolCalls = [];
   for await (const evt of events) {
     if (evt.type === 'relayed') {
       // An HTTP leg took the open stream over (relayLeg) and finished it, row and all.
@@ -947,10 +1023,13 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     } else if (evt.type === 'cut') {
       cutAt = evt.tool;
     } else if (evt.type === 'reasoning') {
+      fullReasoning += evt.text;
       face.reasoning(evt.text);
     } else if (evt.type === 'delta') {
+      fullText += evt.text;
       face.text(evt.text);
     } else if (evt.type === 'tool_call') {
+      rawToolCalls.push(evt);
       face.toolCall(faceCall(evt, 'openai'));
     } else if (evt.type === 'tool_mode') {
       [toolMode, fallback, bridge] = [evt.mode || null, evt.fallback || null, evt.bridge || null];
@@ -973,6 +1052,17 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   // and `x-keysmith-session` is still set on non-streaming responses. An error the
   // engine reported after the answer began replaces that chunk with the error frame.
   face.finish({ usage: faceUsage(u, uReason), keysmith: sid ? { session: sid, resumed: !!publicId } : null, error: errMessage });
+  if (!errMessage && cacheKey && responseCache) {
+    const costUsd = estimateCachedCostUsd(gateway, cfg, leg, requested, u, uReason);
+    responseCache.set(cacheKey, {
+      route: '/v1/chat/completions',
+      model: requested,
+      value: { text: fullText, reasoning: fullReasoning || null, toolCalls: rawToolCalls, usage: u, usageReason: uReason, leg, effort: ran, toolMode },
+      costUsd,
+      usage: u,
+      ttlMs: cachePol.ttlMs,
+    });
+  }
   meta.done = true;
   record(usage, {
     model: requested,
@@ -989,7 +1079,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   });
 }
 
-async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null }) {
+async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, responseCache = null, cfg = null }) {
   const body = await readJson(req);
   const messages = anthropicMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -1027,6 +1117,54 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
     meta.virtual = v;
     if (v?.skipped?.length) meta.skipped = v.skipped;
   };
+  const chain = gateway.resolve(requested, { scope });
+  const cachePol = responseCache ? responseCache.policy(req, body) : { active: false };
+  let cacheKey = null;
+  if (cachePol.active) {
+    if (cachePol.bypass) {
+      res.setHeader('X-Keysmith-Cache', 'BYPASS');
+    } else {
+      cacheKey = responseCache.buildKey({ route: '/v1/messages', model: requested, targets: chain.map((c) => c.target), body, effort });
+      const cached = responseCache.get(cacheKey);
+      if (cached) {
+        const cv = cached.value;
+        res.setHeader('X-Keysmith-Cache', 'HIT');
+        res.setHeader('X-Keysmith-Cache-Key', cacheKey);
+        if (cv.toolMode) res.setHeader('x-keysmith-mode', cv.toolMode);
+        const calls = (cv.toolCalls || []).map((c) => faceCall(c, 'anthropic'));
+        if (!stream) {
+          meta.done = true;
+          json(res, 200, anthropicMessage({ id, model: requested, text: cv.text || '', usage: faceUsage(cv.usage, cv.usageReason), toolCalls: calls }));
+        } else {
+          startSse(res, 'text/event-stream', cv.toolMode ? { 'x-keysmith-mode': cv.toolMode } : {});
+          const face = new AnthropicStream(res, { id, model: requested, keepaliveMs });
+          meta.face = face;
+          face.open();
+          if (cv.text) face.text(cv.text);
+          for (const c of calls) face.toolCall(c);
+          face.finish({ usage: faceUsage(cv.usage, cv.usageReason) });
+          meta.done = true;
+        }
+        record(usage, {
+          model: requested,
+          status: 'ok',
+          ms: Date.now() - t0,
+          ...usageMarks(null, cv.usage, cv.usageReason),
+          stream,
+          cacheHit: true,
+          cost: { usd: 0, basis: 'cached', ...(cached.costUsd > 0 ? { savedUsd: cached.costUsd } : {}) },
+          client: req.headers['user-agent'] || 'anthropic',
+          via: '/v1/messages',
+          ...(cv.leg ? { _leg: cv.leg } : {}),
+          ...marks({ toolMode: cv.toolMode, toolCalls: calls.length }),
+          ...effortMarks(cv.effort),
+        });
+        return;
+      }
+      res.setHeader('X-Keysmith-Cache', 'MISS');
+      res.setHeader('X-Keysmith-Cache-Key', cacheKey);
+    }
+  }
   // The Messages API defaults to a single JSON reply; SSE only when asked.
   if (!stream) {
     const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
@@ -1038,6 +1176,17 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
     }
     const calls = toolCalls.map((c) => faceCall(c, 'anthropic'));
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
+    if (cacheKey && responseCache) {
+      const costUsd = estimateCachedCostUsd(gateway, cfg, leg, requested, u, usageReason);
+      responseCache.set(cacheKey, {
+        route: '/v1/messages',
+        model: requested,
+        value: { text, toolCalls, usage: u, usageReason, leg, effort: ran, toolMode },
+        costUsd,
+        usage: u,
+        ttlMs: cachePol.ttlMs,
+      });
+    }
     meta.done = true;
     // Session goes out as a header only: Anthropic clients schema-check the body.
     json(res, 200, anthropicMessage({ id, model: requested, text, usage: faceUsage(u, usageReason), toolCalls: calls }), sid);
@@ -1082,6 +1231,8 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   let bridge = null;
   let leg = null;
   let upstreamId = null;
+  let fullAnthText = '';
+  const rawAnthCalls = [];
   for await (const evt of events) {
     if (evt.type === 'relayed') {
       // An anthropic-wire leg took the open stream over (relayMessagesLeg) and finished it, row and all.
@@ -1094,14 +1245,25 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
     else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'usage_unknown') uReason ||= evt.reason;
     else if (evt.type === 'effort') ran = evt;
-    else if (evt.type === 'delta') face.text(evt.text);
-    else if (evt.type === 'tool_call') face.toolCall(faceCall(evt, 'anthropic'));
+    else if (evt.type === 'delta') { fullAnthText += evt.text; face.text(evt.text); }
+    else if (evt.type === 'tool_call') { rawAnthCalls.push(evt); face.toolCall(faceCall(evt, 'anthropic')); }
     else if (evt.type === 'tool_mode') [toolMode, fallback, bridge] = [evt.mode || null, evt.fallback || null, evt.bridge || null];
     else if (evt.type === 'usage') u = mergeUsage(u, evt.usage);
     else if (evt.type === 'error') errMessage = redactSecrets(evt.message); // written to the client below
     else if (evt.type === 'done') break;
   }
   face.finish({ usage: faceUsage(u, uReason), error: errMessage });
+  if (!errMessage && cacheKey && responseCache) {
+    const costUsd = estimateCachedCostUsd(gateway, cfg, leg, requested, u, uReason);
+    responseCache.set(cacheKey, {
+      route: '/v1/messages',
+      model: requested,
+      value: { text: fullAnthText, toolCalls: rawAnthCalls, usage: u, usageReason: uReason, leg, effort: ran, toolMode },
+      costUsd,
+      usage: u,
+      ttlMs: cachePol.ttlMs,
+    });
+  }
   meta.done = true;
   record(usage, {
     model: requested,
@@ -1120,7 +1282,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   void log;
 }
 
-async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null, holdSpend = null }) {
+async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null, holdSpend = null, responseCache = null, cfg = null }) {
   const body = await readJson(req);
   const trace = extractW3cTrace(req, res);
 
@@ -1201,6 +1363,61 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     }
   };
 
+  const chain = gateway.resolve(requestedModel, { scope });
+  const cachePol = responseCache ? responseCache.policy(req, effectiveBody) : { active: false };
+  let cacheKey = null;
+  if (cachePol.active && !prev && !body.previous_response_id) {
+    if (cachePol.bypass) {
+      res.setHeader('X-Keysmith-Cache', 'BYPASS');
+    } else {
+      cacheKey = responseCache.buildKey({ route: '/v1/responses', model: requestedModel, targets: chain.map((c) => c.target), body: effectiveBody, effort });
+      const cached = responseCache.get(cacheKey);
+      if (cached) {
+        const cv = cached.value;
+        res.setHeader('X-Keysmith-Cache', 'HIT');
+        res.setHeader('X-Keysmith-Cache-Key', cacheKey);
+        if (cv.toolMode) res.setHeader('x-keysmith-mode', cv.toolMode);
+        const calls = (cv.toolCalls || []).map((c) => faceCall(c, 'responses'));
+        const request = offered ? { tools: effectiveBody.tools, tool_choice: effectiveBody.tool_choice, parallel_tool_calls: effectiveBody.parallel_tool_calls } : undefined;
+        if (!stream) {
+          const payload = offered
+            ? responsesBody({ id, model: requestedModel, created, text: cv.text || '', usage: faceUsage(cv.usage, cv.usageReason), toolCalls: calls, request })
+            : responsesResult({ id, model: requestedModel, text: cv.text || '', usage: faceUsage(cv.usage, cv.usageReason), created });
+          onStore(payload, null);
+          meta.done = true;
+          json(res, 200, payload);
+        } else {
+          startSse(res, 'text/event-stream', cv.toolMode ? { 'x-keysmith-mode': cv.toolMode } : {});
+          const face = new ResponsesStream(res, { id, model: requestedModel, created, request, keepaliveMs });
+          meta.face = face;
+          face.open();
+          if (cv.text) face.text(cv.text);
+          for (const c of calls) face.toolCall(c);
+          face.finish({ usage: faceUsage(cv.usage, cv.usageReason) });
+          onStore(face._response('completed', { output: face.output, usage: faceUsage(cv.usage, cv.usageReason) }), null);
+          meta.done = true;
+        }
+        record(usage, {
+          model: requestedModel,
+          status: 'ok',
+          ms: Date.now() - t0,
+          ...usageMarks(null, cv.usage, cv.usageReason),
+          stream,
+          cacheHit: true,
+          cost: { usd: 0, basis: 'cached', ...(cached.costUsd > 0 ? { savedUsd: cached.costUsd } : {}) },
+          client: req.headers['user-agent'],
+          via: '/v1/responses',
+          ...(cv.leg ? { _leg: cv.leg } : {}),
+          ...marks({ toolMode: cv.toolMode, toolCalls: calls.length }),
+          ...effortMarks(cv.effort),
+        });
+        return;
+      }
+      res.setHeader('X-Keysmith-Cache', 'MISS');
+      res.setHeader('X-Keysmith-Cache-Key', cacheKey);
+    }
+  }
+
   if (offered) {
     return await responsesWithTools(req, res, gateway, effectiveBody, {
       usage,
@@ -1230,6 +1447,17 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     if (vRoute) onVirtual(vRoute);
     if (toolCalls.length) throw noResponsesToolCalls();
     meta.done = true;
+    if (cacheKey && responseCache) {
+      const costUsd = estimateCachedCostUsd(gateway, cfg, leg, requestedModel, u, usageReason);
+      responseCache.set(cacheKey, {
+        route: '/v1/responses',
+        model: requestedModel,
+        value: { text, toolCalls: [], usage: u, usageReason, leg, effort: ran, toolMode: null },
+        costUsd,
+        usage: u,
+        ttlMs: cachePol.ttlMs,
+      });
+    }
     const payload = responsesResult({ id, model: requestedModel, text, usage: faceUsage(u, usageReason), created });
     onStore(payload, sid);
     json(res, 200, payload, sid);
@@ -1280,7 +1508,20 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     else if (evt.type === 'done') break;
   }
   face.finish({ usage: faceUsage(u, uReason), error: errMessage });
-  if (!errMessage) onStore(responsesResult({ id, model: requestedModel, text: full, usage: faceUsage(u, uReason), created }), sid);
+  if (!errMessage) {
+    if (cacheKey && responseCache) {
+      const costUsd = estimateCachedCostUsd(gateway, cfg, leg, requestedModel, u, uReason);
+      responseCache.set(cacheKey, {
+        route: '/v1/responses',
+        model: requestedModel,
+        value: { text: full, toolCalls: [], usage: u, usageReason: uReason, leg, effort: ran, toolMode: null },
+        costUsd,
+        usage: u,
+        ttlMs: cachePol.ttlMs,
+      });
+    }
+    onStore(responsesResult({ id, model: requestedModel, text: full, usage: faceUsage(u, uReason), created }), sid);
+  }
   meta.done = true;
   record(usage, {
     model: requestedModel,
@@ -1400,7 +1641,7 @@ function noResponsesToolCalls() {
   return new LlmError('this answer is a tool call, and the request offered no tools', { status: 502 });
 }
 
-async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSpend = null } = {}) {
+async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSpend = null, responseCache = null, cfg = null } = {}) {
   const body = await readJson(req);
   const t0 = Date.now();
   const meta = track(res, body.model, false, t0, '/v1/embeddings');
@@ -1417,6 +1658,37 @@ async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSp
   }
   const adapter = gateway.adapters.get(adapterId);
   if (!adapter || adapter.kind !== 'http') throw new LlmError('embeddings need an HTTP adapter', { status: 400 });
+  const cachePol = responseCache ? responseCache.policy(req, body) : { active: false };
+  let cacheKey = null;
+  if (cachePol.active) {
+    if (cachePol.bypass) {
+      res.setHeader('X-Keysmith-Cache', 'BYPASS');
+    } else {
+      cacheKey = responseCache.buildKey({ route: '/v1/embeddings', model: body.model, targets: [body.model], body });
+      const cached = responseCache.get(cacheKey);
+      if (cached) {
+        const cv = cached.value;
+        meta.done = true;
+        res.writeHead(200, { 'content-type': 'application/json', 'X-Keysmith-Cache': 'HIT', 'X-Keysmith-Cache-Key': cacheKey });
+        res.end(cv.text);
+        record(usage, {
+          model: body.model,
+          status: 'ok',
+          ms: Date.now() - t0,
+          ...(cv.embUsage?.unknown ? { usage: null, usageReason: cv.embUsage.unknown } : cv.embUsage ? { usage: cv.embUsage } : {}),
+          stream: false,
+          cacheHit: true,
+          cost: { usd: 0, basis: 'cached', ...(cached.costUsd > 0 ? { savedUsd: cached.costUsd } : {}) },
+          client: req.headers['user-agent'],
+          via: '/v1/embeddings',
+          _leg: legMetaOf(adapter, upstreamModel),
+        });
+        return;
+      }
+      res.setHeader('X-Keysmith-Cache', 'MISS');
+      res.setHeader('X-Keysmith-Cache-Key', cacheKey);
+    }
+  }
   const tokens = typeof gateway.estimateTokens === 'function'
     ? gateway.estimateTokens(adapter, upstreamModel, { input: body.input, maxTokens: 0 })
     : { inputTokens: 16, outputTokens: 0 };
@@ -1438,6 +1710,18 @@ async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSp
   }
   const upstreamId = upstreamIdFromHeaders(r.headers);
   const embUsage = r.ok ? extractEmbeddingsUsage(text) : undefined;
+  if (r.ok && cacheKey && responseCache) {
+    const legMeta = legMetaOf(adapter, upstreamModel);
+    const costUsd = estimateCachedCostUsd(gateway, cfg, legMeta, body.model, embUsage?.unknown ? null : embUsage, embUsage?.unknown || null);
+    responseCache.set(cacheKey, {
+      route: '/v1/embeddings',
+      model: body.model,
+      value: { text, embUsage },
+      costUsd,
+      usage: embUsage?.unknown ? null : embUsage,
+      ttlMs: cachePol.ttlMs,
+    });
+  }
   meta.done = true;
   res.writeHead(r.status, { 'content-type': 'application/json' });
   // A refusal is the provider's error body, which can quote the key it refused; vectors are
@@ -2130,6 +2414,26 @@ function stamp(entry, { who, req, res, route, gateway, cfg } = {}) {
  * row's cost stays `{usd: null, basis: 'unpriced', reason}` while failed legs are priced on their
  * own.
  */
+function estimateCachedCostUsd(gateway, cfg, leg, requestedModel, u, uReason) {
+  try {
+    const c = stampCost(
+      { status: 'ok', model: requestedModel, usage: u, usageReason: uReason },
+      u,
+      {
+        adapter: leg?.adapter ?? null,
+        upstreamModel: leg?.upstreamModel || leg?.model || null,
+        kind: leg?.kind ?? null,
+        costBasis: leg?.costBasis || null,
+        pricing: cfg?.pricing,
+        gateway,
+      },
+    );
+    return Number(c?.usd || c?.listUsd || 0) || 0;
+  } catch {
+    return 0;
+  }
+}
+
 function stampCost(rest, ownUsage, { adapter, upstreamModel, kind, costBasis = null, pricing, gateway = null }) {
   const isUnknown =
     Boolean(rest.usageReason) ||
