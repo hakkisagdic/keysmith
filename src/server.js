@@ -29,6 +29,7 @@ import { BillingManager } from './billing.js';
 import { MetricsCollector } from './metrics.js';
 import { WebhookDispatcher } from './webhooks.js';
 import { PromptRegistry } from './prompts.js';
+import { extractResponseFormatSpec, injectStructuredOutputInstruction, enforceStructuredOutput } from './structured-output.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
@@ -1159,8 +1160,10 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   const body = await readJson(req);
   applyPromptTemplate(res, body, prompts, 'openai-chat');
   applyGuardrails(req, res, body, guardrails);
-  const messages = openaiMessages(body);
-  if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
+  const rawMessages = openaiMessages(body);
+  if (!rawMessages.length) throw new LlmError('messages is empty', { status: 400 });
+  const structSpec = extractResponseFormatSpec(body);
+  const messages = structSpec ? injectStructuredOutputInstruction(rawMessages, structSpec) : rawMessages;
   const harnessId = extractHarnessId(req, body);
   const requested = resolveRequestedModel(gateway, body.model, { harnessId, backend: body.backend, scope });
   const stream = !!body.stream;
@@ -1260,7 +1263,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   }
 
   if (!stream) {
-    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
+    const { text: rawOutText, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     if (relayed) {
       // An HTTP leg's answer went out verbatim, with its own usage row.
@@ -1268,6 +1271,12 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
       return;
     }
     const calls = toolCalls.map((c) => faceCall(c, 'openai'));
+    let text = rawOutText;
+    if (structSpec && !calls.length) {
+      const enforced = enforceStructuredOutput(rawOutText, structSpec);
+      text = enforced.text;
+      if (enforced.status) res.setHeader('X-Keysmith-Schema-Validated', enforced.status);
+    }
     // Written before the row: an answer the face cannot write is the error row, not an `ok` one.
     const payload = openaiCompletion({ id, model: requested, created, text, usage: faceUsage(u, usageReason), reasoning: body.include_reasoning ? reasoning || null : null, toolCalls: calls, legacy });
     // The header carries the session for clients that read headers; the body carries it
@@ -1665,8 +1674,10 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
 
   const stateless = responsesStateRefusal(effectiveBody);
   if (stateless) throw new LlmError(stateless, { status: 400, type: 'invalid_request_error' });
-  const messages = responsesMessages(effectiveBody);
-  if (!messages.length) throw new LlmError('input is empty', { status: 400 });
+  const rawMessages = responsesMessages(effectiveBody);
+  if (!rawMessages.length) throw new LlmError('input is empty', { status: 400 });
+  const structSpec = extractResponseFormatSpec(effectiveBody);
+  const messages = structSpec ? injectStructuredOutputInstruction(rawMessages, structSpec) : rawMessages;
   const t0 = Date.now();
   const id = chatId('resp');
   const created = Math.floor(t0 / 1000);
@@ -1785,9 +1796,15 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     if (v?.skipped?.length) meta.skipped = v.skipped;
   };
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
+    const { text: rawRespText, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     if (toolCalls.length) throw noResponsesToolCalls();
+    let text = rawRespText;
+    if (structSpec) {
+      const enforced = enforceStructuredOutput(rawRespText, structSpec);
+      text = enforced.text;
+      if (enforced.status) res.setHeader('X-Keysmith-Schema-Validated', enforced.status);
+    }
     meta.done = true;
     if (cacheKey && responseCache) {
       const costUsd = estimateCachedCostUsd(gateway, cfg, leg, requestedModel, u, usageReason);

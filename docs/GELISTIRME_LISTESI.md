@@ -8,7 +8,7 @@
 
 ## Özet Öncelik Tablosu
 
-| Kod | Matris # | İş Kalemi | Matrosteki Durum | Gelir Etkisi | Kullanıcı Değeri | Efor | Puan | Öncelik | Durum |
+| Kod | Matris # | İş Kalemi | Matristeki Durum | Gelir Etkisi | Kullanıcı Değeri | Efor | Puan | Öncelik | Durum |
 |---|---|---|---|---|---|---|---|---|---|
 | **P0-1** | #8 | Deterministik Yanıt Önbellekleme (`Response Cache`, TTL, `X-Keysmith-Cache`, Tasarruf Ölçümü) | Yok | 9 | 10 | 2,0 | **45,0** | **P0** | [x] |
 | **P0-2** | #9 | Kısa Süreli Hız Sınırlama (`RPM` / `TPM` Rate Limiting) ve `X-RateLimit-*` / `Retry-After` Başlıkları | Kısmi | 9 | 9 | 2,0 | **40,5** | **P0** | [x] |
@@ -20,7 +20,7 @@
 | **P2-1** | #14 | Merkezi Prompt Şablonları & Sürümleme (`Prompt Registry`, `{{değişken}}` Yerleştirme) | Yok | 7 | 8 | 2,5 | **22,4** | **P2** | [x] |
 | **P2-2** | #16 | Semantik Benzerlik Önbelleklemesi (`Semantic Cache`, Kosinüs/N-gram Benzerliği, `SEMANTIC-HIT`) | Kısmi | 9 | 9 | 2,0 | **40,5** | **P2 (Dalga 2)** | [x] |
 | **P2-3** | #17 | Otomatik Devre Kesici (`Circuit Breaker`) & Sağlık Tabanlı Soğuma (`closed`/`open`/`half-open`) | Kısmi | 8 | 9 | 2,0 | **36,0** | **P2 (Dalga 2)** | [x] |
-| **P2-4** | #18 | Yapılandırılmış Çıktı (`Structured Output / JSON Schema`) Doğrulama ve Otomatik Onarım (`Response Healing`) | Yok | 8 | 8 | 2,0 | **32,0** | **P2 (Dalga 2)** | [ ] |
+| **P2-4** | #18 | Yapılandırılmış Çıktı (`Structured Output / JSON Schema`) Doğrulama ve Otomatik Onarım (`Response Healing`) | Yok | 8 | 8 | 2,0 | **32,0** | **P2 (Dalga 2)** | [x] |
 
 ---
 
@@ -133,7 +133,7 @@
   3. `cooldownMs` süresi dolduğunda devre `half-open` durumuna geçmeli; ilk deneme başarılı olursa `closed` durumuna sıfırlanmalı, başarısız olursa tekrar `open` durumuna dönmeli.
   4. `GET /v1/keysmith/breakers` ve `POST /v1/keysmith/breakers/reset` uç noktalarıyla devre kesici durumları izlenebilmeli ve sıfırlanabilmeli.
 
-### [ ] P2-4 (Matris #18): Yapılandırılmış Çıktı (`Structured Output / JSON Schema`) Doğrulama ve Otomatik Onarım (`Response Healing`)
+### [x] P2-4 (Matris #18): Yapılandırılmış Çıktı (`Structured Output / JSON Schema`) Doğrulama ve Otomatik Onarım (`Response Healing`)
 - **Durum (Matris):** Yok → Var
 - **Tahmini Efor:** 2,0 birim (~1 saat; `src/structured-output.js` + `src/server.js` + `test/structured-output.test.js`)
 - **Bağımlılık:** Yok.
