@@ -18,7 +18,7 @@
 | **P1-2** | #12 | Prometheus `/metrics` Uç Noktası & İmzalı Bütçe/Hata Webhook Bildirimleri (`Alerts`) | Kısmi | 8 | 8 | 2,5 | **25,6** | **P1** | [x] |
 | **P1-3** | #15 | Operasyonel Web Kontrol Paneli (TR/EN, Mobil Uyumlu, `ui-quality` Standardında Durum/Fatura/Önbellek Konsolu) | Kısmi | 9 | 9 | 3,5 | **23,1** | **P1** | [x] |
 | **P2-1** | #14 | Merkezi Prompt Şablonları & Sürümleme (`Prompt Registry`, `{{değişken}}` Yerleştirme) | Yok | 7 | 8 | 2,5 | **22,4** | **P2** | [x] |
-| **P2-2** | #16 | Semantik Benzerlik Önbelleklemesi (`Semantic Cache`, Kosinüs/N-gram Benzerliği, `SEMANTIC-HIT`) | Kısmi | 9 | 9 | 2,0 | **40,5** | **P2 (Dalga 2)** | [ ] |
+| **P2-2** | #16 | Semantik Benzerlik Önbelleklemesi (`Semantic Cache`, Kosinüs/N-gram Benzerliği, `SEMANTIC-HIT`) | Kısmi | 9 | 9 | 2,0 | **40,5** | **P2 (Dalga 2)** | [x] |
 | **P2-3** | #17 | Otomatik Devre Kesici (`Circuit Breaker`) & Sağlık Tabanlı Soğuma (`closed`/`open`/`half-open`) | Kısmi | 8 | 9 | 2,0 | **36,0** | **P2 (Dalga 2)** | [ ] |
 | **P2-4** | #18 | Yapılandırılmış Çıktı (`Structured Output / JSON Schema`) Doğrulama ve Otomatik Onarım (`Response Healing`) | Yok | 8 | 8 | 2,0 | **32,0** | **P2 (Dalga 2)** | [ ] |
 
@@ -113,7 +113,7 @@
   2. `/v1/chat/completions`, `/v1/messages` ve `/v1/responses` isteklerinde `prompt_id` (veya `metadata.prompt_id`) ile `prompt_variables: { ... }` gönderildiğinde şablondaki `{{değişken}}` alanları güvenli biçimde yerleştirilmeli; eksik zorunlu değişkende `400 Bad Request` dönmeli.
   3. Her şablon güncellemesi yeni bir `version` (`1, 2, 3...`) oluşturmalı ve istemci `prompt_version` belirterek belirli bir sürümü sabitleyebilmeli.
 
-### [ ] P2-2 (Matris #16): Semantik Benzerlik Önbelleklemesi (`Semantic Cache`)
+### [x] P2-2 (Matris #16): Semantik Benzerlik Önbelleklemesi (`Semantic Cache`)
 - **Durum (Matris):** Kısmi (yalnızca birebir SHA-256 `Exact` önbellek var) → Var
 - **Tahmini Efor:** 2,0 birim (~1 saat; `src/cache.js` + `src/server.js` + `test/semantic-cache.test.js`)
 - **Bağımlılık:** P0-1.

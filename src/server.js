@@ -235,7 +235,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     }
     const route = url.pathname.replace(/\/+$/, '') || '/';
 
-    res.setHeader('access-control-allow-headers', 'authorization,content-type,x-keysmith-session,x-keysmith-tag,x-keysmith-cache,x-keysmith-guardrails,cache-control,x-api-key,anthropic-version,uhp-version,idempotency-key,x-harness-id,traceparent,tracestate');
+    res.setHeader('access-control-allow-headers', 'authorization,content-type,x-keysmith-session,x-keysmith-tag,x-keysmith-cache,x-keysmith-cache-semantic,x-keysmith-guardrails,cache-control,x-api-key,anthropic-version,uhp-version,idempotency-key,x-harness-id,traceparent,tracestate');
     res.setHeader('access-control-allow-methods', 'GET,POST,DELETE,OPTIONS');
 
     // UHP-Version header negotiation (UHP 2026-10-19).
@@ -1205,11 +1205,12 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
       res.setHeader('X-Keysmith-Cache', 'BYPASS');
     } else {
       cacheKey = responseCache.buildKey({ route: '/v1/chat/completions', model: requested, targets: chain.map((c) => c.target), body, effort });
-      const cached = responseCache.get(cacheKey);
+      const cached = responseCache.get(cacheKey, { semantic: cachePol.semantic, semanticThreshold: cachePol.semanticThreshold, route: '/v1/chat/completions', model: requested, targets: chain.map((c) => c.target), body, effort });
       if (cached) {
         const cv = cached.value;
-        res.setHeader('X-Keysmith-Cache', 'HIT');
-        res.setHeader('X-Keysmith-Cache-Key', cacheKey);
+        res.setHeader('X-Keysmith-Cache', cached.semantic ? 'SEMANTIC-HIT' : 'HIT');
+        res.setHeader('X-Keysmith-Cache-Key', cached.key || cacheKey);
+        if (cached.semantic) res.setHeader('X-Keysmith-Cache-Similarity', String(cached.similarity));
         if (cv.toolMode) res.setHeader('x-keysmith-mode', cv.toolMode);
         const calls = (cv.toolCalls || []).map((c) => faceCall(c, 'openai'));
         if (!stream) {
@@ -1268,6 +1269,9 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
       responseCache.set(cacheKey, {
         route: '/v1/chat/completions',
         model: requested,
+        targets: chain.map((c) => c.target),
+        body,
+        effort,
         value: { text, reasoning, toolCalls, usage: u, usageReason, leg, effort: ran, toolMode },
         costUsd,
         usage: u,
@@ -1369,6 +1373,9 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     responseCache.set(cacheKey, {
       route: '/v1/chat/completions',
       model: requested,
+      targets: chain.map((c) => c.target),
+      body,
+      effort,
       value: { text: fullText, reasoning: fullReasoning || null, toolCalls: rawToolCalls, usage: u, usageReason: uReason, leg, effort: ran, toolMode },
       costUsd,
       usage: u,
@@ -1439,11 +1446,12 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
       res.setHeader('X-Keysmith-Cache', 'BYPASS');
     } else {
       cacheKey = responseCache.buildKey({ route: '/v1/messages', model: requested, targets: chain.map((c) => c.target), body, effort });
-      const cached = responseCache.get(cacheKey);
+      const cached = responseCache.get(cacheKey, { semantic: cachePol.semantic, semanticThreshold: cachePol.semanticThreshold, route: '/v1/messages', model: requested, targets: chain.map((c) => c.target), body, effort });
       if (cached) {
         const cv = cached.value;
-        res.setHeader('X-Keysmith-Cache', 'HIT');
-        res.setHeader('X-Keysmith-Cache-Key', cacheKey);
+        res.setHeader('X-Keysmith-Cache', cached.semantic ? 'SEMANTIC-HIT' : 'HIT');
+        res.setHeader('X-Keysmith-Cache-Key', cached.key || cacheKey);
+        if (cached.semantic) res.setHeader('X-Keysmith-Cache-Similarity', String(cached.similarity));
         if (cv.toolMode) res.setHeader('x-keysmith-mode', cv.toolMode);
         const calls = (cv.toolCalls || []).map((c) => faceCall(c, 'anthropic'));
         if (!stream) {
@@ -1495,6 +1503,9 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
       responseCache.set(cacheKey, {
         route: '/v1/messages',
         model: requested,
+        targets: chain.map((c) => c.target),
+        body,
+        effort,
         value: { text, toolCalls, usage: u, usageReason, leg, effort: ran, toolMode },
         costUsd,
         usage: u,
@@ -1572,6 +1583,9 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
     responseCache.set(cacheKey, {
       route: '/v1/messages',
       model: requested,
+      targets: chain.map((c) => c.target),
+      body,
+      effort,
       value: { text: fullAnthText, toolCalls: rawAnthCalls, usage: u, usageReason: uReason, leg, effort: ran, toolMode },
       costUsd,
       usage: u,
@@ -1687,11 +1701,12 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
       res.setHeader('X-Keysmith-Cache', 'BYPASS');
     } else {
       cacheKey = responseCache.buildKey({ route: '/v1/responses', model: requestedModel, targets: chain.map((c) => c.target), body: effectiveBody, effort });
-      const cached = responseCache.get(cacheKey);
+      const cached = responseCache.get(cacheKey, { semantic: cachePol.semantic, semanticThreshold: cachePol.semanticThreshold, route: '/v1/responses', model: requestedModel, targets: chain.map((c) => c.target), body: effectiveBody, effort });
       if (cached) {
         const cv = cached.value;
-        res.setHeader('X-Keysmith-Cache', 'HIT');
-        res.setHeader('X-Keysmith-Cache-Key', cacheKey);
+        res.setHeader('X-Keysmith-Cache', cached.semantic ? 'SEMANTIC-HIT' : 'HIT');
+        res.setHeader('X-Keysmith-Cache-Key', cached.key || cacheKey);
+        if (cached.semantic) res.setHeader('X-Keysmith-Cache-Similarity', String(cached.similarity));
         if (cv.toolMode) res.setHeader('x-keysmith-mode', cv.toolMode);
         const calls = (cv.toolCalls || []).map((c) => faceCall(c, 'responses'));
         const request = offered ? { tools: effectiveBody.tools, tool_choice: effectiveBody.tool_choice, parallel_tool_calls: effectiveBody.parallel_tool_calls } : undefined;
@@ -1768,6 +1783,9 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
       responseCache.set(cacheKey, {
         route: '/v1/responses',
         model: requestedModel,
+        targets: chain.map((c) => c.target),
+        body: effectiveBody,
+        effort,
         value: { text, toolCalls: [], usage: u, usageReason, leg, effort: ran, toolMode: null },
         costUsd,
         usage: u,
@@ -1830,6 +1848,9 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
       responseCache.set(cacheKey, {
         route: '/v1/responses',
         model: requestedModel,
+        targets: chain.map((c) => c.target),
+        body: effectiveBody,
+        effort,
         value: { text: full, toolCalls: [], usage: u, usageReason: uReason, leg, effort: ran, toolMode: null },
         costUsd,
         usage: u,
