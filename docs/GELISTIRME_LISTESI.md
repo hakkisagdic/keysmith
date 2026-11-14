@@ -1,7 +1,7 @@
 # Keysmith — Geliştirme Listesi (Backlog & Yol Haritası)
 
-**Tarih:** 13 Kasım 2026  
-**Kaynak:** `docs/RAKIP_ANALIZI.md` içindeki **"Yok" (3 kalem)** ve **"Kısmi" (5 kalem)** özelliklerin tamamı (toplam 8 iş kalemi).  
+**Tarih:** 14 Kasım 2026 (2. Dalga Güncellemesi)  
+**Kaynak:** `docs/RAKIP_ANALIZI.md` içindeki 1. Dalga (8 kalem — tamamlandı) + 2. Dalga (`#16`, `#17`, `#18` — 3 yeni kalem) özelliklerin tamamı (toplam 11 iş kalemi).  
 **Önceliklendirme Formülü:** `Öncelik Puanı = (Gelir Etkisi [1–10] × Kullanıcı Değeri [1–10]) ÷ Tahmini Efor [1–5]`
 
 ---
@@ -18,6 +18,9 @@
 | **P1-2** | #12 | Prometheus `/metrics` Uç Noktası & İmzalı Bütçe/Hata Webhook Bildirimleri (`Alerts`) | Kısmi | 8 | 8 | 2,5 | **25,6** | **P1** | [x] |
 | **P1-3** | #15 | Operasyonel Web Kontrol Paneli (TR/EN, Mobil Uyumlu, `ui-quality` Standardında Durum/Fatura/Önbellek Konsolu) | Kısmi | 9 | 9 | 3,5 | **23,1** | **P1** | [x] |
 | **P2-1** | #14 | Merkezi Prompt Şablonları & Sürümleme (`Prompt Registry`, `{{değişken}}` Yerleştirme) | Yok | 7 | 8 | 2,5 | **22,4** | **P2** | [x] |
+| **P2-2** | #16 | Semantik Benzerlik Önbelleklemesi (`Semantic Cache`, Kosinüs/N-gram Benzerliği, `SEMANTIC-HIT`) | Kısmi | 9 | 9 | 2,0 | **40,5** | **P2 (Dalga 2)** | [ ] |
+| **P2-3** | #17 | Otomatik Devre Kesici (`Circuit Breaker`) & Sağlık Tabanlı Soğuma (`closed`/`open`/`half-open`) | Kısmi | 8 | 9 | 2,0 | **36,0** | **P2 (Dalga 2)** | [ ] |
+| **P2-4** | #18 | Yapılandırılmış Çıktı (`Structured Output / JSON Schema`) Doğrulama ve Otomatik Onarım (`Response Healing`) | Yok | 8 | 8 | 2,0 | **32,0** | **P2 (Dalga 2)** | [ ] |
 
 ---
 
@@ -109,3 +112,32 @@
   1. `config.prompts` veya `~/.config/keysmith/prompts.json` (`src/prompts.js`) üzerinde sürümlü prompt şablonları (`id`, `version`, `system`, `template`, `model`, `variables`, `updatedAt`) tanımlanabilmeli ve `GET /v1/keysmith/prompts`, `POST /v1/keysmith/prompts`, `GET /v1/keysmith/prompts/:id`, `DELETE /v1/keysmith/prompts/:id` uç noktalarıyla yönetilebilmeli.
   2. `/v1/chat/completions`, `/v1/messages` ve `/v1/responses` isteklerinde `prompt_id` (veya `metadata.prompt_id`) ile `prompt_variables: { ... }` gönderildiğinde şablondaki `{{değişken}}` alanları güvenli biçimde yerleştirilmeli; eksik zorunlu değişkende `400 Bad Request` dönmeli.
   3. Her şablon güncellemesi yeni bir `version` (`1, 2, 3...`) oluşturmalı ve istemci `prompt_version` belirterek belirli bir sürümü sabitleyebilmeli.
+
+### [ ] P2-2 (Matris #16): Semantik Benzerlik Önbelleklemesi (`Semantic Cache`)
+- **Durum (Matris):** Kısmi (yalnızca birebir SHA-256 `Exact` önbellek var) → Var
+- **Tahmini Efor:** 2,0 birim (~1 saat; `src/cache.js` + `src/server.js` + `test/semantic-cache.test.js`)
+- **Bağımlılık:** P0-1.
+- **Kabul Ölçütleri:**
+  1. `config.cache` altında `semantic: true` ve `semanticThreshold` (varsayılan `0.88`, `0.50–0.99` arası) yapılandırması ile istek bazlı `x-keysmith-cache-semantic` başlığı desteklenmeli.
+  2. Birebir SHA-256 anahtarı eşleşmediğinde (`Exact MISS`), aynı rota, hedef model kümesi, sistem talimatı ve araç şeması içinde normalize edilmiş kullanıcı sorgusunun karakter/kelime N-gram kosinüs benzerliği hesaplanmalı.
+  3. Benzerlik skoru `>= semanticThreshold` olan en yüksek skorlu önbellek kaydı bulunduğunda yukarı akışa gidilmeden yanıt dönülmeli; yanıt başlığında `X-Keysmith-Cache: SEMANTIC-HIT` ve `X-Keysmith-Cache-Similarity: <0.xxxx>` yer almalı.
+  4. `GET /v1/keysmith/cache` istatistiklerinde `semanticHits` sayacı ayrı olarak raporlanmalı ve maliyet tasarrufuna (`savedUsd`) eklenmeli.
+
+### [ ] P2-3 (Matris #17): Otomatik Devre Kesici (`Circuit Breaker`) ve Sağlık Tabanlı Soğuma (`Cooldown`)
+- **Durum (Matris):** Kısmi (yalnızca istek içi sıralı failover var) → Var
+- **Tahmini Efor:** 2,0 birim (~1 saat; `src/circuit-breaker.js` + `src/gateway.js` + `src/server.js` + `test/circuit-breaker.test.js`)
+- **Bağımlılık:** P1-1.
+- **Kabul Ölçütleri:**
+  1. `config.limits.circuitBreaker` (`{ enabled, failureThreshold: 3, cooldownMs: 30000 }`) ile her `adapter` veya `adapter/model` bacağı için durum makinesi (`closed` → `open` → `half-open`) çalışmalı.
+  2. Bir bacak ardışık `failureThreshold` kez hata verdiğinde (`429`, `5xx`, zaman aşımı veya süreç çökmesi) devre `open` durumuna geçmeli ve `cooldownMs` süresince çok bacaklı rotalarda bu bacak hiç çağrılmadan (`skippedLegs: ["...:circuit_open"]`) sağlıklı yedek bacağa geçilmeli.
+  3. `cooldownMs` süresi dolduğunda devre `half-open` durumuna geçmeli; ilk deneme başarılı olursa `closed` durumuna sıfırlanmalı, başarısız olursa tekrar `open` durumuna dönmeli.
+  4. `GET /v1/keysmith/breakers` ve `POST /v1/keysmith/breakers/reset` uç noktalarıyla devre kesici durumları izlenebilmeli ve sıfırlanabilmeli.
+
+### [ ] P2-4 (Matris #18): Yapılandırılmış Çıktı (`Structured Output / JSON Schema`) Doğrulama ve Otomatik Onarım (`Response Healing`)
+- **Durum (Matris):** Yok → Var
+- **Tahmini Efor:** 2,0 birim (~1 saat; `src/structured-output.js` + `src/server.js` + `test/structured-output.test.js`)
+- **Bağımlılık:** Yok.
+- **Kabul Ölçütleri:**
+  1. `/v1/chat/completions` ve `/v1/responses` uç noktalarında `response_format: { type: "json_object" }` ve `response_format: { type: "json_schema", json_schema: { name, schema, strict } }` tam olarak desteklenmeli.
+  2. CLI veya HTTP adaptörlere gönderilen isteme şema talimatı otomatik enjekte edilmeli; modelin yanıtı Markdown kod bloğu (````json ... ````) veya öncül/ardıl açıklama içeriyorsa otomatik soyularak (`Response Healing`) saf JSON'a dönüştürülmeli ve `X-Keysmith-Schema-Validated: healed|valid` başlığı eklenmeli.
+  3. Yerleşik sıfır-bağımlılıklı JSON Schema doğrulayıcısı (`type`, `required`, `properties`, `items`, `enum`, `additionalProperties`) ile yanıt doğrulanmalı; şemaya uymayan yanıtta (`strict: true`) yapılandırılmış `422 Unprocessable Entity` (`code: "schema_validation_failed"`) dönmeli.
