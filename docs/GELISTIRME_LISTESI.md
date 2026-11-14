@@ -19,7 +19,7 @@
 | **P1-3** | #15 | Operasyonel Web Kontrol Paneli (TR/EN, Mobil Uyumlu, `ui-quality` Standardında Durum/Fatura/Önbellek Konsolu) | Kısmi | 9 | 9 | 3,5 | **23,1** | **P1** | [x] |
 | **P2-1** | #14 | Merkezi Prompt Şablonları & Sürümleme (`Prompt Registry`, `{{değişken}}` Yerleştirme) | Yok | 7 | 8 | 2,5 | **22,4** | **P2** | [x] |
 | **P2-2** | #16 | Semantik Benzerlik Önbelleklemesi (`Semantic Cache`, Kosinüs/N-gram Benzerliği, `SEMANTIC-HIT`) | Kısmi | 9 | 9 | 2,0 | **40,5** | **P2 (Dalga 2)** | [x] |
-| **P2-3** | #17 | Otomatik Devre Kesici (`Circuit Breaker`) & Sağlık Tabanlı Soğuma (`closed`/`open`/`half-open`) | Kısmi | 8 | 9 | 2,0 | **36,0** | **P2 (Dalga 2)** | [ ] |
+| **P2-3** | #17 | Otomatik Devre Kesici (`Circuit Breaker`) & Sağlık Tabanlı Soğuma (`closed`/`open`/`half-open`) | Kısmi | 8 | 9 | 2,0 | **36,0** | **P2 (Dalga 2)** | [x] |
 | **P2-4** | #18 | Yapılandırılmış Çıktı (`Structured Output / JSON Schema`) Doğrulama ve Otomatik Onarım (`Response Healing`) | Yok | 8 | 8 | 2,0 | **32,0** | **P2 (Dalga 2)** | [ ] |
 
 ---
@@ -123,7 +123,7 @@
   3. Benzerlik skoru `>= semanticThreshold` olan en yüksek skorlu önbellek kaydı bulunduğunda yukarı akışa gidilmeden yanıt dönülmeli; yanıt başlığında `X-Keysmith-Cache: SEMANTIC-HIT` ve `X-Keysmith-Cache-Similarity: <0.xxxx>` yer almalı.
   4. `GET /v1/keysmith/cache` istatistiklerinde `semanticHits` sayacı ayrı olarak raporlanmalı ve maliyet tasarrufuna (`savedUsd`) eklenmeli.
 
-### [ ] P2-3 (Matris #17): Otomatik Devre Kesici (`Circuit Breaker`) ve Sağlık Tabanlı Soğuma (`Cooldown`)
+### [x] P2-3 (Matris #17): Otomatik Devre Kesici (`Circuit Breaker`) ve Sağlık Tabanlı Soğuma (`Cooldown`)
 - **Durum (Matris):** Kısmi (yalnızca istek içi sıralı failover var) → Var
 - **Tahmini Efor:** 2,0 birim (~1 saat; `src/circuit-breaker.js` + `src/gateway.js` + `src/server.js` + `test/circuit-breaker.test.js`)
 - **Bağımlılık:** P1-1.

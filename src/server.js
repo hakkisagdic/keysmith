@@ -638,6 +638,17 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
         }
         return json(res, 200, { object: 'list', data: list });
       }
+      if ((route === '/v1/keysmith/breakers' || route === '/keysmith/breakers') && req.method === 'GET') {
+        return json(res, 200, gateway.circuitBreaker ? gateway.circuitBreaker.snapshot() : { enabled: false, breakers: [] });
+      }
+      if ((route === '/v1/keysmith/breakers/reset' || route === '/keysmith/breakers/reset') && req.method === 'POST') {
+        if (scope) {
+          throw new LlmError('resetting circuit breakers requires an unscoped key', { status: 403, type: 'permission_error' });
+        }
+        const body = await readJson(req).catch(() => ({}));
+        const cleared = gateway.circuitBreaker ? gateway.circuitBreaker.reset(body?.target || null) : 0;
+        return json(res, 200, { ok: true, cleared, ...(gateway.circuitBreaker ? gateway.circuitBreaker.snapshot() : {}) });
+      }
       if ((route === '/v1/keysmith/guardrails' || route === '/keysmith/guardrails') && req.method === 'GET') {
         return json(res, 200, guardrails.stats());
       }

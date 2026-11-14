@@ -10,6 +10,7 @@ import { describeUnsupported, relaysVerbatim, toolEvents, toolPath, toolSkipReas
 import { addUsage } from './tools/emulate.js';
 import { McpBridge } from './bridge/index.js';
 import { CreditGuard, creditGuardError } from './credit-guard.js';
+import { CircuitBreakerRegistry } from './circuit-breaker.js';
 import { DRIVERS } from './bridge/drivers.js';
 import { resolveEffort, suffixedIds } from './effort.js';
 import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExecCredentialAdapter, matchPrice } from './usage.js';
@@ -66,6 +67,7 @@ export class Gateway {
     // by while its plan is at or over its threshold. In memory unless the caller keeps the
     // readings in a file (the CLI does: dataDir()/credit-guard.json).
     this.creditGuard = creditGuard || new CreditGuard({ log: this.log });
+    this.circuitBreaker = new CircuitBreakerRegistry(cfg, { now: this.now });
     if (this.usage && !this.usage.log) this.usage.log = this.log;
     this._virtualCache = new Map();
     const rawAdaptersMap = new Map();
@@ -1481,6 +1483,19 @@ export class Gateway {
    * 429 a request that names it alone gets — the leg is passed by, the reason recorded.
    */
   async _heldBack(leg, run) {
+    if (this.circuitBreaker?.enabled) {
+      const cb = this.circuitBreaker.check(leg);
+      if (!cb.ok) {
+        const err = cb.error;
+        err.leg = legMetaOf(leg.adapter, leg.model);
+        this._skipLeg(run, leg, 'circuit_open', cb.detail, { failures: cb.failures, retryAfter: cb.retryAfter });
+        if (run.virtualState) {
+          recordVirtualFallback(run.virtualState, leg, err);
+          run.onVirtual?.(snapshotVirtual(run.virtualState));
+        }
+        return err;
+      }
+    }
     if (!leg?.adapter?.creditGuard || !this.creditGuard) return null;
     let verdict;
     try {
@@ -1599,6 +1614,7 @@ export class Gateway {
     if (!latencyRecorded) {
       latencyRecorded = true;
       this.recordLatency(legTarget, Math.max(0, this.now() - legStartMs));
+      this.circuitBreaker?.recordSuccess?.(legTarget);
     }
     if (effort) yield effort;
     if (heldUsage.length) yield* heldUsage.splice(0);
@@ -1609,7 +1625,8 @@ export class Gateway {
   }
 
   /** A leg's failure as the LlmError the route keeps, logged; rethrown when it must end the route. */
-  _legFailed({ adapter, model: upstreamModel }, e, state, signal, next) {
+  _legFailed({ adapter, model: upstreamModel, target }, e, state, signal, next) {
+    const legTarget = target || `${adapter.id}/${upstreamModel}`;
     // Wrapped, a failure keeps what a tool engine marked it with: which engine, and what it spent.
     // The status of an untyped failure: its own when it carries one, 504 only for a failure that
     // is typed as a timeout (`ETIMEDOUT`, a `TimeoutError`), 502 for any other upstream error.
@@ -1627,6 +1644,7 @@ export class Gateway {
     err.leg = e?.leg || legMetaOf(adapter, upstreamModel);
     if (e?.upstreamId && !err.upstreamId) err.upstreamId = e.upstreamId;
     if (signal?.aborted) throw err;
+    this.circuitBreaker?.recordFailure?.({ adapter, model: upstreamModel, target: legTarget }, err);
     if (state.emitted) {
       this.log(`${adapter.id}/${truncate(upstreamModel, 60)} failed after it had started answering, so no other leg is tried: ${truncate(e.message, 160)}`);
       throw err;
