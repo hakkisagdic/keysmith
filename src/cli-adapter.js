@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { getParser, toLines } from './parsers.js';
-import { expand } from './config.js';
+import { expand, resolveSecret } from './config.js';
+import { registerSecrets } from './redact.js';
 import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, agentCleanEnv } from './util.js';
 import { checkCreditGuard } from './credit-guard.js';
 import { checkToolMode } from './tools/router.js';
@@ -676,6 +677,33 @@ export class CliAdapter {
   }
 
   /**
+   * `env` with its secret references ({exec:…}, {env:…}, {file:…}, {dotenv:…}, {json:…}) read now,
+   * at the moment a child is spawned: never at config load, never kept on the adapter (this.env
+   * stays as written, so /status, `keysmith get` and the saved config show the reference). A value
+   * read here is registered with the redactor before it goes anywhere. A reference that reads as
+   * nothing fails the run, naming the variable and nothing else: not the reference, not the output.
+   */
+  _resolvedEnv() {
+    const out = {};
+    for (const [name, value] of Object.entries(this.env || {})) {
+      if (typeof value !== 'string' || !/^\{\w+:[\s\S]*\}$/.test(value)) {
+        out[name] = value;
+        continue;
+      }
+      let resolved = null;
+      try {
+        resolved = resolveSecret(value);
+      } catch {}
+      if (typeof resolved !== 'string' || !resolved) {
+        throw new LlmError(`adapter "${this.id}": env ${name} is a secret reference that did not resolve (nothing to pass to ${this.bin}); check the reference with the command that reads it`, { status: 500, provider: this.id });
+      }
+      registerSecrets([resolved]);
+      out[name] = resolved;
+    }
+    return out;
+  }
+
+  /**
    * The child's environment. `PWD` is set to the working directory: spawn() changes the directory but
    * leaves the parent's PWD, and opencode takes PWD as its project directory — with the
    * gateway's (or the shell's that started it) it fails ("Unexpected server error"), or reads
@@ -690,11 +718,12 @@ export class CliAdapter {
    * files, and `OPENCODE_CONFIG_CONTENT` re-applies `opencode.json` after `ConfigPaths.directories`.
    */
   _childEnv(runCwd = this.cwd) {
+    const env = this._resolvedEnv();
     if (!this._ownsOpencodeWorkspace) {
-      return { ...agentCleanEnv(), PWD: runCwd, ...this.env };
+      return { ...agentCleanEnv(), PWD: runCwd, ...env };
     }
     const baseEnv = { ...agentCleanEnv(), PWD: runCwd };
-    const xdgDataHome = this.env?.XDG_DATA_HOME || baseEnv.XDG_DATA_HOME;
+    const xdgDataHome = env.XDG_DATA_HOME || baseEnv.XDG_DATA_HOME;
     let ocConfigContent = this.workspaceFiles?.['opencode.json'];
     if (typeof ocConfigContent === 'string' && ocConfigContent.trim() && xdgDataHome) {
       try {
@@ -717,7 +746,7 @@ export class CliAdapter {
         ? { OPENCODE_CONFIG_CONTENT: ocConfigContent }
         : {}),
     };
-    return sanitizeOpencodeEnv(baseEnv, ocConfigEnv, this.env);
+    return sanitizeOpencodeEnv(baseEnv, ocConfigEnv, env);
   }
 
   _spawn({ args, stdin = null, timeoutMs }) {
