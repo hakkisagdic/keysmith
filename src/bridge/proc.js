@@ -43,8 +43,9 @@ export async function spawnGroup(adapter, { argv, env, stdinText = null, parser,
     for (const k of KEYSMITH_OPENCODE_ENV_ALLOWLIST) {
       if (env?.[k] !== undefined) allowedOpencode[k] = env[k];
     }
-    allowedOpencode.OPENCODE_CONFIG_DIR = adapter.env?.OPENCODE_CONFIG_DIR || path.join(adapter.cwd, '.opencode');
-    allowedOpencode.OPENCODE_DISABLE_PROJECT_CONFIG = adapter.env?.OPENCODE_DISABLE_PROJECT_CONFIG || '1';
+    const own = (k) => { const v = adapter.env?.[k]; return typeof v === 'string' && /^\{\w+:[\s\S]*\}$/.test(v) ? env?.[k] : v; };
+    allowedOpencode.OPENCODE_CONFIG_DIR = own('OPENCODE_CONFIG_DIR') || path.join(adapter.cwd, '.opencode');
+    allowedOpencode.OPENCODE_DISABLE_PROJECT_CONFIG = own('OPENCODE_DISABLE_PROJECT_CONFIG') || '1';
     childEnv = sanitizeOpencodeEnv({ ...env, PWD: runCwd }, allowedOpencode);
   }
   let child;
@@ -128,7 +129,7 @@ export async function spawnGroup(adapter, { argv, env, stdinText = null, parser,
 export function bridgeEnv(adapter, { drop = null, set = {} } = {}) {
   const base = agentCleanEnv();
   if (drop) for (const k of Object.keys(base)) if (drop.test(k)) delete base[k];
-  return { ...base, PWD: adapter.cwd, ...(adapter.env || {}), ...set };
+  return { ...base, PWD: adapter.cwd, ...(typeof adapter._resolvedEnv === 'function' ? adapter._resolvedEnv() : adapter.env || {}), ...set };
 }
 
 /** Write `content` to `file` 0600, through a temporary file, in a directory made 0700. */

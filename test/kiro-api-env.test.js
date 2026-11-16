@@ -164,3 +164,11 @@ test('a disabled adapter is not routed', async () => {
   assert.equal(stubRuns().length, before);
   assert.ok(!(await get('/v1/models')).includes('kiro-off/'));
 });
+
+test('bridgeEnv resolves a secret reference; an unresolved one fails naming the variable', async () => {
+  const { bridgeEnv } = await import('../src/bridge/proc.js');
+  const mk = (env) => new CliAdapter('bridge-env', kiroApi('bridge-env', env));
+  const ok = bridgeEnv(mk({ BRIDGE_TOKEN: '{exec:printf bridge-secret-value}' }));
+  assert.equal(ok.BRIDGE_TOKEN, 'bridge-secret-value');
+  assert.throws(() => bridgeEnv(mk({ BRIDGE_MISSING: '{exec:true}' })), (e) => /BRIDGE_MISSING/.test(e.message) && !/\{exec/.test(e.message));
+});
