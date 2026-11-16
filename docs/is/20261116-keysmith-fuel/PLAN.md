@@ -54,7 +54,7 @@
 - **`gateway.js` değişiklikleri:**
   - Kurucu, `catalogueSettings(cfg).path` varsa bir `CatalogueLimiter` kurar.
   - `seedMonthTokens: (id) => this.usage?.monthTokensByAdapter?.()?.[id] ?? 0` verilir. Yöntem dilim 3'te gelir; yokken 0 kullanılır.
-  - Satır ~107.de kurulan her `HttpAdapter` için `adapter.limiter = this.catalogue` atanır. `checkAdapter` (doctor) ve `CliAdapter` değişmez.
+  - Satır ~107'de kurulan her `HttpAdapter` için `adapter.limiter = this.catalogue` atanır. `checkAdapter` (doctor) ve `CliAdapter` değişmez.
 - **`http-adapter.js` değişiklikleri:**
   - Kurucu `this.limiter = null` yapar.
   - `complete` içinde fetch'ten önce iki kontrol çalışır:
