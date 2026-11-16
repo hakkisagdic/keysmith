@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add an optional catalogue (`catalogue` in `config.json`) with per-adapter `requestsPerMinute`, `requestsPerDay` and `tokensPerMonth`: over a limit a local `429` with `retry-after`, a cooldown after an upstream `429`, and `source`/`tier` on usage rows.
+- Add the `tokenrouter` and `mistral` profiles, `keysmith discover <adapter>` (free models, behind `discovery.enabled`) and the `freeOnly` adapter option.
+- Add `keysmith usage record` for runs made outside the gateway (`face: "external"`, repeat-safe with `--id`).
+
 ### Security
 - Reload `auth.keys` on `SIGHUP` (so `SIGHUP` now reloads keys and no longer stops the gateway on terminal hang-up) and `config.json` `mtime` changes (recording reload state only after valid JSON parse, logging a failed reload once per file stamp, refusing to disable auth on reload when a named or quick tunnel or non-loopback host is active, and writing `config.json` atomically via temp+rename), signal a running `keysmith serve` instance whose pidfile matches `config.json` from `key add`/`key revoke`/`key scope`, and print the restart hint only when no signal was delivered (M1).
 - Re-check caller key scope against the resolved base model after effort-suffix stripping and filter effort-suffixed entries on `/v1/models` (M2).
