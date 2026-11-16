@@ -902,6 +902,8 @@ export const HTTP_PROFILES = {
   anthropic: { kind: 'http', wire: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', apiKey: '{env:ANTHROPIC_API_KEY}', media: ['image', 'pdf'] },
   openrouter: { kind: 'http', wire: 'openai', baseUrl: 'https://openrouter.ai/api/v1', apiKey: '{env:OPENROUTER_API_KEY}' },
   groq: { kind: 'http', wire: 'openai', baseUrl: 'https://api.groq.com/openai/v1', apiKey: '{env:GROQ_API_KEY}' },
+  tokenrouter: { kind: 'http', wire: 'openai', baseUrl: 'https://api.tokenrouter.com/v1', apiKey: '{env:TOKENROUTER_API_KEY}' },
+  mistral: { kind: 'http', wire: 'openai', baseUrl: 'https://api.mistral.ai/v1', apiKey: '{env:MISTRAL_API_KEY}' },
   deepseek: { kind: 'http', wire: 'openai', baseUrl: 'https://api.deepseek.com/v1', apiKey: '{env:DEEPSEEK_API_KEY}' },
   together: { kind: 'http', wire: 'openai', baseUrl: 'https://api.together.xyz/v1', apiKey: '{env:TOGETHER_API_KEY}' },
   google: {

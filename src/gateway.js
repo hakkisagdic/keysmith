@@ -9,6 +9,7 @@ import { adapterReach, aliasDecision, globCanStartWith, requestDecision, scopeTe
 import { describeUnsupported, relaysVerbatim, toolEvents, toolPath, toolSkipReason } from './tools/router.js';
 import { addUsage } from './tools/emulate.js';
 import { McpBridge } from './bridge/index.js';
+import { CatalogueLimiter, catalogueSettings, loadCatalogue } from './catalogue.js';
 import { CreditGuard, creditGuardError } from './credit-guard.js';
 import { DRIVERS } from './bridge/drivers.js';
 import { resolveEffort, suffixedIds } from './effort.js';
@@ -65,6 +66,15 @@ export class Gateway {
     // readings in a file (the CLI does: dataDir()/credit-guard.json).
     this.creditGuard = creditGuard || new CreditGuard({ log: this.log });
     if (this.usage && !this.usage.log) this.usage.log = this.log;
+    // Catalogue limits (src/catalogue.js): only built when `catalogue` names a file; null otherwise, and every hook is skipped.
+    const catPath = catalogueSettings(cfg).path;
+    this.catalogue = catPath
+      ? new CatalogueLimiter({
+          catalogue: loadCatalogue(catPath, { log: this.log }),
+          now: this.now,
+          seedMonthTokens: (id) => this.usage?.monthTokensByAdapter?.()?.[id] ?? 0,
+        })
+      : null;
     this._virtualCache = new Map();
     const rawAdaptersMap = new Map();
     const origSet = rawAdaptersMap.set.bind(rawAdaptersMap);
@@ -105,6 +115,7 @@ export class Gateway {
         // Whether a media URL a request sends is fetched (public addresses only) or refused: the gateway's call, not an adapter's.
         prepared._fetchMedia = cfg.fetchMedia !== false;
         const adapter = prepared.kind === 'cli' ? new CliAdapter(id, prepared) : new HttpAdapter(id, prepared);
+        if (adapter instanceof HttpAdapter) adapter.limiter = this.catalogue;
         this.adapters.set(id, adapter);
         if (adapter.unsafeTools && !adapter.disabled) this.log(`adapter "${id}" can run commands and edit files (unsafeTools) and is enabled: it answers requests that name it, never an alias`);
         if (adapter.kind === 'cli' && !adapter.disabled && !deferAdapterChecks) {
