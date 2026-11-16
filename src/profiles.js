@@ -904,6 +904,9 @@ export const HTTP_PROFILES = {
   groq: { kind: 'http', wire: 'openai', baseUrl: 'https://api.groq.com/openai/v1', apiKey: '{env:GROQ_API_KEY}' },
   tokenrouter: { kind: 'http', wire: 'openai', baseUrl: 'https://api.tokenrouter.com/v1', apiKey: '{env:TOKENROUTER_API_KEY}' },
   mistral: { kind: 'http', wire: 'openai', baseUrl: 'https://api.mistral.ai/v1', apiKey: '{env:MISTRAL_API_KEY}' },
+  // Workers AI's OpenAI-compatible endpoint: the account id sits in the URL, so `{account}` is
+  // filled in by `keysmith add cloudflare --account-id <id>` / `source enable cloudflare --account-id <id>`.
+  cloudflare: { kind: 'http', wire: 'openai', baseUrl: 'https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1', apiKey: '{env:CLOUDFLARE_API_TOKEN}' },
   deepseek: { kind: 'http', wire: 'openai', baseUrl: 'https://api.deepseek.com/v1', apiKey: '{env:DEEPSEEK_API_KEY}' },
   together: { kind: 'http', wire: 'openai', baseUrl: 'https://api.together.xyz/v1', apiKey: '{env:TOGETHER_API_KEY}' },
   google: {
@@ -964,6 +967,40 @@ export const HTTP_PROFILES = {
     explicitOnly: true,
     provenance: 'Traycer inference gateway (https://server.traycer.ai/api/traycer/models & /inference/{openai,anthropic,xai,meta,openrouter}) — verified live against GET /api/traycer/models (32 models across openai, anthropic, xai, meta, openrouter) and POST /inference/{anthropic/messages,openai/responses,{xai,meta,openrouter}/chat/completions}',
     note: 'Uses your Traycer sign-in (~/.traycer/cli/credentials, or TRAYCER_BEARER_TOKEN) and Traycer inference credits, so it is explicit-only: it answers traycer/<model> and is in no alias and no doctor --probe-models (`keysmith set traycer explicitOnly false` opts out). Routes each model to its native Traycer inference endpoint (/inference/anthropic/messages, /inference/openai/responses, or /inference/{xai,meta,openrouter}/chat/completions) with x-traycer-account-context: PERSONAL.',
+  },
+};
+
+/**
+ * What `keysmith source enable` knows about a source that has a free tier. `documented` is the
+ * free allowance as the provider states it (the most restrictive model, when it differs by model);
+ * `limits` is what the catalogue gets: at most half of it. `freeOnly` is true only where the
+ * provider's /models carries prices, so that "free" can be read off it (tokenrouter); on the
+ * others /models has no price and freeOnly would refuse every model, so the guard there is: out
+ * of every alias, a catalogue limit, and a model named with --model.
+ * Allowances are from the providers' pricing/limits pages as last read, not checked live here.
+ */
+export const SOURCE_FACTS = {
+  tokenrouter: {
+    freeOnly: true,
+    prices: { inputPricePath: 'pricing.prompt', outputPricePath: 'pricing.completion' },
+    documented: null, // no published allowance found: the limits below are a placeholder floor
+    limits: { requestsPerMinute: 10, requestsPerDay: 200, tokensPerDay: 200_000 },
+  },
+  groq: {
+    freeOnly: false,
+    documented: { requestsPerMinute: 30, requestsPerDay: 1000, tokensPerDay: 100_000 },
+    limits: { requestsPerMinute: 15, requestsPerDay: 500, tokensPerDay: 50_000 },
+  },
+  mistral: {
+    freeOnly: false,
+    documented: { requestsPerMinute: 60, tokensPerMonth: 1_000_000_000 },
+    limits: { requestsPerMinute: 30, tokensPerMonth: 500_000_000 },
+  },
+  cloudflare: {
+    freeOnly: false,
+    needsAccount: true,
+    documented: { tokensPerDay: 100_000 }, // 10,000 neurons a day; tokens per neuron varies by model, this is a floor
+    limits: { requestsPerDay: 500, tokensPerDay: 50_000 },
   },
 };
 

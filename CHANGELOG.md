@@ -5,6 +5,9 @@
 ### Added
 
 - Add an optional catalogue (`catalogue` in `config.json`) with per-adapter `requestsPerMinute`, `requestsPerDay` and `tokensPerMonth`: over a limit a local `429` with `retry-after`, a cooldown after an upstream `429`, and `source`/`tier` on usage rows.
+- Add `keysmith source enable|disable <profile>` (tokenrouter, groq, mistral, cloudflare): the adapter with a Keychain key reference, out of every alias, conservative catalogue limits, discovery on; and `keysmith config get|set|unset <key>` for the top-level settings, with a dated backup first.
+- Add the `cloudflare` (Workers AI) profile (`--account-id`) and the catalogue field `tokensPerDay`.
+- Fix: `--help` / `-h` after any command prints that command's help and does nothing else (`add tokenrouter --help` used to attach the adapter).
 - Add the `tokenrouter` and `mistral` profiles, `keysmith discover <adapter>` (free models, behind `discovery.enabled`) and the `freeOnly` adapter option.
 - Add `keysmith usage record` for runs made outside the gateway (`face: "external"`, repeat-safe with `--id`).
 
