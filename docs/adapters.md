@@ -167,7 +167,7 @@ adapter takes (`media`, and `vision` for images).
 | `emulateArgs` | `args` | the argv template of an EMULATE run, same placeholders as `args`; no session is resumed on that path, so `{session}` is always empty. agy's names the `keysmith-tools` agent |
 | `bridge` | — | the MCP bridge's settings: `driver` (`agy`, `opencode`, `codex`, `qoder` or `claude`; absent, agy's for an `agy-stream-json` entry), `args`, its argv template, with `{agent}` (the session's agent), `{server}`, `{printTimeout}` (its `sessionMaxMs`, as `1800s`) and the driver's own placeholders (see [opencode, codex, qoder and kiro](#opencode-codex-qoder-and-kiro-tool-requests)) filled in per session — read by the auto-approve check below, and an approval in it may approve the session's own server only; `maxSessions` (2), `toolResultTimeoutMs` (300000), `readyTimeoutMs` (30000), `sessionMaxMs` (1800000), `maxTurns` (32); `mcpCacheDir` (`~/.gemini/antigravity-cli/mcp`, where agy keeps a server's schemas). See [agy and tool requests: the MCP bridge](#agy-and-tool-requests-the-mcp-bridge) |
 | `unsafeTools` | `false` | keysmith could not take this CLI's tools away: it can run commands and edit files. Implies `explicitOnly`; `keysmith set` refuses to serve it (`disabled false`), to take the mark off, or to change anything that shapes what it runs or how it is stopped (`stopAtToolCall`, `args`, `resumeArgs`, `visionArgs`, `bin`, `env`, `cwd`, `parser`, `modelsFrom`, …) without `--allow-unsafe-tools`; the gateway logs it at load when it is enabled. An argv template — `args`, `resumeArgs`, `emulateArgs`, `visionArgs`, `bridge.args` — with an auto-approve flag (`--auto`, `--yolo`, `--dangerously-skip-permissions`, `--full-auto`, `--trust-all-tools`, `--permission-mode yolo`, `--sandbox danger-full-access`, agy's `--mode auto` / `--mode accept-edits`, …) is a load error unless the entry has this mark; with it, `toolMode` must be `off` (`keysmith set <id> unsafeTools true`, and a re-add that keeps the mark, turn it off). See [Warp](#warps-oz-an-agent-that-keeps-its-tools) and [Command Code](#command-code-an-agent-that-approves-its-own-tools) |
-| `env` | `{}` | merged over the scrubbed parent env |
+| `env` | `{}` | merged over the scrubbed parent env. A value that is a [secret reference](#secret-references) (`{exec:…}`, `{env:…}`, `{file:…}`, `{dotenv:…}`, `{json:…}`) is read each time a child is spawned (a request, a version or model probe, the Kiro credit guard's `/usage` run), never at load; the entry, `keysmith get`, `keysmith set` and the status page show the reference, the value is registered with the redactor, and a reference that reads as nothing fails that run with an error naming the variable (never the value or the command's output). A literal is passed as written |
 | `maxConcurrent` | `1` | semaphore; each call is a real process |
 | `stripSystemPrompt` | `false` | drop system turns instead of inlining them |
 | `systemFlag` | — | e.g. `"--system-prompt"`: passed as `--system-prompt <text>` when a system turn exists |
@@ -618,6 +618,47 @@ answer from either. Check the first real answer before putting `kiro` in an alia
 in `~/.local/bin`, which the LaunchAgent's PATH does not include: `keysmith add kiro --bin
 ~/.local/bin/kiro-cli`.
 
+### Kiro API key
+
+A Kiro API key is not an HTTP API: it is the `KIRO_API_KEY` environment variable of a headless
+`kiro-cli chat --no-interactive`, billed in the same plan credits. So a second Kiro login is the
+`kiro` entry copied to a new id, with its own workspace and the key in its `env` as a
+[secret reference](#secret-references), read when each run starts:
+
+```json
+"kiro-api": {
+  "kind": "cli",
+  "bin": "~/.local/bin/kiro-cli",
+  "cwd": "~/.local/share/keysmith/workspaces/kiro-api",
+  "env": { "KIRO_API_KEY": "{exec:security find-generic-password -s <SERVICE> -w}" },
+  "disabled": true,
+  "creditGuardThreshold": 0.9
+}
+```
+
+Take the rest of the entry (argv, parser, workspace agent file, `toolMode: "off"`) from the
+`kiro` profile: `keysmith add kiro --as kiro-api`, then `keysmith set kiro-api env ...` and
+`keysmith set kiro-api cwd ...`. `<SERVICE>` is the name of the Keychain item that holds the
+key; it is a name, not the key. The adapter joins no alias, no auto tier and no route: only a
+request that names `kiro-api/<model>` reaches it, and only once `disabled` is taken off
+(`keysmith set kiro-api disabled false`, then restart the gateway).
+
+The API key path adds no HTTP, no tools and no streaming: it is the text-only `kiro` adapter
+under another login. The credit guard keeps one reading per login (the binary and the `env` as
+written), so this entry is guarded on its own plan reading. Whether `/usage` answers under an
+API-key login has to be checked on the first real run: if it does not, the reading fails and
+the guard never holds an adapter back on a failed reading.
+
+To give the key to one gateway key only, scope it and keep every other key away from it:
+
+```
+keysmith key scope fp:3f9a0c12 --allow kiro-api
+keysmith key scope fp:77aa0e41 --deny kiro-api
+```
+
+(or `"allow": ["kiro-api"]` on that key's entry in `auth.keys`, and `"deny": ["kiro-api"]` on
+the others).
+
 ### Warp's oz: an agent that keeps its tools
 
 `oz agent run --output-format ndjson --prompt …` (the `oz` inside Warp.app;
@@ -862,6 +903,9 @@ covers a Keychain entry or a secrets manager; it runs through a shell with a 10 
 A resolved key is registered with the redactor (`src/redact.js`) the moment its adapter
 loads, so it comes out of every log line, usage row, error body and page as
 `AIza…39 fp:1a2b3c4d` — the same treatment as the gateway key.
+
+`env` values of a CLI adapter are references too, but are resolved later: when each child is
+spawned, not at load (see the `env` field above).
 
 A reference that resolves to nothing is a **load error, not a silent skip**: the adapter
 stays out of service, `doctor` names the missing env var, `/v1/models` reports it,
