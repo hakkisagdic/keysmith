@@ -3,6 +3,8 @@ import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { redactSecrets } from './redact.js';
 import { checkMedia, hasMedia, upstreamMessages } from './media.js';
 import { credentialAccount, hostOf } from './usage.js';
+import { catalogueLimitError, discoveredPath, readDiscovered } from './catalogue.js';
+import { dataDir } from './config.js';
 
 const UHP_TOOL_MODES = ['off', 'emulate', 'uhp', 'auto'];
 
@@ -29,6 +31,8 @@ export class HttpAdapter {
     this.timeoutMs = cfg.timeoutMs ?? 120_000;
     this.priority = cfg.priority ?? 100;
     this.disabled = !!cfg.disabled;
+    this.freeOnly = cfg.freeOnly === true;
+    this.limiter = null; // set by the gateway when a catalogue is configured
     this.modelMap = cfg.modelMap && typeof cfg.modelMap === 'object' && !Array.isArray(cfg.modelMap) ? cfg.modelMap : {};
     this._apiKey = cfg._apiKey ?? null;
     this._declared = cfg.models;
@@ -479,6 +483,19 @@ export class HttpAdapter {
       : this.wire;
     const effectiveModel = isTraycer ? traycerTarget.upstreamModelId : this.upstreamModel(model);
 
+    if (this.freeOnly) {
+      const free = readDiscovered(discoveredPath(dataDir(), this.id));
+      if (!free || !(free.has(effectiveModel) || free.has(model))) {
+        throw new LlmError(`${model} is not on the discovered free list (keysmith discover ${this.id})`, {
+          status: 400, type: 'invalid_request_error', provider: this.id,
+        });
+      }
+    }
+    if (this.limiter) {
+      const d = this.limiter.admit(this.id);
+      if (!d.ok) throw catalogueLimitError(this.id, d);
+    }
+
     if (rendered && typeof rendered.prompt === 'string' && effectiveWire !== 'uhp') {
       messages = [
         ...(rendered.system ? [{ role: 'system', content: rendered.system }] : []),
@@ -598,6 +615,7 @@ export class HttpAdapter {
       const text = await res.text().catch(() => '');
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
+      if (res.status === 429 && this.limiter) this.limiter.noteUpstream429(this.id, parseFloat(res.headers?.get?.('retry-after')));
       throw upstreamError(this.id, res, text);
     }
     let upstreamId = upstreamIdFromHeaders(res.headers);
@@ -615,6 +633,7 @@ export class HttpAdapter {
           yield { type: 'upstream', upstreamId };
         }
         if (evt.type === 'usage' || evt.type === 'usage_unknown') sawUsage = true;
+        if (evt.type === 'usage' && this.limiter && evt.usage) this.limiter.noteTokens(this.id, (evt.usage.input || 0) + (evt.usage.output || 0));
         if (evt.type === 'reasoning' && !includeReasoning) continue;
         if (evt.type === 'done' && !this.streamUsage && !isUhp && !isAnthropic && !sawUsage) {
           sawUsage = true;

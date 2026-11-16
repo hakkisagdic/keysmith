@@ -2095,6 +2095,7 @@ function stamp(entry, { who, req, res, route, gateway, cfg } = {}) {
       }
     : {};
 
+  const catInfo = gateway?.catalogue && adapter ? (gateway.catalogue.info(adapter, upstreamModel) || gateway.catalogue.info(adapter, rest.model)) : null;
   const legSkips = res?._keysmith?.legSkips;
   const base = {
     ...rest,
@@ -2109,6 +2110,7 @@ function stamp(entry, { who, req, res, route, gateway, cfg } = {}) {
     bytesOut,
     ...(tag ? { tag } : {}),
     cost,
+    ...(catInfo ? { source: catInfo.source, ...(catInfo.tier ? { sourceTier: catInfo.tier } : {}) } : {}),
   };
 
   if (!who?.fp) return base;
