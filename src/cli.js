@@ -11,6 +11,7 @@ import { autoApproveFlag, which } from './cli-adapter.js';
 import { CreditGuard, readCreditState } from './credit-guard.js';
 import { carriageLines, creditGuardLines, creditGuardRows, guardShiftLines, recentSkips, skipLines, toolCarriage } from './failover-report.js';
 import * as tunnel from './tunnel.js';
+import { catalogueSettings, discoveredPath, freeModels, writeDiscovered } from './catalogue.js';
 import * as service from './service.js';
 import { rel, truncate } from './util.js';
 import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets, streamRedactor } from './redact.js';
@@ -50,6 +51,9 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith tunnel <status|setup|run> cloudflared: named tunnel first, quick as fallback
   keysmith usage [--by d1[,d2]] [--since t] [--until t] [--format table|csv|json]
                                      who spent what (by key, label, adapter, model, account, tag, day, client)
+  keysmith usage record --source S [--model M --tag T --requests N --credits C --input N --output N --ms N --accepted B --id ID | --from FILE.jsonl]
+                                     log a run made outside keysmith (counted as face "external")
+  keysmith discover <adapterId>      list the free models an adapter offers (needs discovery.enabled)
   keysmith key <add|list> [--reveal] client-facing API keys; --reveal prints them in full, to a terminal only
   keysmith key add <label> [--allow p,…] [--deny p,…] [--out <file>]
                                      a labelled key with a scope; --out writes the key to a new 0600 file
@@ -142,7 +146,10 @@ export async function main(argv) {
         return await cmdDoctor(flags);
       case 'tunnel':
         return await cmdTunnel(flags);
+      case 'discover':
+        return await cmdDiscover(flags);
       case 'usage':
+        if (flags._[0] === 'record') return await cmdUsageRecord(flags);
         return await cmdUsage(flags);
       case 'key':
         return await cmdKey(flags);
@@ -1444,6 +1451,65 @@ async function cmdTunnel(flags) {
     return;
   }
   fail(`unknown tunnel command "${sub}" — status | setup <hostname> [--yes] | run`);
+}
+
+/* ------------------------------------------------------------- discover / usage record */
+
+async function cmdDiscover(flags) {
+  const id = flags._[0];
+  if (!id) fail('usage: keysmith discover <adapterId>');
+  const cfg = loadOrFail();
+  const settings = catalogueSettings(cfg);
+  if (settings.discovery.enabled !== true) fail('discovery is off (discovery.enabled)');
+  const raw = cfg.adapters?.[id];
+  if (!raw) fail(`no adapter "${id}"`);
+  if (!raw.baseUrl) fail(`adapter "${id}" has no baseUrl`);
+  const key = resolveSecret(raw.apiKey ?? raw.key ?? null);
+  if (key) registerSecrets([key]);
+  const url = String(raw.baseUrl).replace(/\/+$/, '') + '/models';
+  const headers = { accept: 'application/json' };
+  if (key) headers.authorization = `Bearer ${key}`;
+  let res;
+  try {
+    res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+  } catch (e) {
+    fail(`${id}: ${e.message}`);
+  }
+  if (res.status === 401 || res.status === 403) fail(`renew key: ${id}`);
+  if (!res.ok) fail(`${id}: GET /models answered ${res.status}`);
+  let body;
+  try { body = await res.json(); } catch { fail(`${id}: /models did not return JSON`); }
+  const opts = settings.discovery[id] || { inputPricePath: 'pricing.prompt', outputPricePath: 'pricing.completion' };
+  const ids = freeModels(body, opts);
+  writeDiscovered(discoveredPath(dataDir(), id), ids);
+  out(`${id}: ${ids.length} free model${ids.length === 1 ? '' : 's'} written`);
+}
+
+function cmdUsageRecord(flags) {
+  const usage = new UsageLog();
+  const records = [];
+  if (flags.from) {
+    const file = expand(String(flags.from));
+    let text;
+    try { text = fs.readFileSync(file, 'utf8'); } catch (e) { fail(`--from ${rel(file)}: ${e.code || e.message}`); }
+    text.split('\n').forEach((line, i) => {
+      if (!line.trim()) return;
+      try { records.push(JSON.parse(line)); } catch { fail(`--from ${rel(file)}: line ${i + 1} is not JSON`); }
+    });
+  } else {
+    records.push({
+      source: flags.source, model: flags.model, tag: flags.tag, requests: flags.requests, credits: flags.credits,
+      input: flags.input, output: flags.output, ms: flags.ms, accepted: flags.accepted, id: flags.id,
+    });
+  }
+  let written = 0;
+  for (const r of records) {
+    if (!r || typeof r !== 'object') continue;
+    const res = usage.recordExternal(r);
+    if (res.written) written++;
+    else out(`already recorded: ${r.id}`);
+  }
+  if (written) out(`recorded ${written} external ${written === 1 ? 'row' : 'rows'}`);
 }
 
 /* ------------------------------------------------------------------------- usage */
