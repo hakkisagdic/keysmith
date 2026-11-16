@@ -1168,6 +1168,60 @@ comes before a metered HTTP leg no `limits.spend` cap covers (from the threshold
 pays for the kiro traffic); `status` shows the reading the gateway last kept (it runs no
 kiro-cli), and `/v1/keysmith/routes` has it as `credit_guards`.
 
+### Catalogue limits
+
+An optional catalogue file tells keysmith what each source allows, so it refuses locally
+(`429` with `retry-after`) before the provider does. Nothing changes until `catalogue` is set
+in `config.json` (`"catalogue": "~/catalogue.json"`); the file is re-read when it changes, and
+an unreadable or invalid one is logged once and ignored.
+
+```json
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": "tokenrouter",
+      "reach": { "keysmith": "tokenrouter" },
+      "limits": { "requestsPerMinute": 20, "requestsPerDay": 200, "tokensPerMonth": 5000000 },
+      "models": [{ "id": "some-model", "tier": "free" }]
+    }
+  ]
+}
+```
+
+Only `reach.keysmith` (the adapter id), `limits` and `models[].tier` are read; unknown fields
+are ignored. Over a limit the request is refused with a `429` and a `retry-after` of the time
+until the minute, UTC day or UTC month window opens again, and nothing is sent upstream. After
+an upstream `429` the adapter cools down for that response's `retry-after`, or 60 s without
+one, and requests in that time get a local `429`. Counters live in memory (the month's tokens
+are seeded from the usage file at start). A usage row gets `source` and `tier` when the
+catalogue knows the model; without a catalogue the rows are unchanged.
+
+### Recording external usage
+
+Work done outside the gateway can be counted next to it, with no server running:
+
+```bash
+keysmith usage record --source qoder --model some-model --tag job/1 --id r1 \
+  --requests 1 --credits 2 --input 1200 --output 300 --ms 8000 --accepted true
+keysmith usage record --from ~/runs.jsonl     # one JSON object per line, same field names
+```
+
+Each call appends one row with `face: "external"` (the adapter column is the `--source`), so
+`keysmith usage --by adapter` counts it. With `--id` a second call with the same id writes
+nothing (`already recorded`); a different `--accepted` for that id is added as an amending row.
+
+### Free models: `discover` and `freeOnly`
+
+Set `"discovery": { "enabled": true }` in `config.json`, then `keysmith discover tokenrouter`
+asks the adapter's `GET <baseUrl>/models` and writes the models whose input and output price
+are both `0` to `<data>/discovered/tokenrouter.json`. The price fields default to
+`pricing.prompt` and `pricing.completion`; change them per adapter with
+`"discovery": { "tokenrouter": { "inputPricePath": "...", "outputPricePath": "..." } }`.
+With discovery off the command refuses; a `401` or `403` prints `renew key: <adapter>`.
+`keysmith set tokenrouter freeOnly true` then refuses any model not on that list (`400`); the
+file is re-read when it changes, so a new `discover` takes effect without a restart.
+
 ## Publishing it safely
 
 `keysmith serve --tunnel` is the whole point for remote clients, and a tunnel is
@@ -1279,6 +1333,7 @@ tools.
 | `gemini` | cli | documented argv shape, not run against a live install — **`unsafeTools`** until a tool-less argv is checked: ships disabled |
 | `openai`, `anthropic`, `openrouter`, `groq`, `deepseek`, `together` | http | standard endpoints; `openai` takes images, PDFs and audio, `anthropic` images and PDFs (`media`, from their API references) |
 | `google` | http | verified live against Gemini's OpenAI-compatible endpoint: tools, streaming, thought signatures — see [above](#gemini-with-tools-the-google-profile); takes images (read live on `gemini-3.5-flash`) and audio; refuses a PDF `file` part and `video_url` |
+| `tokenrouter`, `mistral` | http | OpenAI-wire endpoints (`https://api.tokenrouter.com/v1`, `https://api.mistral.ai/v1`; keys `TOKENROUTER_API_KEY`, `MISTRAL_API_KEY`), checked against a stub only; `tokenrouter` pairs with `discover` and `freeOnly`, see [Free models](#free-models-discover-and-freeonly) |
 | `ollama`, `lmstudio`, `llamacpp`, `vllm` | http | local servers, no key |
 | `copilot` | http | verified live against `api.githubcopilot.com` with an OAuth device token; takes images with `copilot-vision-request: true` (not checked live) |
 | `traycer` | http | verified live against `https://server.traycer.ai` (`wire: "traycer"`): discovers 32 models across `anthropic`, `openai`, `xai`, `meta` and `openrouter` from `GET /api/traycer/models`, routes each to its native `/inference/…` endpoint with `x-traycer-account-context: PERSONAL`, answers tool requests via `EMULATE`, takes images and PDFs; explicit-only |
