@@ -1214,6 +1214,15 @@ function maxWidth(items, fn, min = 0) {
   return max;
 }
 
+function externalCount(e) {
+  const n = Math.floor(Number(e.requests));
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+
+const EXTERNAL_FIELD_MAX = 128;
+const clip = (v) => (typeof v === 'string' ? v.slice(0, EXTERNAL_FIELD_MAX) : v);
+const num = (v) => (Number.isFinite(Number(v)) && v !== '' && v !== null && v !== undefined ? Number(v) : null);
+
 export class UsageLog {
   /** `now`: the clock a row's `ts` is read from (ms or Date), injectable for a test. */
   constructor(file = null, { pricing = null, now = null, log = null } = {}) {
@@ -1970,6 +1979,73 @@ export class UsageLog {
     }
   }
 
+  /**
+   * Record one run that happened outside keysmith (a CLI or tool the owner drove by hand), as a
+   * single appended line. Returns { written, reason }. With `id`, the same id is written once
+   * (a lock file serialises two writers); a changed `accepted` on a known id adds an `amends` row.
+   */
+  recordExternal(entry = {}) {
+    const source = clip(String(entry.source ?? ''));
+    if (!source) throw new Error('usage record: --source is required');
+    const row = { ts: typeof entry.ts === 'string' && entry.ts ? entry.ts : this._nowDate().toISOString(), face: 'external', adapter: source, source, status: 'ok' };
+    for (const k of ['model', 'tag', 'id']) if (entry[k] !== undefined && entry[k] !== null && entry[k] !== '') row[k] = clip(String(entry[k]));
+    const req = num(entry.requests);
+    row.requests = req && req > 0 ? Math.floor(req) : 1;
+    const credits = num(entry.credits);
+    if (credits !== null) row.credits = credits;
+    row.usage = { input: num(entry.input) ?? 0, output: num(entry.output) ?? 0 };
+    const ms = num(entry.ms);
+    if (ms !== null) row.ms = ms;
+    const hasAccepted = entry.accepted !== undefined && entry.accepted !== null && entry.accepted !== '';
+    if (hasAccepted) row.accepted = entry.accepted === true || entry.accepted === 'true' || entry.accepted === '1' || entry.accepted === 1;
+    if (!row.id) { this.record(row); return { written: true }; }
+    const lock = path.join(path.dirname(this.file), 'usage-record.lock');
+    const release = acquireLock(lock);
+    try {
+      const prior = this._externalRowsWithId(row.id, utcMonth(row.ts));
+      if (prior.length) {
+        const last = [...prior].reverse().find((r) => r.accepted !== undefined);
+        if (hasAccepted && (!last || last.accepted !== row.accepted)) {
+          this.record({ ts: row.ts, face: 'external', adapter: source, source, id: row.id, requests: 1, status: 'ok', amends: true, accepted: row.accepted, usage: { input: 0, output: 0 } });
+          return { written: true, amended: true };
+        }
+        return { written: false, reason: 'already recorded' };
+      }
+      this.record(row);
+      return { written: true };
+    } finally {
+      release();
+    }
+  }
+
+  _externalRowsWithId(id, month) {
+    const needle = JSON.stringify(id);
+    const out = [];
+    for (const f of new Set([this.monthFile(month), this.file])) {
+      let text;
+      try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
+      for (const line of text.split('\n')) {
+        if (!line.includes(needle) || !line.includes('"external"')) continue;
+        try { const r = JSON.parse(line); if (r.face === 'external' && r.id === id) out.push(r); } catch {}
+      }
+    }
+    return out;
+  }
+
+  /** This UTC month's input+output tokens per adapter (rows without a known count add 0). */
+  monthTokensByAdapter() {
+    const now = this._nowDate();
+    const month = utcMonth(now);
+    const stats = this.query({ by: ['adapter'], since: `${month}-01T00:00:00.000Z` });
+    const out = {};
+    for (const r of stats.groups || []) {
+      const id = r.adapter ?? r.key;
+      if (typeof id !== 'string' || !id) continue;
+      out[id] = (out[id] || 0) + (Number(r.tokensIn) || 0) + (Number(r.tokensOut) || 0);
+    }
+    return out;
+  }
+
   record(entry) {
     try {
       const ts = typeof entry?.ts === 'string' && entry.ts ? entry.ts : this._nowDate().toISOString();
@@ -2645,6 +2721,10 @@ export class UsageLog {
 
   _addRowToDayAggregates(e, count = 1) {
     if (!this._dayAggregates || !e || typeof e.ts !== 'string' || e.ts.length < 10) return;
+    if (e.face === 'external') {
+      if (e.amends) return;
+      count = externalCount(e);
+    }
     const day = e.ts.slice(0, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
 
@@ -3045,6 +3125,10 @@ export class UsageLog {
   }
 
   _addEntryToAggregate(agg, e, count = 1) {
+    if (e && e.face === 'external') {
+      if (e.amends) return;
+      count = externalCount(e);
+    }
     const n = Math.max(1, Number(count) || Number(e?.count) || 1);
     const isLimited = e.status === 'limited';
     const addEntryToBucket = (b, row) => {
@@ -3493,4 +3577,22 @@ export function formatUsageTable(report, { spend = [], daily = [] } = {}) {
     }
   }
   return lines.join('\n');
+}
+
+/** Take `file` with O_EXCL, retrying 2 s; a lock older than 10 s is stale. Returns the release. */
+function acquireLock(file) {
+  ensurePrivateDir(path.dirname(file));
+  const end = Date.now() + 2000;
+  for (;;) {
+    try {
+      const fd = fs.openSync(file, 'wx', 0o600);
+      fs.closeSync(fd);
+      return () => { try { fs.unlinkSync(file); } catch {} };
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      try { if (Date.now() - fs.statSync(file).mtimeMs > 10000) { fs.unlinkSync(file); continue; } } catch {}
+      if (Date.now() > end) throw new Error('usage record: could not take the lock');
+      const t = Date.now() + 20; while (Date.now() < t) { /* brief spin */ }
+    }
+  }
 }
