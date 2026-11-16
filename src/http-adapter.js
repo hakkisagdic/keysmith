@@ -5,6 +5,7 @@ import { checkMedia, hasMedia, upstreamMessages } from './media.js';
 import { credentialAccount, hostOf } from './usage.js';
 import { catalogueLimitError, discoveredPath, readDiscovered } from './catalogue.js';
 import { dataDir } from './config.js';
+import { checkPromptCache, planCache } from './prompt-cache.js';
 
 const UHP_TOOL_MODES = ['off', 'emulate', 'uhp', 'auto'];
 
@@ -93,6 +94,22 @@ export class HttpAdapter {
       throw new Error(`adapter "${id}": streamUsage must be true or false`);
     }
     this.streamUsage = cfg.streamUsage !== false;
+    // Prompt caching (src/prompt-cache.js): off unless set; only the anthropic wire carries cache_control.
+    this.promptCache = checkPromptCache(id, cfg.promptCache);
+    this.cacheStats = { requests: 0, breakpoints: 0, estTokens: 0 };
+    if (this.promptCache && this.wire !== 'anthropic') {
+      process.stderr.write(`keysmith: adapter "${id}" sets promptCache but its wire is ${this.wire}: only the anthropic wire carries cache_control, so nothing is cached (switch its wire to "anthropic")\n`);
+    }
+  }
+
+  /** The body with cache breakpoints (when `promptCache` is on); counts what was planned. */
+  _cached(body, model) {
+    if (!this.promptCache || this.wire !== 'anthropic') return body;
+    const { body: out, report } = planCache(body, this.promptCache, model);
+    this.cacheStats.requests++;
+    this.cacheStats.breakpoints += report.breakpoints;
+    this.cacheStats.estTokens += report.estTokens;
+    return out;
   }
 
   get resumeArgs() {
@@ -448,7 +465,7 @@ export class HttpAdapter {
       method: 'POST',
       headers,
       // The client's own fields win over `modelParams`, as on the chat relay.
-      body: JSON.stringify({ ...this.paramsFor(upstream), ...allowed, model: upstream }),
+      body: JSON.stringify(this._cached({ ...this.paramsFor(upstream), ...allowed, model: upstream }, upstream)),
       signal: ctrl.signal,
     });
   }
@@ -602,7 +619,7 @@ export class HttpAdapter {
           ...this.headers,
           ...(withMedia ? this.mediaHeaders : {}),
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(isAnthropic && !isTraycer ? this._cached(payload, effectiveModel) : payload),
         signal: controller.signal,
       });
     } catch (e) {
@@ -1033,6 +1050,7 @@ function extractUhpUsage(u, adapterId = 'uhp') {
     output: u.output_tokens ?? u.completion_tokens ?? 0,
     cacheRead,
     cacheWrite,
+    ...(u.cache_creation?.ephemeral_1h_input_tokens ? { cacheWrite1h: u.cache_creation.ephemeral_1h_input_tokens } : {}),
     ...(reasoning ? { reasoning } : {}),
     ...(hasTotal && !hasInput && !hasOutput ? { total: u.total_tokens } : {}),
   };
@@ -1268,7 +1286,7 @@ async function* parseAnthropicStream(body) {
         } else if (u) {
           const cacheRead = u.cache_read_input_tokens || 0;
           const cacheWrite = u.cache_creation_input_tokens || 0;
-          yield { type: 'usage', usage: { input: (u.input_tokens || 0) + cacheRead + cacheWrite, output: u.output_tokens || 0, cacheRead, cacheWrite } };
+          yield { type: 'usage', usage: { input: (u.input_tokens || 0) + cacheRead + cacheWrite, output: u.output_tokens || 0, cacheRead, cacheWrite, ...(u.cache_creation?.ephemeral_1h_input_tokens ? { cacheWrite1h: u.cache_creation.ephemeral_1h_input_tokens } : {}) } };
         }
         break;
       }
@@ -1297,7 +1315,7 @@ async function* parseAnthropicStream(body) {
         } else if (u) {
           const cacheRead = u.cache_read_input_tokens || 0;
           const cacheWrite = u.cache_creation_input_tokens || 0;
-          yield { type: 'usage', usage: { input: (u.input_tokens || 0) + cacheRead + cacheWrite, output: u.output_tokens || 0, cacheRead, cacheWrite } };
+          yield { type: 'usage', usage: { input: (u.input_tokens || 0) + cacheRead + cacheWrite, output: u.output_tokens || 0, cacheRead, cacheWrite, ...(u.cache_creation?.ephemeral_1h_input_tokens ? { cacheWrite1h: u.cache_creation.ephemeral_1h_input_tokens } : {}) } };
         }
         yield { type: 'done', finishReason: 'stop' };
         return;

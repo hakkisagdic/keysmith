@@ -773,12 +773,38 @@ export function tokensToUsd(usage, rates) {
   const u = usage || {};
   const cacheRead = Math.max(0, Number(u.cacheRead) || 0);
   const cacheWrite = Math.max(0, Number(u.cacheWrite) || 0);
+  const write1h = Math.min(cacheWrite, Math.max(0, Number(u.cacheWrite1h) || 0));
   const uncachedInput = Math.max(0, (Number(u.input) || 0) - cacheRead - cacheWrite);
   const raw =
     (uncachedInput * (Number(rates.input) || 0) +
       (Number(u.output) || 0) * (Number(rates.output) || 0) +
       cacheRead * (Number(rates.cacheRead) || 0) +
-      cacheWrite * (Number(rates.cacheWrite) || 0)) /
+      (cacheWrite - write1h) * (Number(rates.cacheWrite) || 0) +
+      write1h * cacheWrite1hRate(rates)) /
+    1_000_000;
+  return roundUsd(raw);
+}
+
+/** The 1-hour cache write rate: the table's `cacheWrite1h`, else 2x the input rate (Anthropic's list). */
+export function cacheWrite1hRate(rates) {
+  return Number(rates.cacheWrite1h) || 2 * (Number(rates.input) || 0);
+}
+
+/**
+ * What the cache saved at list price, USD: each token read at the cache rate instead of the
+ * input rate, less the premium of each token written over the input rate.
+ */
+export function cacheSavingsUsd(usage, rates) {
+  if (!rates || typeof rates !== 'object' || !usage) return 0;
+  const cacheRead = Math.max(0, Number(usage.cacheRead) || 0);
+  const cacheWrite = Math.max(0, Number(usage.cacheWrite) || 0);
+  if (!cacheRead && !cacheWrite) return 0;
+  const write1h = Math.min(cacheWrite, Math.max(0, Number(usage.cacheWrite1h) || 0));
+  const input = Number(rates.input) || 0;
+  const raw =
+    (cacheRead * (input - (Number(rates.cacheRead) || 0)) -
+      (cacheWrite - write1h) * ((Number(rates.cacheWrite) || 0) - input) -
+      write1h * (cacheWrite1hRate(rates) - input)) /
     1_000_000;
   return roundUsd(raw);
 }
@@ -2873,11 +2899,20 @@ export class UsageLog {
       output: 0,
       cacheRead: 0,
       cacheWrite: 0,
+      savingsUsd: 0,
       meteredUsd: 0,
       listUsd: 0,
       msTotal: 0,
       hist: new Uint32Array(LATENCY_BOUNDS.length),
     };
+  }
+
+  /** What the cache saved on one row at list price (price table: this log's, then the default), 0 without cache use. */
+  _rowSavings(row) {
+    const u = row?.usage;
+    if (!u || !(u.cacheRead || u.cacheWrite)) return 0;
+    const rates = matchPrice(this.pricing, row.adapter, row.model, { upstreamModel: row.upstreamModel || null, anyAdapter: true });
+    return rates ? cacheSavingsUsd(u, rates) : 0;
   }
 
   _AccumulateRowIntoCell(cell, e, isLimited, isDenied, count = 1) {
@@ -2907,6 +2942,7 @@ export class UsageLog {
       cell.output += (Number(e.usage?.output) || 0) * n;
       cell.cacheRead += (Number(e.usage?.cacheRead) || 0) * n;
       cell.cacheWrite += (Number(e.usage?.cacheWrite) || 0) * n;
+      cell.savingsUsd = roundUsd(cell.savingsUsd + this._rowSavings(e) * n);
       if (e.cost?.basis === 'metered' && typeof e.cost.usd === 'number') {
         cell.meteredUsd = roundUsd(cell.meteredUsd + e.cost.usd * n);
       }
@@ -2976,6 +3012,7 @@ export class UsageLog {
       ov.output += c.output;
       ov.cacheRead += c.cacheRead;
       ov.cacheWrite += c.cacheWrite;
+      ov.savingsUsd = roundUsd(ov.savingsUsd + (c.savingsUsd || 0));
       ov.meteredUsd = roundUsd(ov.meteredUsd + c.meteredUsd);
       ov.listUsd = roundUsd(ov.listUsd + c.listUsd);
       ov.msTotal += c.msTotal;
@@ -3001,6 +3038,7 @@ export class UsageLog {
       output: 0,
       cacheRead: 0,
       cacheWrite: 0,
+      savingsUsd: 0,
       meteredUsd: 0,
       listUsd: 0,
       msTotal: 0,
@@ -3026,6 +3064,7 @@ export class UsageLog {
     dst.output += src.output;
     dst.cacheRead += src.cacheRead;
     dst.cacheWrite += src.cacheWrite;
+    dst.savingsUsd = roundUsd((dst.savingsUsd || 0) + (src.savingsUsd || 0));
     dst.meteredUsd = roundUsd(dst.meteredUsd + src.meteredUsd);
     dst.listUsd = roundUsd(dst.listUsd + src.listUsd);
     dst.msTotal += src.msTotal;
@@ -3160,6 +3199,7 @@ export class UsageLog {
         b.output += out;
         b.cacheRead += cr;
         b.cacheWrite += cw;
+        b.savingsUsd = roundUsd((b.savingsUsd || 0) + this._rowSavings(row) * n);
         if (row.cost?.basis === 'metered' && typeof row.cost.usd === 'number') {
           b.meteredUsd = roundUsd(b.meteredUsd + row.cost.usd * n);
         }
@@ -3257,6 +3297,8 @@ export class UsageLog {
         output,
         cacheRead,
         cacheWrite,
+        cacheShare: allUnknown || !input ? null : Math.round((cacheRead / input) * 1000) / 1000,
+        cacheSavingsUsd: allUnknown ? null : roundUsd(b.savingsUsd || 0),
         tokensIn: input,
         tokensOut: output,
         tokens: allUnknown ? null : { input, output, cacheRead, cacheWrite },
@@ -3303,6 +3345,8 @@ export class UsageLog {
       output: totals.output,
       cacheRead: totals.cacheRead,
       cacheWrite: totals.cacheWrite,
+      cacheShare: totals.cacheShare,
+      cacheSavingsUsd: totals.cacheSavingsUsd,
       tokensIn: totals.tokensIn,
       tokensOut: totals.tokensOut,
       tokens: totals.tokens,
@@ -3531,7 +3575,7 @@ export function formatUsageTable(report, { spend = [], daily = [] } = {}) {
   const fmtBucketUsd = (n, cell = false) => (n == null ? (cell ? '-' : 'unknown') : fmtUsd(n));
   const unkNote = t.unknownUsage ? `, ${t.unknownUsage} unknown usage` : '';
   lines.push(
-    `requests: ${t.requests} (${t.failures} failed${unkNote}) · tokens: ${fmtTok(t.input)} in / ${fmtTok(t.output)} out / ${fmtTok(t.cacheRead)} cache read / ${fmtTok(t.cacheWrite)} cache write · metered: ${fmtBucketUsd(t.meteredUsd)} · list-equiv: ${fmtBucketUsd(t.listUsd)} · duration: p50 ${t.p50Ms}ms / p95 ${t.p95Ms}ms`,
+    `requests: ${t.requests} (${t.failures} failed${unkNote}) · tokens: ${fmtTok(t.input)} in / ${fmtTok(t.output)} out / ${fmtTok(t.cacheRead)} cache read / ${fmtTok(t.cacheWrite)} cache write${t.cacheRead || t.cacheWrite ? ` (cache read share ${t.cacheShare == null ? 'unknown' : `${(t.cacheShare * 100).toFixed(1)}%`}, saved at list price ${fmtBucketUsd(t.cacheSavingsUsd)})` : ''} · metered: ${fmtBucketUsd(t.meteredUsd)} · list-equiv: ${fmtBucketUsd(t.listUsd)} · duration: p50 ${t.p50Ms}ms / p95 ${t.p95Ms}ms`,
   );
   const allGroups = report.groups || [];
   const groups = allGroups.length > MAX_TABLE_GROUPS ? allGroups.slice(0, MAX_TABLE_GROUPS) : allGroups;

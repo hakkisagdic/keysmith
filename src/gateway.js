@@ -1902,6 +1902,7 @@ function mergeUsage(a, b) {
     output: Math.max(a.output || 0, b.output || 0),
     cacheRead: Math.max(a.cacheRead || 0, b.cacheRead || 0),
     cacheWrite: Math.max(a.cacheWrite || 0, b.cacheWrite || 0),
+    ...(a.cacheWrite1h || b.cacheWrite1h ? { cacheWrite1h: Math.max(a.cacheWrite1h || 0, b.cacheWrite1h || 0) } : {}),
     ...(a.reasoning || b.reasoning ? { reasoning: Math.max(a.reasoning || 0, b.reasoning || 0) } : {}),
     ...(a.total || b.total ? { total: Math.max(a.total || 0, b.total || 0) } : {}),
   };

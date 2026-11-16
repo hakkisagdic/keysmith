@@ -503,7 +503,7 @@ function showValue(field, v) {
 /** Fields worth knowing about that an entry may not have yet, by kind (docs/adapters.md has them all). */
 const SETTABLE = {
   cli: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'models', 'defaultModel', 'toolMode', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'stopAtToolCall', 'workspaceFilesCustom', 'allowUnverifiedVersion', 'stripSystemPrompt', 'systemFlag', 'promptVia', 'env'],
-  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'streamUsage', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
+  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'streamUsage', 'promptCache', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
 };
 
 /**
