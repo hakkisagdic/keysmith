@@ -9,11 +9,39 @@
  *   minTokens: a prefix shorter than this (estimated, ~4 chars a token) gets no breakpoint
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 export const MODES = ['off', 'dry-run', 'on'];
 export const TTLS = ['5m', '1h'];
 const MAX_BREAKPOINTS = 4; // the API's limit, the client's own counted
-const DEFAULT_MIN_TOKENS = 1024;
-const HAIKU_MIN_TOKENS = 2048;
+
+/**
+ * Minimum cacheable prompt length per model, read from Anthropic's prompt caching page
+ * ("Cache limitations"): https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+ * Read on 2026-11-17 (Claude API, Claude Platform on AWS, Google Cloud, Microsoft Foundry; Bedrock has its own).
+ * First match wins, so a more specific pattern sits above a looser one. A model that is not
+ * here gets the largest minimum in the table (a mark that is ignored still costs the write
+ * price), and `promptCache.minTokens` overrides the table.
+ */
+const V = '[-.]'; // 4-5, 4.5
+export const MIN_TOKENS_TABLE = [
+  [new RegExp(`(fable|mythos)${V}5${V}[12]\\b`, 'i'), 512],
+  [new RegExp(`(fable|mythos)${V}5(?!${V}\\d(?!\\d))`, 'i'), 512],
+  [new RegExp(`opus${V}5(${V}5)?(?!\\d)`, 'i'), 512],
+  [new RegExp(`sonnet${V}5${V}5(?!\\d)`, 'i'), 512],
+  [new RegExp(`haiku${V}5${V}5(?!\\d)`, 'i'), 512],
+  [/mythos[-.]preview/i, 2048],
+  [new RegExp(`opus${V}4${V}7(?!\\d)`, 'i'), 2048],
+  [new RegExp(`opus${V}4${V}[56](?!\\d)`, 'i'), 4096],
+  [new RegExp(`haiku${V}4${V}5(?!\\d)`, 'i'), 4096],
+  [new RegExp(`opus${V}4${V}8(?!\\d)`, 'i'), 1024],
+  [new RegExp(`opus${V}4${V}1(?!\\d)`, 'i'), 1024],
+  [new RegExp(`sonnet${V}5(?!${V}\\d(?!\\d))`, 'i'), 1024],
+  [new RegExp(`sonnet${V}4${V}[56](?!\\d)`, 'i'), 1024],
+  [new RegExp(`opus${V}4(?!${V}\\d(?!\\d))`, 'i'), 1024],
+  [new RegExp(`sonnet${V}4(?!${V}\\d(?!\\d))`, 'i'), 1024],
+];
+export const UNKNOWN_MODEL_MIN_TOKENS = Math.max(...MIN_TOKENS_TABLE.map(([, n]) => n));
 
 /** A load error for a malformed `promptCache`, else the normalised setting (null = off). */
 export function checkPromptCache(id, cfg) {
@@ -41,9 +69,11 @@ function hasCacheControl(v) {
 
 const estTokens = (v) => Math.ceil((typeof v === 'string' ? v : JSON.stringify(v ?? '')).length / 4);
 
-function minFor(setting, model) {
-  if (setting.minTokens != null) return setting.minTokens;
-  return /haiku/i.test(String(model || '')) ? HAIKU_MIN_TOKENS : DEFAULT_MIN_TOKENS;
+export function minFor(setting, model) {
+  if (setting?.minTokens != null) return setting.minTokens;
+  const name = String(model || '');
+  for (const [re, n] of MIN_TOKENS_TABLE) if (re.test(name)) return n;
+  return UNKNOWN_MODEL_MIN_TOKENS;
 }
 
 /** A content block that may carry a breakpoint: not thinking, not an empty text. */
@@ -53,6 +83,12 @@ function markable(b) {
   if (b.type === 'text' && !b.text) return false;
   return true;
 }
+
+/**
+ * Where a dry-run plan goes so the usage row of the same request can carry it: the server runs
+ * each request inside `cachePlanScope.run({})`; the adapter writes `store.plan`, the row reads it.
+ */
+export const cachePlanScope = new AsyncLocalStorage();
 
 /** `{ body, report }`; `body` is the input itself unless breakpoints were added. */
 export function planCache(body, setting, model) {

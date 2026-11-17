@@ -26,6 +26,7 @@ import { DailyQuota, overCapMessage } from './quota.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
+import { cachePlanScope } from './prompt-cache.js';
 
 export function isLoopbackHost(host) {
   if (!host) return true;
@@ -184,7 +185,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   // every 10 s for as long as somebody keeps sending the request, and Node's own crash
   // report prints the error's fields — a bad URL's among them — unredacted.
   const server = http.createServer((req, res) => {
-    handle(req, res).catch((e) => {
+    cachePlanScope.run({}, () => handle(req, res)).catch((e) => {
       log(`request crashed: ${e?.stack || e}`);
       try {
         if (!res.headersSent) json(res, 500, errorBody('internal error', 'internal_error', 500));
@@ -2097,9 +2098,11 @@ function stamp(entry, { who, req, res, route, gateway, cfg } = {}) {
 
   const catInfo = gateway?.catalogue && adapter ? (gateway.catalogue.info(adapter, upstreamModel) || gateway.catalogue.info(adapter, rest.model)) : null;
   const legSkips = res?._keysmith?.legSkips;
+  const plan = cachePlanScope.getStore()?.plan;
   const base = {
     ...rest,
     ...virtualFields,
+    ...(plan && rest.cachePlan === undefined ? { cachePlan: plan } : {}),
     ...(legSkips?.length ? { skippedLegs: legSkips.map((x) => ({ ...x })) } : {}),
     adapter,
     kind,

@@ -2913,11 +2913,27 @@ export class UsageLog {
       cacheRead: 0,
       cacheWrite: 0,
       savingsUsd: 0,
+      planRequests: 0,
+      planTokens: 0,
+      planSavingsUsd: 0,
       meteredUsd: 0,
       listUsd: 0,
       msTotal: 0,
       hist: new Uint32Array(LATENCY_BOUNDS.length),
     };
+  }
+
+  /**
+   * A dry-run row's `cachePlan` ({breakpoints, estTokens}), priced as an ESTIMATE: the planned
+   * tokens read at the cache rate instead of the input rate, once. Null without a plan.
+   */
+  _rowPlan(row) {
+    const p = row?.cachePlan;
+    const tokens = Number(p?.estTokens) || 0;
+    if (!p || !(Number(p.breakpoints) > 0) || tokens <= 0) return null;
+    const rates = matchPrice(this.pricing, row.adapter, row.model, { upstreamModel: row.upstreamModel || null, anyAdapter: true });
+    const usd = rates ? roundUsd((tokens * ((Number(rates.input) || 0) - (Number(rates.cacheRead) || 0))) / 1_000_000) : 0;
+    return { tokens, usd };
   }
 
   /** What the cache saved on one row at list price (price table: this log's, then the default), 0 without cache use. */
@@ -2935,6 +2951,12 @@ export class UsageLog {
       return;
     }
     cell.requests += n;
+    const plan = this._rowPlan(e);
+    if (plan) {
+      cell.planRequests += n;
+      cell.planTokens += plan.tokens * n;
+      cell.planSavingsUsd = roundUsd(cell.planSavingsUsd + plan.usd * n);
+    }
     if (e.status !== 'ok') cell.failures += n;
     if (isDenied) cell.denied += n;
     if (isRowUsageUnknown(e)) {
@@ -3026,6 +3048,9 @@ export class UsageLog {
       ov.cacheRead += c.cacheRead;
       ov.cacheWrite += c.cacheWrite;
       ov.savingsUsd = roundUsd(ov.savingsUsd + (c.savingsUsd || 0));
+      ov.planRequests += c.planRequests || 0;
+      ov.planTokens += c.planTokens || 0;
+      ov.planSavingsUsd = roundUsd(ov.planSavingsUsd + (c.planSavingsUsd || 0));
       ov.meteredUsd = roundUsd(ov.meteredUsd + c.meteredUsd);
       ov.listUsd = roundUsd(ov.listUsd + c.listUsd);
       ov.msTotal += c.msTotal;
@@ -3052,6 +3077,9 @@ export class UsageLog {
       cacheRead: 0,
       cacheWrite: 0,
       savingsUsd: 0,
+      planRequests: 0,
+      planTokens: 0,
+      planSavingsUsd: 0,
       meteredUsd: 0,
       listUsd: 0,
       msTotal: 0,
@@ -3078,6 +3106,9 @@ export class UsageLog {
     dst.cacheRead += src.cacheRead;
     dst.cacheWrite += src.cacheWrite;
     dst.savingsUsd = roundUsd((dst.savingsUsd || 0) + (src.savingsUsd || 0));
+    dst.planRequests = (dst.planRequests || 0) + (src.planRequests || 0);
+    dst.planTokens = (dst.planTokens || 0) + (src.planTokens || 0);
+    dst.planSavingsUsd = roundUsd((dst.planSavingsUsd || 0) + (src.planSavingsUsd || 0));
     dst.meteredUsd = roundUsd(dst.meteredUsd + src.meteredUsd);
     dst.listUsd = roundUsd(dst.listUsd + src.listUsd);
     dst.msTotal += src.msTotal;
@@ -3189,6 +3220,12 @@ export class UsageLog {
         return;
       }
       b.requests += n;
+      const plan = this._rowPlan(row);
+      if (plan) {
+        b.planRequests = (b.planRequests || 0) + n;
+        b.planTokens = (b.planTokens || 0) + plan.tokens * n;
+        b.planSavingsUsd = roundUsd((b.planSavingsUsd || 0) + plan.usd * n);
+      }
       if (row.status !== 'ok') b.failures += n;
       if (isRowUsageUnknown(row)) {
         b.unknownUsage += n;
@@ -3312,6 +3349,7 @@ export class UsageLog {
         cacheWrite,
         cacheShare: allUnknown || !input ? null : Math.round((cacheRead / input) * 1000) / 1000,
         cacheSavingsUsd: allUnknown ? null : roundUsd(b.savingsUsd || 0),
+        ...(b.planRequests ? { cachePlanRequests: b.planRequests, cachePlanTokens: b.planTokens, cachePlanSavingsUsd: roundUsd(b.planSavingsUsd || 0) } : {}),
         tokensIn: input,
         tokensOut: output,
         tokens: allUnknown ? null : { input, output, cacheRead, cacheWrite },
@@ -3590,6 +3628,9 @@ export function formatUsageTable(report, { spend = [], daily = [] } = {}) {
   lines.push(
     `requests: ${t.requests} (${t.failures} failed${unkNote}) · tokens: ${fmtTok(t.input)} in / ${fmtTok(t.output)} out / ${fmtTok(t.cacheRead)} cache read / ${fmtTok(t.cacheWrite)} cache write${t.cacheRead || t.cacheWrite ? ` (cache read share ${t.cacheShare == null ? 'unknown' : `${(t.cacheShare * 100).toFixed(1)}%`}, saved at list price ${fmtBucketUsd(t.cacheSavingsUsd)})` : ''} · metered: ${fmtBucketUsd(t.meteredUsd)} · list-equiv: ${fmtBucketUsd(t.listUsd)} · duration: p50 ${t.p50Ms}ms / p95 ${t.p95Ms}ms`,
   );
+  if (t.cachePlanRequests) {
+    lines.push(`cache dry-run (ESTIMATE, not spent or saved): ${t.cachePlanRequests} request(s) would have cached ~${t.cachePlanTokens} tokens; estimated saving per reuse at list price ${fmtUsd(t.cachePlanSavingsUsd)}`);
+  }
   const allGroups = report.groups || [];
   const groups = allGroups.length > MAX_TABLE_GROUPS ? allGroups.slice(0, MAX_TABLE_GROUPS) : allGroups;
   if (groups.length) {

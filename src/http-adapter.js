@@ -5,7 +5,7 @@ import { checkMedia, hasMedia, upstreamMessages } from './media.js';
 import { credentialAccount, hostOf } from './usage.js';
 import { catalogueLimitError, discoveredPath, readDiscovered } from './catalogue.js';
 import { dataDir } from './config.js';
-import { checkPromptCache, planCache } from './prompt-cache.js';
+import { cachePlanScope, checkPromptCache, planCache } from './prompt-cache.js';
 
 const UHP_TOOL_MODES = ['off', 'emulate', 'uhp', 'auto'];
 
@@ -110,6 +110,11 @@ export class HttpAdapter {
     this.cacheStats.requests++;
     this.cacheStats.breakpoints += report.breakpoints;
     this.cacheStats.estTokens += report.estTokens;
+    // A dry run leaves the body alone; its plan rides on the request's usage row (`cachePlan`).
+    if (this.promptCache.mode === 'dry-run') {
+      const store = cachePlanScope.getStore();
+      if (store) store.plan = { breakpoints: report.breakpoints, estTokens: report.estTokens };
+    }
     return out;
   }
 
