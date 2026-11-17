@@ -80,13 +80,13 @@ test('K5: a request below the model minimum gets no mark (Haiku 4.5 needs 4096 p
   assert.equal(JSON.stringify(planCache(body, { mode: 'on', ttl: '5m' }, 'claude-haiku-4-5').body).includes('cache_control'), false);
 });
 
-test('K5 vs docs: ~3000-token prompt on Haiku 4.5 (docs minimum 4096) should not be marked', { todo: 'code uses 2048 for every Haiku, docs say 4096 for Haiku 4.5' }, () => {
+test('K5 vs docs: ~3000-token prompt on Haiku 4.5 (docs minimum 4096) should not be marked', () => {
   const mid = 'x '.repeat(3000);
   const body = { system: mid, messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }, { role: 'user', content: 'c' }] };
   assert.equal(JSON.stringify(planCache(body, { mode: 'on', ttl: '5m' }, 'claude-haiku-4-5').body).includes('cache_control'), false);
 });
 
-test('K5 vs docs: Opus 4.5 minimum is 4096 (code default 1024)', { todo: 'default minimum 1024 for every non-Haiku model' }, () => {
+test('K5 vs docs: Opus 4.5 minimum is 4096 (code default 1024)', () => {
   const mid = 'x '.repeat(3000);
   const body = { system: mid, messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }, { role: 'user', content: 'c' }] };
   assert.equal(JSON.stringify(planCache(body, { mode: 'on', ttl: '5m' }, 'claude-opus-4-5').body).includes('cache_control'), false);

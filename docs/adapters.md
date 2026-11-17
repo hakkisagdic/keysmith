@@ -1068,8 +1068,9 @@ On an adapter whose wire is `anthropic`, `"promptCache": { "mode": "on", "ttl": 
 system block, and the last block before the final turn. Text and order are never changed; a request that
 already has a `cache_control` anywhere passes as it is. `mode`: `off` (default), `dry-run` (the body is
 untouched, the plan is counted), `on`. `ttl`: `5m` (the field is left out) or `1h` (2x input price on the
-write; pays back from the second read). `minTokens`: a prefix estimated shorter than this (default 1024,
-2048 for Haiku; about four characters a token) gets no mark.
+write; pays back from the second read). `minTokens`: a prefix estimated shorter than this (taken from the model table in
+`src/prompt-cache.js`, source and read date beside it; a model not in the table gets the largest minimum, and
+`minTokens` overrides the table; about four characters a token) gets no mark.
 
 An adapter on the `openai` wire (the OpenAI-compatible endpoint of Anthropic included) cannot carry
 `cache_control`: keysmith warns on start and adds nothing. Switch its wire to `anthropic` to cache.

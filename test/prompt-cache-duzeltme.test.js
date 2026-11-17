@@ -129,3 +129,9 @@ test('K4: checkAdapters warns for promptCache on a non-anthropic wire, not for a
   assert.deepEqual(await mk({ wire: 'openai' }).checkAdapters(), []);
   assert.deepEqual(await mk({ wire: 'openai', promptCache: { mode: 'off' } }).checkAdapters(), []);
 });
+
+test('K5b: an unlisted Opus 5.x version gets the largest minimum', async () => {
+  const { minFor, UNKNOWN_MODEL_MIN_TOKENS } = await import('../src/prompt-cache.js');
+  for (const m of ['claude-opus-5-1', 'claude-opus-5-2']) assert.equal(minFor(null, m), UNKNOWN_MODEL_MIN_TOKENS);
+  for (const m of ['claude-opus-5', 'claude-opus-5-5']) assert.equal(minFor(null, m), 512);
+});

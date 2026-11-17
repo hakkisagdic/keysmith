@@ -27,7 +27,8 @@ const V = '[-.]'; // 4-5, 4.5
 export const MIN_TOKENS_TABLE = [
   [new RegExp(`(fable|mythos)${V}5${V}[12]\\b`, 'i'), 512],
   [new RegExp(`(fable|mythos)${V}5(?!${V}\\d(?!\\d))`, 'i'), 512],
-  [new RegExp(`opus${V}5(${V}5)?(?!\\d)`, 'i'), 512],
+  [new RegExp(`opus${V}5(?!${V}\\d(?!\\d))`, 'i'), 512],
+  [new RegExp(`opus${V}5${V}5(?!\\d)`, 'i'), 512],
   [new RegExp(`sonnet${V}5${V}5(?!\\d)`, 'i'), 512],
   [new RegExp(`haiku${V}5${V}5(?!\\d)`, 'i'), 512],
   [/mythos[-.]preview/i, 2048],

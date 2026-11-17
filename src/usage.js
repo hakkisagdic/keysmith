@@ -3629,7 +3629,7 @@ export function formatUsageTable(report, { spend = [], daily = [] } = {}) {
     `requests: ${t.requests} (${t.failures} failed${unkNote}) · tokens: ${fmtTok(t.input)} in / ${fmtTok(t.output)} out / ${fmtTok(t.cacheRead)} cache read / ${fmtTok(t.cacheWrite)} cache write${t.cacheRead || t.cacheWrite ? ` (cache read share ${t.cacheShare == null ? 'unknown' : `${(t.cacheShare * 100).toFixed(1)}%`}, saved at list price ${fmtBucketUsd(t.cacheSavingsUsd)})` : ''} · metered: ${fmtBucketUsd(t.meteredUsd)} · list-equiv: ${fmtBucketUsd(t.listUsd)} · duration: p50 ${t.p50Ms}ms / p95 ${t.p95Ms}ms`,
   );
   if (t.cachePlanRequests) {
-    lines.push(`cache dry-run (ESTIMATE, not spent or saved): ${t.cachePlanRequests} request(s) would have cached ~${t.cachePlanTokens} tokens; estimated saving per reuse at list price ${fmtUsd(t.cachePlanSavingsUsd)}`);
+    lines.push(`cache dry-run (ESTIMATE, not spent or saved): ${t.cachePlanRequests} request(s) would have cached ~${t.cachePlanTokens} tokens; estimated saving at list price if each request were reused once, write premium not subtracted ${fmtUsd(t.cachePlanSavingsUsd)}`);
   }
   const allGroups = report.groups || [];
   const groups = allGroups.length > MAX_TABLE_GROUPS ? allGroups.slice(0, MAX_TABLE_GROUPS) : allGroups;
