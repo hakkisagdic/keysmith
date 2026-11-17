@@ -224,3 +224,14 @@ test('add cloudflare fills {account} from --account-id and refuses without it', 
   assert.equal(run('add', 'cloudflare', '--account-id', ACCOUNT).status, 0);
   assert.equal(cfg().adapters.cloudflare.baseUrl, `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/ai/v1`);
 });
+
+test('source enable writes modelsOnly with the named models for groq, mistral and cloudflare, not for tokenrouter', (t) => {
+  const { run, cfg } = setup(t);
+  assert.equal(run('source', 'enable', 'groq', '--key-ref', 'svc-groq', '--model', 'm1').status, 0);
+  assert.equal(run('source', 'enable', 'mistral', '--key-ref', 'svc-mistral', '--model', 'm2').status, 0);
+  assert.equal(run('source', 'enable', 'cloudflare', '--key-ref', 'svc-cf', '--account-id', ACCOUNT, '--model', '@cf/x').status, 0);
+  assert.equal(run('source', 'enable', 'tokenrouter', '--key-ref', 'svc-tr').status, 0);
+  const a = cfg().adapters;
+  for (const n of ['groq', 'mistral', 'cloudflare']) assert.equal(a[n].modelsOnly, true, n);
+  assert.equal(a.tokenrouter.modelsOnly, undefined);
+});

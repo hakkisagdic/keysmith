@@ -76,11 +76,12 @@ export function sourceEnable(cfgFile, name, flags = {}) {
   entry.explicitOnly = true;
   if (facts.freeOnly) entry.freeOnly = true;
   if (models.length) entry.models = models;
+  if (!facts.freeOnly) entry.modelsOnly = true;
   checkAdapter(id, entry);
 
   const lines = [];
   setPath(doc, `adapters.${id}`, entry);
-  lines.push(`+ adapters.${id}  ${entry.baseUrl}, key from Keychain "${service}", explicitOnly${facts.freeOnly ? ', freeOnly' : ''}${models.length ? `, models ${models.join(',')}` : ''}`);
+  lines.push(`+ adapters.${id}  ${entry.baseUrl}, key from Keychain "${service}", explicitOnly${facts.freeOnly ? ', freeOnly' : ', modelsOnly'}${models.length ? `, models ${models.join(',')}` : ''}`);
   if (getPath(doc, 'discovery.enabled') !== true) { setPath(doc, 'discovery.enabled', true); lines.push('+ discovery.enabled  true'); }
   if (facts.prices) { setPath(doc, `discovery.${id}`, { ...facts.prices }); lines.push(`+ discovery.${id}  ${JSON.stringify(facts.prices)}`); }
 
