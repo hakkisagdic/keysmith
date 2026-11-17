@@ -136,7 +136,10 @@ test('K4 batch submit of Haiku 4.5 is no longer refused for a missing price; a t
   assert.equal(s.calls.length, 0);
   const dry = await b.runAsync('batch', 'submit', input, '--adapter', 'cl', '--name', 'dry', '--cap-usd', '1', '--dry-run');
   assert.doesNotMatch(dry.stderr + dry.stdout, /no price/);
-  console.log('K4 dry-run flag output:', dry.status, (dry.stdout + dry.stderr).trim(), 'posts', s.calls.length);
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.match(dry.stdout, /dry run.*estimate/);
+  assert.equal(s.calls.length, 0, 'dry run must not send');
+  assert.equal(fs.readdirSync(b.home, { recursive: true }).some((f) => /dry\.json$/.test(String(f))), false, 'dry run must not save a job');
   const real = await b.runAsync('batch', 'submit', input, '--adapter', 'cl', '--name', 'real', '--cap-usd', '1');
   assert.equal(real.status, 0, real.stderr);
   assert.doesNotMatch(real.stderr + real.stdout, /no price/);

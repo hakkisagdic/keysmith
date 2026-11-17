@@ -56,7 +56,7 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith tunnel <status|setup|run> cloudflared: named tunnel first, quick as fallback
   keysmith usage [--by d1[,d2]] [--since t] [--until t] [--format table|csv|json]
                                      who spent what (by key, label, adapter, model, account, tag, day, client)
-  keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>|label] [--cache]
+  keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>|label] [--cache] [--dry-run]
   keysmith batch status [name] | results <name> | cancel <name>
                                      work that can wait, at half price, on an anthropic-wire adapter; off
                                      unless "batch": { "enabled": true } is in the config (see README)
@@ -1523,11 +1523,12 @@ async function cmdBatch(flags) {
   if (!batchEnabled(cfg)) fail('batch is off (set "batch": { "enabled": true } in the config)');
   try {
     if (sub === 'submit') {
-      if (!arg || !flags.adapter || !flags.name) fail('usage: keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>] [--cache]');
+      if (!arg || !flags.adapter || !flags.name) fail('usage: keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>] [--cache] [--dry-run]');
       const job = await batchSubmit(cfg, {
         name: String(flags.name), file: expand(String(arg)), adapterId: String(flags.adapter),
-        capUsd: Number(flags['cap-usd']), keyRef: flags.key, cache: flags.cache === true || flags.cache === 'true',
+        capUsd: Number(flags['cap-usd']), keyRef: flags.key, cache: flags.cache === true || flags.cache === 'true', dryRun: !!flags.dryRun,
       });
+      if (job.dryRun) return out(`dry run: ${job.name} (${job.requests} requests); estimate ${fmtUsd(job.estimateUsd)} of cap ${fmtUsd(job.capUsd)} (nothing was sent, nothing saved)`);
       return out(`submitted ${job.name} (${job.requests} requests, ${job.status}); estimate ${fmtUsd(job.estimateUsd)} of cap ${fmtUsd(job.capUsd)}`);
     }
     if (sub === 'status') {

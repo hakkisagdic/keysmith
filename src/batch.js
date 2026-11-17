@@ -232,7 +232,7 @@ async function call(adapter, method, suffix, body) {
 }
 
 /** Check everything and, if it all holds, send. Nothing leaves this process before the last check. */
-export async function submit(cfg, { name, file, adapterId, capUsd, keyRef = null, cache = false }) {
+export async function submit(cfg, { name, file, adapterId, capUsd, keyRef = null, cache = false, dryRun = false }) {
   if (!batchEnabled(cfg)) throw new BatchError('batch is off (set batch.enabled to true in the config)');
   if (!safeName(name)) throw new BatchError(`"${name}" is not a job name (letters, digits, . _ -; at most 64)`);
   if (!Number.isFinite(capUsd) || capUsd <= 0) throw new BatchError('--cap-usd is required and must be above 0');
@@ -268,6 +268,7 @@ export async function submit(cfg, { name, file, adapterId, capUsd, keyRef = null
     requests: requests.length, models: [...new Set(requests.map((r) => r.params.model))], cache: !!cache,
     estimateUsd: estimate, capUsd, status: 'submitting', createdAt: new Date().toISOString(), id: null,
   };
+  if (dryRun) return { ...job, status: 'dry-run', dryRun: true };
   // The file is created first and exclusively: a name sends once, however many times it is asked.
   try { saveJob(job, { exclusive: true }); } catch (e) {
     if (e.code === 'EEXIST') throw new BatchError(`job "${name}" exists already (nothing was sent): pick another name`);
