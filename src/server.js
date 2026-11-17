@@ -1809,11 +1809,13 @@ function extractRelayedUsage(rawText) {
             (Number(raw.input_tokens ?? raw.input ?? 0) || 0) +
               (raw.cache_read_input_tokens != null || raw.cache_creation_input_tokens != null ? cacheRead + cacheWrite : 0),
           );
+    const w1h = raw.cache_creation?.ephemeral_1h_input_tokens;
     u = mergeUsage(u, {
       input: rawInput,
       output: raw.completion_tokens ?? raw.output_tokens ?? raw.output ?? 0,
       cacheRead,
       cacheWrite,
+      ...(typeof w1h === 'number' && Number.isFinite(w1h) && w1h > 0 ? { cacheWrite1h: w1h } : {}),
     });
   };
   const trimmed = rawText.trim();
@@ -2038,6 +2040,7 @@ function mergeUsage(a, b) {
     output: Math.max(a.output || 0, b.output || 0),
     cacheRead: Math.max(a.cacheRead || 0, b.cacheRead || 0),
     cacheWrite: Math.max(a.cacheWrite || 0, b.cacheWrite || 0),
+    ...(a.cacheWrite1h || b.cacheWrite1h ? { cacheWrite1h: Math.max(a.cacheWrite1h || 0, b.cacheWrite1h || 0) } : {}),
     ...(a.reasoning || b.reasoning ? { reasoning: Math.max(a.reasoning || 0, b.reasoning || 0) } : {}),
     ...(a.total || b.total ? { total: Math.max(a.total || 0, b.total || 0) } : {}),
   };
