@@ -82,3 +82,64 @@ test('a source whose /models carries no price at all says so, and a 405 says the
   assert.notEqual(r2.status, 0);
   assert.match(r2.all, /no GET \/models \(405\)/);
 });
+
+const tbl = (rows, tiered = {}) => ({ data: rows, tiered_pricing: tiered });
+const row = (name, o = {}) => ({ model_name: name, quota_type: 0, model_price: 0, model_ratio: 0, ...o });
+
+async function priceSetup(t, body) {
+  const state = { body, status: 200 };
+  const srv = http.createServer((req, res) => {
+    res.writeHead(state.status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(state.body));
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => srv.close());
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-disc-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const config = path.join(home, 'config.json');
+  fs.writeFileSync(config, JSON.stringify({
+    host: '127.0.0.1', port: 0, auth: { enabled: false, keys: [] }, aliases: {},
+    adapters: { tr: { type: 'http', baseUrl: 'http://127.0.0.1:1/v1', apiKey: SECRET, freeOnly: true } },
+    discovery: { enabled: true, tr: { pricingUrl: `http://127.0.0.1:${srv.address().port}/api/pricing` } },
+  }), { mode: 0o600 });
+  const data = path.join(home, 'data');
+  const env = { ...process.env, HOME: home, KEYSMITH_CONFIG: config, KEYSMITH_DATA: data };
+  const run = () => new Promise((resolve) => {
+    const p = spawn(process.execPath, [CLI, 'discover', 'tr'], { env });
+    let all = '';
+    p.stdout.on('data', (d) => { all += d; });
+    p.stderr.on('data', (d) => { all += d; });
+    p.on('close', (status) => resolve({ status, all }));
+  });
+  const doc = () => JSON.parse(fs.readFileSync(path.join(data, 'discovered', 'tr.json'), 'utf8'));
+  return { state, run, doc };
+}
+
+test('price table: only quota 0, price 0, ratio 0 and untiered models are free; source and time are written', async (t) => {
+  const { run, doc } = await priceSetup(t, tbl([
+    row('a/free1'), row('b/free2:free'), row('c/paid', { model_ratio: 0.5 }),
+    row('d/quota', { quota_type: 1 }), row('e/tiered'), row('f/missing', { model_ratio: undefined }),
+    row('g/priced', { model_price: 0.01 }),
+  ], { 'e/tiered': { input: [] } }));
+  const r = await run();
+  assert.equal(r.status, 0, r.all);
+  const d = doc();
+  assert.deepEqual(d.ids, ['a/free1', 'b/free2:free']);
+  assert.match(d.source, /^127\.0\.0\.1:\d+\/api\/pricing$/);
+  assert.ok(!Number.isNaN(Date.parse(d.at)));
+  assert.ok(!r.all.includes(SECRET));
+});
+
+test('price table: a model that turns paid drops out; an unreadable table empties the list', async (t) => {
+  const { state, run, doc } = await priceSetup(t, tbl([row('a/free1'), row('b/free2')]));
+  await run();
+  assert.deepEqual(doc().ids, ['a/free1', 'b/free2']);
+  state.body = tbl([row('a/free1'), row('b/free2', { model_ratio: 1 })]);
+  await run();
+  assert.deepEqual(doc().ids, ['a/free1']);
+  state.status = 500;
+  const r = await run();
+  assert.equal(r.status, 0, r.all);
+  assert.match(r.all, /free list is now empty/);
+  assert.deepEqual(doc().ids, []);
+});

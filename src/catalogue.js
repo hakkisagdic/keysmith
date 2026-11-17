@@ -20,7 +20,7 @@ export function catalogueSettings(cfg) {
   const discovery = { enabled: d.enabled === true };
   for (const [id, v] of Object.entries(d)) {
     if (id === 'enabled' || !v || typeof v !== 'object') continue;
-    discovery[id] = { ...DEFAULT_PRICE_PATHS, ...pick(v, ['inputPricePath', 'outputPricePath']) };
+    discovery[id] = { ...DEFAULT_PRICE_PATHS, ...pick(v, ['inputPricePath', 'outputPricePath', 'pricingUrl']) };
   }
   return { path: raw ? expand(raw) : null, discovery };
 }
@@ -220,10 +220,31 @@ export function readDiscovered(file) {
   return set;
 }
 
-export function writeDiscovered(file, ids) {
+/**
+ * Ids that are free in a NewAPI-style public price table (`{ data: [{ model_name, quota_type,
+ * model_price, model_ratio }], tiered_pricing: { <model>: … } }`): a model counts only when
+ * quota_type, model_price and model_ratio are all present and zero and it has no tiered entry.
+ * A completion ratio multiplies model_ratio, so zero there is zero out. Anything missing,
+ * unreadable or not numeric is not free.
+ */
+export function freeModelsFromPriceTable(body) {
+  const rows = Array.isArray(body?.data) ? body.data : [];
+  const tiered = body?.tiered_pricing && typeof body.tiered_pricing === 'object' ? body.tiered_pricing : {};
+  const out = [];
+  for (const m of rows) {
+    if (!m || typeof m.model_name !== 'string' || !m.model_name) continue;
+    if (m.quota_type !== 0 || m.model_price !== 0 || m.model_ratio !== 0) continue;
+    if (Object.hasOwn(tiered, m.model_name)) continue;
+    if (!out.includes(m.model_name)) out.push(m.model_name);
+  }
+  return out;
+}
+
+/** `source` is a host and path only: never a query, never a credential. */
+export function writeDiscovered(file, ids, meta = null) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ version: 1, ids: [...ids] }, null, 2) + '\n', { mode: 0o600 });
+  fs.writeFileSync(tmp, JSON.stringify({ version: 1, ids: [...ids], ...(meta ? { source: meta.source, at: meta.at } : {}) }, null, 2) + '\n', { mode: 0o600 });
   fs.chmodSync(tmp, 0o600);
   fs.renameSync(tmp, file);
 }

@@ -235,3 +235,76 @@ test('source enable writes modelsOnly with the named models for groq, mistral an
   for (const n of ['groq', 'mistral', 'cloudflare']) assert.equal(a[n].modelsOnly, true, n);
   assert.equal(a.tokenrouter.modelsOnly, undefined);
 });
+
+import { pickDefaultModel } from '../src/source.js';
+
+/** Like stubSecurity, but `-w` prints a fake value, so the list can be asked for. */
+function keyedSecurity(home) {
+  const f = path.join(home, 'security-keyed.sh');
+  fs.writeFileSync(f, '#!/bin/sh\nfor a in "$@"; do if [ "$a" = "-w" ]; then echo fake-key-value; fi; done\nexit 0\n', { mode: 0o700 });
+  return f;
+}
+
+async function listServer(t, ids) {
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    hits.push(req.headers.authorization);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: ids.map((id) => ({ id })) }));
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => srv.close());
+  return { url: `http://127.0.0.1:${srv.address().port}/v1/models`, hits };
+}
+
+function runAsync(setupRes, args) {
+  const env = { ...setupRes.env, KEYSMITH_SECURITY_BIN: keyedSecurity(setupRes.home) };
+  return new Promise((resolve) => {
+    const p = spawn(process.execPath, [CLI, ...args], { env });
+    let out = '', err = '';
+    p.stdout.on('data', (d) => { out += d; });
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('close', (status) => resolve({ status, out, err }));
+  });
+}
+
+test('pickDefaultModel: chat, small by name, newest; first chat model when none is small', () => {
+  assert.equal(pickDefaultModel(['whisper-large-v3', 'llama-3.1-8b-instant', 'llama-3.3-70b', 'llama-guard-4-12b', 'llama-3.2-3b', 'text-embed-1']), 'llama-3.2-3b');
+  assert.equal(pickDefaultModel(['gpt-oss-120b', 'gpt-oss-20b', 'whisper-1']), 'gpt-oss-20b');
+  assert.equal(pickDefaultModel(['embed-x', 'big-model-70b', 'other-chat']), 'big-model-70b');
+  assert.equal(pickDefaultModel([]), null);
+});
+
+test('K4: enable with no --model picks from the provider list; --model wins; a model not listed writes nothing', async (t) => {
+  const s = setup(t);
+  const { url, hits } = await listServer(t, ['whisper-large', 'llama-3.1-8b-instant', 'llama-3.3-70b', 'gpt-oss-20b']);
+  const r = await runAsync(s, ['source', 'enable', 'groq', '--key-ref', 'svc-groq', '--models-url', url]);
+  assert.equal(r.status, 0, r.err);
+  assert.deepEqual(s.cfg().adapters.groq.models, ['llama-3.1-8b-instant']);
+  assert.match(r.out, /chose llama-3.1-8b-instant/);
+  assert.equal(hits[0], 'Bearer fake-key-value');
+  assert.ok(!r.out.includes('fake-key-value') && !fs.readFileSync(s.config, 'utf8').includes('fake-key-value'));
+
+  const s2 = setup(t);
+  const ok = await runAsync(s2, ['source', 'enable', 'groq', '--key-ref', 'svc-groq', '--model', 'gpt-oss-20b', '--models-url', url]);
+  assert.equal(ok.status, 0, ok.err);
+  assert.deepEqual(s2.cfg().adapters.groq.models, ['gpt-oss-20b']);
+
+  const s3 = setup(t);
+  const before = sha(s3.config);
+  const bad = await runAsync(s3, ['source', 'enable', 'groq', '--key-ref', 'svc-groq', '--model', 'retired-model', '--models-url', url]);
+  assert.notEqual(bad.status, 0);
+  assert.match(bad.err, /asked for retired-model, but the provider's list has/);
+  assert.equal(sha(s3.config), before);
+  assert.deepEqual(fs.readdirSync(s3.dir), ['config.json']);
+});
+
+test('K5: mistral says why it is left out, in enable and in source list', async (t) => {
+  const s = setup(t);
+  const r = s.run('source', 'enable', 'mistral', '--key-ref', 'svc-mistral', '--model', 'mistral-small-latest');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /429/);
+  const l = s.run('source', 'list');
+  assert.equal(l.status, 0, l.stderr);
+  assert.match(l.stdout, /mistral \(attached\).*429.*left out/);
+});

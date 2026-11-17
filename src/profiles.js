@@ -993,6 +993,7 @@ export const SOURCE_FACTS = {
   },
   mistral: {
     freeOnly: false,
+    note: 'no free rate (429 with a key), left out',
     documented: { requestsPerMinute: 60, tokensPerMonth: 1_000_000_000 },
     limits: { requestsPerMinute: 30, tokensPerMonth: 500_000_000 },
   },

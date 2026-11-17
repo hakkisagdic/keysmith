@@ -11,10 +11,10 @@ import { autoApproveFlag, which } from './cli-adapter.js';
 import { CreditGuard, readCreditState } from './credit-guard.js';
 import { carriageLines, creditGuardLines, creditGuardRows, guardShiftLines, recentSkips, skipLines, toolCarriage } from './failover-report.js';
 import * as tunnel from './tunnel.js';
-import { catalogueSettings, discoveredPath, freeModels, writeDiscovered } from './catalogue.js';
+import { catalogueSettings, discoveredPath, freeModels, freeModelsFromPriceTable, writeDiscovered } from './catalogue.js';
 import * as service from './service.js';
 import { configEdit } from './config-edit.js';
-import { sourceDisable, sourceEnable, fillAccount } from './source.js';
+import { sourceDisable, sourceEnable, sourceList, fillAccount } from './source.js';
 import { rel, truncate } from './util.js';
 import { BatchError, batchEnabled, cancel as batchCancel, describeJob, fetchResults, listJobs, loadJob, refresh as batchRefresh, submit as batchSubmit } from './batch.js';
 import { fmtUsd } from './usage.js';
@@ -69,6 +69,7 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
                                      open a free-tier source (tokenrouter, groq, mistral, cloudflare): adapter with a Keychain
                                      key reference, out of every alias, catalogue limits, discovery on
   keysmith source disable <profile> [--as id] [--dry-run]
+  keysmith source list               the profiles, which are attached, and what to know about each
                                      take that adapter, its catalogue row and discovery entry out again
   keysmith key <add|list> [--reveal] client-facing API keys; --reveal prints them in full, to a terminal only
   keysmith key add <label> [--allow p,…] [--deny p,…] [--out <file>]
@@ -186,7 +187,7 @@ export async function main(argv) {
       case 'config':
         return cmdConfig(flags);
       case 'source':
-        return cmdSource(flags);
+        return await cmdSource(flags);
       case 'usage':
         if (flags._[0] === 'record') return await cmdUsageRecord(flags);
         return await cmdUsage(flags);
@@ -1555,12 +1556,17 @@ function cmdConfig(flags) {
   }
 }
 
-function cmdSource(flags) {
+async function cmdSource(flags) {
   const [op, name, ...extra] = flags._;
+  if (op === 'list' && !name) {
+    if (!configExists()) fail(`no config at ${rel(configPath())} — run \`keysmith init\``);
+    for (const l of sourceList(configPath())) out(l);
+    return;
+  }
   if (!['enable', 'disable'].includes(op) || !name || extra.length) fail(helpFor('source'));
   if (!configExists()) fail(`no config at ${rel(configPath())} — run \`keysmith init\``);
   const run = op === 'enable' ? sourceEnable : sourceDisable;
-  for (const l of run(configPath(), name, flags).lines) out(l);
+  for (const l of (await run(configPath(), name, flags)).lines) out(l);
 }
 
 async function cmdDiscover(flags) {
@@ -1572,6 +1578,8 @@ async function cmdDiscover(flags) {
   const raw = cfg.adapters?.[id];
   if (!raw) fail(`no adapter "${id}"`);
   if (!raw.baseUrl) fail(`adapter "${id}" has no baseUrl`);
+  const priceUrl = discoveryPriceTableUrl(raw, settings.discovery[id]);
+  if (priceUrl) return discoverFromPriceTable(id, priceUrl);
   const key = resolveSecret(raw.apiKey ?? raw.key ?? null);
   if (key) registerSecrets([key]);
   const url = String(raw.baseUrl).replace(/\/+$/, '') + '/models';
@@ -1596,6 +1604,36 @@ async function cmdDiscover(flags) {
     out(`! ${id}: ${listed.length} models listed, none with a price at ${opts.inputPricePath}: free cannot be read from this source${raw.freeOnly ? ', so freeOnly refuses every model here' : ' (its guard is: no alias, a catalogue limit, a named model)'}`);
   }
   out(`${id}: ${ids.length} free model${ids.length === 1 ? '' : 's'} written`);
+}
+
+/** tokenrouter's /models carries no price; its public table does. An explicit `pricingUrl` wins. */
+function discoveryPriceTableUrl(raw, opts) {
+  if (opts?.pricingUrl) return opts.pricingUrl;
+  try {
+    const u = new URL(String(raw.baseUrl));
+    if (u.protocol === 'https:' && u.hostname === 'api.tokenrouter.com') return `${u.origin}/api/pricing`;
+  } catch { /* no baseUrl worth reading */ }
+  return null;
+}
+
+/**
+ * Rebuilds the free list from the price table, from scratch: a model that was free yesterday and
+ * is not today drops out. A table that cannot be read empties the list (the safe direction).
+ */
+async function discoverFromPriceTable(id, priceUrl) {
+  const u = new URL(priceUrl);
+  const source = `${u.host}${u.pathname}`;
+  const file = discoveredPath(dataDir(), id);
+  let ids = [];
+  let why = null;
+  try {
+    const res = await fetch(priceUrl, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15000) });
+    if (!res.ok) why = `answered ${res.status}`;
+    else ids = freeModelsFromPriceTable(await res.json());
+  } catch (e) { why = e.message; }
+  writeDiscovered(file, ids, { source, at: new Date().toISOString() });
+  if (why) out(`! ${id}: price table ${source} ${why}: the free list is now empty`);
+  out(`${id}: ${ids.length} free model${ids.length === 1 ? '' : 's'} written (from ${source})`);
 }
 
 function hasPath(obj, dotted) {

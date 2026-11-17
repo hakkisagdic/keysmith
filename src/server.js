@@ -26,7 +26,7 @@ import { DailyQuota, overCapMessage } from './quota.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
-import { cachePlanScope } from './prompt-cache.js';
+import { cachePlanScope, checkPromptCache } from './prompt-cache.js';
 
 export function isLoopbackHost(host) {
   if (!host) return true;
@@ -101,6 +101,29 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     } catch {}
   }
 
+  /**
+   * A reload re-reads one adapter setting besides auth.keys: `promptCache`, assigned in place on
+   * the http adapters that are already running. Nothing else of an adapter changes (a new
+   * baseUrl or model list needs a restart), an adapter the file no longer names is left as it
+   * is, and a value that does not validate keeps the old one.
+   */
+  function reloadPromptCache(disk) {
+    const rawAdapters = disk?.adapters && typeof disk.adapters === 'object' && !Array.isArray(disk.adapters) ? disk.adapters : null;
+    if (!rawAdapters || !gateway?.adapters?.entries) return;
+    for (const [id, adapter] of gateway.adapters.entries()) {
+      const raw = Object.hasOwn(rawAdapters, id) ? rawAdapters[id] : null;
+      if (!raw || typeof raw !== 'object' || !adapter || adapter.kind !== 'http' || !('cacheStats' in adapter)) continue;
+      let next;
+      try { next = checkPromptCache(id, raw.promptCache); } catch (e) {
+        log(`promptCache reload refused for "${id}", keeping the previous value: ${e.message}`);
+        continue;
+      }
+      if (JSON.stringify(next) === JSON.stringify(adapter.promptCache)) continue;
+      adapter.promptCache = next;
+      log(`promptCache reloaded for "${id}": ${next ? `${next.mode}, ttl ${next.ttl}` : 'off'}`);
+    }
+  }
+
   function reloadKeys(force = false) {
     let st = null;
     try {
@@ -116,6 +139,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
         lastFailedMtimeMs = 0;
         lastFailedSize = 0;
         lastFailedIno = 0;
+        reloadPromptCache(disk);
         if (disk && typeof disk === 'object' && !Array.isArray(disk)) {
           const nextAuth = disk.auth && typeof disk.auth === 'object' && !Array.isArray(disk.auth)
             ? { ...disk.auth, enabled: disk.auth.enabled === false ? false : true }

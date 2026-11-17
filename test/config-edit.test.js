@@ -72,3 +72,15 @@ test('config get masks the gateway keys; unset removes; discovery price paths ar
   assert.equal(run('config', 'get', 'discovery.tr.inputPricePath').status, 1);
   assert.equal(run('config', 'set', 'tunnel.name', 'null').status, 0);
 });
+
+test('batch.enabled: set, get, reject non-bool, unset', (t) => {
+  const { config, run } = setup(t);
+  assert.equal(run('config', 'set', 'batch.enabled', 'true').status, 0);
+  assert.equal(run('config', 'get', 'batch.enabled').stdout.trim(), 'true');
+  assert.equal(JSON.parse(fs.readFileSync(config, 'utf8')).batch.enabled, true);
+  const bad = run('config', 'set', 'batch.enabled', 'maybe');
+  assert.notEqual(bad.status, 0);
+  assert.match(bad.stderr, /true or false/);
+  assert.equal(run('config', 'unset', 'batch.enabled').status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(config, 'utf8')).batch?.enabled, undefined);
+});

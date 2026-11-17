@@ -34,8 +34,9 @@ export const SCHEMA = {
   'tunnel.configFile': T.nstr,
   catalogue: T.nstr,
   'discovery.enabled': T.bool,
+  'batch.enabled': T.bool,
 };
-const DISCOVERY_LEAF = /^discovery\.([A-Za-z0-9_-]+)\.(inputPricePath|outputPricePath)$/;
+const DISCOVERY_LEAF = /^discovery\.([A-Za-z0-9_-]+)\.(inputPricePath|outputPricePath|pricingUrl)$/;
 const SECRETISH = /(^|\.)(keys?|apiKey|token|secret|password)$/i;
 
 export function schemaFor(key) {
