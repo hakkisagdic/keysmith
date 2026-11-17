@@ -2958,7 +2958,7 @@ export class UsageLog {
     const u = row?.usage;
     if (!c || !u || typeof u !== 'object' || (c.basis !== 'unpriced' && !(c.basis === 'subscription' && typeof c.listUsd !== 'number'))) return c;
     const rates = matchPrice(this.pricing, row.adapter, row.model, { upstreamModel: row.upstreamModel || null, anyAdapter: c.basis === 'subscription' });
-    if (!rates || row.kind === 'cli') return c;
+    if (!rates || row.face === 'external' || row.kind !== 'http') return c;
     if (c.basis === 'subscription') return { ...c, listUsd: tokensToUsd(u, rates) };
     return { usd: tokensToUsd(u, rates), basis: 'metered' };
   }
@@ -2971,6 +2971,7 @@ export class UsageLog {
     const u = row?.usage;
     if (!u || typeof u !== 'object') return 0;
     if (!(Number(u.input) > 0 || Number(u.output) > 0 || Number(u.cacheRead) > 0)) return 0;
+    if (row.face === 'external') return 0;
     const cost = this._rowCost(row);
     if (cost?.basis === 'unpriced') return 1;
     if (cost?.basis === 'subscription' && typeof cost.listUsd !== 'number') return 1;
