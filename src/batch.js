@@ -151,7 +151,10 @@ export function estimateUsd(requests, pricing, adapter, cachedTokens = new Map()
     if (!rates) throw new BatchError(`no price for ${adapter.id}/${p.model} in the price table: a cap cannot be checked without one (add it under "pricing")`);
     const half = halfRates(rates);
     const total = tokensOf({ system: p.system, messages: p.messages, tools: p.tools });
-    const cached = Math.min(total, cachedTokens.get(r.custom_id) || 0);
+    // A cache_control the user wrote is billed as a write (2x at most) and we cannot tell how much it
+    // covers: every input token of that request is counted at the highest write rate.
+    const ownMark = !cachedTokens.has(r.custom_id) && hasCacheControl(p);
+    const cached = ownMark ? total : Math.min(total, cachedTokens.get(r.custom_id) || 0);
     usd += ((total - cached) * half.input + cached * half.input * 2 + p.max_tokens * half.output) / 1_000_000;
   }
   return roundUsd(usd);
@@ -199,13 +202,15 @@ export function callerKey(cfg, ref) {
 function todaysRequests(fp) {
   const day = new Date();
   const start = new Date(day.getFullYear(), day.getMonth(), day.getDate()).toISOString();
+  const startMs = Date.parse(start);
   let n = 0;
   try {
     const groups = new UsageLog().query({ by: ['key'], since: start }).groups || [];
     n = groups.filter((g) => g.key === `fp:${fp}`).reduce((a, g) => a + (g.requests || 0), 0);
   } catch { /* no log yet */ }
   for (const j of listJobs()) {
-    if (j.key === `fp:${fp}` && !TERMINAL.has(j.status) && String(j.createdAt || '').slice(0, 10) === start.slice(0, 10)) n += j.requests;
+    // Jobs whose usage rows are not written yet are not in the log: count them, ended or not.
+    if (j.key === `fp:${fp}` && !j.usageRecorded && Date.parse(j.createdAt) >= startMs) n += j.requests;
   }
   return n;
 }
