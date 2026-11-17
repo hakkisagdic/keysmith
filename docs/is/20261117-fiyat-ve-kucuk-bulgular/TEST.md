@@ -26,3 +26,16 @@ Tekrar kontrol (düzeltme turu 1): K4 kapandı. Ilgili 111 testin 110'u geçti, 
 1. K7 aynı-kök olumlu dalı (https + aynı kök = anahtar gider) yalnız birim testle görüldü; uçtan uca sahte sunucuyla görülemedi (profil baseUrl'i sabit herkese açık adres). Engelleyici değil, not olarak kalır.
 
 Canlı için not: değişen fiyat tablosu geçidin yeniden başlatılmasını ister; yönetici listesine yazılır, launchd işi yeniden başlatılmadı.
+
+## İnceleme düzeltmeleri
+
+Düzeltme commit'i `d1716f6` (`_rowCost` ve `_rowUnpriced`: external veya kind http olmayan satır olduğu gibi döner).
+
+| Bulgu | Sonuç | Kanıt |
+|---|---|---|
+| 1 [büyük] external claude-* satırı metered $6.00 olarak yeniden fiyatlanıyordu | geçti | Elle (geçici HOME/yapılandırma): `usage record --source kiro-cli --model claude-sonnet-4-5 --input 1000000 --output 200000` sonra `usage` -> `metered: $0.00`, `list-equiv: $0.00`; `doctor` çıktısında "price" satırı yok. Test `an external claude-* row is not re-priced as metered and doctor does not name it` geçti; korumayı geçici kaldırınca aynı test kaldı (1 kaldı), geri alındı. |
+| Gerileme: http `unpriced` satırı hâlâ yeniden fiyatlanır (K1) | geçti | `price-tester.test.js` (K1) geçti |
+
+Çalıştırılan: `node --test test/usage-record.test.js test/price-tester.test.js test/price.test.js test/discover.test.js test/source.test.js` -> 52/52 geçti. Tam paket geliştiricinin kapısıdır (geliştirici: 1003/1031, yalnız zamanlamaya bağlı bridge-agy testi aralıklı kalıyor, bu dalın dışında); ben koşmadım. `machine-resources.sh check` çıkış 0.
+
+Yönetici listesi: değişen canlı fiyat tablosu geçit yeniden başlatması ister; launchd işi yeniden başlatılmadı. Canlı yapılandırmaya dokunulmadı. Fiyat sayfası kaydı (platform.claude.com/docs/en/about-claude/pricing, 2026-11-17) geliştiriciye aittir, ben açmadım. Push yapılmadı; push öncesi özel desen taraması inişi yapana kalır.
