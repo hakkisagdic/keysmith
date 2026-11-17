@@ -22,3 +22,21 @@ Mod: function. Dal `is/20261117-saglayicilari-ac`, yerelde çalıştırıldı (c
 - K9 yürütülmedi: gateway yeniden başlatılana kadar canlı çağrı ve `usage` satırı görülemez (kasıtlı). Beklenen: dört kaynakta discover>0 (groq/mistral/cloudflare için model listesi kuralı), tek küçük istek 200.
 - Gözlem (hata değil): tüm geçmişte gitleaks 11 eski bulgu veriyor, bu dalın commit'lerinde yok. `tokenrouter` `/models` fiyat vermediği için SONUC.md'deki bulguya göre freeOnly şimdilik her modeli reddeder (güvenli yön).
 - Gözlem: `-h/--help` testi her çağrıda ~1 sn sürdüğü için K1 testi ~70 sn.
+
+## İnceleme düzeltmeleri
+
+Bulgu 1 (büyük): groq, mistral, cloudflare'de "adı verilmiş model" koruması istekte uygulanmıyordu. Düzeltme commit'i f0d4394.
+
+| Kontrol | Sonuç | Kanıt |
+|---|---|---|
+| HttpAdapter `modelsOnly` alanı var; `chat` içinde freeOnly kontrolünün yanında, limiter ve upstream'den önce, model/effectiveModel `_declaredModelList()` içinde değilse 400 | geçti | src/http-adapter.js:35 ve 495-501 okundu; kontrol `if (this.limiter)` bloğundan önce |
+| Listede olmayan model 400 döner, upstream'e POST gitmez; listedeki 200 | geçti | `test/catalogue-gateway.test.js` "modelsOnly: a model off the declared list is a 400 before the limiter and the upstream" (hits.length 0), koşuldu |
+| `source enable` groq/mistral/cloudflare için `--model` ile birlikte `modelsOnly: true` yazar, tokenrouter'a yazmaz | geçti | `test/source.test.js` "source enable writes modelsOnly ..." koşuldu; source.js:79 |
+| Canlı config'te groq, mistral, cloudflare adaptörlerinde `modelsOnly: true` + `models` + `explicitOnly` | geçti | ~/.config/keysmith/config.json okundu (yalnız bu alanlar basıldı); tokenrouter'da modelsOnly yok; yedek `config.json.bak-20261117-modelsonly` var |
+| Kapı: `node --test` tümü | geçti | 941 test, 915 geçti, 0 kaldı (ikinci koşu; TODO işaretli bilinen vakalar sayılmaz). İlk koşuda yük altında bir zaman aşımı testi (bridge, "never comes back") düştü; tek başına 99/99 geçti, wire-conformance tek başına 0 kaldı. Değişiklikle ilgisiz, yük kaynaklı dalgalanma |
+| gitleaks | geçti | `gitleaks git --log-opts="origin/main..HEAD"`: no leaks found |
+| Public repoda özel yol/e-posta/anahtar | geçti | `git grep -E "/Users/<ad>|@gmail|sk-..."` src, bin, README: sonuç yok |
+| Gateway yeniden başlatılmadı, ikinci örnek açılmadı | geçti | testler kendi geçici sunucularını kullandı; çalışan gateway'e dokunulmadı |
+| Cloudflare profili ve günlük token alanı | geçti | önceki turda (K-kontrolleri) kanıtlı; bu turda bozulmadı (source/catalogue testleri geçti) |
+
+Not: INCELEME.md'deki küçük bulgular bu turun kapsamı dışında; yalnız büyük bulgu doğrulandı.
