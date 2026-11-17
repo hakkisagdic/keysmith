@@ -29,3 +29,13 @@ Hedefli regresyon: config-edit, discover, integration, keysec, prompt-cache*, qa
 2. Gözlem (kaldı sayılmadı): `source enable --models-url` verilirse Keychain anahtarı o adrese Bearer olarak gider; yalnız sahibin verdiği adres, ama belgede belirtilmeli.
 
 Yeniden kontrol (tur 1): `node --test test/acilis-eksikleri-tester.test.js` 7/7 geçti; unit + audit 107/107 geçti.
+
+## İnceleme düzeltmeleri
+
+| Bulgu | Sonuç | Kanıt |
+|---|---|---|
+| 1. K11 deseninde sunucu IP'si ve kullanıcı adı açık metin; test kendi dosyasını taramıyordu | geçti (yerelde); uzak dal henüz temizlenmedi | `test/acilis-eksikleri-tester.test.js` K11: yalnız genel desenler; özel desenler `KEYSMITH_PRIVATE_PATTERNS` ortam değişkeninden ya da `KEYSMITH_PRIVATE_PATTERNS_FILE` (izlenmeyen dosya) ile okunur, yoksa yalnız genel desenler çalışır; kendi dosyasını dışarıda bırakan filtre yok, dosya `ls-files` listesinde. `git log main..HEAD -p` ve `git grep HEAD` içinde sunucu IP'si ve kullanıcı adlı Keychain adı yok (yalnız INCELEME.md'nin kendisi bulguyu anlatır, değer yazmaz). Yerel dal tek commit (967ecd4, f50a61e atası değil). Özel desenler ortamda (IP öneki ve `kiro-api:<ad>`) verilerek tam paket koşuldu: K11 geçti |
+
+Kalan, bana ait olmayan adım: `origin/is/20261117-acilis-eksikleri` hâlâ b8e922a'da ve f50a61e (IP + kullanıcı adı) geçmişinde. Releaser dalı silmeli ya da zorla güncellemeli; sahibe bildirilmeli, GitHub önbelleğinde kopya kalabilir. Ana dalda f50a61e yok (`merge-base --is-ancestor` hayır).
+
+Kapı yeniden koşusu (heavy_slot ile, yük 80+): 1003 test, 976 geçti, 1 kaldı, geri kalanı TODO işaretli. Kalan: `test/relay.test.js` "a route whose first leg answered 429" yük altında kaldı; aynı dosya yalnız koşulunca hem bu dalda hem main'de 10/10 geçti (yük kaynaklı zamanlama, değişen dosyalarla ilgisiz). K8-K10: yürütülmedi (restart sonrası).
