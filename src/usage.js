@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { dataDir } from './config.js';
+import { CLAUDE_PRICING, PRICE_SOURCE } from './prices.js';
 import { FILE_MODE, ensurePrivateDir, openPrivateLog } from './logfiles.js';
 import { fingerprint, redactSecrets } from './redact.js';
 import { dayOf, nextMidnight, startOfDay } from './quota.js';
@@ -25,16 +26,11 @@ import { dayOf, nextMidnight, startOfDay } from './quota.js';
  */
 
 /**
- * Default price table (USD per 1,000,000 tokens: input, output, cacheRead, cacheWrite).
- * Read from Anthropic's pricing page on 2026-10-20, with cache writes at the 5-minute TTL
- * rate. Claude Haiku 5.5 uses its rate for prompts up to 100K tokens (prompts above 100K
- * are billed at 2x; a single per-token rate table approximates all Haiku 5.5 calls at <=100K).
+ * Default price table (USD per 1,000,000 tokens). The rates and where they were read are in
+ * `prices.js`; entries a config's `pricing` names replace these.
  */
-export const DEFAULT_PRICING = {
-  '*/claude-opus-5-5*': { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
-  '*/claude-sonnet-5-5*': { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
-  '*/claude-haiku-5-5*': { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
-};
+export const DEFAULT_PRICING = CLAUDE_PRICING;
+export { PRICE_SOURCE };
 
 export const USAGE_DIMENSIONS = ['key', 'label', 'adapter', 'model', 'account', 'tag', 'day', 'client'];
 export const TAIL_RING_MAX = 2000;
@@ -703,7 +699,9 @@ function sameDefaultRate(pattern, rates) {
     Number(def.input) === Number(rates.input) &&
     Number(def.output) === Number(rates.output) &&
     Number(def.cacheRead) === Number(rates.cacheRead) &&
-    Number(def.cacheWrite) === Number(rates.cacheWrite)
+    Number(def.cacheWrite) === Number(rates.cacheWrite) &&
+    (def.cacheWrite1h == null || Number(def.cacheWrite1h) === Number(rates.cacheWrite1h)) &&
+    (def.batchFactor == null || Number(def.batchFactor) === Number(rates.batchFactor))
   );
 }
 
@@ -715,7 +713,7 @@ function patternScore(pattern, isCustom) {
   return (isCustom ? 100_000 : 0) + aExact * 10_000 + mExact * 1_000 + literalLen;
 }
 
-function mergedPriceEntries(pricing) {
+export function mergedPriceEntries(pricing) {
   const merged = { ...DEFAULT_PRICING, ...(pricing && typeof pricing === 'object' ? pricing : {}) };
   const list = [];
   for (const [pattern, rates] of Object.entries(merged)) {
@@ -783,6 +781,12 @@ export function tokensToUsd(usage, rates) {
       write1h * cacheWrite1hRate(rates)) /
     1_000_000;
   return roundUsd(raw);
+}
+
+/** The Batch API share of the list price: the entry's `batchFactor` (0 to 1), else 0.5. */
+export function batchFactorOf(rates) {
+  const f = Number(rates?.batchFactor);
+  return Number.isFinite(f) && f > 0 && f <= 1 ? f : 0.5;
 }
 
 /** The 1-hour cache write rate: the table's `cacheWrite1h`, else 2x the input rate (Anthropic's list). */
@@ -2913,6 +2917,7 @@ export class UsageLog {
       cacheRead: 0,
       cacheWrite: 0,
       savingsUsd: 0,
+      unpricedRequests: 0,
       planRequests: 0,
       planTokens: 0,
       planSavingsUsd: 0,
@@ -2942,6 +2947,39 @@ export class UsageLog {
     if (!u || !(u.cacheRead || u.cacheWrite)) return 0;
     const rates = matchPrice(this.pricing, row.adapter, row.model, { upstreamModel: row.upstreamModel || null, anyAdapter: true });
     return rates ? cacheSavingsUsd(u, rates) : 0;
+  }
+
+  /**
+   * A row's cost for a report. A row written as `unpriced` before the price table had its model is
+   * priced now from its own token counts (the log is not rewritten); one still without a price stays unpriced.
+   */
+  _rowCost(row) {
+    const c = row?.cost;
+    const u = row?.usage;
+    if (!c || !u || typeof u !== 'object' || (c.basis !== 'unpriced' && !(c.basis === 'subscription' && typeof c.listUsd !== 'number'))) return c;
+    const rates = matchPrice(this.pricing, row.adapter, row.model, { upstreamModel: row.upstreamModel || null, anyAdapter: c.basis === 'subscription' });
+    if (!rates || row.face === 'external' || row.kind !== 'http') return c;
+    if (c.basis === 'subscription') return { ...c, listUsd: tokensToUsd(u, rates) };
+    return { usd: tokensToUsd(u, rates), basis: 'metered' };
+  }
+
+  /**
+   * 1 when a row with known tokens has no price: its cost is "unpriced" (not zero dollars). Either the
+   * row was written as `unpriced`, or it used the cache and the price table has no entry, so no saving can be told.
+   */
+  _rowUnpriced(row) {
+    const u = row?.usage;
+    if (!u || typeof u !== 'object') return 0;
+    if (!(Number(u.input) > 0 || Number(u.output) > 0 || Number(u.cacheRead) > 0)) return 0;
+    if (row.face === 'external') return 0;
+    const cost = this._rowCost(row);
+    if (cost?.basis === 'unpriced') return 1;
+    if (cost?.basis === 'subscription' && typeof cost.listUsd !== 'number') return 1;
+    if (u.cacheRead || u.cacheWrite) {
+      const rates = matchPrice(this.pricing, row.adapter, row.model, { upstreamModel: row.upstreamModel || null, anyAdapter: true });
+      if (!rates) return 1;
+    }
+    return 0;
   }
 
   _AccumulateRowIntoCell(cell, e, isLimited, isDenied, count = 1) {
@@ -2978,11 +3016,13 @@ export class UsageLog {
       cell.cacheRead += (Number(e.usage?.cacheRead) || 0) * n;
       cell.cacheWrite += (Number(e.usage?.cacheWrite) || 0) * n;
       cell.savingsUsd = roundUsd(cell.savingsUsd + this._rowSavings(e) * n);
-      if (e.cost?.basis === 'metered' && typeof e.cost.usd === 'number') {
-        cell.meteredUsd = roundUsd(cell.meteredUsd + e.cost.usd * n);
+      cell.unpricedRequests += this._rowUnpriced(e) * n;
+      const cost = this._rowCost(e);
+      if (cost?.basis === 'metered' && typeof cost.usd === 'number') {
+        cell.meteredUsd = roundUsd(cell.meteredUsd + cost.usd * n);
       }
-      if (typeof e.cost?.listUsd === 'number') {
-        cell.listUsd = roundUsd(cell.listUsd + e.cost.listUsd * n);
+      if (typeof cost?.listUsd === 'number') {
+        cell.listUsd = roundUsd(cell.listUsd + cost.listUsd * n);
       }
     }
     const ms = Number(e.ms) || 0;
@@ -3048,6 +3088,7 @@ export class UsageLog {
       ov.cacheRead += c.cacheRead;
       ov.cacheWrite += c.cacheWrite;
       ov.savingsUsd = roundUsd(ov.savingsUsd + (c.savingsUsd || 0));
+      ov.unpricedRequests = (ov.unpricedRequests || 0) + (c.unpricedRequests || 0);
       ov.planRequests += c.planRequests || 0;
       ov.planTokens += c.planTokens || 0;
       ov.planSavingsUsd = roundUsd(ov.planSavingsUsd + (c.planSavingsUsd || 0));
@@ -3077,6 +3118,7 @@ export class UsageLog {
       cacheRead: 0,
       cacheWrite: 0,
       savingsUsd: 0,
+      unpricedRequests: 0,
       planRequests: 0,
       planTokens: 0,
       planSavingsUsd: 0,
@@ -3106,6 +3148,7 @@ export class UsageLog {
     dst.cacheRead += src.cacheRead;
     dst.cacheWrite += src.cacheWrite;
     dst.savingsUsd = roundUsd((dst.savingsUsd || 0) + (src.savingsUsd || 0));
+    dst.unpricedRequests = (dst.unpricedRequests || 0) + (src.unpricedRequests || 0);
     dst.planRequests = (dst.planRequests || 0) + (src.planRequests || 0);
     dst.planTokens = (dst.planTokens || 0) + (src.planTokens || 0);
     dst.planSavingsUsd = roundUsd((dst.planSavingsUsd || 0) + (src.planSavingsUsd || 0));
@@ -3250,11 +3293,13 @@ export class UsageLog {
         b.cacheRead += cr;
         b.cacheWrite += cw;
         b.savingsUsd = roundUsd((b.savingsUsd || 0) + this._rowSavings(row) * n);
-        if (row.cost?.basis === 'metered' && typeof row.cost.usd === 'number') {
-          b.meteredUsd = roundUsd(b.meteredUsd + row.cost.usd * n);
+        b.unpricedRequests = (b.unpricedRequests || 0) + this._rowUnpriced(row) * n;
+        const cost = this._rowCost(row);
+        if (cost?.basis === 'metered' && typeof cost.usd === 'number') {
+          b.meteredUsd = roundUsd(b.meteredUsd + cost.usd * n);
         }
-        if (typeof row.cost?.listUsd === 'number') {
-          b.listUsd = roundUsd(b.listUsd + row.cost.listUsd * n);
+        if (typeof cost?.listUsd === 'number') {
+          b.listUsd = roundUsd(b.listUsd + cost.listUsd * n);
         }
       }
       const ms = Number(row.ms) || 0;
@@ -3349,6 +3394,7 @@ export class UsageLog {
         cacheWrite,
         cacheShare: allUnknown || !input ? null : Math.round((cacheRead / input) * 1000) / 1000,
         cacheSavingsUsd: allUnknown ? null : roundUsd(b.savingsUsd || 0),
+        unpricedRequests: b.unpricedRequests || 0,
         ...(b.planRequests ? { cachePlanRequests: b.planRequests, cachePlanTokens: b.planTokens, cachePlanSavingsUsd: roundUsd(b.planSavingsUsd || 0) } : {}),
         tokensIn: input,
         tokensOut: output,
@@ -3392,6 +3438,7 @@ export class UsageLog {
       failures: totals.failures,
       refused: totals.refused,
       unknownUsage: totals.unknownUsage,
+      unpricedRequests: totals.unpricedRequests,
       input: totals.input,
       output: totals.output,
       cacheRead: totals.cacheRead,
@@ -3624,12 +3671,23 @@ export function formatUsageTable(report, { spend = [], daily = [] } = {}) {
   const fmtTok = (n) => (n == null ? 'unknown' : String(n));
   const fmtCellTok = (n) => (n == null ? '-' : String(n));
   const fmtBucketUsd = (n, cell = false) => (n == null ? (cell ? '-' : 'unknown') : fmtUsd(n));
+  // A bucket whose priced spend is nothing but has unpriced rows says so; mixed ones carry a '*'.
+  const cellUsd = (n, b) => {
+    const base = fmtBucketUsd(n, true);
+    if (!b?.unpricedRequests) return base;
+    return !n ? 'unpriced' : `${base}*`;
+  };
   const unkNote = t.unknownUsage ? `, ${t.unknownUsage} unknown usage` : '';
+  const unpNote = t.unpricedRequests ? ` + ${t.unpricedRequests} unpriced request(s), not counted` : '';
   lines.push(
-    `requests: ${t.requests} (${t.failures} failed${unkNote}) · tokens: ${fmtTok(t.input)} in / ${fmtTok(t.output)} out / ${fmtTok(t.cacheRead)} cache read / ${fmtTok(t.cacheWrite)} cache write${t.cacheRead || t.cacheWrite ? ` (cache read share ${t.cacheShare == null ? 'unknown' : `${(t.cacheShare * 100).toFixed(1)}%`}, saved at list price ${fmtBucketUsd(t.cacheSavingsUsd)})` : ''} · metered: ${fmtBucketUsd(t.meteredUsd)} · list-equiv: ${fmtBucketUsd(t.listUsd)} · duration: p50 ${t.p50Ms}ms / p95 ${t.p95Ms}ms`,
+    `requests: ${t.requests} (${t.failures} failed${unkNote}) · tokens: ${fmtTok(t.input)} in / ${fmtTok(t.output)} out / ${fmtTok(t.cacheRead)} cache read / ${fmtTok(t.cacheWrite)} cache write${t.cacheRead || t.cacheWrite ? ` (cache read share ${t.cacheShare == null ? 'unknown' : `${(t.cacheShare * 100).toFixed(1)}%`}, saved at list price ${fmtBucketUsd(t.cacheSavingsUsd)}${unpNote})` : ''} · metered: ${fmtBucketUsd(t.meteredUsd)}${unpNote} · list-equiv: ${fmtBucketUsd(t.listUsd)} · duration: p50 ${t.p50Ms}ms / p95 ${t.p95Ms}ms`,
   );
   if (t.cachePlanRequests) {
     lines.push(`cache dry-run (ESTIMATE, not spent or saved): ${t.cachePlanRequests} request(s) would have cached ~${t.cachePlanTokens} tokens; estimated saving at list price if each request were reused once, write premium not subtracted ${fmtUsd(t.cachePlanSavingsUsd)}`);
+  }
+  const unpricedModels = (report.models || []).filter((m) => m.unpricedRequests > 0);
+  if (unpricedModels.length) {
+    lines.push(`unpriced (no entry in the price table: tokens are counted, no dollars; add one with \`keysmith price set\`): ${unpricedModels.map((m) => `${m.model} (${m.unpricedRequests})`).join(', ')}`);
   }
   const allGroups = report.groups || [];
   const groups = allGroups.length > MAX_TABLE_GROUPS ? allGroups.slice(0, MAX_TABLE_GROUPS) : allGroups;
@@ -3643,7 +3701,7 @@ export function formatUsageTable(report, { spend = [], daily = [] } = {}) {
     for (const g of groups) {
       const cols = dims.map((d, i) => String(g[d] ?? '-').padEnd(widths[i])).join('  ');
       lines.push(
-        `  ${cols}  ${String(g.requests).padStart(5)}  ${String(g.failures).padStart(4)}  ${fmtCellTok(g.input).padStart(9)}  ${fmtCellTok(g.output).padStart(9)}  ${fmtCellTok(g.cacheRead).padStart(9)}  ${fmtCellTok(g.cacheWrite).padStart(9)}  ${fmtBucketUsd(g.meteredUsd, true).padStart(9)}  ${fmtBucketUsd(g.listUsd, true).padStart(9)}  ${(g.p50Ms + 'ms').padStart(7)}  ${(g.p95Ms + 'ms').padStart(7)}`,
+        `  ${cols}  ${String(g.requests).padStart(5)}  ${String(g.failures).padStart(4)}  ${fmtCellTok(g.input).padStart(9)}  ${fmtCellTok(g.output).padStart(9)}  ${fmtCellTok(g.cacheRead).padStart(9)}  ${fmtCellTok(g.cacheWrite).padStart(9)}  ${cellUsd(g.meteredUsd, g).padStart(9)}  ${fmtBucketUsd(g.listUsd, true).padStart(9)}  ${(g.p50Ms + 'ms').padStart(7)}  ${(g.p95Ms + 'ms').padStart(7)}`,
       );
     }
     if (allGroups.length > groups.length) {
@@ -3651,7 +3709,7 @@ export function formatUsageTable(report, { spend = [], daily = [] } = {}) {
     }
     const totalDims = dims.map((_, i) => (i === 0 ? 'total' : '').padEnd(widths[i])).join('  ');
     lines.push(
-      `  ${totalDims}  ${String(t.requests).padStart(5)}  ${String(t.failures).padStart(4)}  ${fmtCellTok(t.input).padStart(9)}  ${fmtCellTok(t.output).padStart(9)}  ${fmtCellTok(t.cacheRead).padStart(9)}  ${fmtCellTok(t.cacheWrite).padStart(9)}  ${fmtBucketUsd(t.meteredUsd, true).padStart(9)}  ${fmtBucketUsd(t.listUsd, true).padStart(9)}  ${(t.p50Ms + 'ms').padStart(7)}  ${(t.p95Ms + 'ms').padStart(7)}`,
+      `  ${totalDims}  ${String(t.requests).padStart(5)}  ${String(t.failures).padStart(4)}  ${fmtCellTok(t.input).padStart(9)}  ${fmtCellTok(t.output).padStart(9)}  ${fmtCellTok(t.cacheRead).padStart(9)}  ${fmtCellTok(t.cacheWrite).padStart(9)}  ${cellUsd(t.meteredUsd, t).padStart(9)}  ${fmtBucketUsd(t.listUsd, true).padStart(9)}  ${(t.p50Ms + 'ms').padStart(7)}  ${(t.p95Ms + 'ms').padStart(7)}`,
     );
   }
   if (spend && spend.length) {

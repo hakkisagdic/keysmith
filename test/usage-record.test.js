@@ -96,3 +96,13 @@ test('monthTokensByAdapter sums this month', (t) => {
   log.recordExternal({ source: 'qoder', input: 10, output: 5 });
   assert.equal(log.monthTokensByAdapter().qoder, 15);
 });
+
+test('an external claude-* row is not re-priced as metered and doctor does not name it', (t) => {
+  const { run } = sandbox(t);
+  assert.equal(run('usage', 'record', '--source', 'kiro-cli', '--model', 'claude-sonnet-4-5', '--input', '1000000', '--output', '200000').status, 0);
+  const j = JSON.parse(run('usage', '--format', 'json').stdout);
+  assert.equal(j.meteredUsd, 0);
+  assert.equal(j.groups[0].meteredUsd, 0);
+  assert.equal(j.unpricedRequests, 0);
+  assert.doesNotMatch(run('doctor').all, /price warning|price claude-sonnet-4-5/);
+});

@@ -14,6 +14,7 @@ import * as tunnel from './tunnel.js';
 import { catalogueSettings, discoveredPath, freeModels, freeModelsFromPriceTable, writeDiscovered } from './catalogue.js';
 import * as service from './service.js';
 import { configEdit } from './config-edit.js';
+import { priceList, priceSet } from './price-cmd.js';
 import { sourceDisable, sourceEnable, sourceList, fillAccount } from './source.js';
 import { rel, truncate } from './util.js';
 import { BatchError, batchEnabled, cancel as batchCancel, describeJob, fetchResults, listJobs, loadJob, refresh as batchRefresh, submit as batchSubmit } from './batch.js';
@@ -55,17 +56,23 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith tunnel <status|setup|run> cloudflared: named tunnel first, quick as fallback
   keysmith usage [--by d1[,d2]] [--since t] [--until t] [--format table|csv|json]
                                      who spent what (by key, label, adapter, model, account, tag, day, client)
-  keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>|label] [--cache]
+  keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>|label] [--cache] [--dry-run]
   keysmith batch status [name] | results <name> | cancel <name>
                                      work that can wait, at half price, on an anthropic-wire adapter; off
                                      unless "batch": { "enabled": true } is in the config (see README)
+  keysmith price list [<model>] | set <adapter/model pattern> --input N --output N --cache-read N --cache-write-5m N [--cache-write-1h N] [--batch-factor F] [--dry-run]
+                                     the price table (USD per million tokens, with the page and date it was read);
+                                     set writes one entry to the config after a dated backup, 0600; the running
+                                     gateway keeps its table until it restarts
   keysmith usage record --source S [--model M --tag T --requests N --credits C --input N --output N --ms N --accepted B --id ID | --from FILE.jsonl]
                                      log a run made outside keysmith (counted as face "external")
   keysmith discover <adapterId>      list the free models an adapter offers (needs discovery.enabled)
   keysmith config get|set|unset <key> [value] [--dry-run]
                                      top-level settings (discovery.enabled, catalogue, tunnel.*, limits.*, port …);
                                      a dated backup first, 0600; an unknown key is refused with the list
-  keysmith source enable <profile> --key-ref <Keychain service> [--model id[,id]] [--account-id id] [--as id] [--dry-run]
+  keysmith source enable <profile> --key-ref <Keychain service> [--model id[,id]] [--models-url <url>] [--account-id id] [--as id] [--dry-run]
+                                     --models-url lists models from that address instead of <baseUrl>/models; the key
+                                     goes along only to an https address with the baseUrl's own origin (else none)
                                      open a free-tier source (tokenrouter, groq, mistral, cloudflare): adapter with a Keychain
                                      key reference, out of every alias, catalogue limits, discovery on
   keysmith source disable <profile> [--as id] [--dry-run]
@@ -186,6 +193,8 @@ export async function main(argv) {
         return await cmdDiscover(flags);
       case 'config':
         return cmdConfig(flags);
+      case 'price':
+        return cmdPrice(flags);
       case 'source':
         return await cmdSource(flags);
       case 'usage':
@@ -1390,12 +1399,17 @@ async function cmdDoctor(flags) {
   } catch (e) {
     rows.push(['account key', 'unreadable', e.message]);
   }
+  try {
+    for (const m of usage.query({ by: ['model'] }).models || []) {
+      if (m.unpricedRequests > 0) rows.push([`price ${m.model}`, 'price warning', truncate(`${m.unpricedRequests} request(s) used it and the price table has no entry: tokens counted, no dollars (keysmith price set)`, 90)]);
+    }
+  } catch { /* the usage log's own row says why */ }
 
   const w = maxLen(rows, (r) => r[0].length, 8);
   for (const [id, state, detail] of rows) {
     // '!' rather than '✗': the route still answers, because the next leg in the chain picks it
     // up. What is broken is the ordering you asked for, and the money you think you are saving.
-    out(`  ${state === 'ok' ? '✓' : state === 'alias warning' || state === 'version warning' || state === 'workspace warning' ? '!' : state === 'disabled' ? '·' : '✗'} ${id.padEnd(w)}  ${state.padEnd(16)} ${detail}`);
+    out(`  ${state === 'ok' ? '✓' : state === 'alias warning' || state === 'price warning' || state === 'version warning' || state === 'workspace warning' ? '!' : state === 'disabled' ? '·' : '✗'} ${id.padEnd(w)}  ${state.padEnd(16)} ${detail}`);
   }
 
   // Failover: which legs carry a tool request (one that cannot is passed by; a route with none
@@ -1509,11 +1523,12 @@ async function cmdBatch(flags) {
   if (!batchEnabled(cfg)) fail('batch is off (set "batch": { "enabled": true } in the config)');
   try {
     if (sub === 'submit') {
-      if (!arg || !flags.adapter || !flags.name) fail('usage: keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>] [--cache]');
+      if (!arg || !flags.adapter || !flags.name) fail('usage: keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>] [--cache] [--dry-run]');
       const job = await batchSubmit(cfg, {
         name: String(flags.name), file: expand(String(arg)), adapterId: String(flags.adapter),
-        capUsd: Number(flags['cap-usd']), keyRef: flags.key, cache: flags.cache === true || flags.cache === 'true',
+        capUsd: Number(flags['cap-usd']), keyRef: flags.key, cache: flags.cache === true || flags.cache === 'true', dryRun: !!flags.dryRun,
       });
+      if (job.dryRun) return out(`dry run: ${job.name} (${job.requests} requests); estimate ${fmtUsd(job.estimateUsd)} of cap ${fmtUsd(job.capUsd)} (nothing was sent, nothing saved)`);
       return out(`submitted ${job.name} (${job.requests} requests, ${job.status}); estimate ${fmtUsd(job.estimateUsd)} of cap ${fmtUsd(job.capUsd)}`);
     }
     if (sub === 'status') {
@@ -1553,6 +1568,25 @@ function cmdConfig(flags) {
   if (res.changed) {
     out(`backup ${rel(res.backup)}`);
     noteRestart(key);
+  }
+}
+
+function cmdPrice(flags) {
+  const [op, ...rest] = flags._;
+  if (op === 'list') {
+    const cfg = configExists() ? loadConfig({ mint: false }) : { pricing: {} };
+    for (const l of priceList(cfg.pricing, rest[0])) out(l);
+    return;
+  }
+  if (op !== 'set' || rest.length !== 1) fail(helpFor('price'));
+  if (!configExists()) fail(`no config at ${rel(configPath())} — run \`keysmith init\``);
+  let res;
+  try { res = priceSet(configPath(), rest[0], flags, { write: !flags.dryRun }); } catch (e) { fail(e.message); }
+  for (const l of res.lines) out(l);
+  if (flags.dryRun) out('(dry run: nothing written)');
+  if (res.changed) {
+    out(`backup ${rel(res.backup)}`);
+    noteRestart('the new price');
   }
 }
 
@@ -1621,7 +1655,9 @@ function discoveryPriceTableUrl(raw, opts) {
  * is not today drops out. A table that cannot be read empties the list (the safe direction).
  */
 async function discoverFromPriceTable(id, priceUrl) {
-  const u = new URL(priceUrl);
+  let u;
+  try { u = new URL(priceUrl); } catch { fail(`${id}: the price table address is not a URL (discovery.${id}.pricingUrl): no list written`); }
+  if (u.protocol !== 'https:') fail(`${id}: the price table address must be https, not ${u.protocol.replace(':', '')} (discovery.${id}.pricingUrl): no list written`);
   const source = `${u.host}${u.pathname}`;
   const file = discoveredPath(dataDir(), id);
   let ids = [];

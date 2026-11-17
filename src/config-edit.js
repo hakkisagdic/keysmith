@@ -37,12 +37,13 @@ export const SCHEMA = {
   'batch.enabled': T.bool,
 };
 const DISCOVERY_LEAF = /^discovery\.([A-Za-z0-9_-]+)\.(inputPricePath|outputPricePath|pricingUrl)$/;
+const HTTPS_STR = { type: 'string', https: true };
 const SECRETISH = /(^|\.)(keys?|apiKey|token|secret|password)$/i;
 
 export function schemaFor(key) {
   if (Object.hasOwn(SCHEMA, key)) return SCHEMA[key];
   const m = DISCOVERY_LEAF.exec(key);
-  if (m && !['__proto__', 'prototype', 'constructor', 'enabled'].includes(m[1])) return T.str;
+  if (m && !['__proto__', 'prototype', 'constructor', 'enabled'].includes(m[1])) return m[2] === 'pricingUrl' ? HTTPS_STR : T.str;
   return null;
 }
 
@@ -70,6 +71,11 @@ export function parseValue(key, schema, raw) {
     return n;
   }
   if (!s.trim()) throw new Error(`${key} takes a non-empty string${schema.nullable ? ' (or null)' : ''}`);
+  if (schema.https) {
+    let u;
+    try { u = new URL(s); } catch { throw new Error(`${key} takes an https address, and "${s.slice(0, 60)}" is not a URL`); }
+    if (u.protocol !== 'https:') throw new Error(`${key} must be https (a price table is read from it), not ${u.protocol.replace(':', '')}`);
+  }
   return s;
 }
 

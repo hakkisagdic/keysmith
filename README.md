@@ -1008,7 +1008,7 @@ keysmith batch cancel eval-1
 - Before anything is sent, keysmith estimates the most the batch can cost (every input token at the batch rate, every request answering with its full `max_tokens`, characters / 3.5 as tokens, rounded up) and refuses when it is above `--cap-usd`. A model with no entry in `pricing` is refused too: a cap cannot be checked without a price.
 - `--key` applies that key's allow/deny list and daily cap (`perDay`) to the batch, as a live request would. Without `--key` the owner of the config submits, unscoped.
 - A job name sends once: the job file under the data dir (`batch/<name>.json`) is created before the request goes out, so a second `submit` of the name sends nothing.
-- Cost: every result is billed at 50% of the live price (a 1-hour cache write at 2x the base input rate, halved); `usage.jsonl` gets one row per request with `batch: true`, and `batch results` prints the real total beside the estimate. Requests that errored, expired or were canceled are not billed and get a zero row. Whether promotional credit pays for batches is not in Anthropic's documentation: the first small job shows it on the Console.
+- Cost: every result is billed at the entry's `batchFactor` (0.5 unless set) of the live price (a 1-hour cache write at the entry's `cacheWrite1h`, 2x the base input rate without one); `usage.jsonl` gets one row per request with `batch: true`, and `batch results` prints the real total beside the estimate. Requests that errored, expired or were canceled are not billed and get a zero row. Whether promotional credit pays for batches is not in Anthropic's documentation: the first small job shows it on the Console.
 - `--cache` puts one 1-hour `cache_control` mark on the system prompt when it is long enough to be cached (512 tokens for the 5.x models, up to 4,096 for others) and nothing carries a mark yet. Cache hits inside a batch are best-effort.
 - Anthropic keeps batch data for 29 days and zero data retention does not apply: send nothing secret or personal.
 
@@ -1056,7 +1056,8 @@ records:
     with `listUsd` holding what those tokens would cost at the list rate `pricing` names for that
     model, when it names one;
   - `"unpriced"` with `usd: null` and `reason` when the row's token counts are unknown (`usage: null`
-    with `usageReason`), or `usd: 0` when no price entry matches.
+    with `usageReason`), or `usd: 0` when no price entry matches (`keysmith usage` prints such a
+    row as `unpriced`, with its tokens, not as $0.00).
 
 **One file per UTC calendar month.** The active month is always written to
 `~/.local/share/keysmith/usage.jsonl`, so `tail -F ~/.local/share/keysmith/usage.jsonl` keeps
@@ -1066,15 +1067,37 @@ fresh `usage.jsonl` starts the new month (and an entry dated in an older month g
 its `usage.jsonl.YYYY-MM`). Nothing is ever deleted.
 
 **Price table (`pricing`).** Keyed by `adapter/model` glob in `config.json`, in USD per million
-tokens for `input`, `output`, `cacheRead` and `cacheWrite`. keysmith ships defaults for the
-Anthropic models (Anthropic's pricing page, read 2026-10-20; cache writes at the 5-minute TTL
-price):
+tokens for `input`, `output`, `cacheRead`, `cacheWrite` (5-minute) and, optionally, `cacheWrite1h`
+(1-hour; 2x `input` when absent) and `batchFactor` (the Batch API's share of the price; 0.5 when
+absent). keysmith ships defaults for all 15 Claude models `keysmith models` lists, read from
+Anthropic's official pricing page, https://platform.claude.com/docs/en/about-claude/pricing, on
+2026-11-17 (the batch discount is 50% on every model there). `keysmith price list` prints the table with
+that page and date beside each entry.
 
-| Glob | `input` | `output` | `cacheRead` | `cacheWrite` | Notes |
-|---|---:|---:|---:|---:|---|
-| `*/claude-opus-5-5*` | `$4.00` | `$20.00` | `$0.20` | `$5.00` | per 1M tokens |
-| `*/claude-sonnet-5-5*` | `$2.00` | `$10.00` | `$0.10` | `$2.50` | per 1M tokens |
-| `*/claude-haiku-5-5*` | `$0.10` | `$0.50` | `$0.01` | `$0.125` | Anthropic's rate for prompts up to 100K tokens (an approximation: each row is priced from its token totals without tiered prompt-length breakpoints) |
+| Glob | `input` | `output` | `cacheRead` | `cacheWrite` 5m | `cacheWrite1h` |
+|---|---:|---:|---:|---:|---:|
+| `*/claude-fable-5-2*` | `$8` | `$40` | `$0.2` | `$10` | `$16` |
+| `*/claude-fable-5-1*` | `$10` | `$50` | `$0.25` | `$12.5` | `$20` |
+| `*/claude-fable-5*` | `$10` | `$50` | `$1` | `$12.5` | `$20` |
+| `*/claude-opus-5-5*` | `$4` | `$20` | `$0.2` | `$5` | `$8` |
+| `*/claude-opus-5*, 4-8, 4-7, 4-6, 4-5` | `$5` | `$25` | `$0.5` | `$6.25` | `$10` |
+| `*/claude-sonnet-5-5*` | `$2` | `$10` | `$0.1` | `$2.5` | `$4` |
+| `*/claude-sonnet-5*` | `$2` | `$10` | `$0.2` | `$2.5` | `$4` |
+| `*/claude-sonnet-4-6*, 4-5` | `$3` | `$15` | `$0.3` | `$3.75` | `$6` |
+| `*/claude-haiku-5-5*` | `$0.1` | `$0.5` | `$0.01` | `$0.125` | `$0.2` |
+| `*/claude-haiku-4-5*` | `$1` | `$5` | `$0.1` | `$1.25` | `$2` |
+
+`claude-haiku-5-5` is priced by prompt length on that page: the rates above are for prompts up to
+100K tokens; a request over 100K pays 5x on input and output, which one rate cannot tell apart.
+A model with no entry is shown as `unpriced` in `keysmith usage` (tokens counted, no dollars, not
+a $0.00) and `keysmith doctor` names it. Add an entry with `keysmith price set`:
+
+```bash
+keysmith price set '*/claude-haiku-4-5*' --input 1 --output 5 --cache-read 0.1 --cache-write-5m 1.25 [--cache-write-1h 2] [--batch-factor 0.5] [--dry-run]
+```
+
+It validates every number (0 or more, a plain decimal), copies the config to a dated backup,
+writes through a temp file and a rename, mode 0600. The running gateway keeps its table until it restarts.
 
 A config entry overrides any default that matches the same target; a price never comes from the
 client:
@@ -1247,6 +1270,7 @@ asks the adapter's `GET <baseUrl>/models` and writes the models whose input and 
 are both `0` to `<data>/discovered/tokenrouter.json`. The price fields default to
 `pricing.prompt` and `pricing.completion`; change them per adapter with
 `"discovery": { "tokenrouter": { "inputPricePath": "...", "outputPricePath": "..." } }`.
+A `pricingUrl` (a price table read instead of `/models`) must be https: an http or unreadable address is refused with one line and no list is written.
 With discovery off the command refuses; a `401` or `403` prints `renew key: <adapter>`.
 `keysmith set tokenrouter freeOnly true` then refuses any model not on that list (`400`); the
 file is re-read when it changes, so a new `discover` takes effect without a restart.
@@ -1369,6 +1393,10 @@ tools.
 | `traycer` | http | verified live against `https://server.traycer.ai` (`wire: "traycer"`): discovers 32 models across `anthropic`, `openai`, `xai`, `meta` and `openrouter` from `GET /api/traycer/models`, routes each to its native `/inference/…` endpoint with `x-traycer-account-context: PERSONAL`, answers tool requests via `EMULATE`, takes images and PDFs; explicit-only |
 | `harnessrouter` | http | UHP (`2026-10-19`) relay to HarnessRouter CE (`http://127.0.0.1:8000/api/harness/v1`) or Cloud (`https://api.harnessrouter.ai/v1`); native `/v1/responses` tools with automatic `EMULATE` fallback |
 | `traycer-cli`, `droid`, `devin`, `copilot-cli`, `cursor`, `amp`, `reasonix` | cli | Traycer & packaged CLI harness profiles (`traycer --json agent send --expect-reply`, Factory `droid exec`, `devin -p`, GitHub `copilot -p`, `cursor-agent -p`, Sourcegraph `amp -x`, `reasonix -p`); parsed via `harness-json`; `unsafeTools` (ship disabled) |
+
+`keysmith source enable <profile> --models-url <url>` lists models from that address instead of
+`<baseUrl>/models`; the key is sent only to an https address with the baseUrl's own origin (scheme,
+host, port), to nothing else.
 
 `keysmith adapters` lists them; `keysmith add <profile>` copies one into your config
 where every field stays yours. Adding an agent nobody has heard of is a config edit:

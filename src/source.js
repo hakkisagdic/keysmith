@@ -66,12 +66,27 @@ export function pickDefaultModel(ids) {
   return chat[0] ?? ids.find((id) => typeof id === 'string' && id) ?? null;
 }
 
+/**
+ * The request that lists a provider's models. The key goes along only when the address is https
+ * and has the origin (scheme, host, port) of the source's own baseUrl: `--models-url` must never
+ * carry the key to another host, or over plain http.
+ */
+export function modelsRequest(baseUrl, key, override) {
+  const url = override || baseUrl.replace(/\/+$/, '') + '/models';
+  let sameOrigin = false;
+  try {
+    const u = new URL(url);
+    sameOrigin = u.protocol === 'https:' && u.origin === new URL(baseUrl).origin;
+  } catch { /* an unreadable address gets no key */ }
+  return { url, headers: { accept: 'application/json', ...(key && sameOrigin ? { authorization: `Bearer ${key}` } : {}) } };
+}
+
 /** The provider's model ids, or null when there is no key to ask with or the answer is unusable. */
 async function providerModels(baseUrl, key, override) {
   if (!key && !override) return null;
-  const url = override || baseUrl.replace(/\/+$/, '') + '/models';
   try {
-    const res = await fetch(url, { headers: { accept: 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) }, signal: AbortSignal.timeout(15000) });
+    const { url, headers } = modelsRequest(baseUrl, key, override);
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
     if (!res.ok) return null;
     const body = await res.json();
     const arr = Array.isArray(body) ? body : (Array.isArray(body?.data) ? body.data : null);

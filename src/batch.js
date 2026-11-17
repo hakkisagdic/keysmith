@@ -23,7 +23,7 @@ import { dataDir } from './config.js';
 import { HttpAdapter } from './http-adapter.js';
 import { prepareAdapter } from './gateway.js';
 import { parseKeys, requestDecision } from './keys.js';
-import { matchPrice, roundUsd, fmtUsd, UsageLog } from './usage.js';
+import { matchPrice, batchFactorOf, cacheWrite1hRate, roundUsd, fmtUsd, UsageLog } from './usage.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 
 export const MAX_REQUESTS = 100_000;
@@ -134,13 +134,15 @@ export function withCache(req) {
 
 export function halfRates(rates) {
   const out = {};
-  for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) out[k] = (Number(rates[k]) || 0) * BATCH_FACTOR;
+  const f = batchFactorOf(rates);
+  for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) out[k] = (Number(rates[k]) || 0) * f;
+  out.cacheWrite1h = cacheWrite1hRate(rates) * f;
   return out;
 }
 
 /**
  * The most a batch can cost, before it is sent: every input token at the batch input rate
- * (a cached system prompt at the 1-hour write rate, 2x), every request answering with its
+ * (a cached system prompt at the 1-hour write rate), every request answering with its
  * full max_tokens. Cache reads would only lower it.
  */
 export function estimateUsd(requests, pricing, adapter, cachedTokens = new Map()) {
@@ -155,12 +157,12 @@ export function estimateUsd(requests, pricing, adapter, cachedTokens = new Map()
     // covers: every input token of that request is counted at the highest write rate.
     const ownMark = !cachedTokens.has(r.custom_id) && hasCacheControl(p);
     const cached = ownMark ? total : Math.min(total, cachedTokens.get(r.custom_id) || 0);
-    usd += ((total - cached) * half.input + cached * half.input * 2 + p.max_tokens * half.output) / 1_000_000;
+    usd += ((total - cached) * half.input + cached * half.cacheWrite1h + p.max_tokens * half.output) / 1_000_000;
   }
   return roundUsd(usd);
 }
 
-/** Cost of one succeeded result at half the live price, 1-hour cache writes at 2x the input rate. */
+/** Cost of one succeeded result at half the live price, 1-hour cache writes at the table's 1-hour rate (2x input without one). */
 export function resultUsd(usage, rates) {
   const u = usage || {};
   const half = halfRates(rates);
@@ -170,7 +172,7 @@ export function resultUsd(usage, rates) {
   const write5m = write - write1h;
   const input = Number(u.input_tokens) || 0;
   const usd =
-    (input * half.input + (Number(u.output_tokens) || 0) * half.output + cacheRead * half.cacheRead + write5m * half.cacheWrite + write1h * half.input * 2) /
+    (input * half.input + (Number(u.output_tokens) || 0) * half.output + cacheRead * half.cacheRead + write5m * half.cacheWrite + write1h * half.cacheWrite1h) /
     1_000_000;
   return roundUsd(usd);
 }
@@ -230,7 +232,7 @@ async function call(adapter, method, suffix, body) {
 }
 
 /** Check everything and, if it all holds, send. Nothing leaves this process before the last check. */
-export async function submit(cfg, { name, file, adapterId, capUsd, keyRef = null, cache = false }) {
+export async function submit(cfg, { name, file, adapterId, capUsd, keyRef = null, cache = false, dryRun = false }) {
   if (!batchEnabled(cfg)) throw new BatchError('batch is off (set batch.enabled to true in the config)');
   if (!safeName(name)) throw new BatchError(`"${name}" is not a job name (letters, digits, . _ -; at most 64)`);
   if (!Number.isFinite(capUsd) || capUsd <= 0) throw new BatchError('--cap-usd is required and must be above 0');
@@ -266,6 +268,7 @@ export async function submit(cfg, { name, file, adapterId, capUsd, keyRef = null
     requests: requests.length, models: [...new Set(requests.map((r) => r.params.model))], cache: !!cache,
     estimateUsd: estimate, capUsd, status: 'submitting', createdAt: new Date().toISOString(), id: null,
   };
+  if (dryRun) return { ...job, status: 'dry-run', dryRun: true };
   // The file is created first and exclusively: a name sends once, however many times it is asked.
   try { saveJob(job, { exclusive: true }); } catch (e) {
     if (e.code === 'EEXIST') throw new BatchError(`job "${name}" exists already (nothing was sent): pick another name`);
