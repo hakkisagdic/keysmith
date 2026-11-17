@@ -171,6 +171,15 @@ export class Gateway {
     const logger = log ? (m) => log(redactSecrets(m)) : this.log;
     const warnings = [];
     for (const adapter of this.publicAdapters) {
+      // `promptCache` on a wire that cannot carry `cache_control`: nothing is cached, say so.
+      if (adapter.promptCache && adapter.wire && adapter.wire !== 'anthropic') {
+        const line = `adapter "${adapter.id}": promptCache is on but its wire is ${adapter.wire}; only the anthropic wire carries cache_control, so nothing is cached (set wire "anthropic")`;
+        warnings.push(line);
+        if (!adapter._cacheWireWarned) {
+          adapter._cacheWireWarned = true;
+          logger(line);
+        }
+      }
       if (adapter.kind !== 'cli' || typeof adapter.probe !== 'function') continue;
       const res = await adapter.probe();
       if (res.workspaceWarning) {
@@ -1903,6 +1912,7 @@ function mergeUsage(a, b) {
     output: Math.max(a.output || 0, b.output || 0),
     cacheRead: Math.max(a.cacheRead || 0, b.cacheRead || 0),
     cacheWrite: Math.max(a.cacheWrite || 0, b.cacheWrite || 0),
+    ...(a.cacheWrite1h || b.cacheWrite1h ? { cacheWrite1h: Math.max(a.cacheWrite1h || 0, b.cacheWrite1h || 0) } : {}),
     ...(a.reasoning || b.reasoning ? { reasoning: Math.max(a.reasoning || 0, b.reasoning || 0) } : {}),
     ...(a.total || b.total ? { total: Math.max(a.total || 0, b.total || 0) } : {}),
   };

@@ -26,6 +26,7 @@ import { DailyQuota, overCapMessage } from './quota.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
+import { cachePlanScope } from './prompt-cache.js';
 
 export function isLoopbackHost(host) {
   if (!host) return true;
@@ -184,7 +185,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   // every 10 s for as long as somebody keeps sending the request, and Node's own crash
   // report prints the error's fields — a bad URL's among them — unredacted.
   const server = http.createServer((req, res) => {
-    handle(req, res).catch((e) => {
+    cachePlanScope.run({}, () => handle(req, res)).catch((e) => {
       log(`request crashed: ${e?.stack || e}`);
       try {
         if (!res.headersSent) json(res, 500, errorBody('internal error', 'internal_error', 500));
@@ -1808,11 +1809,13 @@ function extractRelayedUsage(rawText) {
             (Number(raw.input_tokens ?? raw.input ?? 0) || 0) +
               (raw.cache_read_input_tokens != null || raw.cache_creation_input_tokens != null ? cacheRead + cacheWrite : 0),
           );
+    const w1h = raw.cache_creation?.ephemeral_1h_input_tokens;
     u = mergeUsage(u, {
       input: rawInput,
       output: raw.completion_tokens ?? raw.output_tokens ?? raw.output ?? 0,
       cacheRead,
       cacheWrite,
+      ...(typeof w1h === 'number' && Number.isFinite(w1h) && w1h > 0 ? { cacheWrite1h: w1h } : {}),
     });
   };
   const trimmed = rawText.trim();
@@ -2037,6 +2040,7 @@ function mergeUsage(a, b) {
     output: Math.max(a.output || 0, b.output || 0),
     cacheRead: Math.max(a.cacheRead || 0, b.cacheRead || 0),
     cacheWrite: Math.max(a.cacheWrite || 0, b.cacheWrite || 0),
+    ...(a.cacheWrite1h || b.cacheWrite1h ? { cacheWrite1h: Math.max(a.cacheWrite1h || 0, b.cacheWrite1h || 0) } : {}),
     ...(a.reasoning || b.reasoning ? { reasoning: Math.max(a.reasoning || 0, b.reasoning || 0) } : {}),
     ...(a.total || b.total ? { total: Math.max(a.total || 0, b.total || 0) } : {}),
   };
@@ -2097,9 +2101,11 @@ function stamp(entry, { who, req, res, route, gateway, cfg } = {}) {
 
   const catInfo = gateway?.catalogue && adapter ? (gateway.catalogue.info(adapter, upstreamModel) || gateway.catalogue.info(adapter, rest.model)) : null;
   const legSkips = res?._keysmith?.legSkips;
+  const plan = cachePlanScope.getStore()?.plan;
   const base = {
     ...rest,
     ...virtualFields,
+    ...(plan && rest.cachePlan === undefined ? { cachePlan: plan } : {}),
     ...(legSkips?.length ? { skippedLegs: legSkips.map((x) => ({ ...x })) } : {}),
     adapter,
     kind,

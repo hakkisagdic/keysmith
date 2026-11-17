@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Gateway } from '../src/gateway.js';
 import { createServer } from '../src/server.js';
-import { UsageLog } from '../src/usage.js';
+import { UsageLog, tokensToUsd } from '../src/usage.js';
 import { anthropicBetas, pickMessagesRelayFields } from '../src/http-adapter.js';
 
 const KEY = 'ks_' + crypto.randomBytes(24).toString('base64url');
@@ -69,12 +69,16 @@ function stub(req, res) {
       });
       return;
     }
+    const h1 = body.metadata?.user_id === 'h1';
+    const CC = { cache_creation: { ephemeral_5m_input_tokens: 100, ephemeral_1h_input_tokens: 400 } };
     if (body.stream) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'request-id': 'req_stub_1' });
-      return res.end(SSE);
+      return res.end(h1 ? SSE.replace('"cache_creation_input_tokens":2', '"cache_creation_input_tokens":500,"cache_creation":' + JSON.stringify(CC.cache_creation)) : SSE);
     }
     res.writeHead(200, { 'content-type': 'application/json', 'request-id': 'req_stub_1' });
-    res.end(JSON.stringify(MESSAGE(body.model)));
+    const m = MESSAGE(body.model);
+    if (h1) m.usage = { ...m.usage, cache_creation_input_tokens: 500, ...CC };
+    res.end(JSON.stringify(m));
   });
 }
 
@@ -260,4 +264,18 @@ test('a client that leaves mid-answer (Claude Code\'s Esc) stops the upstream\'s
   assert.ok(dripClosed && dripClosed - left < 1_500, 'the upstream request was closed soon after the client left');
   for (let i = 0; i < 40 && lastRow()?.error !== 'client disconnected'; i++) await new Promise((r) => setTimeout(r, 50));
   assert.deepEqual([lastRow().status, lastRow().error], ['error', 'client disconnected']);
+});
+
+test('/v1/messages relay: a 1h cache write reaches the row as cacheWrite1h and is priced at 2x input, streamed or not', async () => {
+  const rates = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 };
+  for (const stream of [false, true]) {
+    const r = await post({ model: 'claude/sonnet', max_tokens: 256, stream, tools: TOOLS, metadata: { user_id: 'h1' }, messages: [{ role: 'user', content: 'read /x' }] });
+    assert.equal(r.status, 200, r.text);
+    const row = lastRow();
+    assert.equal(row.usage.cacheWrite, 500);
+    assert.equal(row.usage.cacheWrite1h, 400, `stream=${stream}`);
+    const uncached = row.usage.input - row.usage.cacheRead - row.usage.cacheWrite;
+    const want = (uncached * 3 + row.usage.output * 15 + row.usage.cacheRead * 0.3 + 100 * 3.75 + 400 * 6) / 1e6;
+    assert.ok(Math.abs(tokensToUsd(row.usage, rates) - want) < 1e-9);
+  }
 });

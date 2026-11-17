@@ -547,7 +547,7 @@ function showValue(field, v) {
 /** Fields worth knowing about that an entry may not have yet, by kind (docs/adapters.md has them all). */
 const SETTABLE = {
   cli: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'models', 'defaultModel', 'toolMode', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'stopAtToolCall', 'workspaceFilesCustom', 'allowUnverifiedVersion', 'stripSystemPrompt', 'systemFlag', 'promptVia', 'env'],
-  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'streamUsage', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
+  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'streamUsage', 'promptCache', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
 };
 
 /**
@@ -850,6 +850,9 @@ function cmdAdapters() {
     const state = a.kind === 'cli' ? (which(a.bin || id) ? 'binary ok' : `MISSING ${a.bin || id}`) : `key ${maskRef(a.apiKey)}`;
     const marks = `${a.disabled ? ' · disabled' : ''}${a.unsafeTools ? ' · unsafeTools' : a.explicitOnly ? ' · explicit-only' : ''}${a.toolMode && a.toolMode !== 'off' ? ` · toolMode ${a.toolMode}` : ''}`;
     lines.push(`  ${id.padEnd(14)} ${String(a.kind).padEnd(5)} ${a.wire || a.parser || ''}  ${state}${marks}`);
+    if (a.kind === 'http' && a.promptCache && a.promptCache.mode && a.promptCache.mode !== 'off' && (a.wire || 'openai') !== 'anthropic') {
+      lines.push(`  ! ${id}: promptCache is on but its wire is ${a.wire || 'openai'}; only the anthropic wire carries cache_control, so nothing is cached`);
+    }
   }
   lines.push('');
   lines.push('profiles:');

@@ -1060,3 +1060,18 @@ Every virtual model entry is validated at config load time:
 keysmith route explain auto/text "Explain the difference between TCP and UDP"
 keysmith route explain auto/text "Design a lock-free ring buffer" --json
 ```
+
+## Prompt caching (`promptCache`)
+
+On an adapter whose wire is `anthropic`, `"promptCache": { "mode": "on", "ttl": "5m" }` makes keysmith put
+`cache_control` on at most three places of a request that carries none of its own: the last tool, the last
+system block, and the last block before the final turn. Text and order are never changed; a request that
+already has a `cache_control` anywhere passes as it is. `mode`: `off` (default), `dry-run` (the body is
+untouched, the plan is counted), `on`. `ttl`: `5m` (the field is left out) or `1h` (2x input price on the
+write; pays back from the second read). `minTokens`: a prefix estimated shorter than this (taken from the model table in
+`src/prompt-cache.js`, source and read date beside it; a model not in the table gets the largest minimum, and
+`minTokens` overrides the table; about four characters a token) gets no mark.
+
+An adapter on the `openai` wire (the OpenAI-compatible endpoint of Anthropic included) cannot carry
+`cache_control`: keysmith warns on start and adds nothing. Switch its wire to `anthropic` to cache.
+`keysmith usage` shows the share of input read from the cache and the saving at list price.
