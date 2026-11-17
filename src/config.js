@@ -4,6 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fingerprint, redactKey, registerSecrets } from './redact.js';
+import { CLAUDE_PRICING } from './prices.js';
 import { checkVirtualModel, validateVirtualModels } from './virtual-models.js';
 
 export { checkVirtualModel, validateVirtualModels };
@@ -151,11 +152,7 @@ export const DEFAULTS = {
   auth: { enabled: true, keys: [] },
   log: { usage: true, body: false },
   limits: { maxConcurrent: 32, timeoutMs: 300_000, spend: {} },
-  pricing: {
-    '*/claude-opus-5-5*': { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
-    '*/claude-sonnet-5-5*': { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
-    '*/claude-haiku-5-5*': { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
-  },
+  pricing: structuredClone(CLAUDE_PRICING),
   tunnel: { provider: 'cloudflared', name: null, hostname: null, configFile: null },
   adapters: {},
   aliases: {},

@@ -282,7 +282,7 @@ test('K4: enable with no --model picks from the provider list; --model wins; a m
   assert.equal(r.status, 0, r.err);
   assert.deepEqual(s.cfg().adapters.groq.models, ['llama-3.1-8b-instant']);
   assert.match(r.out, /chose llama-3.1-8b-instant/);
-  assert.equal(hits[0], 'Bearer fake-key-value');
+  assert.equal(hits[0], undefined, 'an http --models-url, and another origin than the profile\'s baseUrl, gets no key');
   assert.ok(!r.out.includes('fake-key-value') && !fs.readFileSync(s.config, 'utf8').includes('fake-key-value'));
 
   const s2 = setup(t);

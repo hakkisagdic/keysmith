@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { httpsServer, selfSigned } from './tls-helper.js';
 
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const SECRET = 'sk-discover-secret-0123456789abcdef';
@@ -88,11 +89,10 @@ const row = (name, o = {}) => ({ model_name: name, quota_type: 0, model_price: 0
 
 async function priceSetup(t, body) {
   const state = { body, status: 200 };
-  const srv = http.createServer((req, res) => {
+  const srv = await httpsServer((req, res) => {
     res.writeHead(state.status, { 'content-type': 'application/json' });
     res.end(JSON.stringify(state.body));
   });
-  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   t.after(() => srv.close());
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-disc-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -100,10 +100,10 @@ async function priceSetup(t, body) {
   fs.writeFileSync(config, JSON.stringify({
     host: '127.0.0.1', port: 0, auth: { enabled: false, keys: [] }, aliases: {},
     adapters: { tr: { type: 'http', baseUrl: 'http://127.0.0.1:1/v1', apiKey: SECRET, freeOnly: true } },
-    discovery: { enabled: true, tr: { pricingUrl: `http://127.0.0.1:${srv.address().port}/api/pricing` } },
+    discovery: { enabled: true, tr: { pricingUrl: `https://127.0.0.1:${srv.address().port}/api/pricing` } },
   }), { mode: 0o600 });
   const data = path.join(home, 'data');
-  const env = { ...process.env, HOME: home, KEYSMITH_CONFIG: config, KEYSMITH_DATA: data };
+  const env = { ...process.env, HOME: home, KEYSMITH_CONFIG: config, KEYSMITH_DATA: data, NODE_EXTRA_CA_CERTS: selfSigned().file };
   const run = () => new Promise((resolve) => {
     const p = spawn(process.execPath, [CLI, 'discover', 'tr'], { env });
     let all = '';

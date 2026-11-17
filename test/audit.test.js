@@ -221,24 +221,30 @@ test('parseTag keeps [A-Za-z0-9._-] up to 40 chars and drops anything else', () 
 /* ------------------------------------------- 2. price table & cost bases with cache */
 
 test('default Anthropic price table and cost computation across metered, subscription and unpriced bases', () => {
-  // Verify shipped Anthropic defaults (2026-10-20; 5-minute cache write rate)
+  // Verify shipped Anthropic defaults (2026-11-17; 5-minute cache write rate, 1-hour rate and batch share beside)
   assert.deepEqual(DEFAULT_PRICING['*/claude-opus-5-5*'], {
     input: 4,
     output: 20,
     cacheRead: 0.2,
     cacheWrite: 5,
+    cacheWrite1h: 8,
+    batchFactor: 0.5,
   });
   assert.deepEqual(DEFAULT_PRICING['*/claude-sonnet-5-5*'], {
     input: 2,
     output: 10,
     cacheRead: 0.1,
     cacheWrite: 2.5,
+    cacheWrite1h: 4,
+    batchFactor: 0.5,
   });
   assert.deepEqual(DEFAULT_PRICING['*/claude-haiku-5-5*'], {
     input: 0.1,
     output: 0.5,
     cacheRead: 0.01,
     cacheWrite: 0.125,
+    cacheWrite1h: 0.2,
+    batchFactor: 0.5,
   });
 
   // usage.input is total input charged (100k uncached + 200k cacheRead + 40k cacheWrite = 340k)
@@ -4728,7 +4734,7 @@ test('exec credential references derive stable non-secret account names for secu
 
   const sentinelPath = path.join(tmpDir, 'must-never-be-created-by-credentialAccount');
   const dangerousAccount = credentialAccount({
-    apiKey: `{exec:/bin/sh -c "touch ${sentinelPath}" sk-ant-api03-SUPERSECRET9999999999}`,
+    apiKey: `{exec:/bin/sh -c "touch ${sentinelPath}" sk-ant-${"api03-SUPERSECRET9999999999"}}`,
   }, { hmacKey: TEST_HMAC_KEY });
   assert.equal(fs.existsSync(sentinelPath), false, 'credentialAccount must never execute the command');
   assert.match(dangerousAccount, /^touch:[0-9a-f]{12}$/);

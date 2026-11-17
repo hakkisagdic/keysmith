@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { httpsServer, selfSigned } from './tls-helper.js';
 
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -68,8 +69,13 @@ const TABLE = (over = {}) => ({
 test('K2+K3: discover builds the free list from the price table, with source and time; a repriced model drops out; unreadable empties', async (t) => {
   let table = TABLE();
   let status = 200;
-  const port = await serve(t, (q, r) => (q.url === '/api/pricing' ? json(r, table, status) : json(r, {}, 404)));
-  const { arun, home } = env0(t, { port: 8787, auth: { enabled: false, keys: [] }, aliases: {}, discovery: { enabled: true, tokenrouter: { pricingUrl: `http://127.0.0.1:${port}/api/pricing` } },
+  const srv = await httpsServer((q, r) => (q.url === '/api/pricing' ? json(r, table, status) : json(r, {}, 404)));
+  t.after(() => srv.close());
+  const port = srv.address().port;
+  const prevCa = process.env.NODE_EXTRA_CA_CERTS;
+  process.env.NODE_EXTRA_CA_CERTS = selfSigned().file; // env0 copies the environment for its children
+  t.after(() => { if (prevCa === undefined) delete process.env.NODE_EXTRA_CA_CERTS; else process.env.NODE_EXTRA_CA_CERTS = prevCa; });
+  const { arun, home } = env0(t, { port: 8787, auth: { enabled: false, keys: [] }, aliases: {}, discovery: { enabled: true, tokenrouter: { pricingUrl: `https://127.0.0.1:${port}/api/pricing` } },
     adapters: { tokenrouter: { kind: 'http', baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: 'k', freeOnly: true } } });
   const file = path.join(home, 'data', 'discovered', 'tokenrouter.json');
   const r1 = await arun('discover', 'tokenrouter'); r1.s = r1.status; r1.o = r1.stdout + r1.stderr;
