@@ -992,6 +992,35 @@ adapter added later stays out until you add it to the list:
 keysmith key add ada --allow agy,alias:argon --out ~/.config/ada/keysmith.key
 ```
 
+## Batch jobs: work that can wait, at half the price
+
+Off unless the config says `"batch": { "enabled": true }`; a gateway that is already running is not touched by any of this (it is a CLI command, nothing is served).
+
+```
+keysmith batch submit jobs.jsonl --adapter anthropic --name eval-1 --cap-usd 5 [--key fp:<8 hex>|<label>] [--cache]
+keysmith batch status [eval-1]      # asks the upstream; a job is found again on disk after a restart
+keysmith batch results eval-1       # writes jobs.results.jsonl, one line per request, same custom_id
+keysmith batch cancel eval-1
+```
+
+- Input: one JSON object per line, `{"custom_id": "r1", "params": {"model": "...", "max_tokens": 1000, "messages": [...]}}` (the Messages request, as the Message Batches API takes it). At most 100,000 requests or 256 MB.
+- Only an adapter on the `anthropic` wire takes a batch; any other is refused with a message. Gemini batches are not built.
+- Before anything is sent, keysmith estimates the most the batch can cost (every input token at the batch rate, every request answering with its full `max_tokens`, characters / 3.5 as tokens, rounded up) and refuses when it is above `--cap-usd`. A model with no entry in `pricing` is refused too: a cap cannot be checked without a price.
+- `--key` applies that key's allow/deny list and daily cap (`perDay`) to the batch, as a live request would. Without `--key` the owner of the config submits, unscoped.
+- A job name sends once: the job file under the data dir (`batch/<name>.json`) is created before the request goes out, so a second `submit` of the name sends nothing.
+- Cost: every result is billed at 50% of the live price (a 1-hour cache write at 2x the base input rate, halved); `usage.jsonl` gets one row per request with `batch: true`, and `batch results` prints the real total beside the estimate. Requests that errored, expired or were canceled are not billed and get a zero row. Whether promotional credit pays for batches is not in Anthropic's documentation: the first small job shows it on the Console.
+- `--cache` puts one 1-hour `cache_control` mark on the system prompt when it is long enough to be cached (512 tokens for the 5.x models, up to 4,096 for others) and nothing carries a mark yet. Cache hits inside a batch are best-effort.
+- Anthropic keeps batch data for 29 days and zero data retention does not apply: send nothing secret or personal.
+
+Example, the eval harness reference run (500 requests, Sonnet 5.5, capped at 3 USD):
+
+```
+keysmith batch submit eval/reference.jsonl --adapter anthropic --name eval-ref-1 --cap-usd 3 --cache
+keysmith batch status eval-ref-1          # repeat until ended (most batches take under an hour)
+keysmith batch results eval-ref-1
+keysmith usage --by tag                   # batch/eval-ref-1 carries the real cost
+```
+
 ## Usage audit, pricing and spend caps
 
 Every request writes one JSON line to `usage.jsonl` (`0600` in a `0700` directory; every string

@@ -16,6 +16,8 @@ import * as service from './service.js';
 import { configEdit } from './config-edit.js';
 import { sourceDisable, sourceEnable, fillAccount } from './source.js';
 import { rel, truncate } from './util.js';
+import { BatchError, batchEnabled, cancel as batchCancel, describeJob, fetchResults, listJobs, loadJob, refresh as batchRefresh, submit as batchSubmit } from './batch.js';
+import { fmtUsd } from './usage.js';
 import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets, streamRedactor } from './redact.js';
 import { ensurePrivateDir, logFiles, openPrivateLog, rotatedLogFiles, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
 import { adapterReach, aliasDecision, authEnabled, describePerDay, describeScope, entryFp, hashKey, keyHashOf, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
@@ -53,6 +55,10 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith tunnel <status|setup|run> cloudflared: named tunnel first, quick as fallback
   keysmith usage [--by d1[,d2]] [--since t] [--until t] [--format table|csv|json]
                                      who spent what (by key, label, adapter, model, account, tag, day, client)
+  keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>|label] [--cache]
+  keysmith batch status [name] | results <name> | cancel <name>
+                                     work that can wait, at half price, on an anthropic-wire adapter; off
+                                     unless "batch": { "enabled": true } is in the config (see README)
   keysmith usage record --source S [--model M --tag T --requests N --credits C --input N --output N --ms N --accepted B --id ID | --from FILE.jsonl]
                                      log a run made outside keysmith (counted as face "external")
   keysmith discover <adapterId>      list the free models an adapter offers (needs discovery.enabled)
@@ -184,6 +190,8 @@ export async function main(argv) {
       case 'usage':
         if (flags._[0] === 'record') return await cmdUsageRecord(flags);
         return await cmdUsage(flags);
+      case 'batch':
+        return await cmdBatch(flags);
       case 'key':
         return await cmdKey(flags);
       case 'scrub-logs':
@@ -1487,6 +1495,46 @@ async function cmdTunnel(flags) {
     return;
   }
   fail(`unknown tunnel command "${sub}" — status | setup <hostname> [--yes] | run`);
+}
+
+/* ------------------------------------------------------------------------- batch */
+
+async function cmdBatch(flags) {
+  const [sub, arg] = flags._;
+  const cfg = loadOrFail({ mint: false });
+  if (!batchEnabled(cfg)) fail('batch is off (set "batch": { "enabled": true } in the config)');
+  try {
+    if (sub === 'submit') {
+      if (!arg || !flags.adapter || !flags.name) fail('usage: keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>] [--cache]');
+      const job = await batchSubmit(cfg, {
+        name: String(flags.name), file: expand(String(arg)), adapterId: String(flags.adapter),
+        capUsd: Number(flags['cap-usd']), keyRef: flags.key, cache: flags.cache === true || flags.cache === 'true',
+      });
+      return out(`submitted ${job.name} (${job.requests} requests, ${job.status}); estimate ${fmtUsd(job.estimateUsd)} of cap ${fmtUsd(job.capUsd)}`);
+    }
+    if (sub === 'status') {
+      const jobs = arg ? [loadJob(arg)] : listJobs();
+      if (!jobs.length) return out('no batch jobs');
+      for (const j of jobs) {
+        try { await batchRefresh(cfg, j); } catch (e) { warn(`${j.name}: ${e.message}`); }
+        out(describeJob(j));
+      }
+      return;
+    }
+    if (sub === 'results') {
+      if (!arg) fail('usage: keysmith batch results <name>');
+      const r = await fetchResults(cfg, loadJob(arg));
+      return out(`${r.count} results written to ${rel(r.file)}; actual cost ${fmtUsd(r.usd)} (estimate ${fmtUsd(r.job.estimateUsd)})\n${describeJob(r.job)}`);
+    }
+    if (sub === 'cancel') {
+      if (!arg) fail('usage: keysmith batch cancel <name>');
+      return out(describeJob(await batchCancel(cfg, loadJob(arg))));
+    }
+    fail('usage: keysmith batch submit|status|results|cancel (keysmith help)');
+  } catch (e) {
+    if (e instanceof BatchError) fail(e.message);
+    throw e;
+  }
 }
 
 /* ------------------------------------------------------------- discover / usage record */
