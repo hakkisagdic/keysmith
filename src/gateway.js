@@ -73,6 +73,7 @@ export class Gateway {
           catalogue: loadCatalogue(catPath, { log: this.log }),
           now: this.now,
           seedMonthTokens: (id) => this.usage?.monthTokensByAdapter?.()?.[id] ?? 0,
+          seedDayTokens: (id) => this.usage?.dayTokensByAdapter?.()?.[id] ?? 0,
         })
       : null;
     this._virtualCache = new Map();

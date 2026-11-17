@@ -13,7 +13,11 @@ import { carriageLines, creditGuardLines, creditGuardRows, guardShiftLines, rece
 import * as tunnel from './tunnel.js';
 import { catalogueSettings, discoveredPath, freeModels, writeDiscovered } from './catalogue.js';
 import * as service from './service.js';
+import { configEdit } from './config-edit.js';
+import { sourceDisable, sourceEnable, fillAccount } from './source.js';
 import { rel, truncate } from './util.js';
+import { BatchError, batchEnabled, cancel as batchCancel, describeJob, fetchResults, listJobs, loadJob, refresh as batchRefresh, submit as batchSubmit } from './batch.js';
+import { fmtUsd } from './usage.js';
 import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets, streamRedactor } from './redact.js';
 import { ensurePrivateDir, logFiles, openPrivateLog, rotatedLogFiles, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
 import { adapterReach, aliasDecision, authEnabled, describePerDay, describeScope, entryFp, hashKey, keyHashOf, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
@@ -51,9 +55,21 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith tunnel <status|setup|run> cloudflared: named tunnel first, quick as fallback
   keysmith usage [--by d1[,d2]] [--since t] [--until t] [--format table|csv|json]
                                      who spent what (by key, label, adapter, model, account, tag, day, client)
+  keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>|label] [--cache]
+  keysmith batch status [name] | results <name> | cancel <name>
+                                     work that can wait, at half price, on an anthropic-wire adapter; off
+                                     unless "batch": { "enabled": true } is in the config (see README)
   keysmith usage record --source S [--model M --tag T --requests N --credits C --input N --output N --ms N --accepted B --id ID | --from FILE.jsonl]
                                      log a run made outside keysmith (counted as face "external")
   keysmith discover <adapterId>      list the free models an adapter offers (needs discovery.enabled)
+  keysmith config get|set|unset <key> [value] [--dry-run]
+                                     top-level settings (discovery.enabled, catalogue, tunnel.*, limits.*, port …);
+                                     a dated backup first, 0600; an unknown key is refused with the list
+  keysmith source enable <profile> --key-ref <Keychain service> [--model id[,id]] [--account-id id] [--as id] [--dry-run]
+                                     open a free-tier source (tokenrouter, groq, mistral, cloudflare): adapter with a Keychain
+                                     key reference, out of every alias, catalogue limits, discovery on
+  keysmith source disable <profile> [--as id] [--dry-run]
+                                     take that adapter, its catalogue row and discovery entry out again
   keysmith key <add|list> [--reveal] client-facing API keys; --reveal prints them in full, to a terminal only
   keysmith key add <label> [--allow p,…] [--deny p,…] [--out <file>]
                                      a labelled key with a scope; --out writes the key to a new 0600 file
@@ -83,8 +99,27 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   it) — never where the config, or an unscoped key, can be read.
 `;
 
+/** The HELP entries for one command: its `keysmith <cmd>` lines and their continuation lines. */
+export function helpFor(cmd) {
+  const name = { rm: 'remove', aliases: 'alias' }[cmd] || cmd;
+  const keep = [];
+  let on = false;
+  for (const line of HELP.split('\n')) {
+    const m = /^ {2}keysmith ([a-z-]+(?:\s*\|\s*[a-z-]+)*)/.exec(line);
+    if (m) on = m[1].split(/\s*\|\s*/).includes(name);
+    else if (!/^ {20,}\S/.test(line)) on = false;
+    if (on) keep.push(line);
+  }
+  return keep.length ? `usage:\n${keep.join('\n')}` : HELP;
+}
+
 export async function main(argv) {
   const [cmd, ...rest] = argv;
+  // `--help` / `-h` after a command is help, never an argument: it must not run the command
+  // (`add tokenrouter --help` once attached the adapter). Nothing is read or written.
+  if (cmd && !['help', '-h', '--help'].includes(cmd) && !cmd.startsWith('-') && rest.some((a) => a === '--help' || a === '-h')) {
+    return out(helpFor(cmd));
+  }
   const flags = parseFlags(rest);
   // `return await`, not `return`: a promise returned from inside `try` settles after the
   // `catch` is gone, so its rejection skipped fail() and Node printed it raw — message,
@@ -148,9 +183,15 @@ export async function main(argv) {
         return await cmdTunnel(flags);
       case 'discover':
         return await cmdDiscover(flags);
+      case 'config':
+        return cmdConfig(flags);
+      case 'source':
+        return cmdSource(flags);
       case 'usage':
         if (flags._[0] === 'record') return await cmdUsageRecord(flags);
         return await cmdUsage(flags);
+      case 'batch':
+        return await cmdBatch(flags);
       case 'key':
         return await cmdKey(flags);
       case 'scrub-logs':
@@ -229,6 +270,9 @@ function cmdAdd(flags) {
     entry.apiKey = looksLikeRef(flags.key) ? flags.key : flags.key;
   }
   if (flags.baseUrl || flags.url) entry.baseUrl = flags.baseUrl || flags.url;
+  if (typeof entry.baseUrl === 'string' && entry.baseUrl.includes('{account}')) {
+    entry.baseUrl = fillAccount(entry.baseUrl, flags.accountId);
+  }
   if (flags.bin) entry.bin = flags.bin;
   if (flags.args) entry.args = JSON.parse(flags.args);
   if (flags.parser) entry.parser = flags.parser;
@@ -1453,7 +1497,68 @@ async function cmdTunnel(flags) {
   fail(`unknown tunnel command "${sub}" — status | setup <hostname> [--yes] | run`);
 }
 
+/* ------------------------------------------------------------------------- batch */
+
+async function cmdBatch(flags) {
+  const [sub, arg] = flags._;
+  const cfg = loadOrFail({ mint: false });
+  if (!batchEnabled(cfg)) fail('batch is off (set "batch": { "enabled": true } in the config)');
+  try {
+    if (sub === 'submit') {
+      if (!arg || !flags.adapter || !flags.name) fail('usage: keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>] [--cache]');
+      const job = await batchSubmit(cfg, {
+        name: String(flags.name), file: expand(String(arg)), adapterId: String(flags.adapter),
+        capUsd: Number(flags['cap-usd']), keyRef: flags.key, cache: flags.cache === true || flags.cache === 'true',
+      });
+      return out(`submitted ${job.name} (${job.requests} requests, ${job.status}); estimate ${fmtUsd(job.estimateUsd)} of cap ${fmtUsd(job.capUsd)}`);
+    }
+    if (sub === 'status') {
+      const jobs = arg ? [loadJob(arg)] : listJobs();
+      if (!jobs.length) return out('no batch jobs');
+      for (const j of jobs) {
+        try { await batchRefresh(cfg, j); } catch (e) { warn(`${j.name}: ${e.message}`); }
+        out(describeJob(j));
+      }
+      return;
+    }
+    if (sub === 'results') {
+      if (!arg) fail('usage: keysmith batch results <name>');
+      const r = await fetchResults(cfg, loadJob(arg));
+      return out(`${r.count} results written to ${rel(r.file)}; actual cost ${fmtUsd(r.usd)} (estimate ${fmtUsd(r.job.estimateUsd)})\n${describeJob(r.job)}`);
+    }
+    if (sub === 'cancel') {
+      if (!arg) fail('usage: keysmith batch cancel <name>');
+      return out(describeJob(await batchCancel(cfg, loadJob(arg))));
+    }
+    fail('usage: keysmith batch submit|status|results|cancel (keysmith help)');
+  } catch (e) {
+    if (e instanceof BatchError) fail(e.message);
+    throw e;
+  }
+}
+
 /* ------------------------------------------------------------- discover / usage record */
+
+function cmdConfig(flags) {
+  const [op, key, value] = flags._;
+  if (!['get', 'set', 'unset'].includes(op)) fail(helpFor('config'));
+  if (!configExists()) fail(`no config at ${rel(configPath())} — run \`keysmith init\``);
+  const res = configEdit(configPath(), op, key, value, { write: !flags.dryRun });
+  for (const l of res.lines) out(l);
+  if (flags.dryRun && op !== 'get') out('(dry run: nothing written)');
+  if (res.changed) {
+    out(`backup ${rel(res.backup)}`);
+    noteRestart(key);
+  }
+}
+
+function cmdSource(flags) {
+  const [op, name, ...extra] = flags._;
+  if (!['enable', 'disable'].includes(op) || !name || extra.length) fail(helpFor('source'));
+  if (!configExists()) fail(`no config at ${rel(configPath())} — run \`keysmith init\``);
+  const run = op === 'enable' ? sourceEnable : sourceDisable;
+  for (const l of run(configPath(), name, flags).lines) out(l);
+}
 
 async function cmdDiscover(flags) {
   const id = flags._[0];
@@ -1476,13 +1581,27 @@ async function cmdDiscover(flags) {
     fail(`${id}: ${e.message}`);
   }
   if (res.status === 401 || res.status === 403) fail(`renew key: ${id}`);
+  if (res.status === 404 || res.status === 405) fail(`${id}: this endpoint has no GET /models (${res.status}) — name the models you accept (keysmith source enable <profile> --model …); free cannot be listed from here`);
   if (!res.ok) fail(`${id}: GET /models answered ${res.status}`);
   let body;
   try { body = await res.json(); } catch { fail(`${id}: /models did not return JSON`); }
   const opts = settings.discovery[id] || { inputPricePath: 'pricing.prompt', outputPricePath: 'pricing.completion' };
   const ids = freeModels(body, opts);
   writeDiscovered(discoveredPath(dataDir(), id), ids);
+  const listed = Array.isArray(body) ? body : (Array.isArray(body?.data) ? body.data : []);
+  if (listed.length && !listed.some((m) => hasPath(m, opts.inputPricePath) || hasPath(m, opts.outputPricePath))) {
+    out(`! ${id}: ${listed.length} models listed, none with a price at ${opts.inputPricePath}: free cannot be read from this source${raw.freeOnly ? ', so freeOnly refuses every model here' : ' (its guard is: no alias, a catalogue limit, a named model)'}`);
+  }
   out(`${id}: ${ids.length} free model${ids.length === 1 ? '' : 's'} written`);
+}
+
+function hasPath(obj, dotted) {
+  let v = obj;
+  for (const k of String(dotted).split('.')) {
+    if (v == null || typeof v !== 'object' || !Object.hasOwn(v, k)) return false;
+    v = v[k];
+  }
+  return true;
 }
 
 function cmdUsageRecord(flags) {

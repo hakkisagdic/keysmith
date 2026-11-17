@@ -153,3 +153,14 @@ test('the new profiles exist and the old ones are untouched', () => {
   assert.equal(HTTP_PROFILES.mistral.baseUrl, 'https://api.mistral.ai/v1');
   assert.equal(HTTP_PROFILES.groq.baseUrl, 'https://api.groq.com/openai/v1');
 });
+
+test('modelsOnly: a model off the declared list is a 400 before the limiter and the upstream', async () => {
+  const s = await boot({ catalogue: writeCatalogue({ requestsPerDay: 1000 }) }, { modelsOnly: true, models: ['m1'] });
+  try {
+    const no = await s.post('tr/big-paid-model');
+    assert.equal(no.status, 400, no.text);
+    assert.equal(hits.length, 0, 'the upstream never saw it');
+    assert.equal((await s.post('tr/m1')).status, 200);
+    assert.equal(hits.length, 1);
+  } finally { await s.close(); }
+});

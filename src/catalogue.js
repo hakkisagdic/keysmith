@@ -51,6 +51,7 @@ function normalise(doc) {
       limits: {
         requestsPerMinute: posInt(l.requestsPerMinute),
         requestsPerDay: posInt(l.requestsPerDay),
+        tokensPerDay: posInt(l.tokensPerDay),
         tokensPerMonth: posInt(l.tokensPerMonth),
       },
       models,
@@ -89,17 +90,18 @@ export function loadCatalogue(file, { log = (m) => console.warn(m) } = {}) {
 }
 
 export class CatalogueLimiter {
-  constructor({ catalogue, now = () => Date.now(), seedMonthTokens = () => 0 } = {}) {
+  constructor({ catalogue, now = () => Date.now(), seedMonthTokens = () => 0, seedDayTokens = () => 0 } = {}) {
     this.catalogue = catalogue;
     this.now = now;
     this.seedMonthTokens = seedMonthTokens;
+    this.seedDayTokens = seedDayTokens;
     this.state = new Map();
   }
 
   _st(id) {
     let s = this.state.get(id);
     if (!s) {
-      s = { minute: [], day: null, dayCount: 0, month: null, monthTokens: 0, cooldownUntil: 0 };
+      s = { minute: [], day: null, dayCount: 0, tokenDay: null, dayTokens: 0, month: null, monthTokens: 0, cooldownUntil: 0 };
       this.state.set(id, s);
     }
     return s;
@@ -114,7 +116,7 @@ export class CatalogueLimiter {
       return { ok: false, retryAfter: Math.max(1, Math.ceil((s.cooldownUntil - t) / 1000)), why: 'cooling down after an upstream 429' };
     }
     if (!entry) return { ok: true };
-    const { requestsPerMinute: rpm, requestsPerDay: rpd, tokensPerMonth: tpm } = entry.limits;
+    const { requestsPerMinute: rpm, requestsPerDay: rpd, tokensPerDay: tpd, tokensPerMonth: tpm } = entry.limits;
     s.minute = s.minute.filter((x) => x > t - 60000);
     if (rpm && s.minute.length >= rpm) {
       return { ok: false, retryAfter: Math.max(1, Math.ceil((s.minute[0] + 60000 - t) / 1000)), why: `${rpm} requests per minute` };
@@ -123,6 +125,9 @@ export class CatalogueLimiter {
     if (s.day !== day) { s.day = day; s.dayCount = 0; }
     if (rpd && s.dayCount >= rpd) {
       return { ok: false, retryAfter: Math.max(1, Math.ceil((nextMidnight(t) - t) / 1000)), why: `${rpd} requests per day` };
+    }
+    if (tpd && this._dayTokens(adapterId, s, t) >= tpd) {
+      return { ok: false, retryAfter: Math.max(1, Math.ceil((nextMidnight(t) - t) / 1000)), why: `${tpd} tokens per day` };
     }
     if (tpm) {
       const used = this._monthTokens(adapterId, s, t);
@@ -147,9 +152,23 @@ export class CatalogueLimiter {
     return s.monthTokens;
   }
 
+  /** Today's tokens (local day, as requestsPerDay counts it); a restart re-seeds from the usage log. */
+  _dayTokens(id, s, t) {
+    const d = dayOf(t);
+    if (s.tokenDay !== d) {
+      s.tokenDay = d;
+      let seed = 0;
+      try { seed = Number(this.seedDayTokens(id)) || 0; } catch { seed = 0; }
+      s.dayTokens = seed;
+    }
+    return s.dayTokens;
+  }
+
   noteTokens(adapterId, n) {
     if (!Number.isFinite(n) || n <= 0) return;
     const s = this._st(adapterId);
+    this._dayTokens(adapterId, s, this.now());
+    s.dayTokens += n;
     this._monthTokens(adapterId, s, this.now());
     s.monthTokens += n;
   }

@@ -2072,6 +2072,19 @@ export class UsageLog {
     return out;
   }
 
+  /** Today's (local day) input+output tokens per adapter, as `monthTokensByAdapter` counts the month. */
+  dayTokensByAdapter() {
+    const now = this._nowDate();
+    const since = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+    const out = {};
+    for (const r of this.query({ by: ['adapter'], since }).groups || []) {
+      const id = r.adapter ?? r.key;
+      if (typeof id !== 'string' || !id) continue;
+      out[id] = (out[id] || 0) + (Number(r.tokensIn) || 0) + (Number(r.tokensOut) || 0);
+    }
+    return out;
+  }
+
   record(entry) {
     try {
       const ts = typeof entry?.ts === 'string' && entry.ts ? entry.ts : this._nowDate().toISOString();

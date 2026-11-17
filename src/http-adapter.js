@@ -33,6 +33,7 @@ export class HttpAdapter {
     this.priority = cfg.priority ?? 100;
     this.disabled = !!cfg.disabled;
     this.freeOnly = cfg.freeOnly === true;
+    this.modelsOnly = cfg.modelsOnly === true; // only the ids in `models` may be asked for: the guard where /models has no price
     this.limiter = null; // set by the gateway when a catalogue is configured
     this.modelMap = cfg.modelMap && typeof cfg.modelMap === 'object' && !Array.isArray(cfg.modelMap) ? cfg.modelMap : {};
     this._apiKey = cfg._apiKey ?? null;
@@ -504,6 +505,14 @@ export class HttpAdapter {
       const free = readDiscovered(discoveredPath(dataDir(), this.id));
       if (!free || !(free.has(effectiveModel) || free.has(model))) {
         throw new LlmError(`${model} is not on the discovered free list (keysmith discover ${this.id})`, {
+          status: 400, type: 'invalid_request_error', provider: this.id,
+        });
+      }
+    }
+    if (this.modelsOnly) {
+      const named = new Set(this._declaredModelList().map((m) => m.id));
+      if (!(named.has(effectiveModel) || named.has(model))) {
+        throw new LlmError(`${model} is not one of the models named for ${this.id} (${[...named].join(', ') || 'none'}); add it to the adapter's models to allow it`, {
           status: 400, type: 'invalid_request_error', provider: this.id,
         });
       }

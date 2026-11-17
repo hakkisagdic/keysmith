@@ -70,3 +70,15 @@ test('401 says renew key and does not print the key', async (t) => {
   assert.match(r.all, /renew key: orx/);
   assert.ok(!r.all.includes(SECRET));
 });
+
+test('a source whose /models carries no price at all says so, and a 405 says there is no listing', async (t) => {
+  const { run } = await setup(t, { enabled: true, body: { data: [{ id: 'm1' }, { id: 'm2' }] } });
+  const r = await run();
+  assert.equal(r.status, 0, r.all);
+  assert.match(r.all, /2 models listed, none with a price/);
+  assert.match(r.all, /0 free models written/);
+  const none = await setup(t, { enabled: true, status: 405, body: {} });
+  const r2 = await none.run();
+  assert.notEqual(r2.status, 0);
+  assert.match(r2.all, /no GET \/models \(405\)/);
+});

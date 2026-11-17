@@ -1,0 +1,23 @@
+# 20261117-saglayicilari-ac: İnceleme
+
+**Karar: yayınlanmaz (ship: false).** Bir büyük bulgu var: groq, mistral ve cloudflare için koruma olarak sunulan "adı verilmiş model" kuralı istek anında uygulanmıyor. Geri kalanlar küçük. K9 yürütülmedi; TEST.md bunu açıkça yazıyor, dürüst.
+
+Okunan dosyalar: src/catalogue.js, src/cli.js, src/config-edit.js, src/gateway.js, src/profiles.js, src/source.js, src/usage.js, CHANGELOG.md, README.md, test/qa-saglayicilari.test.js, test/source.test.js (ilgili kısımlar), ANALIZ.md, SONUC.md, TEST.md. Ayrıca bağlam için src/http-adapter.js (freeOnly ve limiter yolu) ile src/gateway.js içindeki knownModels okundu.
+
+## Mercekler
+1. Veri güvenliği: yazımlar eklemeli. Önce tarihli yedek alınıyor (0600, üzerine yazmıyor), sonra geçici dosyaya yazılıp rename ediliyor. Canlı dosyada dört `-source` yedeği ve 0600 izinli catalogue.json var. Migrasyon yok.
+2. Erişim: yeni uç nokta yok. CLI komutları yerel config sahibinin. `--key-ref` ve hesap adı SAFE düzenli ifadesinden geçtiği için exec satırına komut sokulamıyor.
+3. Para ve kişisel veri: aşağıdaki büyük bulgu.
+4. Dürüstlük: K1-K7 testleri gerçekten bir şey doğruluyor (sha, mod, upstream'e POST gitmemesi). K8 için gitleaks yalnız `HEAD~2..HEAD` aralığında koşmuş. Ben tüm dal üzerinde (`origin/main..HEAD`, 4 commit) yeniden koşturdum ve temiz çıktı.
+5. Sırlar: dalda anahtar değeri yok. Testteki sahte anahtar ve sahte hesap kimliği uydurma değerler.
+
+## Bulgular
+
+| Önem | Dosya:satır | Sorun | Düzeltme |
+|---|---|---|---|
+| büyük | src/source.js:66-80, src/http-adapter.js:486-497 | groq, mistral ve cloudflare'de freeOnly yok. Bunun yerine koruma "alias dışı + katalog limiti + adı verilmiş model" diye anlatılıyor (kod yorumu, hata mesajı, discover uyarısı, ANALIZ kararı 3). Oysa `entry.models` yalnız listeleme ve doctor uyarısında kullanılıyor (gateway.js knownModels), istekte kapı değil. Gateway anahtarı olan herhangi bir istemci `cloudflare/@cf/meta/llama-3.3-70b-...` ya da `groq/<başka model>` isteyebilir ve bu istek upstream'e gider. Cloudflare Workers Paid hesabında 10.000 neuron sonrası faturalanır. 70b modelde 50k tokenlık günlük sınır bu eşiği aşabilir. Groq ya da Mistral ücretli kademedeyse de para çıkar. | Adaptöre `modelsOnly: true` gibi bir alan ekleyin ve `source enable` bunu `--model` ile birlikte yazsın. `HttpAdapter.chat` içinde freeOnly kontrolünün yanında, `modelsOnly` açıkken model (ya da effectiveModel) `_declaredModelList()` içinde değilse limiter ve upstream'den önce 400 dönsün. Test: groq ile listede olmayan model 400 döner ve sahte upstream'e POST gitmez. Canlı config'teki üç adaptöre de bu alanı ekleyin. |
+| küçük | src/config-edit.js:131 (SECRETISH, satır 39) | `config get adapters` ya da `config get adapters.x` maskeyi yalnız `key`, `apiKey`, `token`, `secret`, `password` adlı alanlara uyguluyor. `headers.Authorization` ya da `env.ANTHROPIC_API_KEY` gibi düz değerler açık basılır ve ajan dökümlerine düşer. Canlı config'te şu an böyle bir alan yok, ama ANALIZ "sırlar get'te maskeli" diyor. | Son segmentte `authorization` ile `_?(api_)?key`, `token` ve `secret` eklerini de yakalayın. Ya da `headers.*` ve `env.*` altındaki, `{…:` ile başlamayan tüm dizgileri maskeleyin. Bunun için config-edit testine bir vaka ekleyin. |
+| küçük | SONUC.md "Yeniden başlatma sonrası kontroller" | Canlı catalogue.json groq ve cloudflare için `tokensPerDay` kullanıyor. main'deki catalogue.js bu alanı tanımıyor (normalise atıyor). Gateway dal inmeden yeniden başlatılırsa günlük token sınırı sessizce kalkar ve cloudflare'de yalnız 500 istek/gün kalır. | Listeye 0. adım ekleyin: önce dal main'e insin, çalışan keysmith'in bu sürüm olduğu doğrulansın (`grep tokensPerDay src/catalogue.js`), yeniden başlatma ondan sonra yapılsın. |
+| küçük | src/http-adapter.js:636 (bu dalın kullandığı yol) | `tokensPerDay` yalnız akıştaki `usage` olayından sayılıyor. Kaynak akışta usage göndermezse (streamUsage false) günlük token sınırı hiç dolmaz. | K9'da her kaynak için `keysmith usage --by adapter` satırında tokensIn/tokensOut değerinin sıfırdan büyük olduğunu kanıt olarak yazın. Sıfırsa o kaynakta `streamUsage` ya da `stream_options.include_usage` açılsın. |
+| küçük | src/source.js:106-112 | `source disable <ad>` adaptörü, source ile açılmış olmasa da siler. Adaptör bir alias'ta ya da sanal modelde geçiyorsa o bacak 404 olur (mevcut `remove` ile aynı davranış, yedek var). | Adaptör herhangi bir `aliases.*` ya da `virtualModels.*` içinde geçiyorsa `--force` olmadan reddedin ve geçtiği yerleri adlarıyla listeleyin. |
+| küçük | TEST.md K8 | gitleaks aralığı `HEAD~2..HEAD`, dalın tamamı değil. | Kanıtı `gitleaks git --log-opts="origin/main..HEAD"` olarak güncelleyin (inceleme sırasında koşuldu: 4 commit, temiz). |
