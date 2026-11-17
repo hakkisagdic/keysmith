@@ -23,3 +23,20 @@ Koşular: `node --test test/prompt-cache*.test.js` (24 test, fail 0, 2 todo); `n
 ## Kalanlar
 - Kabul kontrollerinde kalan yok. K8 yöneticiye ait.
 - Not: tablo değerleri güncel sayfayla bugün (2026-11-17) tutuyor; sayfa değişirse yeniden okunmalı.
+
+## İnceleme düzeltmeleri
+
+Bulgu 1 [büyük] aktarma yolunda 1h önbellek yazımı (`extractRelayedUsage`, `mergeUsage`): düzeltme b417208. Yerelde doğrulandı (canlı adres kanıt sayılmadı).
+
+| Kontrol | Sonuç | Kanıt |
+|---|---|---|
+| `extractRelayedUsage` `cache_creation.ephemeral_1h_input_tokens` okuyor, `mergeUsage` alanı düşürmüyor | geçti | `src/server.js` satır 1812-1818 ve 2043 (gateway.js'teki Math.max ile aynı biçim) |
+| /v1/messages, akışsız ve akışlı: satırda `cacheWrite1h` = 400, `cacheWrite` = 500 | geçti | `test/messages-relay.test.js` "a 1h cache write reaches the row as cacheWrite1h and is priced at 2x input, streamed or not" geçti |
+| `tokensToUsd` 1h yazımı 2x girdi oranından fiyatlıyor (400 x 6 = 400 x 2 x 3, 5m kısmı 100 x 3,75) | geçti | aynı test, beklenen tutarla 1e-9 içinde eşit |
+| Test düzeltmeyi gerçekten yakalıyor | geçti | düzeltme geri alınınca (b417208^ `server.js`) test kaldı, geri konunca geçti; çalışma ağacı temiz geri döndü |
+| Kapı: önbellek, kullanım, aktarma, toplu iş testleri | geçti | `messages-relay`, `relay`, `cli-usage`, `usage*`, `batch*`, `source*`, `prompt-cache*` dosyaları fail 0 |
+| Ayarsız ağ geçidi bayt bayt aynı | geçti | `prompt-cache.test.js`, `prompt-cache-tester.test.js` geçti; düzeltme yalnız `cache_creation` alanı varken değer ekler |
+| Tablo değerleri/kaynak/tarih | geçti | değişmedi; `src/prompt-cache.js` kaynak ve "Read on 2026-11-17" yorumu duruyor |
+| Özel yol/e-posta/anahtar | geçti | dalın eklenen satırlarında `/Users/`, e-posta, `sk-` taraması: yalnız TEST.md'deki tarama notlarının kendisi eşleşti |
+
+Tam paket (`node --test`): 987 test, 810-812 geçti, 1-3 kaldı, koşudan koşuya değişiyor. Kalanlar bu işle ilgisiz: (a) `test/wire-conformance*.test.js` ailesi, bu çalışma ağacında `node_modules` yok (`ai is not installed: run npm ci`), ortam eksiği; (b) "foreign tool while the result waits" ve "reloadAgent bootstraps" testleri yük altında bir koşuda kaldı, tek başına koşulunca geçti (`bridge-*`, `service-reload`, `cli-usage` fail 0). `npm ci` ile SDK testleri yürütülmedi.
