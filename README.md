@@ -1333,6 +1333,7 @@ tools.
 | `gemini` | cli | documented argv shape, not run against a live install — **`unsafeTools`** until a tool-less argv is checked: ships disabled |
 | `openai`, `anthropic`, `openrouter`, `groq`, `deepseek`, `together` | http | standard endpoints; `openai` takes images, PDFs and audio, `anthropic` images and PDFs (`media`, from their API references) |
 | `google` | http | verified live against Gemini's OpenAI-compatible endpoint: tools, streaming, thought signatures — see [above](#gemini-with-tools-the-google-profile); takes images (read live on `gemini-3.5-flash`) and audio; refuses a PDF `file` part and `video_url` |
+| `cloudflare` | http | Workers AI's OpenAI-compatible endpoint; the account id sits in the URL (`--account-id`), key `CLOUDFLARE_API_TOKEN`; open it with `keysmith source enable cloudflare` |
 | `tokenrouter`, `mistral` | http | OpenAI-wire endpoints (`https://api.tokenrouter.com/v1`, `https://api.mistral.ai/v1`; keys `TOKENROUTER_API_KEY`, `MISTRAL_API_KEY`), checked against a stub only; `tokenrouter` pairs with `discover` and `freeOnly`, see [Free models](#free-models-discover-and-freeonly) |
 | `ollama`, `lmstudio`, `llamacpp`, `vllm` | http | local servers, no key |
 | `copilot` | http | verified live against `api.githubcopilot.com` with an OAuth device token; takes images with `copilot-vision-request: true` (not checked live) |
