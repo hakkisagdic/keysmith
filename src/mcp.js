@@ -827,9 +827,9 @@ function upsertCodexToml(existing, serverName, command, args) {
   const out = [];
   let skipping = false;
   for (const line of lines) {
-    const m = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(line);
+    const m = /^\s*(?:\[\[([^\[\]]+)\]\]|\[([^\[\]]+)\])\s*(?:#.*)?$/.exec(line);
     if (m) {
-      const section = m[1].trim();
+      const section = (m[1] ?? m[2]).trim();
       if (section === `mcp_servers.${serverName}` || section.startsWith(`mcp_servers.${serverName}.`)) {
         skipping = true;
         continue;

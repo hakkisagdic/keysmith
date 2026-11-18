@@ -673,3 +673,56 @@ test('--setup prints manual JSON snippet, exits 0, and creates or changes no fil
   assert.equal(fs.readFileSync(existingCc, 'utf8'), originalContent);
   assert.deepEqual(fs.readdirSync(fakeHomeExisting, { recursive: true }).sort(), beforeTreeExisting);
 });
+
+test('codex TOML re-registration preserves [[...]] array-of-tables blocks after [mcp_servers.keysmith]', () => {
+  const sb = makeSandbox();
+  const fakeHome = path.join(sb.root, 'codex-home');
+  const codexFile = path.join(fakeHome, '.codex', 'config.toml');
+  fs.mkdirSync(path.dirname(codexFile), { recursive: true });
+  fs.writeFileSync(
+    codexFile,
+    [
+      'model = "gpt-5"',
+      '',
+      '[mcp_servers.keysmith]',
+      'command = "/old/bin/node"',
+      'args = ["/old/cli.js", "mcp"]',
+      '',
+      '[[projects]]',
+      'path = "/tmp/proj-a"',
+      'trust_level = "trusted"',
+      '',
+      '[[projects]] # second entry',
+      'path = "/tmp/proj-b"',
+      'trust_level = "untrusted"',
+      '',
+    ].join('\n'),
+  );
+
+  const first = registerMcpClients({
+    homeDir: fakeHome,
+    platform: 'darwin',
+    nodeBin: '/usr/local/bin/node',
+    entry: CLI,
+  });
+  assert.equal(first.results.length, 1);
+  assert.equal(first.results[0].client, 'codex-cli');
+  assert.equal(first.results[0].status, 'updated');
+  assert.ok(fs.existsSync(first.results[0].backup));
+
+  const updated = fs.readFileSync(codexFile, 'utf8');
+  assert.match(updated, /model = "gpt-5"/);
+  assert.equal(updated.includes('/old/bin/node'), false);
+  assert.match(updated, /\[\[projects\]\]\npath = "\/tmp\/proj-a"\ntrust_level = "trusted"/);
+  assert.match(updated, /\[\[projects\]\] # second entry\npath = "\/tmp\/proj-b"\ntrust_level = "untrusted"/);
+  assert.equal(updated.match(/^\[mcp_servers\.keysmith\]$/gm)?.length, 1);
+  assert.match(updated, /command = "\/usr\/local\/bin\/node"/);
+
+  const second = registerMcpClients({
+    homeDir: fakeHome,
+    platform: 'darwin',
+    nodeBin: '/usr/local/bin/node',
+    entry: CLI,
+  });
+  assert.equal(second.results[0].status, 'unchanged');
+});
