@@ -758,3 +758,56 @@ test('redaction: write tools never leak fake secrets, key ref interiors, account
     else process.env.KEYSMITH_SECURITY_BIN = prevSec;
   }
 });
+
+test('approved model write tools refuse CLI sources and leave config unchanged', async () => {
+  const sb = makeSandbox();
+  writeConfig(sb.configFile, {
+    adapters: {
+      kiro_cli: {
+        kind: 'cli',
+        bin: 'kiro-cli',
+        args: ['{prompt}'],
+        parser: 'raw',
+        models: ['m1'],
+      },
+      inferred_cli: {
+        bin: 'echo',
+        args: ['{prompt}'],
+        parser: 'raw',
+        models: ['m2'],
+      },
+    },
+  });
+  const beforeBytes = fs.readFileSync(sb.configFile);
+
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
+  const replies = [];
+  const server = createMcpServer({
+    registry: reg,
+    configFile: sb.configFile,
+    dataDir: sb.dataDir,
+    send: (m) => replies.push(m),
+    context: { homeDir: sb.root },
+  });
+
+  const calls = [
+    ['keysmith_source_set_models', { source: 'kiro_cli', models: ['m1', 'm2'], confirm: true }],
+    ['keysmith_model_approve', { source: 'kiro_cli', model: 'm3', confirm: true }],
+    ['keysmith_model_revoke', { source: 'kiro_cli', model: 'm1', confirm: true }],
+    ['keysmith_source_set_models', { source: 'inferred_cli', models: ['m2'], confirm: true }],
+    ['keysmith_model_approve', { source: 'inferred_cli', model: 'm3', confirm: true }],
+    ['keysmith_model_revoke', { source: 'inferred_cli', model: 'm2', confirm: true }],
+  ];
+
+  for (const [idx, [tool, args]] of calls.entries()) {
+    await callTool(server, tool, args, idx + 1);
+    const res = replies[idx].result;
+    assert.equal(res.isError, true, `${tool} on ${args.source} must refuse`);
+    assert.equal(res.structuredContent.ok, false);
+    assert.equal(res.structuredContent.error, 'approved model lists are enforced only on HTTP sources');
+  }
+
+  assert.equal(Buffer.compare(fs.readFileSync(sb.configFile), beforeBytes), 0, 'config bytes unchanged');
+  assert.deepEqual(listBackups(sb.configFile), [], 'no backups created');
+});

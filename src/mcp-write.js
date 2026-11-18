@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { getPath, readRaw, setPath } from './config-edit.js';
-import { checkAdapter } from './gateway.js';
+import { checkAdapter, kindOf } from './gateway.js';
 import { registerTool, writeConfigWithBackup } from './mcp.js';
 import { SOURCE_FACTS } from './profiles.js';
 import { redactSecrets, registerSecrets } from './redact.js';
@@ -608,6 +608,9 @@ async function handleSourceSetModels(args, ctx) {
       }
       const existing = requireExistingAdapter(doc, source, extraLiterals, ctx);
       if (!existing.ok) return existing.error;
+      if (kindOf(existing.entry) === 'cli') {
+        return toolError('approved model lists are enforced only on HTTP sources', { source }, extraLiterals, ctx);
+      }
 
       const previousModels = extractDeclaredModelIds(existing.entry.models);
       const prevSet = new Set(previousModels);
@@ -672,6 +675,9 @@ async function handleModelApprove(args, ctx) {
       }
       const existing = requireExistingAdapter(doc, source, extraLiterals, ctx);
       if (!existing.ok) return existing.error;
+      if (kindOf(existing.entry) === 'cli') {
+        return toolError('approved model lists are enforced only on HTTP sources', { source }, extraLiterals, ctx);
+      }
 
       let writeRes;
       try {
@@ -740,6 +746,9 @@ async function handleModelRevoke(args, ctx) {
       }
       const existing = requireExistingAdapter(doc, source, extraLiterals, ctx);
       if (!existing.ok) return existing.error;
+      if (kindOf(existing.entry) === 'cli') {
+        return toolError('approved model lists are enforced only on HTTP sources', { source }, extraLiterals, ctx);
+      }
 
       let writeRes;
       try {

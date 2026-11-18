@@ -247,6 +247,7 @@ export function computePendingFreeChanges(doc, { dataDir = null, filterSource = 
   for (const [source, raw] of Object.entries(adapters)) {
     if (!isPlainObject(raw)) continue;
     if (filterSource && source !== filterSource) continue;
+    if (kindOf(raw) !== 'http') continue;
 
     const declaredIds = extractDeclaredModelIds(raw.models);
     const hasApprovedBaseline = raw.modelsOnly === true || declaredIds.length > 0;

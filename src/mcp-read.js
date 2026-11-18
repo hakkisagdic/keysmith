@@ -485,12 +485,13 @@ async function handleSourceModels(args, ctx) {
     const extraLiterals = extraSecretsForAdapter(raw);
     const declaredIds = extractDeclaredModelIds(raw.models);
     const declaredSet = new Set(declaredIds);
-    const modelsOnly = raw.modelsOnly === true;
-    const freeOnly = raw.freeOnly === true;
-
     const kind = kindOf(raw);
+    const enforced = kind === 'http';
+    const modelsOnly = enforced && raw.modelsOnly === true;
+    const freeOnly = enforced && raw.freeOnly === true;
+
     const settings = catalogueSettings(doc);
-    const discSet = kind === 'http' ? readDiscovered(discoveredPath(ctx.dataDir, source)) : null;
+    const discSet = enforced ? readDiscovered(discoveredPath(ctx.dataDir, source)) : null;
 
     let discoveryAvailable = false;
     let discoveryMessage = null;
@@ -514,7 +515,7 @@ async function handleSourceModels(args, ctx) {
     const allIds = discoveryAvailable ? [...declaredIds, ...onlyInDiscovered] : declaredIds;
     const models = allIds.map((id) => {
       const configured = declaredSet.has(id);
-      const approved = modelsOnly && configured;
+      const approved = enforced && modelsOnly && configured;
       return {
         id,
         approved,
@@ -528,6 +529,8 @@ async function handleSourceModels(args, ctx) {
       {
         ok: true,
         source,
+        kind,
+        enforced,
         modelsOnly,
         freeOnly,
         configuredModels: declaredIds,
@@ -898,7 +901,7 @@ async function handleApproved(args, ctx) {
     const approved = {};
     for (const [id, raw] of Object.entries(adapters)) {
       if (filterSource && id !== filterSource) continue;
-      if (isPlainObject(raw) && raw.modelsOnly === true) {
+      if (isPlainObject(raw) && kindOf(raw) === 'http' && raw.modelsOnly === true) {
         approved[id] = extractDeclaredModelIds(raw.models);
       }
     }

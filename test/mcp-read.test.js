@@ -930,3 +930,67 @@ test('redaction: none of the 6 read tools leak fake secrets, key ref interiors, 
     else process.env.KEYSMITH_SECURITY_BIN = prevSec;
   }
 });
+
+test('keysmith_approved and keysmith_source_models do not present CLI sources as having an enforced approved list', async () => {
+  const sb = makeSandbox();
+  writeConfig(sb.configFile, {
+    adapters: {
+      groq: {
+        kind: 'http',
+        baseUrl: 'https://api.example.invalid/v1',
+        apiKey: '{env:GROQ_KEY}',
+        modelsOnly: true,
+        models: ['llama-3.1-8b-instant'],
+      },
+      kiro: {
+        kind: 'cli',
+        bin: 'kiro-cli',
+        args: ['{prompt}'],
+        parser: 'raw',
+        modelsOnly: true,
+        freeOnly: true,
+        models: ['claude-sonnet-4'],
+      },
+    },
+  });
+
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
+  const replies = [];
+  const server = createMcpServer({
+    registry: reg,
+    configFile: sb.configFile,
+    dataDir: sb.dataDir,
+    send: (m) => replies.push(m),
+  });
+
+  await callTool(server, 'keysmith_approved', {}, 1);
+  await callTool(server, 'keysmith_approved', { source: 'kiro' }, 2);
+  await callTool(server, 'keysmith_source_models', { source: 'kiro' }, 3);
+  await callTool(server, 'keysmith_source_models', { source: 'groq' }, 4);
+
+  const allApproved = replies[0].result.structuredContent;
+  assert.deepEqual(allApproved.approved, { groq: ['llama-3.1-8b-instant'] });
+  assert.equal(Object.hasOwn(allApproved.approved, 'kiro'), false);
+  assert.deepEqual(allApproved.pending, []);
+
+  const kiroApproved = replies[1].result.structuredContent;
+  assert.deepEqual(kiroApproved.approved, {});
+  assert.deepEqual(kiroApproved.pending, []);
+
+  const kiroModels = replies[2].result.structuredContent;
+  assert.equal(kiroModels.ok, true);
+  assert.equal(kiroModels.kind, 'cli');
+  assert.equal(kiroModels.enforced, false);
+  assert.equal(kiroModels.modelsOnly, false);
+  assert.equal(kiroModels.freeOnly, false);
+  assert.deepEqual(kiroModels.models, [
+    { id: 'claude-sonnet-4', approved: false, status: 'unapproved', configured: true, discoveredFree: null },
+  ]);
+
+  const groqModels = replies[3].result.structuredContent;
+  assert.equal(groqModels.kind, 'http');
+  assert.equal(groqModels.enforced, true);
+  assert.equal(groqModels.modelsOnly, true);
+  assert.equal(groqModels.models[0].approved, true);
+});
