@@ -434,15 +434,16 @@ async function handleSources(args, ctx) {
       const disabled = Boolean(raw.disabled);
       if (!includeDisabled && disabled) continue;
       const kind = kindOf(raw);
+      const isHttp = kind === 'http';
       sources.push({
         id,
         kind,
-        wire: kind === 'http' ? String(raw.wire || 'openai') : null,
-        baseUrl: kind === 'http' ? sanitizeBaseUrl(raw.baseUrl, raw) : null,
+        wire: isHttp ? String(raw.wire || 'openai') : null,
+        baseUrl: isHttp ? sanitizeBaseUrl(raw.baseUrl, raw) : null,
         disabled,
         explicitOnly: Boolean(raw.explicitOnly || raw.unsafeTools),
-        modelsOnly: raw.modelsOnly === true,
-        freeOnly: raw.freeOnly === true,
+        modelsOnly: isHttp && raw.modelsOnly === true,
+        freeOnly: isHttp && raw.freeOnly === true,
         modelCount: extractDeclaredModelIds(raw.models).length,
         keyRefType: classifyKeyRef(raw),
         keychainExists: await checkKeychainExists(raw, ctx),
@@ -486,12 +487,13 @@ async function handleSourceModels(args, ctx) {
     const declaredIds = extractDeclaredModelIds(raw.models);
     const declaredSet = new Set(declaredIds);
     const kind = kindOf(raw);
-    const enforced = kind === 'http';
-    const modelsOnly = enforced && raw.modelsOnly === true;
-    const freeOnly = enforced && raw.freeOnly === true;
+    const isHttp = kind === 'http';
+    const modelsOnly = isHttp && raw.modelsOnly === true;
+    const freeOnly = isHttp && raw.freeOnly === true;
+    const enforced = isHttp && (modelsOnly || freeOnly);
 
     const settings = catalogueSettings(doc);
-    const discSet = enforced ? readDiscovered(discoveredPath(ctx.dataDir, source)) : null;
+    const discSet = isHttp ? readDiscovered(discoveredPath(ctx.dataDir, source)) : null;
 
     let discoveryAvailable = false;
     let discoveryMessage = null;
@@ -505,7 +507,7 @@ async function handleSourceModels(args, ctx) {
       onlyInDiscovered = discoveredFree.filter((m) => !declaredSet.has(m));
       onlyInModels = declaredIds.filter((m) => !discSet.has(m));
     } else if (kind === 'cli') {
-      discoveryMessage = 'model discovery is not used for CLI sources';
+      discoveryMessage = 'model discovery and approved-list enforcement do not apply to CLI sources';
     } else if (!settings.discovery.enabled) {
       discoveryMessage = 'discovery is disabled in config (discovery.enabled is false); run keysmith discover after enabling';
     } else {
@@ -519,7 +521,7 @@ async function handleSourceModels(args, ctx) {
       return {
         id,
         approved,
-        status: approved ? 'approved' : 'unapproved',
+        status: isHttp ? (approved ? 'approved' : 'unapproved') : 'not_enforced',
         configured,
         discoveredFree: discoveryAvailable ? discSet.has(id) : null,
       };
@@ -533,6 +535,9 @@ async function handleSourceModels(args, ctx) {
         enforced,
         modelsOnly,
         freeOnly,
+        ...(kind === 'cli'
+          ? { note: 'Approved model lists are not enforced for CLI sources; enforcement applies only to HTTP sources.' }
+          : {}),
         configuredModels: declaredIds,
         models,
         discovery: {
@@ -899,17 +904,30 @@ async function handleApproved(args, ctx) {
     const filterSource = typeof args?.source === 'string' && args.source.trim() ? args.source.trim() : null;
 
     const approved = {};
+    const unenforcedCliSources = [];
     for (const [id, raw] of Object.entries(adapters)) {
       if (filterSource && id !== filterSource) continue;
-      if (isPlainObject(raw) && kindOf(raw) === 'http' && raw.modelsOnly === true) {
+      if (!isPlainObject(raw)) continue;
+      const kind = kindOf(raw);
+      if (kind === 'cli') {
+        unenforcedCliSources.push(id);
+        continue;
+      }
+      if (kind === 'http' && raw.modelsOnly === true) {
         approved[id] = extractDeclaredModelIds(raw.models);
       }
     }
+    const filterIsCli = Boolean(
+      filterSource && Object.hasOwn(adapters, filterSource) && isPlainObject(adapters[filterSource]) && kindOf(adapters[filterSource]) === 'cli',
+    );
 
     return scrubOutput({
       ok: true,
       configLoaded: cfgRes.exists,
       approved,
+      ...(unenforcedCliSources.length ? { unenforcedCliSources } : {}),
+      ...(filterIsCli ? { kind: 'cli', enforced: false } : {}),
+      note: 'Approved model lists are enforced only on HTTP sources; list is not enforced for CLI sources.',
       pending: computePendingFreeChanges(doc, {
         dataDir: ctx.dataDir,
         filterSource,

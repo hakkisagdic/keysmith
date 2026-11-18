@@ -805,7 +805,10 @@ test('approved model write tools refuse CLI sources and leave config unchanged',
     const res = replies[idx].result;
     assert.equal(res.isError, true, `${tool} on ${args.source} must refuse`);
     assert.equal(res.structuredContent.ok, false);
-    assert.equal(res.structuredContent.error, 'approved model lists are enforced only on HTTP sources');
+    assert.equal(
+      res.structuredContent.error,
+      'approved model lists are not enforced for CLI sources; enforcement applies only to HTTP sources',
+    );
   }
 
   assert.equal(Buffer.compare(fs.readFileSync(sb.configFile), beforeBytes), 0, 'config bytes unchanged');

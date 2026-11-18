@@ -227,12 +227,20 @@ function ensureConfigExists(ctx, extraLiterals) {
   return null;
 }
 
-function requireExistingAdapter(doc, source, extraLiterals, ctx) {
+const CLI_APPROVED_ERROR = 'approved model lists are not enforced for CLI sources; enforcement applies only to HTTP sources';
+
+function requireExistingAdapter(doc, source, extraLiterals, ctx, { httpOnly = false } = {}) {
   const entry = getPath(doc, `adapters.${source}`);
   if (!isPlainObject(entry)) {
     return {
       ok: false,
       error: toolError(`unknown source "${source}"`, { source }, extraLiterals, ctx),
+    };
+  }
+  if (httpOnly && kindOf(entry) === 'cli') {
+    return {
+      ok: false,
+      error: toolError(CLI_APPROVED_ERROR, { source }, extraLiterals, ctx),
     };
   }
   return { ok: true, entry };
@@ -654,11 +662,8 @@ async function handleSourceSetModels(args, ctx) {
       } catch (e) {
         return toolError(e?.message || String(e), { source }, extraLiterals, ctx);
       }
-      const existing = requireExistingAdapter(doc, source, extraLiterals, ctx);
+      const existing = requireExistingAdapter(doc, source, extraLiterals, ctx, { httpOnly: true });
       if (!existing.ok) return existing.error;
-      if (kindOf(existing.entry) === 'cli') {
-        return toolError('approved model lists are enforced only on HTTP sources', { source }, extraLiterals, ctx);
-      }
 
       const previousModels = extractDeclaredModelIds(existing.entry.models);
       const prevSet = new Set(previousModels);
@@ -731,11 +736,8 @@ async function handleModelApprove(args, ctx) {
       } catch (e) {
         return toolError(e?.message || String(e), { source }, extraLiterals, ctx);
       }
-      const existing = requireExistingAdapter(doc, source, extraLiterals, ctx);
+      const existing = requireExistingAdapter(doc, source, extraLiterals, ctx, { httpOnly: true });
       if (!existing.ok) return existing.error;
-      if (kindOf(existing.entry) === 'cli') {
-        return toolError('approved model lists are enforced only on HTTP sources', { source }, extraLiterals, ctx);
-      }
 
       const catFile = resolveCataloguePathForApprove(doc, ctx.configFile);
       let existingCat = null;
@@ -843,11 +845,8 @@ async function handleModelRevoke(args, ctx) {
       } catch (e) {
         return toolError(e?.message || String(e), { source }, extraLiterals, ctx);
       }
-      const existing = requireExistingAdapter(doc, source, extraLiterals, ctx);
+      const existing = requireExistingAdapter(doc, source, extraLiterals, ctx, { httpOnly: true });
       if (!existing.ok) return existing.error;
-      if (kindOf(existing.entry) === 'cli') {
-        return toolError('approved model lists are enforced only on HTTP sources', { source }, extraLiterals, ctx);
-      }
 
       let writeRes;
       try {

@@ -740,6 +740,7 @@ test('keysmith_approved returns approved source -> models mapping and empty pend
       groq: ['llama-3.1-8b-instant', 'llama-3.3-70b'],
       mistral: ['mistral-small-latest'],
     },
+    note: 'Approved model lists are enforced only on HTTP sources; list is not enforced for CLI sources.',
     pending: [],
   });
   assert.deepEqual(replies[1].result.structuredContent.approved, {
@@ -973,10 +974,17 @@ test('keysmith_approved and keysmith_source_models do not present CLI sources as
   const allApproved = replies[0].result.structuredContent;
   assert.deepEqual(allApproved.approved, { groq: ['llama-3.1-8b-instant'] });
   assert.equal(Object.hasOwn(allApproved.approved, 'kiro'), false);
+  assert.deepEqual(allApproved.unenforcedCliSources, ['kiro']);
+  assert.match(allApproved.note, /not enforced for CLI sources/i);
+  assert.equal(allApproved.enforced, undefined);
   assert.deepEqual(allApproved.pending, []);
 
   const kiroApproved = replies[1].result.structuredContent;
   assert.deepEqual(kiroApproved.approved, {});
+  assert.equal(kiroApproved.kind, 'cli');
+  assert.equal(kiroApproved.enforced, false);
+  assert.deepEqual(kiroApproved.unenforcedCliSources, ['kiro']);
+  assert.match(kiroApproved.note, /not enforced for CLI sources/i);
   assert.deepEqual(kiroApproved.pending, []);
 
   const kiroModels = replies[2].result.structuredContent;
@@ -985,8 +993,9 @@ test('keysmith_approved and keysmith_source_models do not present CLI sources as
   assert.equal(kiroModels.enforced, false);
   assert.equal(kiroModels.modelsOnly, false);
   assert.equal(kiroModels.freeOnly, false);
+  assert.match(kiroModels.note, /not enforced for CLI sources/i);
   assert.deepEqual(kiroModels.models, [
-    { id: 'claude-sonnet-4', approved: false, status: 'unapproved', configured: true, discoveredFree: null },
+    { id: 'claude-sonnet-4', approved: false, status: 'not_enforced', configured: true, discoveredFree: null },
   ]);
 
   const groqModels = replies[3].result.structuredContent;
@@ -994,4 +1003,5 @@ test('keysmith_approved and keysmith_source_models do not present CLI sources as
   assert.equal(groqModels.enforced, true);
   assert.equal(groqModels.modelsOnly, true);
   assert.equal(groqModels.models[0].approved, true);
+  assert.equal(groqModels.note, undefined);
 });
