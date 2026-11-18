@@ -939,3 +939,151 @@ test('keysmith_source_set_models and keysmith_model_approve reject model ids wit
   assert.equal(Buffer.compare(fs.readFileSync(sb.configFile), beforeBytes), 0, 'config bytes unchanged');
   assert.deepEqual(listBackups(sb.configFile), [], 'no backups created');
 });
+
+test('keysmith_source_add production Keychain path registers key value in redactSecrets and extraLiterals', async () => {
+  const sb = makeSandbox();
+  writeConfig(sb.configFile, { port: 8787, auth: { enabled: true, keys: [] }, adapters: {}, aliases: {} });
+
+  const prodSecret = 'plain_kc_' + 'prod_secret_99887766';
+  const secBin = path.join(sb.root, 'fake-prod-security');
+  const secOut = path.join(sb.root, 'prod-sec-val.txt');
+  fs.writeFileSync(secOut, prodSecret, { mode: 0o600 });
+  fs.writeFileSync(
+    secBin,
+    [
+      '#!/bin/sh',
+      'want_w=0',
+      'for arg in "$@"; do',
+      '  if [ "$arg" = "-w" ]; then want_w=1; fi',
+      'done',
+      `if [ "$want_w" = "1" ]; then cat "${secOut}"; fi`,
+      'exit 0',
+      '',
+    ].join('\n'),
+    { mode: 0o700 },
+  );
+
+  const prevSec = process.env.KEYSMITH_SECURITY_BIN;
+  process.env.KEYSMITH_SECURITY_BIN = secBin;
+
+  let mode = 'mismatch';
+  try {
+    const reg = createToolRegistry();
+    await loadBuiltInTools(reg);
+    const replies = [];
+    const server = createMcpServer({
+      registry: reg,
+      configFile: sb.configFile,
+      dataDir: sb.dataDir,
+      send: (m) => replies.push(m),
+      context: {
+        homeDir: sb.root,
+        fetch: async () =>
+          new Response(
+            JSON.stringify({
+              data: [{ id: mode === 'mismatch' ? `err_${prodSecret}` : 'llama-3.1-8b-instant' }],
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+      },
+    });
+
+    await callTool(
+      server,
+      'keysmith_source_add',
+      { profile: 'groq', keyRef: 'prod-svc', models: ['llama-3.1-8b-instant'], confirm: true },
+      1,
+    );
+    assert.equal(replies[0].result.isError, true);
+    const errDump = JSON.stringify(replies[0]);
+    assert.equal(errDump.includes(prodSecret), false, 'full secret absent from error output');
+    assert.equal(errDump.includes(prodSecret.slice(0, 12)), false, '12-char secret fragment redacted');
+
+    mode = 'ok';
+    await callTool(server, 'keysmith_source_add', { profile: 'groq', keyRef: 'prod-svc', confirm: true }, 2);
+    assert.equal(replies[1].result.isError, undefined);
+    assert.equal(replies[1].result.structuredContent.ok, true);
+    assert.equal(JSON.stringify(replies[1]).includes(prodSecret), false, 'secret absent from success output');
+    assert.equal(fs.readFileSync(sb.configFile, 'utf8').includes(prodSecret), false, 'secret never written to config');
+  } finally {
+    if (prevSec === undefined) delete process.env.KEYSMITH_SECURITY_BIN;
+    else process.env.KEYSMITH_SECURITY_BIN = prevSec;
+  }
+});
+
+test('keysmith_model_approve writes tier: free to catalogue so approved models missing from catalogue are handled in pending list', async () => {
+  const sb = makeSandbox();
+  const catFile = path.join(sb.root, 'catalogue.json');
+  writeConfig(sb.configFile, {
+    catalogue: '~/catalogue.json',
+    adapters: {
+      groq: {
+        kind: 'http',
+        wire: 'openai',
+        baseUrl: 'https://api.example.invalid/v1',
+        apiKey: '{env:GROQ_KEY}',
+        modelsOnly: true,
+        models: ['m-existing'],
+      },
+    },
+  });
+  fs.writeFileSync(
+    catFile,
+    JSON.stringify(
+      {
+        version: 1,
+        sources: [
+          {
+            id: 'groq',
+            reach: { keysmith: 'groq' },
+            limits: { requestsPerMinute: 30 },
+            models: [{ id: 'm-existing', tier: 'free' }],
+          },
+        ],
+      },
+      null,
+      2,
+    ) + '\n',
+    { mode: 0o600 },
+  );
+
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
+  const replies = [];
+  const server = createMcpServer({
+    registry: reg,
+    configFile: sb.configFile,
+    dataDir: sb.dataDir,
+    send: (m) => replies.push(m),
+    context: { homeDir: sb.root },
+  });
+
+  await callTool(server, 'keysmith_model_approve', { source: 'groq', model: 'm-missing', confirm: true }, 1);
+  const appOut = replies[0].result.structuredContent;
+  assert.equal(appOut.ok, true);
+  assert.equal(appOut.changed, true);
+  assert.deepEqual(appOut.models, ['m-existing', 'm-missing']);
+
+  const catAfter = JSON.parse(fs.readFileSync(catFile, 'utf8'));
+  const groqCat = catAfter.sources.find((s) => s?.reach?.keysmith === 'groq');
+  assert.ok(groqCat.models.some((m) => m.id === 'm-missing' && m.tier === 'free'));
+  assert.equal(modeOf(catFile), 0o600);
+  const catBackups = fs.readdirSync(sb.root).filter((f) => f.startsWith('catalogue.json.bak-'));
+  assert.equal(catBackups.length, 1);
+  assert.equal(modeOf(path.join(sb.root, catBackups[0])), 0o600);
+
+  await callTool(server, 'keysmith_approved', { source: 'groq' }, 2);
+  assert.deepEqual(replies[1].result.structuredContent.approved, { groq: ['m-existing', 'm-missing'] });
+  assert.deepEqual(replies[1].result.structuredContent.pending, []);
+
+  // Re-classify m-missing as paid in catalogue -> keysmith_approved surfaces it in pending just like source.js entries.
+  groqCat.models = groqCat.models.map((m) => (m.id === 'm-missing' ? { ...m, tier: 'paid' } : m));
+  fs.writeFileSync(catFile, JSON.stringify(catAfter, null, 2) + '\n', { mode: 0o600 });
+  const future = new Date(Date.now() + 5000);
+  fs.utimesSync(catFile, future, future);
+
+  await callTool(server, 'keysmith_approved', { source: 'groq' }, 3);
+  assert.deepEqual(replies[2].result.structuredContent.pending, [
+    { source: 'groq', model: 'm-missing', oldFree: true, newFree: false },
+  ]);
+});

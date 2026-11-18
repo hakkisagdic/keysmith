@@ -13,11 +13,13 @@
  * gateway.js), and scrub secrets, reference interiors, and directory paths
  * before returning results.
  */
+import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { getPath, readRaw, setPath } from './config-edit.js';
+import { catalogueSettings } from './catalogue.js';
+import { backupFile, getPath, readRaw, setPath, writeJsonAtomic } from './config-edit.js';
 import { checkAdapter, kindOf } from './gateway.js';
 import { registerTool, writeConfigWithBackup } from './mcp.js';
 import { SOURCE_FACTS } from './profiles.js';
@@ -231,7 +233,7 @@ function requireExistingAdapter(doc, source, extraLiterals, ctx) {
  * Provide a scoped temporary KEYSMITH_SECURITY_BIN wrapper when `ctx.keychainHas`
  * is injected so `sourceEnable` never calls the real `/usr/bin/security` binary.
  */
-async function withScopedKeychainAndFetch(ctx, service, account, extraLiterals, fn) {
+async function withScopedKeychainAndFetch(ctx, service, account, extraLiterals, fn, { readKeyValue = false } = {}) {
   const prevSec = process.env.KEYSMITH_SECURITY_BIN;
   const prevFetch = globalThis.fetch;
   let tempDir = null;
@@ -277,6 +279,23 @@ async function withScopedKeychainAndFetch(ctx, service, account, extraLiterals, 
       ].join('\n');
       fs.writeFileSync(stubPath, script, { mode: 0o700 });
       process.env.KEYSMITH_SECURITY_BIN = stubPath;
+    } else if (readKeyValue) {
+      const bin = process.env.KEYSMITH_SECURITY_BIN || '/usr/bin/security';
+      const hasRes = spawnSync(bin, ['find-generic-password', '-s', service, '-a', account], {
+        stdio: 'ignore',
+        timeout: 10_000,
+      });
+      if (hasRes.status === 0) {
+        const valRes = spawnSync(bin, ['find-generic-password', '-s', service, '-a', account, '-w'], {
+          encoding: 'utf8',
+          timeout: 10_000,
+        });
+        const secretOut = valRes.status === 0 ? String(valRes.stdout || '').trim() : '';
+        if (secretOut) {
+          registerSecrets([secretOut]);
+          extraLiterals.push(secretOut);
+        }
+      }
     }
 
     if (typeof ctx?.fetch === 'function') {
@@ -436,11 +455,26 @@ async function handleSourceAdd(args, ctx) {
         ...(args?.force === true ? { force: true } : {}),
       };
 
+      let readKeyValue = !facts.freeOnly;
+      if (readKeyValue && args?.force !== true) {
+        try {
+          const curDoc = readRaw(ctx.configFile);
+          if (getPath(curDoc, `adapters.${targetId}`)) readKeyValue = false;
+        } catch {}
+      }
+
       let runRes;
       try {
-        runRes = await withScopedKeychainAndFetch(ctx, rawKeyRef, rawKeyAccount, extraLiterals, async () => {
-          return await sourceEnable(ctx.configFile, profile, flags);
-        });
+        runRes = await withScopedKeychainAndFetch(
+          ctx,
+          rawKeyRef,
+          rawKeyAccount,
+          extraLiterals,
+          async () => {
+            return await sourceEnable(ctx.configFile, profile, flags);
+          },
+          { readKeyValue },
+        );
       } catch (e) {
         return toolError(e?.message || String(e), { source: targetId, profile }, extraLiterals, ctx);
       }
@@ -655,6 +689,16 @@ async function handleSourceSetModels(args, ctx) {
   );
 }
 
+function resolveCataloguePathForApprove(doc, cfgFile) {
+  const configured = catalogueSettings(doc).path;
+  if (configured) return configured;
+  if (cfgFile) {
+    const fallback = path.join(path.dirname(cfgFile), 'catalogue.json');
+    if (fs.existsSync(fallback)) return fallback;
+  }
+  return null;
+}
+
 async function handleModelApprove(args, ctx) {
   return await withWriteLock(async () =>
     withScopedEnv(ctx, async () => {
@@ -682,6 +726,19 @@ async function handleModelApprove(args, ctx) {
         return toolError('approved model lists are enforced only on HTTP sources', { source }, extraLiterals, ctx);
       }
 
+      const catFile = resolveCataloguePathForApprove(doc, ctx.configFile);
+      let existingCat = null;
+      if (catFile && fs.existsSync(catFile)) {
+        try {
+          existingCat = readRaw(catFile);
+          if (existingCat.version !== 1 || !Array.isArray(existingCat.sources)) {
+            return toolError('catalogue: expected { version: 1, sources: [...] }', { source }, extraLiterals, ctx);
+          }
+        } catch (e) {
+          return toolError(e?.message || String(e), { source }, extraLiterals, ctx);
+        }
+      }
+
       let writeRes;
       try {
         writeRes = await runWriteConfigWithBackup(ctx, (draft) => {
@@ -707,17 +764,45 @@ async function handleModelApprove(args, ctx) {
         return toolError(e?.message || String(e), { source }, extraLiterals, ctx);
       }
 
+      let catChanged = false;
+      if (catFile) {
+        const nextCat = existingCat ? structuredClone(existingCat) : { version: 1, sources: [] };
+        let srcRow = nextCat.sources.find((s) => s?.reach?.keysmith === source);
+        if (!srcRow) {
+          srcRow = {
+            id: source,
+            reach: { keysmith: source },
+            limits: SOURCE_FACTS[source]?.limits ? { ...SOURCE_FACTS[source].limits } : {},
+            models: [],
+          };
+          nextCat.sources.push(srcRow);
+        }
+        if (!Array.isArray(srcRow.models)) srcRow.models = [];
+        const existingModel = srcRow.models.find((m) => isPlainObject(m) && m.id === model);
+        if (existingModel) {
+          if (existingModel.tier !== 'free') existingModel.tier = 'free';
+        } else {
+          srcRow.models.push({ id: model, tier: 'free' });
+        }
+        if (!existingCat || JSON.stringify(existingCat) !== JSON.stringify(nextCat)) {
+          if (existingCat) backupFile(catFile, 'mcp');
+          writeJsonAtomic(catFile, nextCat);
+          catChanged = true;
+        }
+      }
+
+      const changed = Boolean(writeRes.changed || catChanged);
       return scrubOutput(
         {
           ok: true,
-          changed: writeRes.changed,
+          changed,
           source,
           model,
           approved: true,
           modelsOnly: true,
           models: writeRes.models,
           backup: backupBasename(writeRes.backup),
-          reloadRequired: writeRes.changed,
+          reloadRequired: changed,
         },
         extraLiterals,
         ctx,
