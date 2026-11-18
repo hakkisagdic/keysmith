@@ -84,7 +84,7 @@ test('loadBuiltInTools registers all 6 write tools with destructive annotations 
     assert.equal(def.inputSchema.type, 'object');
     assert.equal(def.inputSchema.properties.confirm?.type, 'boolean');
   }
-  assert.equal(tools.filter((t) => t.annotations.readOnlyHint === false).length, 6);
+  assert.equal(tools.filter((t) => WRITE_TOOL_NAMES.includes(t.name) && t.annotations.readOnlyHint === false).length, 6);
 
   const sb = makeSandbox();
   writeConfig(sb.configFile, { host: '127.0.0.1', port: 8787, auth: { enabled: true, keys: [] }, adapters: {}, aliases: {} });

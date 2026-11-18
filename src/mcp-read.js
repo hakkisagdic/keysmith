@@ -19,6 +19,7 @@ import { catalogueSettings, discoveredPath, readDiscovered } from './catalogue.j
 import { which } from './cli-adapter.js';
 import { DEFAULTS, jsonErrorWithoutText, loadConfig, resolveSecret } from './config.js';
 import { checkAdapter, kindOf } from './gateway.js';
+import { computePendingFreeChanges } from './mcp-reload.js';
 import { registerTool } from './mcp.js';
 import { SOURCE_FACTS } from './profiles.js';
 import { redactSecrets, registerSecrets } from './redact.js';
@@ -38,8 +39,10 @@ const CF_ACCOUNT_SEG_RE = /(\/accounts\/)(?!\{account\})(?!\[redacted\])[^/?#]+/
 async function withScopedEnv(ctx, fn) {
   const prevConfig = process.env.KEYSMITH_CONFIG;
   const prevData = process.env.KEYSMITH_DATA;
+  const prevHome = process.env.HOME;
   if (ctx?.configFile) process.env.KEYSMITH_CONFIG = ctx.configFile;
   if (ctx?.dataDir) process.env.KEYSMITH_DATA = ctx.dataDir;
+  if (ctx?.homeDir !== undefined) process.env.HOME = ctx.homeDir;
   try {
     return await fn();
   } finally {
@@ -47,6 +50,10 @@ async function withScopedEnv(ctx, fn) {
     else process.env.KEYSMITH_CONFIG = prevConfig;
     if (prevData === undefined) delete process.env.KEYSMITH_DATA;
     else process.env.KEYSMITH_DATA = prevData;
+    if (ctx?.homeDir !== undefined) {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
   }
 }
 
@@ -900,7 +907,11 @@ async function handleApproved(args, ctx) {
       ok: true,
       configLoaded: cfgRes.exists,
       approved,
-      pending: [],
+      pending: computePendingFreeChanges(doc, {
+        dataDir: ctx.dataDir,
+        filterSource,
+        previousCatalogue: ctx?.previousCatalogue,
+      }),
     });
   });
 }
