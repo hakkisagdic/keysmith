@@ -18,6 +18,8 @@ import { redactKey, redactSecrets, registerSecrets } from './redact.js';
 import { stablePath } from './service.js';
 import { isPlainObject } from './tools/model.js';
 
+export { backupFile, writeJsonAtomic };
+
 const PKG = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const CLI_ENTRY = fileURLToPath(new URL('./cli.js', import.meta.url));
 const SERVER_INFO = { name: 'keysmith', version: PKG.version };
@@ -308,6 +310,83 @@ export function mergeSecretContexts(a, b) {
   return { keys, verbatim };
 }
 
+function findBalancedEnd(s, start, openCh, closeCh) {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === openCh) depth++;
+    else if (ch === closeCh) {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return s.length;
+}
+
+function findQuotedEnd(s, start, quoteCh) {
+  let esc = false;
+  for (let i = start + 1; i < s.length; i++) {
+    const ch = s[i];
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (ch === '\\') esc = true;
+    else if (ch === quoteCh) return i + 1;
+    else if (ch === '\n') return i;
+  }
+  return s.length;
+}
+
+function scrubBodyLiterals(s) {
+  const re = /(?:^|[^A-Za-z0-9_.])((?:request|response|req|res|raw)Body|body)"?\s*([:=])\s*/gi;
+  let out = '';
+  let at = 0;
+  for (;;) {
+    re.lastIndex = at;
+    const m = re.exec(s);
+    if (!m) break;
+    const key = m[1];
+    const sep = m[2];
+    const valStart = m.index + m[0].length;
+    if (valStart >= s.length) break;
+    const ch = s[valStart];
+    let valEnd = -1;
+    let repl = '[redacted]';
+    if (ch === '{' || ch === '[') {
+      valEnd = findBalancedEnd(s, valStart, ch, ch === '{' ? '}' : ']');
+      repl = sep === ':' ? '"[redacted]"' : '[redacted]';
+    } else if (ch === '"' || ch === "'") {
+      valEnd = findQuotedEnd(s, valStart, ch);
+      repl = ch === '"' ? '"[redacted]"' : "'[redacted]'";
+    } else if (key.toLowerCase() !== 'body') {
+      const rest = s.slice(valStart);
+      const token = /^[^\s,}\]]+/.exec(rest)?.[0] || '';
+      if (token && !/^(?:null|true|false|undefined|\[redacted\])$/i.test(token)) {
+        valEnd = valStart + token.length;
+        repl = '[redacted]';
+      }
+    }
+    if (valEnd > valStart) {
+      out += s.slice(at, valStart) + repl;
+      at = valEnd;
+    } else {
+      out += s.slice(at, valStart);
+      at = valStart;
+    }
+  }
+  return out + s.slice(at);
+}
+
 export function redactMcpText(text, secretCtx = null) {
   let s = String(text ?? '');
   if (!s) return s;
@@ -334,6 +413,9 @@ export function redactMcpText(text, secretCtx = null) {
       if (escaped !== needle && s.includes(escaped)) s = s.split(escaped).join('[redacted]');
     }
   }
+
+  // Mask request/response body fragments in raw text or error strings.
+  s = scrubBodyLiterals(s);
 
   // Mask inline Bearer tokens and common upstream API key shapes.
   s = s.replace(/\b(Bearer\s+)(?!\[redacted\])[A-Za-z0-9._~+/=-]{8,}/gi, '$1[redacted]');
@@ -640,6 +722,9 @@ export function createMcpServer({
       ...context,
       configFile: resolvedConfigFile,
       dataDir: resolvedDataDir,
+      backupFile,
+      writeJsonAtomic,
+      writeConfigWithBackup: (mutate, opts) => writeConfigWithBackup(resolvedConfigFile, mutate, opts),
     };
 
     try {
