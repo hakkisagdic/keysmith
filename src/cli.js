@@ -22,6 +22,7 @@ import { fmtUsd } from './usage.js';
 import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets, streamRedactor } from './redact.js';
 import { ensurePrivateDir, logFiles, openPrivateLog, rotatedLogFiles, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
 import { adapterReach, aliasDecision, authEnabled, describePerDay, describeScope, entryFp, hashKey, keyHashOf, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
+import { runMcpCli } from './mcp.js';
 
 const PKG = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
@@ -88,6 +89,7 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith key who-can <adapter>     the keys, by fingerprint, that can reach an adapter (or adapter/model, alias:<name>)
   keysmith key revoke fp:<8 hex>     revoke by the fingerprint list/logs print (never the key itself: argv is public)
   keysmith scrub-logs [file…]        redact keys left in the logs, their rotated copies and any file named; counts only
+  keysmith mcp [--register]          stdio MCP server; --register adds keysmith to installed MCP clients
 
   config  ${rel(configPath())}
   data    ${rel(dataDir())}/usage.jsonl
@@ -206,6 +208,8 @@ export async function main(argv) {
         return await cmdKey(flags);
       case 'scrub-logs':
         return await cmdScrubLogs(flags);
+      case 'mcp':
+        return await runMcpCli(flags);
       default:
         fail(`unknown command "${cmd}"\n\n${HELP}`);
     }
