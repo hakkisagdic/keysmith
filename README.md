@@ -1437,17 +1437,19 @@ and is idempotent.
   dated mode-`0600` backup first and write through a mode-`0600` temp file and `rename`.
 - **Read tools:** `keysmith_ping`, `keysmith_status` (launchd state, PID, port,
   `/healthz`, enabled source count), `keysmith_sources` (non-secret metadata, key
-  reference kind, Keychain `yes`/`no`), `keysmith_source_models` (models, `approved`,
-  discovered free diff), `keysmith_test` (single-source check, latency + status, no
-  body), `keysmith_usage` (per-source requests/tokens/spend and `limits.spend`
-  headroom), `keysmith_approved` (approved `source -> models` and pending free-flag
-  changes).
+  reference kind, Keychain `yes`/`no`), `keysmith_source_models` (models, `enforced`,
+  `approved`, discovered free diff), `keysmith_test` (single-source check, latency +
+  status, no body), `keysmith_usage` (per-source requests/tokens/spend and
+  `limits.spend` headroom), `keysmith_approved` (approved HTTP `source -> models` and
+  pending free-flag changes).
 - **Write & reload tools (all require `confirm: true`):** `keysmith_source_add` (takes
   a built-in profile and Keychain service/account names, never a key value),
   `keysmith_source_enable`, `keysmith_source_disable`, `keysmith_source_set_models`
-  (keeps `modelsOnly: true`), `keysmith_model_approve`, `keysmith_model_revoke`, and
-  `keysmith_reload` (restarts `dev.keysmith.gateway` via `launchd`, warns on in-flight
-  requests, waits for `/healthz`).
+  (HTTP sources only; refuses CLI sources), `keysmith_model_approve`,
+  `keysmith_model_revoke` (HTTP sources only; refuses CLI sources), and
+  `keysmith_reload` (validates config via `loadConfig({ mint: false })`, refuses when
+  requests are in flight unless `force: true`, restarts `dev.keysmith.gateway` via
+  `launchd`, waits for `/healthz`).
 - **Never returned:** key values, secret reference interiors (Keychain service/account or
   file/json/dotenv paths included), `auth.keys[].key`, Cloudflare account id,
   `workspaceFiles` content, or request/response bodies — all responses and errors pass

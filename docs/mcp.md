@@ -83,8 +83,9 @@ Lists configured sources with non-secret metadata, key reference kind, and Keych
 Inspects one source's configured models, approval flags, and difference against the cached discovered free list.
 
 - **Arguments:** `{ source: string }` (`required: ["source"]`)
-- **Returns:** `{ ok, source, modelsOnly, freeOnly, configuredModels, models, discovery }`
-  - `models[]`: `{ id, approved (modelsOnly && configured), status ("approved" | "unapproved"), configured, discoveredFree (boolean | null) }`
+- **Returns:** `{ ok, source, kind, enforced, modelsOnly, freeOnly, configuredModels, models, discovery }`
+  - `enforced`: `true` for `http` sources and `false` for `cli` sources (approved model lists are enforced only on HTTP sources; for `cli` sources, `modelsOnly`, `freeOnly`, and `models[].approved` are always `false` with `status: "unapproved"`).
+  - `models[]`: `{ id, approved (enforced && modelsOnly && configured), status ("approved" | "unapproved"), configured, discoveredFree (boolean | null) }`
   - `discovery`: `{ available, message, discoveredFree, diff: { onlyInDiscovered, onlyInModels } }` comparing `configuredModels` with `<dataDir>/discovered/<source>.json` (populated by `keysmith discover` when `discovery.enabled` is true).
 
 ### `keysmith_test`
@@ -107,12 +108,12 @@ Reports per-source requests, token counts, spend, and remaining headroom to conf
 
 ### `keysmith_approved`
 
-Returns approved models (`modelsOnly: true` sources) and pending "free flag changed" catalogue review entries.
+Returns approved models (`modelsOnly: true` HTTP sources) and pending "free flag changed" catalogue review entries for HTTP sources.
 
 - **Arguments:** `{ source?: string }`
 - **Returns:** `{ ok, configLoaded, approved, pending }`
-  - `approved`: `{ [source]: string[] }` mapping for sources with `modelsOnly: true`.
-  - `pending`: array of `{ source, model, oldFree, newFree }` entries derived from `catalogue.json`, cached `<dataDir>/discovered/<source>.json`, and configured model baselines.
+  - `approved`: `{ [source]: string[] }` mapping for HTTP sources with `modelsOnly: true` (CLI sources are excluded because approved model lists are enforced only on HTTP sources).
+  - `pending`: array of `{ source, model, oldFree, newFree }` entries for HTTP sources derived from `catalogue.json`, cached `<dataDir>/discovered/<source>.json`, and configured model baselines.
 
 ## Write & reload tools (`readOnlyHint: false`, `destructiveHint: true`, all require `confirm: true`)
 
@@ -125,44 +126,47 @@ Attaches a built-in source profile (`tokenrouter`, `groq`, `mistral`, `cloudflar
   security add-generic-password -s groq-api -a keysmith -w
   ```
 - **Arguments:** `{ profile: string, keyRef: string, keyAccount?: string, as?: string, models?: string[], accountId?: string, force?: boolean, confirm: true }` (`required: ["profile", "keyRef"]`)
-  - `keyRef`: Keychain service name (`-s`), never a key value or `{…}` reference.
-  - `keyAccount`: Keychain account name (`-a`, defaults to `"keysmith"`).
+  - `keyRef`: Keychain service name (`-s`, cannot start with `-`), never a key value or `{…}` reference.
+  - `keyAccount`: Keychain account name (`-a`, cannot start with `-`, defaults to `"keysmith"`).
   - `as`: custom adapter id (defaults to `profile`).
-  - `models`: initial model ids to allow. For non-`freeOnly` profiles (`groq`, `mistral`, `cloudflare`), omitting `models` selects a default small chat model from the provider's `/models` endpoint.
+  - `models`: initial model ids to allow (must not contain whitespace or commas). For non-`freeOnly` profiles (`groq`, `mistral`, `cloudflare`), omitting `models` selects a default small chat model from the provider's `/models` endpoint.
   - `accountId`: 32-hex Cloudflare account id (required only for `cloudflare`; never echoed back).
   - `force`: overwrite an existing source entry with the same id.
-- **Safety & behavior:** refuses requests carrying raw secret fields (`apiKey`, `key`, `secret`, `keyValue`) or secret-shaped / `{…}` values in `keyRef`/`keyAccount`; verifies the Keychain item exists before modifying anything; writes `apiKey` as `{exec:/usr/bin/security find-generic-password -s <service> -a <account> -w}` with `explicitOnly: true`, `freeOnly: true` (`tokenrouter`) or `modelsOnly: true` (named-model profiles), enables `discovery.enabled`, updates `catalogue.json` and `config.json` with `0600` backups, and returns `{ ok, changed: true, source, profile, disabled, explicitOnly, freeOnly, modelsOnly, models, keyRefType: "exec", catalogueUpdated: true, backup, reloadRequired: true, note? }`.
+- **Safety & behavior:** refuses requests carrying raw secret fields (`apiKey`, `key`, `secret`, `keyValue`) or secret-shaped / `{…}` values in `keyRef`/`keyAccount`; verifies the Keychain item exists before modifying anything; registers any resolved Keychain secret with `redact.js` and output scrubbing; writes `apiKey` as `{exec:/usr/bin/security find-generic-password -s <service> -a <account> -w}` with `explicitOnly: true`, `freeOnly: true` (`tokenrouter`) or `modelsOnly: true` (named-model profiles), enables `discovery.enabled`, updates `catalogue.json` and `config.json` with `0600` backups, and returns `{ ok, changed: true, source, profile, disabled, explicitOnly, freeOnly, modelsOnly, models, keyRefType: "exec", catalogueUpdated: true, backup, reloadRequired: true, note? }`.
 
 ### `keysmith_source_enable` / `keysmith_source_disable`
 
 Enables (`disabled: false`) or disables (`disabled: true`) an attached source with a backup-first atomic write, preserving its key reference and all other adapter fields.
 
-- **Arguments:** `{ source: string, confirm: true }` (`required: ["source"]`)
+- **Arguments:** `{ source: string, confirm: true }` (`required: ["source"]`; `source` must match `^[A-Za-z][A-Za-z0-9_-]*$`)
 - **Restrictions:** `keysmith_source_enable` refuses sources marked `unsafeTools: true`.
 - **Returns:** `{ ok, changed, source, field: "disabled", previousDisabled, disabled, backup, reloadRequired }`
 
 ### `keysmith_source_set_models`
 
-Replaces an attached source's `models` list while keeping `modelsOnly: true`.
+Replaces an attached HTTP source's `models` list while keeping `modelsOnly: true`.
 
-- **Arguments:** `{ source: string, models: string[], confirm: true }` (`required: ["source", "models"]`)
+- **Arguments:** `{ source: string, models: string[], confirm: true }` (`required: ["source", "models"]`; `source` must match `^[A-Za-z][A-Za-z0-9_-]*$`, and model ids must not contain whitespace or commas)
+- **Restrictions:** refuses `cli` sources (`"approved model lists are enforced only on HTTP sources"`).
 - **Behavior:** deduplicates model ids and preserves per-model metadata objects when `models` was configured as an object or array of `{ id, … }` objects.
 - **Returns:** `{ ok, changed, source, modelsOnly: true, previousModels, models, added, removed, backup, reloadRequired }`
 
 ### `keysmith_model_approve` / `keysmith_model_revoke`
 
-Adds (`keysmith_model_approve`) or removes (`keysmith_model_revoke`) a single model id on an attached source while keeping `modelsOnly: true`.
+Adds (`keysmith_model_approve`) or removes (`keysmith_model_revoke`) a single model id on an attached HTTP source while keeping `modelsOnly: true`.
 
-- **Arguments:** `{ source: string, model: string, confirm: true }` (`required: ["source", "model"]`)
+- **Arguments:** `{ source: string, model: string, confirm: true }` (`required: ["source", "model"]`; `source` must match `^[A-Za-z][A-Za-z0-9_-]*$`, and `model` must not contain whitespace or commas)
+- **Restrictions:** refuses `cli` sources (`"approved model lists are enforced only on HTTP sources"`).
+- **Behavior:** `keysmith_model_approve` also updates a configured `catalogue.json` (with a mode-`0600` backup first) so the approved model is recorded with `tier: "free"` for `keysmith_approved` pending-diff tracking.
 - **Returns:** `{ ok, changed, source, model, approved, modelsOnly, models, backup, reloadRequired }`
 
 ### `keysmith_reload`
 
-Restarts the macOS `launchd` gateway LaunchAgent (`dev.keysmith.gateway`), warns if requests are in flight, and waits for `/healthz`.
+Validates config, restarts the macOS `launchd` gateway LaunchAgent (`dev.keysmith.gateway`), refuses if requests are in flight unless `force: true`, and waits for `/healthz`.
 
-- **Arguments:** `{ confirm: true }`
+- **Arguments:** `{ force?: boolean, confirm: true }`
 - **Prerequisites:** macOS with `~/Library/LaunchAgents/dev.keysmith.gateway.plist` installed (`keysmith install-service`).
-- **Behavior:** checks active in-flight requests before restarting (via `/healthz` or gateway child process count), runs `launchctl bootout` followed by `launchctl bootstrap` (retrying while launchd releases the old process), and polls `GET /healthz` until `ok: true` (up to 15 s).
+- **Behavior:** validates the config with `loadConfig({ mint: false })` before touching `launchd`; checks active in-flight requests (via `/healthz` or gateway child process count) and refuses without restarting when `inFlight > 0` unless `force: true` is passed; runs `launchctl bootout` followed by `launchctl bootstrap` (retrying while launchd releases the old process), and polls `GET /healthz` until `ok: true` (up to 15 s).
 - **Returns:** `{ ok, restarted, label: "dev.keysmith.gateway", previousPid, pid, pidChanged, port, healthzStatus, healthz, latencyMs, inFlight, inFlightWarning, enabledSources, disabledSources, totalSources }`
 
 ## Never returned
