@@ -753,6 +753,7 @@ async function handleModelApprove(args, ctx) {
       }
 
       let writeRes;
+      let catChanged = false;
       try {
         writeRes = await runWriteConfigWithBackup(ctx, (draft) => {
           const cur = getPath(draft, `adapters.${source}`);
@@ -773,35 +774,44 @@ async function handleModelApprove(args, ctx) {
             models: extractDeclaredModelIds(draft.adapters[source].models),
           };
         });
-      } catch (e) {
-        return toolError(e?.message || String(e), { source }, extraLiterals, ctx);
-      }
 
-      let catChanged = false;
-      if (catFile) {
-        const nextCat = existingCat ? structuredClone(existingCat) : { version: 1, sources: [] };
-        let srcRow = nextCat.sources.find((s) => s?.reach?.keysmith === source);
-        if (!srcRow) {
-          srcRow = {
-            id: source,
-            reach: { keysmith: source },
-            limits: SOURCE_FACTS[source]?.limits ? { ...SOURCE_FACTS[source].limits } : {},
-            models: [],
-          };
-          nextCat.sources.push(srcRow);
+        if (catFile) {
+          const nextCat = existingCat ? structuredClone(existingCat) : { version: 1, sources: [] };
+          let srcRow = nextCat.sources.find((s) => s?.reach?.keysmith === source);
+          if (!srcRow) {
+            srcRow = {
+              id: source,
+              reach: { keysmith: source },
+              limits: SOURCE_FACTS[source]?.limits ? { ...SOURCE_FACTS[source].limits } : {},
+              models: [],
+            };
+            nextCat.sources.push(srcRow);
+          }
+          if (!Array.isArray(srcRow.models)) srcRow.models = [];
+          const existingModel = srcRow.models.find((m) => isPlainObject(m) && m.id === model);
+          if (existingModel) {
+            if (existingModel.tier !== 'free') existingModel.tier = 'free';
+          } else {
+            srcRow.models.push({ id: model, tier: 'free' });
+          }
+          if (!existingCat || JSON.stringify(existingCat) !== JSON.stringify(nextCat)) {
+            if (existingCat) backupFile(catFile, 'mcp');
+            writeJsonAtomic(catFile, nextCat);
+            catChanged = true;
+          }
         }
-        if (!Array.isArray(srcRow.models)) srcRow.models = [];
-        const existingModel = srcRow.models.find((m) => isPlainObject(m) && m.id === model);
-        if (existingModel) {
-          if (existingModel.tier !== 'free') existingModel.tier = 'free';
-        } else {
-          srcRow.models.push({ id: model, tier: 'free' });
+      } catch (e) {
+        const rawErr = e?.message || String(e);
+        const cfgBackup = backupBasename(writeRes?.backup);
+        if (cfgBackup) {
+          return toolError(
+            `catalogue write failed after config was updated (config backup: ${cfgBackup}): ${rawErr}`,
+            { source, backup: cfgBackup },
+            extraLiterals,
+            ctx,
+          );
         }
-        if (!existingCat || JSON.stringify(existingCat) !== JSON.stringify(nextCat)) {
-          if (existingCat) backupFile(catFile, 'mcp');
-          writeJsonAtomic(catFile, nextCat);
-          catChanged = true;
-        }
+        return toolError(rawErr, { source }, extraLiterals, ctx);
       }
 
       const changed = Boolean(writeRes.changed || catChanged);

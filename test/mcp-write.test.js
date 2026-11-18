@@ -1142,3 +1142,45 @@ test('keysmith_source_add rejects invalid profile names explicitly without modif
   assert.equal(Buffer.compare(fs.readFileSync(sb.configFile), beforeBytes), 0, 'config bytes unchanged');
   assert.deepEqual(listBackups(sb.configFile), [], 'no backups created');
 });
+
+test('keysmith_model_approve returns toolError naming config backup file when catalogue path cannot be written', async () => {
+  const sb = makeSandbox();
+  const blocker = path.join(sb.root, 'not-a-dir');
+  fs.writeFileSync(blocker, 'x', { mode: 0o600 });
+
+  writeConfig(sb.configFile, {
+    catalogue: '~/not-a-dir/catalogue.json',
+    adapters: {
+      groq: {
+        kind: 'http',
+        wire: 'openai',
+        baseUrl: 'https://api.example.invalid/v1',
+        apiKey: '{env:GROQ_KEY}',
+        modelsOnly: true,
+        models: ['m-existing'],
+      },
+    },
+  });
+
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
+  const replies = [];
+  const server = createMcpServer({
+    registry: reg,
+    configFile: sb.configFile,
+    dataDir: sb.dataDir,
+    send: (m) => replies.push(m),
+    context: { homeDir: sb.root },
+  });
+
+  await callTool(server, 'keysmith_model_approve', { source: 'groq', model: 'm-new', confirm: true }, 1);
+  const res = replies[0].result;
+  assert.equal(res.isError, true);
+  assert.equal(res.structuredContent.ok, false);
+
+  const backups = listBackups(sb.configFile);
+  assert.equal(backups.length, 1);
+  assert.equal(res.structuredContent.backup, backups[0]);
+  assert.equal(res.structuredContent.error.includes(backups[0]), true);
+  assert.equal(JSON.stringify(res).includes(sb.root), false);
+});
