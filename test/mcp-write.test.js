@@ -811,3 +811,131 @@ test('approved model write tools refuse CLI sources and leave config unchanged',
   assert.equal(Buffer.compare(fs.readFileSync(sb.configFile), beforeBytes), 0, 'config bytes unchanged');
   assert.deepEqual(listBackups(sb.configFile), [], 'no backups created');
 });
+
+test('write tools reject dotted source ids up front without modifying config', async () => {
+  const sb = makeSandbox();
+  writeConfig(sb.configFile, {
+    adapters: {
+      groq: {
+        kind: 'http',
+        wire: 'openai',
+        baseUrl: 'https://api.example.invalid/v1',
+        apiKey: '{env:GROQ_KEY}',
+        headers: { 'x-test': '1' },
+        modelsOnly: true,
+        models: ['m1'],
+      },
+    },
+  });
+  const beforeBytes = fs.readFileSync(sb.configFile);
+
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
+  const replies = [];
+  const server = createMcpServer({
+    registry: reg,
+    configFile: sb.configFile,
+    dataDir: sb.dataDir,
+    send: (m) => replies.push(m),
+    context: { homeDir: sb.root },
+  });
+
+  const calls = [
+    ['keysmith_source_enable', { source: 'groq.headers', confirm: true }],
+    ['keysmith_source_disable', { source: 'groq.headers', confirm: true }],
+    ['keysmith_source_set_models', { source: 'groq.headers', models: ['m2'], confirm: true }],
+    ['keysmith_model_approve', { source: 'groq.headers', model: 'm2', confirm: true }],
+    ['keysmith_model_revoke', { source: 'groq.headers', model: 'm1', confirm: true }],
+  ];
+
+  for (const [idx, [tool, args]] of calls.entries()) {
+    await callTool(server, tool, args, idx + 1);
+    const res = replies[idx].result;
+    assert.equal(res.isError, true, `${tool} rejected dotted source id`);
+    assert.match(res.structuredContent.error, /invalid source name/);
+  }
+
+  assert.equal(Buffer.compare(fs.readFileSync(sb.configFile), beforeBytes), 0, 'config bytes unchanged');
+  assert.deepEqual(listBackups(sb.configFile), [], 'no backups created');
+});
+
+test('keysmith_source_add rejects Keychain names starting with "-"', async () => {
+  const sb = makeSandbox();
+  writeConfig(sb.configFile, { adapters: {} });
+  const beforeBytes = fs.readFileSync(sb.configFile);
+
+  let kcCalled = 0;
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
+  const replies = [];
+  const server = createMcpServer({
+    registry: reg,
+    configFile: sb.configFile,
+    dataDir: sb.dataDir,
+    send: (m) => replies.push(m),
+    context: {
+      homeDir: sb.root,
+      keychainHas: async () => {
+        kcCalled++;
+        return true;
+      },
+    },
+  });
+
+  await callTool(server, 'keysmith_source_add', { profile: 'tokenrouter', keyRef: '-w', confirm: true }, 1);
+  assert.equal(replies[0].result.isError, true);
+  assert.match(replies[0].result.structuredContent.error, /keyRef/);
+
+  await callTool(server, 'keysmith_source_add', { profile: 'tokenrouter', keyRef: 'valid-svc', keyAccount: '-w', confirm: true }, 2);
+  assert.equal(replies[1].result.isError, true);
+  assert.match(replies[1].result.structuredContent.error, /keyAccount/);
+
+  assert.equal(kcCalled, 0, 'Keychain was never checked for leading-dash names');
+  assert.equal(Buffer.compare(fs.readFileSync(sb.configFile), beforeBytes), 0, 'config bytes unchanged');
+  assert.deepEqual(listBackups(sb.configFile), [], 'no backups created');
+});
+
+test('keysmith_source_set_models and keysmith_model_approve reject model ids with spaces or commas', async () => {
+  const sb = makeSandbox();
+  writeConfig(sb.configFile, {
+    adapters: {
+      groq: {
+        kind: 'http',
+        wire: 'openai',
+        baseUrl: 'https://api.example.invalid/v1',
+        apiKey: '{env:GROQ_KEY}',
+        modelsOnly: true,
+        models: ['m1'],
+      },
+    },
+  });
+  const beforeBytes = fs.readFileSync(sb.configFile);
+
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
+  const replies = [];
+  const server = createMcpServer({
+    registry: reg,
+    configFile: sb.configFile,
+    dataDir: sb.dataDir,
+    send: (m) => replies.push(m),
+    context: { homeDir: sb.root },
+  });
+
+  const calls = [
+    ['keysmith_source_set_models', { source: 'groq', models: ['llama 3'], confirm: true }],
+    ['keysmith_source_set_models', { source: 'groq', models: ['m1,m2'], confirm: true }],
+    ['keysmith_model_approve', { source: 'groq', model: 'llama 3', confirm: true }],
+    ['keysmith_model_approve', { source: 'groq', model: 'm1,m2', confirm: true }],
+  ];
+
+  for (const [idx, [tool, args]] of calls.entries()) {
+    await callTool(server, tool, args, idx + 1);
+    const res = replies[idx].result;
+    assert.equal(res.isError, true, `${tool} rejected bad model id`);
+    assert.match(res.structuredContent.error, /invalid model id/);
+  }
+
+  assert.equal(Buffer.compare(fs.readFileSync(sb.configFile), beforeBytes), 0, 'config bytes unchanged');
+  assert.deepEqual(listBackups(sb.configFile), [], 'no backups created');
+});

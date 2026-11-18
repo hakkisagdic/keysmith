@@ -26,7 +26,7 @@ import { sourceEnable, sourceNames } from './source.js';
 import { isPlainObject } from './tools/model.js';
 
 const ADAPTER_ID_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
-const SAFE_KEYCHAIN_NAME_RE = /^[A-Za-z0-9._:@/-]+$/;
+const SAFE_KEYCHAIN_NAME_RE = /^[A-Za-z0-9._:@/][A-Za-z0-9._:@/-]*$/;
 const ACCOUNT_ID_RE = /^[0-9a-f]{32}$/i;
 const ANY_REF_RE = /^\{([a-z][a-z0-9_-]*):([\s\S]*)\}$/i;
 const SECRET_SHAPE_RE = /^(ks_|sk[-_]|gsk_|xai-|AIza|gh[pousr]_|Bearer\s|Basic\s)/i;
@@ -181,15 +181,18 @@ function extractDeclaredModelIds(rawModels) {
 function validateSourceName(rawSource) {
   const source = typeof rawSource === 'string' ? rawSource.trim() : '';
   if (!source) return { ok: false, error: 'source is required' };
-  if (FORBIDDEN_IDS.has(source)) return { ok: false, error: `invalid source name "${source}"` };
+  if (!ADAPTER_ID_RE.test(source) || FORBIDDEN_IDS.has(source)) {
+    return { ok: false, error: `invalid source name "${source}"` };
+  }
   return { ok: true, source };
 }
 
 function validateModelId(rawModel) {
   const model = typeof rawModel === 'string' ? rawModel.trim() : '';
   if (!model) return { ok: false, error: 'model is required' };
-  if (FORBIDDEN_IDS.has(model)) return { ok: false, error: `invalid model id "${model}"` };
-  if (/[\r\n]/.test(model)) return { ok: false, error: 'model id must not contain newlines' };
+  if (FORBIDDEN_IDS.has(model) || /[,\s]/.test(model)) {
+    return { ok: false, error: `invalid model id "${model}"` };
+  }
   return { ok: true, model };
 }
 
