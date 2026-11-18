@@ -1415,6 +1415,49 @@ the parser contract: [docs/adapters.md](docs/adapters.md).
 Warp, Claude Code, opencode, Codex, Qoder, `openai` Python — copy-paste config in
 [docs/clients.md](docs/clients.md).
 
+## MCP server
+
+keysmith ships a local **stdio JSON-RPC 2.0** MCP server for inspecting and managing
+configured sources on **this Mac only** (no HTTP listener, no remote access):
+
+```bash
+keysmith mcp --register            # register "keysmith" in installed local MCP clients (--dry-run previews)
+keysmith mcp                       # run the stdio MCP server (invoked by MCP clients)
+```
+
+`--register` uses the same registration step as keyflip's `--register`: it checks only
+existing configs or directories for `claude-code`, `claude-desktop`, `cursor`,
+`gemini-cli`, `opencode`, and `codex-cli`, resolves the Node binary via `stablePath`,
+writes a mode-`0600` dated backup before modifying any existing file, updates atomically,
+and is idempotent.
+
+- **Conventions:** tools are named `keysmith_<verb>`, return `structuredContent`, and
+  carry `readOnlyHint`/`destructiveHint` annotations. Every writing tool (and
+  `keysmith_reload`) refuses unless `confirm: true` is passed; config writes take a
+  dated mode-`0600` backup first and write through a mode-`0600` temp file and `rename`.
+- **Read tools:** `keysmith_ping`, `keysmith_status` (launchd state, PID, port,
+  `/healthz`, enabled source count), `keysmith_sources` (non-secret metadata, key
+  reference kind, Keychain `yes`/`no`), `keysmith_source_models` (models, `approved`,
+  discovered free diff), `keysmith_test` (single-source check, latency + status, no
+  body), `keysmith_usage` (per-source requests/tokens/spend and `limits.spend`
+  headroom), `keysmith_approved` (approved `source -> models` and pending free-flag
+  changes).
+- **Write & reload tools (all require `confirm: true`):** `keysmith_source_add` (takes
+  a built-in profile and Keychain service/account names, never a key value),
+  `keysmith_source_enable`, `keysmith_source_disable`, `keysmith_source_set_models`
+  (keeps `modelsOnly: true`), `keysmith_model_approve`, `keysmith_model_revoke`, and
+  `keysmith_reload` (restarts `dev.keysmith.gateway` via `launchd`, warns on in-flight
+  requests, waits for `/healthz`).
+- **Never returned:** key values, secret reference interiors (Keychain service/account or
+  file/json/dotenv paths included), `auth.keys[].key`, Cloudflare account id,
+  `workspaceFiles` content, or request/response bodies — all responses and errors pass
+  through `redact.js` and `src/mcp.js` scrubbing.
+- **Non-goals:** no web UI, no remote access, no key generation, no provider signup, no
+  new admin HTTP API, and no `aliases`, `virtualModels`, `tunnel`, or `auth.keys`
+  management.
+
+Full tool schemas, registration targets, and redaction details: [docs/mcp.md](docs/mcp.md).
+
 ## Development
 
 ```bash
