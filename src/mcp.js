@@ -889,6 +889,17 @@ function clientTargets(homeDir, platform) {
   ];
 }
 
+function buildMcpManualSnippet({
+  nodeBin = process.execPath,
+  entry = CLI_ENTRY,
+  serverName = 'keysmith',
+} = {}) {
+  const command = stablePath(nodeBin);
+  const args = [entry, 'mcp'];
+  const snippet = JSON.stringify({ mcpServers: { [serverName]: { command, args } } }, null, 2);
+  return { command, args, serverName, snippet };
+}
+
 export function registerMcpClients({
   homeDir = os.homedir(),
   platform = process.platform,
@@ -897,8 +908,7 @@ export function registerMcpClients({
   dryRun = false,
   serverName = 'keysmith',
 } = {}) {
-  const command = stablePath(nodeBin);
-  const args = [entry, 'mcp'];
+  const { command, args, snippet } = buildMcpManualSnippet({ nodeBin, entry, serverName });
   const results = [];
   const lines = [];
 
@@ -950,17 +960,23 @@ export function registerMcpClients({
 
   if (!results.length) {
     lines.push('no supported MCP client config found; add manually:');
-    lines.push(JSON.stringify({ mcpServers: { [serverName]: { command, args } } }, null, 2));
+    lines.push(snippet);
   }
 
   return { command, args, serverName, results, lines };
 }
 
 export async function runMcpCli(flags = {}, deps = {}) {
-  if (flags._?.length) {
-    throw new Error('usage: keysmith mcp [--register] [--dry-run]');
+  if (flags._?.length || (flags.register && flags.setup)) {
+    throw new Error('usage: keysmith mcp [--register [--dry-run] | --setup]');
   }
-  if (flags.register || flags.setup) {
+  if (flags.setup) {
+    const outStream = deps.stdout || process.stdout;
+    const { command, args, serverName, snippet } = buildMcpManualSnippet(deps);
+    outStream.write(redactSecrets(snippet) + '\n');
+    return { command, args, serverName, snippet, results: [], lines: [snippet] };
+  }
+  if (flags.register) {
     const outStream = deps.stdout || process.stdout;
     const res = registerMcpClients({
       dryRun: Boolean(flags.dryRun),

@@ -16,6 +16,7 @@ import {
   loadBuiltInTools,
   registerMcpClients,
   registerTool,
+  runMcpCli,
   startMcpServer,
   unregisterTool,
   writeConfigWithBackup,
@@ -609,4 +610,66 @@ test('injectable `--register` updates installed client configs with backups, pre
   const cliCcDoc = JSON.parse(fs.readFileSync(path.join(cliHome, '.claude.json'), 'utf8'));
   assert.equal(cliCcDoc.existing, true);
   assert.deepEqual(cliCcDoc.mcpServers.keysmith.args, [CLI, 'mcp']);
+});
+
+test('--setup prints manual JSON snippet, exits 0, and creates or changes no file when all six client folders exist', async () => {
+  const sb = makeSandbox();
+  const fakeHome = path.join(sb.root, 'setup-home');
+  const clientDirs = [
+    path.join(fakeHome, '.claude'),
+    path.join(fakeHome, 'Library', 'Application Support', 'Claude'),
+    path.join(fakeHome, '.config', 'Claude'),
+    path.join(fakeHome, '.cursor'),
+    path.join(fakeHome, '.gemini'),
+    path.join(fakeHome, '.config', 'opencode'),
+    path.join(fakeHome, '.codex'),
+  ];
+  for (const dir of clientDirs) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const beforeTree = fs.readdirSync(fakeHome, { recursive: true }).sort();
+
+  let captured = '';
+  const stdout = { write: (chunk) => { captured += chunk; } };
+  const directRes = await runMcpCli(
+    { setup: true },
+    { homeDir: fakeHome, platform: 'darwin', nodeBin: '/usr/local/bin/node', entry: CLI, stdout },
+  );
+  assert.deepEqual(directRes.results, []);
+  assert.deepEqual(JSON.parse(captured), {
+    mcpServers: {
+      keysmith: {
+        command: '/usr/local/bin/node',
+        args: [CLI, 'mcp'],
+      },
+    },
+  });
+  assert.deepEqual(fs.readdirSync(fakeHome, { recursive: true }).sort(), beforeTree);
+
+  const cliSetup = spawnSync(process.execPath, [CLI, 'mcp', '--setup'], {
+    env: { ...process.env, HOME: fakeHome, KEYSMITH_CONFIG: sb.configFile, KEYSMITH_DATA: sb.dataDir },
+    encoding: 'utf8',
+  });
+  assert.equal(cliSetup.status, 0, cliSetup.stderr);
+  assert.equal(cliSetup.stderr, '');
+  const cliSnippet = JSON.parse(cliSetup.stdout);
+  assert.equal(typeof cliSnippet.mcpServers?.keysmith?.command, 'string');
+  assert.ok(cliSnippet.mcpServers.keysmith.command.length > 0);
+  assert.deepEqual(cliSnippet.mcpServers.keysmith.args, [CLI, 'mcp']);
+  assert.deepEqual(fs.readdirSync(fakeHome, { recursive: true }).sort(), beforeTree);
+
+  const fakeHomeExisting = path.join(sb.root, 'setup-home-existing');
+  fs.mkdirSync(fakeHomeExisting, { recursive: true });
+  const existingCc = path.join(fakeHomeExisting, '.claude.json');
+  const originalContent = JSON.stringify({ theme: 'light', mcpServers: { other: { command: 'echo', args: [] } } }, null, 2);
+  fs.writeFileSync(existingCc, originalContent);
+  const beforeTreeExisting = fs.readdirSync(fakeHomeExisting, { recursive: true }).sort();
+
+  const cliSetupExisting = spawnSync(process.execPath, [CLI, 'mcp', '--setup'], {
+    env: { ...process.env, HOME: fakeHomeExisting, KEYSMITH_CONFIG: sb.configFile, KEYSMITH_DATA: sb.dataDir },
+    encoding: 'utf8',
+  });
+  assert.equal(cliSetupExisting.status, 0, cliSetupExisting.stderr);
+  assert.equal(fs.readFileSync(existingCc, 'utf8'), originalContent);
+  assert.deepEqual(fs.readdirSync(fakeHomeExisting, { recursive: true }).sort(), beforeTreeExisting);
 });
