@@ -6,7 +6,8 @@
  * Wraps src/service.js (`reloadAgent`, `launchdPid`, `isLoaded`, `launchAgentsDir`)
  * and src/catalogue.js (`loadCatalogue`, `catalogueSettings`, `readDiscovered`,
  * `discoveredPath`), requires `confirm: true` (enforced centrally in src/mcp.js),
- * warns when requests are in flight, waits for `/healthz`, and scrubs secrets
+ * validates config via `loadConfig({ mint: false })`, refuses when requests are
+ * in flight unless `force: true`, waits for `/healthz`, and scrubs secrets
  * and directory paths from all outputs.
  */
 import { execFileSync } from 'node:child_process';
@@ -15,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { catalogueSettings, discoveredPath, loadCatalogue, readDiscovered } from './catalogue.js';
-import { DEFAULTS, expand, jsonErrorWithoutText } from './config.js';
+import { DEFAULTS, expand, jsonErrorWithoutText, loadConfig } from './config.js';
 import { kindOf } from './gateway.js';
 import { registerTool } from './mcp.js';
 import { redactSecrets, registerSecrets } from './redact.js';
@@ -493,7 +494,7 @@ async function waitForHealthz(ctx, initialPort, extraLiterals) {
 
 /* --------------------------------------------------------------- tool handler */
 
-async function handleReload(_args, ctx) {
+async function handleReload(args, ctx) {
   return await withReloadLock(async () =>
     withScopedEnv(ctx, async () => {
       const t0 = performance.now();
@@ -515,8 +516,20 @@ async function handleReload(_args, ctx) {
       const totalSources = Object.keys(adapters).length;
       const enabledSources = Object.values(adapters).filter((a) => isPlainObject(a) && !a.disabled).length;
       const disabledSources = totalSources - enabledSources;
-      const configuredPort = Number.isInteger(doc.port) ? doc.port : DEFAULTS.port;
       const sourceCounts = { enabledSources, disabledSources, totalSources };
+
+      let loadedCfg;
+      try {
+        loadedCfg = loadConfig({ path: ctx.configFile, mint: false });
+      } catch (err) {
+        return toolError(
+          err?.message || String(err),
+          buildReloadPayload({ latencyMs: latency(), ...sourceCounts }),
+          extraLiterals,
+          ctx,
+        );
+      }
+      const configuredPort = Number.isInteger(loadedCfg.port) ? loadedCfg.port : DEFAULTS.port;
 
       if (process.platform !== 'darwin' && typeof ctx?.launchctl !== 'function') {
         return toolError(
@@ -553,6 +566,23 @@ async function handleReload(_args, ctx) {
         ctx?.gateway !== undefined;
 
       const inFlight = await detectInFlight(ctx, { previousPid, portBefore, hasInjectedDoubles, extraLiterals });
+      if (inFlight > 0 && args?.force !== true) {
+        return toolError(
+          `${inFlight} request${inFlight === 1 ? '' : 's'} in flight; pass force: true to restart anyway`,
+          buildReloadPayload({
+            restarted: false,
+            previousPid,
+            pid: previousPid,
+            port: portBefore,
+            latencyMs: latency(),
+            inFlight,
+            inFlightWarning: `${inFlight} request${inFlight === 1 ? '' : 's'} in flight`,
+            ...sourceCounts,
+          }),
+          extraLiterals,
+          ctx,
+        );
+      }
       const inFlightWarning =
         inFlight > 0 ? `${inFlight} request${inFlight === 1 ? '' : 's'} in flight when reload started` : null;
 
@@ -615,8 +645,16 @@ const RELOAD_TOOLS = [
   {
     name: 'keysmith_reload',
     description:
-      'Restart the gateway LaunchAgent (dev.keysmith.gateway) via launchd, wait for /healthz, and warn if requests are in flight.',
-    inputSchema: { type: 'object', properties: {} },
+      'Validate config, restart the gateway LaunchAgent (dev.keysmith.gateway) via launchd, and wait for /healthz (refuses when requests are in flight unless force: true).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        force: {
+          type: 'boolean',
+          description: 'Restart even when requests are currently in flight.',
+        },
+      },
+    },
     handler: handleReload,
   },
 ];

@@ -315,7 +315,7 @@ test('keysmith_reload restarts via fake launchd, waits for /healthz transition, 
   assert.ok(cmds.includes('bootstrap'));
 });
 
-test('keysmith_reload warns when requests are in flight (fake /healthz and real Gateway.inFlight)', async () => {
+test('keysmith_reload refuses when requests are in flight unless force: true is passed (fake /healthz and real Gateway.inFlight)', async () => {
   // 1. Fake HTTP server reporting in_flight: 2 on pre-reload /healthz.
   const sb1 = makeSandbox();
   writePlist(sb1.plistFile);
@@ -364,10 +364,28 @@ test('keysmith_reload warns when requests are in flight (fake /healthz and real 
   });
 
   await callTool(mcp1, 'keysmith_reload', { confirm: true }, 1);
-  const out1 = replies1[0].result.structuredContent;
+  assert.equal(replies1[0].result.isError, true);
+  const refuse1 = replies1[0].result.structuredContent;
+  assert.equal(refuse1.ok, false);
+  assert.equal(refuse1.restarted, false);
+  assert.equal(refuse1.inFlight, 2);
+  assert.match(refuse1.error, /2 requests in flight/);
+  assert.equal(launcher1.calls.some((c) => c[0] === 'bootout' || c[0] === 'bootstrap'), false);
+
+  await callTool(mcp1, 'keysmith_reload', { confirm: true, force: false }, 2);
+  assert.equal(replies1[1].result.isError, true);
+  assert.equal(replies1[1].result.structuredContent.restarted, false);
+  assert.equal(launcher1.calls.some((c) => c[0] === 'bootout' || c[0] === 'bootstrap'), false);
+
+  await callTool(mcp1, 'keysmith_reload', { confirm: true, force: true }, 3);
+  assert.equal(replies1[2].result.isError, undefined);
+  const out1 = replies1[2].result.structuredContent;
+  assert.equal(out1.ok, true);
   assert.equal(out1.restarted, true);
   assert.equal(out1.inFlight, 2);
   assert.match(out1.inFlightWarning, /2 requests in flight/);
+  assert.ok(launcher1.calls.some((c) => c[0] === 'bootout'));
+  assert.ok(launcher1.calls.some((c) => c[0] === 'bootstrap'));
 
   // 2. Real Gateway + createServer with a live held request so gateway.inFlight === 1.
   const sb2 = makeSandbox();
@@ -452,13 +470,22 @@ test('keysmith_reload warns when requests are in flight (fake /healthz and real 
       },
     });
 
-    await callTool(mcp2, 'keysmith_reload', { confirm: true }, 2);
-    const out2 = replies2[0].result.structuredContent;
+    await callTool(mcp2, 'keysmith_reload', { confirm: true }, 1);
+    assert.equal(replies2[0].result.isError, true);
+    assert.equal(replies2[0].result.structuredContent.restarted, false);
+    assert.equal(replies2[0].result.structuredContent.inFlight, 1);
+    assert.equal(launcher2.calls.some((c) => c[0] === 'bootout' || c[0] === 'bootstrap'), false);
+
+    await callTool(mcp2, 'keysmith_reload', { confirm: true, force: true }, 2);
+    assert.equal(replies2[1].result.isError, undefined);
+    const out2 = replies2[1].result.structuredContent;
     assert.equal(out2.restarted, true);
     assert.equal(out2.inFlight, 1);
     assert.match(out2.inFlightWarning, /1 request in flight/);
     assert.equal(out2.healthzStatus, 'ok');
     assert.equal(JSON.stringify(replies2).includes(gwKey), false);
+    assert.ok(launcher2.calls.some((c) => c[0] === 'bootout'));
+    assert.ok(launcher2.calls.some((c) => c[0] === 'bootstrap'));
 
     releaseUpstream();
     const chatRes = await inFlightReq;
@@ -471,6 +498,42 @@ test('keysmith_reload warns when requests are in flight (fake /healthz and real 
     else process.env.KEYSMITH_CONFIG = prevCfg;
     if (prevData === undefined) delete process.env.KEYSMITH_DATA;
     else process.env.KEYSMITH_DATA = prevData;
+  }
+});
+
+test('keysmith_reload refuses JSON-valid config that fails loadConfig({ mint: false }) without restarting', async () => {
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
+
+  for (const [idx, badDoc] of [
+    { port: 18787, adapters: {}, virtualModels: { 'auto/text': { tiers: {} } } },
+    { port: 18787, virtualModels: 'not-an-object' },
+  ].entries()) {
+    const sb = makeSandbox();
+    writePlist(sb.plistFile);
+    writeConfig(sb.configFile, badDoc);
+
+    const launcher = makeFakeLaunchctl();
+    const replies = [];
+    const server = createMcpServer({
+      registry: reg,
+      configFile: sb.configFile,
+      dataDir: sb.dataDir,
+      send: (m) => replies.push(m),
+      context: {
+        homeDir: sb.root,
+        plistFile: sb.plistFile,
+        launchctl: launcher.run,
+      },
+    });
+
+    await callTool(server, 'keysmith_reload', { confirm: true }, idx + 1);
+    const res = replies[0].result;
+    assert.equal(res.isError, true);
+    assert.equal(res.structuredContent.ok, false);
+    assert.equal(res.structuredContent.restarted, false);
+    assert.equal(launcher.calls.length, 0, 'launchctl never invoked when loadConfig fails');
+    assert.equal(JSON.stringify(res).includes(sb.root), false, 'sandbox path scrubbed from error');
   }
 });
 
