@@ -83,7 +83,7 @@ test('loadBuiltInTools registers all 6 read-only tools and CLI exposes them in t
     assert.deepEqual(def.annotations, { readOnlyHint: true, destructiveHint: false });
     assert.equal(def.inputSchema.type, 'object');
   }
-  assert.equal(names.length, 6);
+  assert.equal(tools.filter((t) => t.annotations.readOnlyHint).length, 6);
 
   // Verify real CLI `keysmith mcp` stdio server discovers both keysmith_ping and all 6 read tools.
   const sb = makeSandbox();
