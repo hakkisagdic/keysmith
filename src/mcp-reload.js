@@ -98,14 +98,30 @@ function pathReplacements(ctx) {
   const pairs = [];
   const cfgFile = typeof ctx?.configFile === 'string' ? ctx.configFile : '';
   const dataDir = typeof ctx?.dataDir === 'string' ? ctx.dataDir : '';
+  const plistFile = typeof ctx?.plistFile === 'string' ? ctx.plistFile : '';
+  const launchctlBin = typeof process.env.KEYSMITH_MCP_LAUNCHCTL === 'string' ? process.env.KEYSMITH_MCP_LAUNCHCTL.trim() : '';
   const cfgDir = cfgFile ? path.dirname(cfgFile) : '';
+  const plistDir = plistFile ? path.dirname(plistFile) : '';
   const home = typeof ctx?.homeDir === 'string' && ctx.homeDir ? ctx.homeDir : os.homedir();
 
   if (cfgFile) pairs.push([cfgFile, path.basename(cfgFile)]);
   if (dataDir) pairs.push([dataDir, '[dataDir]']);
+  if (plistFile) pairs.push([plistFile, path.basename(plistFile)]);
+  if (launchctlBin && (path.isAbsolute(launchctlBin) || launchctlBin.includes(path.sep))) {
+    pairs.push([launchctlBin, path.basename(launchctlBin)]);
+    const lDir = path.dirname(launchctlBin);
+    if (lDir && lDir !== '.' && lDir !== path.sep && lDir !== cfgDir && lDir !== plistDir) {
+      pairs.push([lDir + path.sep, '']);
+      pairs.push([lDir, '[launchctlDir]']);
+    }
+  }
   if (cfgDir && cfgDir !== '.' && cfgDir !== path.sep) {
     pairs.push([cfgDir + path.sep, '']);
     pairs.push([cfgDir, '[configDir]']);
+  }
+  if (plistDir && plistDir !== '.' && plistDir !== path.sep && plistDir !== cfgDir) {
+    pairs.push([plistDir + path.sep, '']);
+    pairs.push([plistDir, '[plistDir]']);
   }
   if (home && home !== path.sep) {
     pairs.push([home + path.sep, '~/']);

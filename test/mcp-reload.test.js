@@ -995,3 +995,174 @@ test('redaction: planted fake secrets in config, catalogue, and /healthz never l
     else process.env.KEYSMITH_SECURITY_BIN = prevSec;
   }
 });
+
+test('keysmith_reload over spawned stdio server honors KEYSMITH_MCP_LAUNCHCTL, KEYSMITH_MCP_GATEWAY_URL, KEYSMITH_MCP_PLIST and refuses in-flight unless force: true', async () => {
+  const sb = makeSandbox();
+  const customPlist = path.join(sb.root, 'custom-gateway.plist');
+  writePlist(customPlist);
+
+  // Use a different port in config.json than the ephemeral fake gateway to verify KEYSMITH_MCP_GATEWAY_URL overrides it.
+  writeConfig(sb.configFile, {
+    host: '127.0.0.1',
+    port: 18799,
+    auth: { enabled: true, keys: [] },
+    adapters: {
+      a1: { kind: 'http', baseUrl: 'https://api.example.invalid/v1', apiKey: '{env:FAKE_STDIO_K1}' },
+    },
+  });
+
+  let currentInFlight = 2;
+  const gw = await startFakeHealthzServer((req, res) => {
+    assert.equal(req.url, '/healthz');
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, uptime_s: 12, adapters: 1, in_flight: currentInFlight }));
+  });
+
+  const stateFile = path.join(sb.root, 'launchctl-state.txt');
+  const callsLog = path.join(sb.root, 'launchctl-calls.log');
+  const pidFile = path.join(sb.dataDir, 'keysmith.pid');
+  fs.writeFileSync(stateFile, 'loaded:46001\n', { mode: 0o600 });
+  fs.writeFileSync(pidFile, JSON.stringify({ pid: 46001, port: gw.port }), { mode: 0o600 });
+
+  const fakeLaunchctl = path.join(sb.root, 'fake-launchctl.sh');
+  fs.writeFileSync(
+    fakeLaunchctl,
+    [
+      '#!/bin/sh',
+      `STATE_FILE="${stateFile}"`,
+      `CALLS_LOG="${callsLog}"`,
+      `PID_FILE="${pidFile}"`,
+      `GW_PORT="${gw.port}"`,
+      'printf "%s\\n" "$*" >> "$CALLS_LOG"',
+      'cmd="$1"',
+      'case "$cmd" in',
+      '  print)',
+      '    state=$(cat "$STATE_FILE" 2>/dev/null || echo unloaded)',
+      '    case "$state" in',
+      '      loaded:*)',
+      '        pid=${state#loaded:}',
+      `        printf '%s = {\\n\\tstate = running\\n\\tpid = %s\\n}\\n' "${LABEL}" "$pid"`,
+      '        exit 0',
+      '        ;;',
+      '      *)',
+      `        printf 'Could not find service "%s"\\n' "${LABEL}" >&2`,
+      '        exit 113',
+      '        ;;',
+      '    esac',
+      '    ;;',
+      '  bootout)',
+      '    printf "unloaded\\n" > "$STATE_FILE"',
+      '    exit 0',
+      '    ;;',
+      '  bootstrap)',
+      '    printf "loaded:46002\\n" > "$STATE_FILE"',
+      '    printf "{\\"pid\\":46002,\\"port\\":%s}\\n" "$GW_PORT" > "$PID_FILE"',
+      '    exit 0',
+      '    ;;',
+      '  *)',
+      '    printf "unexpected command: %s\\n" "$*" >&2',
+      '    exit 2',
+      '    ;;',
+      'esac',
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+
+  const env = {
+    ...process.env,
+    HOME: sb.root,
+    KEYSMITH_CONFIG: sb.configFile,
+    KEYSMITH_DATA: sb.dataDir,
+    KEYSMITH_MCP_LAUNCHCTL: fakeLaunchctl,
+    KEYSMITH_MCP_GATEWAY_URL: gw.url,
+    KEYSMITH_MCP_PLIST: customPlist,
+  };
+
+  const proc = spawn(process.execPath, [CLI, 'mcp'], { env });
+  let stderr = '';
+  proc.stderr.on('data', (d) => (stderr += d));
+
+  const pendingLines = [];
+  const waiters = [];
+  let lineBuf = '';
+  proc.stdout.on('data', (chunk) => {
+    lineBuf += chunk.toString('utf8');
+    for (;;) {
+      const nl = lineBuf.indexOf('\n');
+      if (nl < 0) break;
+      const line = lineBuf.slice(0, nl).trim();
+      lineBuf = lineBuf.slice(nl + 1);
+      if (!line) continue;
+      const parsed = JSON.parse(line);
+      const w = waiters.shift();
+      if (w) w(parsed);
+      else pendingLines.push(parsed);
+    }
+  });
+  const nextReply = () =>
+    pendingLines.length ? Promise.resolve(pendingLines.shift()) : new Promise((resolve) => waiters.push(resolve));
+
+  const send = (obj) => proc.stdin.write(JSON.stringify(obj) + '\n');
+
+  try {
+    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } });
+    const initReply = await nextReply();
+    assert.equal(initReply.id, 1);
+    send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+
+    // 1. Refused while requests are in flight without force: true.
+    send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'keysmith_reload', arguments: { confirm: true } } });
+    const refusedReply = await nextReply();
+    assert.equal(refusedReply.result.isError, true);
+    const refused = refusedReply.result.structuredContent;
+    assert.equal(refused.ok, false);
+    assert.equal(refused.restarted, false);
+    assert.equal(refused.inFlight, 2);
+    assert.match(refused.error, /2 requests in flight/);
+
+    const callsAfterRefuse = fs.readFileSync(callsLog, 'utf8').trim().split('\n');
+    assert.equal(callsAfterRefuse.every((line) => line.startsWith('print ')), true, 'only print ran when refused');
+
+    // 2. Succeeds with force: true while requests are in flight.
+    send({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: { name: 'keysmith_reload', arguments: { confirm: true, force: true } },
+    });
+    const forcedReply = await nextReply();
+    assert.equal(forcedReply.result.isError, undefined, JSON.stringify(forcedReply));
+    const forced = forcedReply.result.structuredContent;
+    assert.equal(forced.ok, true);
+    assert.equal(forced.restarted, true);
+    assert.equal(forced.previousPid, 46001);
+    assert.equal(forced.pid, 46002);
+    assert.equal(forced.pidChanged, true);
+    assert.equal(forced.port, gw.port);
+    assert.equal(forced.inFlight, 2);
+    assert.match(forced.inFlightWarning, /2 requests in flight/);
+    assert.equal(forced.healthzStatus, 'ok');
+
+    const callsAfterForce = fs.readFileSync(callsLog, 'utf8').trim().split('\n');
+    assert.ok(callsAfterForce.some((line) => line.startsWith('bootout ')));
+    assert.ok(callsAfterForce.some((line) => line.startsWith('bootstrap ') && line.includes(customPlist)));
+
+    // 3. Succeeds without force once inFlight drops to 0.
+    currentInFlight = 0;
+    send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'keysmith_reload', arguments: { confirm: true } } });
+    const cleanReply = await nextReply();
+    assert.equal(cleanReply.result.isError, undefined, JSON.stringify(cleanReply));
+    const clean = cleanReply.result.structuredContent;
+    assert.equal(clean.ok, true);
+    assert.equal(clean.restarted, true);
+    assert.equal(clean.inFlight, 0);
+    assert.equal(clean.inFlightWarning, null);
+    assert.equal(clean.healthzStatus, 'ok');
+  } finally {
+    proc.stdin.end();
+  }
+
+  const exitCode = await new Promise((resolve) => proc.on('close', resolve));
+  assert.equal(exitCode, 0, stderr);
+});

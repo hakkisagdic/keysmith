@@ -5,6 +5,7 @@
  * without duplicating protocol framing, confirmation gating, backup semantics, or
  * output redaction.
  */
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -575,6 +576,24 @@ function cleanInjectedArgs(tool, args) {
   return out;
 }
 
+export function readMcpEnvOverrides(env = process.env) {
+  const out = {};
+  const launchctlBin = typeof env?.KEYSMITH_MCP_LAUNCHCTL === 'string' ? env.KEYSMITH_MCP_LAUNCHCTL.trim() : '';
+  if (launchctlBin) {
+    out.launchctl = (args) =>
+      execFileSync(launchctlBin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  }
+  const gatewayUrl = typeof env?.KEYSMITH_MCP_GATEWAY_URL === 'string' ? env.KEYSMITH_MCP_GATEWAY_URL.trim() : '';
+  if (gatewayUrl) {
+    out.gatewayUrl = gatewayUrl;
+  }
+  const plistFile = typeof env?.KEYSMITH_MCP_PLIST === 'string' ? env.KEYSMITH_MCP_PLIST.trim() : '';
+  if (plistFile) {
+    out.plistFile = plistFile;
+  }
+  return out;
+}
+
 export function createMcpServer({
   registry = defaultRegistry,
   configFile = null,
@@ -583,6 +602,7 @@ export function createMcpServer({
   send = () => {},
   context = {},
 } = {}) {
+  const startupContext = { ...readMcpEnvOverrides(process.env), ...context };
   let version = null;
   let initialized = false;
 
@@ -690,7 +710,7 @@ export function createMcpServer({
     }
 
     const toolCtx = {
-      ...context,
+      ...startupContext,
       configFile: resolvedConfigFile,
       dataDir: resolvedDataDir,
       backupFile,

@@ -259,7 +259,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       if (req.headers['cf-connecting-ip']) {
         return send(res, 200, { 'content-type': 'application/json' }, JSON.stringify({ ok: true }));
       }
-      return send(res, 200, { 'content-type': 'application/json' }, JSON.stringify({ ok: true, uptime_s: Math.round((Date.now() - startedAt) / 1000), adapters: gateway.publicAdapters.length, failed_to_load: Object.keys(gateway.loadErrors).length, alias_warnings: Object.keys(gateway.aliasIssues).length }));
+      return send(res, 200, { 'content-type': 'application/json' }, JSON.stringify({ ok: true, uptime_s: Math.round((Date.now() - startedAt) / 1000), adapters: gateway.publicAdapters.length, failed_to_load: Object.keys(gateway.loadErrors).length, alias_warnings: Object.keys(gateway.aliasIssues).length, in_flight: inFlight }));
     }
     // Unauthenticated UHP protocol discovery endpoint (UHP 2026-10-19).
     if ((route === '/v1/uhp' || route === '/uhp' || route === '/.well-known/uhp') && req.method === 'GET') {
