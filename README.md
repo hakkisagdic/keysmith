@@ -1422,14 +1422,16 @@ configured sources on **this Mac only** (no HTTP listener, no remote access):
 
 ```bash
 keysmith mcp --register            # register "keysmith" in installed local MCP clients (--dry-run previews)
+keysmith mcp --setup               # print the manual mcpServers JSON snippet (writes nothing)
 keysmith mcp                       # run the stdio MCP server (invoked by MCP clients)
 ```
 
-`--register` uses the same registration step as keyflip's `--register`: it checks only
-existing configs or directories for `claude-code`, `claude-desktop`, `cursor`,
-`gemini-cli`, `opencode`, and `codex-cli`, resolves the Node binary via `stablePath`,
-writes a mode-`0600` dated backup before modifying any existing file, updates atomically,
-and is idempotent.
+`--register` writes to `claude-code`, `claude-desktop`, `cursor`, `gemini-cli`,
+`opencode`, and `codex-cli`: it creates a client's config file when only that client's
+folder exists, writes a mode-`0600` dated backup before modifying each existing file,
+resolves the Node binary via `stablePath`, updates atomically, and is idempotent.
+`--setup` writes nothing and only prints the manual JSON snippet (`command` and `args`)
+for adding the server by hand.
 
 - **Conventions:** tools are named `keysmith_<verb>`, return `structuredContent`, and
   carry `readOnlyHint`/`destructiveHint` annotations. Every writing tool (and

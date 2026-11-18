@@ -8,6 +8,7 @@ keysmith includes a local Model Context Protocol (MCP) server over **stdio JSON-
 keysmith mcp                 # run the stdio MCP server (used by MCP clients)
 keysmith mcp --register      # register keysmith in supported local MCP clients
 keysmith mcp --register --dry-run
+keysmith mcp --setup         # print the manual mcpServers JSON snippet (writes nothing)
 ```
 
 - Supported MCP protocol versions: `2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25` (negotiates the client's requested version when supported, otherwise `2025-11-25`).
@@ -15,9 +16,9 @@ keysmith mcp --register --dry-run
 - JSON-RPC methods handled: `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`.
 - Reads config from `~/.config/keysmith/config.json` (`$KEYSMITH_CONFIG`) and runtime/usage state from `~/.local/share/keysmith/` (`$KEYSMITH_DATA`). Inspecting config never runs `{exec:…}` commands.
 
-## Client registration (`--register`)
+## Client registration (`--register` and `--setup`)
 
-`keysmith mcp --register` (`--setup` is accepted as an alias) uses the same registration step as `keyflip --register`. It resolves the Node binary with `stablePath(process.execPath)` (rewriting fnm multishell/default shims to `<fnm>/aliases/default/…` and Homebrew Cellar kegs to `…/opt/<formula>/…` so version upgrades do not break client configs) and registers `"keysmith"` running `["/path/to/keysmith/src/cli.js", "mcp"]`.
+`keysmith mcp --register` writes to six clients (`claude-code`, `claude-desktop`, `cursor`, `gemini-cli`, `opencode`, and `codex-cli`), touching a client when its config file or parent folder exists and creating the client's config file when only its folder exists. Before modifying each existing file, it writes a mode-`0600` dated backup (`<file>.bak-<YYYYMMDD-HHMMSS>-mcp`). It resolves the Node binary with `stablePath(process.execPath)` (rewriting fnm multishell/default shims to `<fnm>/aliases/default/…` and Homebrew Cellar kegs to `…/opt/<formula>/…` so version upgrades do not break client configs) and atomically writes `"keysmith"` running `["/path/to/keysmith/src/cli.js", "mcp"]`. `keysmith mcp --setup` writes nothing: it only prints the manual JSON snippet (`command` and `args`) for adding the server by hand and exits `0`.
 
 It inspects **only** these 6 clients, touching a client **only** when its config file or parent directory already exists:
 
@@ -152,8 +153,8 @@ Replaces an attached HTTP source's `models` list while keeping `modelsOnly: true
 Adds (`keysmith_model_approve`) or removes (`keysmith_model_revoke`) a single model id on an attached HTTP source while keeping `modelsOnly: true`.
 
 - **Arguments:** `{ source: string, model: string, confirm: true }` (`required: ["source", "model"]`; `source` must match `^[A-Za-z][A-Za-z0-9_-]*$`, and `model` must not contain whitespace or commas)
-- **Restrictions:** refuses `cli` sources even with `confirm: true` (`"approved model lists are not enforced for CLI sources; enforcement applies only to HTTP sources"`), leaving config untouched.
-- **Behavior:** `keysmith_model_approve` also updates a configured `catalogue.json` (with a mode-`0600` backup first) so the approved model is recorded with `tier: "free"` for `keysmith_approved` pending-diff tracking.
+- **Restrictions:** refuses `cli` sources even with `confirm: true` (`"approved model lists are not enforced for CLI sources; enforcement applies only to HTTP sources"`), leaving config untouched. `keysmith batch submit` (the owner-run batch command on the anthropic wire) does not check approved lists.
+- **Behavior:** `keysmith_model_approve` also updates a configured `catalogue.json` (with a mode-`0600` backup first) and labels the approved model with `tier: "free"` in the catalogue for every HTTP source (a label used in usage rows, not a price, as well as for `keysmith_approved` pending-diff tracking); if the catalogue write fails after `config.json` was updated, it returns an error naming the `config.json` backup file.
 - **Returns:** `{ ok, changed, source, model, approved, modelsOnly, models, backup, reloadRequired }`
 
 ### `keysmith_reload`
