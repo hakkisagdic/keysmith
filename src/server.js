@@ -1444,6 +1444,7 @@ async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSp
   }
   const adapter = gateway.adapters.get(adapterId);
   if (!adapter || adapter.kind !== 'http') throw new LlmError('embeddings need an HTTP adapter', { status: 400 });
+  adapter.assertModelAllowed(upstreamModel, adapter.upstreamModel(upstreamModel));
   const tokens = typeof gateway.estimateTokens === 'function'
     ? gateway.estimateTokens(adapter, upstreamModel, { input: body.input, maxTokens: 0 })
     : { inputTokens: 16, outputTokens: 0 };

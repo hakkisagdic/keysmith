@@ -394,6 +394,26 @@ export class HttpAdapter {
     return Object.entries(this._declared).map(([id, v]) => ({ id, ...(typeof v === 'object' && v ? v : {}) }));
   }
 
+  /** Enforce `freeOnly` and `modelsOnly` before dispatching any upstream request. */
+  assertModelAllowed(model, upstream = this.upstreamModel(model)) {
+    if (this.freeOnly) {
+      const free = readDiscovered(discoveredPath(dataDir(), this.id));
+      if (!free || !(free.has(upstream) || free.has(model))) {
+        throw new LlmError(`${model} is not on the discovered free list (keysmith discover ${this.id})`, {
+          status: 400, type: 'invalid_request_error', provider: this.id,
+        });
+      }
+    }
+    if (this.modelsOnly) {
+      const named = new Set(this._declaredModelList().map((m) => m.id));
+      if (!(named.has(upstream) || named.has(model))) {
+        throw new LlmError(`${model} is not one of the models named for ${this.id} (${[...named].join(', ') || 'none'}); add it to the adapter's models to allow it`, {
+          status: 400, type: 'invalid_request_error', provider: this.id,
+        });
+      }
+    }
+  }
+
   /**
    * Verbatim relay — used when the client asked for `tools` (see server.tryPassthrough).
    *
@@ -407,9 +427,10 @@ export class HttpAdapter {
     if (this.wire !== 'openai') {
       throw new LlmError(`adapter "${this.id}" cannot relay tool calls on the ${this.wire} wire`, { status: 400, provider: this.id });
     }
+    const upstream = this.upstreamModel(body.model);
+    this.assertModelAllowed(body.model, upstream);
     const allowed = pickChatRelayFields(body);
     const outgoing = this.thoughtSignatures ? this.thoughtSignatures.attach(allowed, { caller }).body : allowed;
-    const upstream = this.upstreamModel(body.model);
     const res = await fetch(this.route('/chat/completions'), {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...this.authHeaders(), ...this.headers },
@@ -453,8 +474,9 @@ export class HttpAdapter {
     if (this.wire !== 'anthropic') {
       throw new LlmError(`adapter "${this.id}" cannot relay a Messages request on the ${this.wire} wire`, { status: 400, provider: this.id });
     }
-    const allowed = pickMessagesRelayFields(body);
     const upstream = this.upstreamModel(body.model);
+    this.assertModelAllowed(body.model, upstream);
+    const allowed = pickMessagesRelayFields(body);
     const headers = { 'content-type': 'application/json', ...this.authHeaders(), ...this.headers };
     const named = (h) => Object.keys(headers).find((k) => k.toLowerCase() === h);
     if (!named('anthropic-version')) headers['anthropic-version'] = '2023-06-01';
@@ -497,8 +519,8 @@ export class HttpAdapter {
   }) {
     const isTraycer = this.wire === 'traycer';
     const traycerTarget = isTraycer ? await this._resolveTraycerModel(model) : null;
-    const effectiveWire = isTraycer
-      ? traycerTarget.provider === 'anthropic'
+    const effectiveWire = isTraycer ?
+      traycerTarget.provider === 'anthropic'
         ? 'anthropic'
         : traycerTarget.provider === 'openai'
           ? 'uhp'
@@ -506,22 +528,7 @@ export class HttpAdapter {
       : this.wire;
     const effectiveModel = isTraycer ? traycerTarget.upstreamModelId : this.upstreamModel(model);
 
-    if (this.freeOnly) {
-      const free = readDiscovered(discoveredPath(dataDir(), this.id));
-      if (!free || !(free.has(effectiveModel) || free.has(model))) {
-        throw new LlmError(`${model} is not on the discovered free list (keysmith discover ${this.id})`, {
-          status: 400, type: 'invalid_request_error', provider: this.id,
-        });
-      }
-    }
-    if (this.modelsOnly) {
-      const named = new Set(this._declaredModelList().map((m) => m.id));
-      if (!(named.has(effectiveModel) || named.has(model))) {
-        throw new LlmError(`${model} is not one of the models named for ${this.id} (${[...named].join(', ') || 'none'}); add it to the adapter's models to allow it`, {
-          status: 400, type: 'invalid_request_error', provider: this.id,
-        });
-      }
-    }
+    this.assertModelAllowed(model, effectiveModel);
     if (this.limiter) {
       const d = this.limiter.admit(this.id);
       if (!d.ok) throw catalogueLimitError(this.id, d);

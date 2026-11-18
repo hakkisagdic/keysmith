@@ -31,6 +31,14 @@ before(async () => {
       hits.push(req.url);
       if (stub429) { res.writeHead(429, { 'retry-after': '5', 'content-type': 'application/json' }); return res.end('{"error":{"message":"slow down"}}'); }
       const body = raw ? JSON.parse(raw) : {};
+      if (req.url.endsWith('/embeddings')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ object: 'list', data: [{ object: 'embedding', index: 0, embedding: [0.1, 0.2] }], model: body.model, usage: { prompt_tokens: 2, total_tokens: 2 } }));
+      }
+      if (req.url.endsWith('/messages')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ id: 'msg_1', type: 'message', role: 'assistant', model: body.model, content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 2, output_tokens: 1 } }));
+      }
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', content: 'ok' } }] })}\n\n`);
       res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 }, model: body.model })}\n\n`);
@@ -46,12 +54,15 @@ after(async () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-async function boot(extra = {}, adapterExtra = {}) {
+async function boot(extra = {}, adapterExtra = {}, extraAdapters = {}) {
   hits = []; stub429 = false;
   const clock = { t: Date.parse('2026-11-16T10:00:00Z') };
   const cfg = {
     auth: { enabled: true, keys: [GW] },
-    adapters: { tr: { ...structuredClone(HTTP_PROFILES.tokenrouter), baseUrl: `http://127.0.0.1:${upstream.address().port}/v1`, apiKey: KEY, ...adapterExtra } },
+    adapters: {
+      tr: { ...structuredClone(HTTP_PROFILES.tokenrouter), baseUrl: `http://127.0.0.1:${upstream.address().port}/v1`, apiKey: KEY, ...adapterExtra },
+      ...extraAdapters,
+    },
     ...extra,
   };
   const file = path.join(dir, `usage-${Math.random().toString(36).slice(2)}.jsonl`);
@@ -60,12 +71,13 @@ async function boot(extra = {}, adapterExtra = {}) {
   const server = createServer(gateway, cfg, { usage, log: (m) => logs.push(m) });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const post = async (model) => {
-    const res = await fetch(base + '/v1/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${GW}`, 'content-type': 'application/json' }, body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], stream: false }) });
+  const postTo = async (route, body) => {
+    const res = await fetch(base + route, { method: 'POST', headers: { authorization: `Bearer ${GW}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
     return { status: res.status, headers: res.headers, text: await res.text() };
   };
+  const post = async (model) => postTo('/v1/chat/completions', { model, messages: [{ role: 'user', content: 'hi' }], stream: false });
   const rows = () => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
-  return { clock, post, rows, close: () => new Promise((r) => server.close(r)) };
+  return { clock, post, postTo, rows, close: () => new Promise((r) => server.close(r)) };
 }
 
 function writeCatalogue(limits, models = [{ id: 'm1', tier: 'free' }]) {
@@ -161,6 +173,65 @@ test('modelsOnly: a model off the declared list is a 400 before the limiter and 
     assert.equal(no.status, 400, no.text);
     assert.equal(hits.length, 0, 'the upstream never saw it');
     assert.equal((await s.post('tr/m1')).status, 200);
+    assert.equal(hits.length, 1);
+  } finally { await s.close(); }
+});
+
+test('modelsOnly: a chat request with tools returns 400 for an unapproved model without calling the upstream', async () => {
+  const anthExtra = {
+    anth: {
+      kind: 'http',
+      wire: 'anthropic',
+      baseUrl: `http://127.0.0.1:${upstream.address().port}/v1`,
+      apiKey: KEY,
+      modelsOnly: true,
+      models: ['claude-ok'],
+    },
+  };
+  const s = await boot({ catalogue: writeCatalogue({ requestsPerDay: 1000 }) }, { modelsOnly: true, models: ['m1'] }, anthExtra);
+  try {
+    const tools = [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object', properties: {} } } }];
+    const denied = await s.postTo('/v1/chat/completions', {
+      model: 'tr/unapproved-model',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools,
+      stream: false,
+    });
+    assert.equal(denied.status, 400, denied.text);
+    assert.match(denied.text, /not one of the models named/);
+    assert.equal(hits.length, 0, 'the upstream never saw the unapproved openai tool relay');
+
+    const deniedAnth = await s.postTo('/v1/messages', {
+      model: 'anth/unapproved-claude',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ name: 'lookup', input_schema: { type: 'object', properties: {} } }],
+    });
+    assert.equal(deniedAnth.status, 400, deniedAnth.text);
+    assert.match(deniedAnth.text, /not one of the models named/);
+    assert.equal(hits.length, 0, 'the upstream never saw the unapproved anthropic tool relay');
+
+    const ok = await s.postTo('/v1/chat/completions', {
+      model: 'tr/m1',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools,
+      stream: false,
+    });
+    assert.equal(ok.status, 200, ok.text);
+    assert.equal(hits.length, 1);
+  } finally { await s.close(); }
+});
+
+test('modelsOnly: an embeddings request returns 400 for an unapproved model without calling the upstream', async () => {
+  const s = await boot({ catalogue: writeCatalogue({ requestsPerDay: 1000 }) }, { modelsOnly: true, models: ['embed-1'] });
+  try {
+    const denied = await s.postTo('/v1/embeddings', { model: 'tr/unapproved-embed', input: 'hello' });
+    assert.equal(denied.status, 400, denied.text);
+    assert.match(denied.text, /not one of the models named/);
+    assert.equal(hits.length, 0, 'the upstream never saw the unapproved embeddings request');
+
+    const ok = await s.postTo('/v1/embeddings', { model: 'tr/embed-1', input: 'hello' });
+    assert.equal(ok.status, 200, ok.text);
     assert.equal(hits.length, 1);
   } finally { await s.close(); }
 });
