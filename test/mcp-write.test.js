@@ -293,7 +293,7 @@ test('keysmith_source_add writes Keychain exec reference, 0600 backup/files, val
   assert.equal(replies[4].result.isError, true);
   assert.equal(JSON.stringify(replies[4]).includes('missing-svc'), false);
 
-  const rawSecretInput = 'sk-fakeLiteralSecretShouldNeverBeAccepted1234';
+  const rawSecretInput = 'sk' + '-fakeLiteralSecretShouldNeverBeAccepted1234';
   await callTool(server, 'keysmith_source_add', { profile: 'mistral', keyRef: rawSecretInput, models: ['m'], confirm: true }, 6);
   assert.equal(replies[5].result.isError, true);
   assert.equal(JSON.stringify(replies[5]).includes(rawSecretInput), false);
