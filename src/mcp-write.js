@@ -189,6 +189,15 @@ function validateSourceName(rawSource) {
   return { ok: true, source };
 }
 
+function validateProfileName(rawProfile) {
+  const profile = typeof rawProfile === 'string' ? rawProfile.trim() : '';
+  if (!profile) return { ok: false, error: 'profile is required' };
+  if (!ADAPTER_ID_RE.test(profile) || FORBIDDEN_IDS.has(profile)) {
+    return { ok: false, error: `invalid profile name "${profile}"` };
+  }
+  return { ok: true, profile };
+}
+
 function validateModelId(rawModel) {
   const model = typeof rawModel === 'string' ? rawModel.trim() : '';
   if (!model) return { ok: false, error: 'model is required' };
@@ -351,11 +360,13 @@ async function handleSourceAdd(args, ctx) {
       const missingCfg = ensureConfigExists(ctx, extraLiterals);
       if (missingCfg) return missingCfg;
 
-      const profile = typeof args?.profile === 'string' ? args.profile.trim() : '';
+      const profileCheck = validateProfileName(args?.profile);
+      if (!profileCheck.ok) return toolError(profileCheck.error, {}, extraLiterals, ctx);
+      const { profile } = profileCheck;
       const validProfiles = sourceNames();
-      if (!profile || !validProfiles.includes(profile)) {
+      if (!validProfiles.includes(profile)) {
         return toolError(
-          `unknown source profile "${profile || '(empty)'}" — expected one of: ${validProfiles.join(', ')}`,
+          `unknown source profile "${profile}" — expected one of: ${validProfiles.join(', ')}`,
           {},
           extraLiterals,
           ctx,

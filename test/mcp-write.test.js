@@ -1087,3 +1087,55 @@ test('keysmith_model_approve writes tier: free to catalogue so approved models m
     { source: 'groq', model: 'm-missing', oldFree: true, newFree: false },
   ]);
 });
+
+test('keysmith_source_add rejects invalid profile names explicitly without modifying config', async () => {
+  const sb = makeSandbox();
+  writeConfig(sb.configFile, { adapters: {} });
+  const beforeBytes = fs.readFileSync(sb.configFile);
+
+  let kcCalled = 0;
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
+  const replies = [];
+  const server = createMcpServer({
+    registry: reg,
+    configFile: sb.configFile,
+    dataDir: sb.dataDir,
+    send: (m) => replies.push(m),
+    context: {
+      homeDir: sb.root,
+      keychainHas: async () => {
+        kcCalled++;
+        return true;
+      },
+    },
+  });
+
+  const invalidProfiles = ['groq.headers', '../bad/profile', 'groq/sub'];
+  for (const [idx, badProfile] of invalidProfiles.entries()) {
+    await callTool(
+      server,
+      'keysmith_source_add',
+      { profile: badProfile, keyRef: 'fake-svc', confirm: true },
+      idx + 1,
+    );
+    const res = replies[idx].result;
+    assert.equal(res.isError, true, `profile "${badProfile}" must be refused`);
+    assert.match(res.structuredContent.error, /invalid profile name/);
+    assert.equal(res.structuredContent.error.includes(badProfile), true, `error names "${badProfile}"`);
+  }
+
+  await callTool(
+    server,
+    'keysmith_source_add',
+    { profile: 'unknownprofile', keyRef: 'fake-svc', confirm: true },
+    10,
+  );
+  const unkRes = replies[3].result;
+  assert.equal(unkRes.isError, true);
+  assert.match(unkRes.structuredContent.error, /unknown source profile "unknownprofile"/);
+
+  assert.equal(kcCalled, 0, 'Keychain was never checked for invalid or unknown profile names');
+  assert.equal(Buffer.compare(fs.readFileSync(sb.configFile), beforeBytes), 0, 'config bytes unchanged');
+  assert.deepEqual(listBackups(sb.configFile), [], 'no backups created');
+});
