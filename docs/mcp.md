@@ -51,13 +51,6 @@ Registration guarantees:
 
 ## Read tools (`readOnlyHint: true`, `destructiveHint: false`)
 
-### `keysmith_ping`
-
-Checks that the MCP server is reachable and returns non-sensitive config summary counts.
-
-- **Arguments:** `{}`
-- **Returns:** `{ ok, server, version, configLoaded, configError?, authEnabled, adapterCount, aliasCount }`
-
 ### `keysmith_status`
 
 Reports gateway launchd state, PID, port, `/healthz` check, and configured source counts.
@@ -83,9 +76,9 @@ Lists configured sources with non-secret metadata, key reference kind, and Keych
 Inspects one source's configured models, approval flags, and difference against the cached discovered free list.
 
 - **Arguments:** `{ source: string }` (`required: ["source"]`)
-- **Returns:** `{ ok, source, kind, enforced, modelsOnly, freeOnly, configuredModels, models, discovery }`
-  - `enforced`: `true` for `http` sources and `false` for `cli` sources (approved model lists are enforced only on HTTP sources; for `cli` sources, `modelsOnly`, `freeOnly`, and `models[].approved` are always `false` with `status: "unapproved"`).
-  - `models[]`: `{ id, approved (enforced && modelsOnly && configured), status ("approved" | "unapproved"), configured, discoveredFree (boolean | null) }`
+- **Returns:** `{ ok, source, kind, enforced, modelsOnly, freeOnly, note?, configuredModels, models, discovery }`
+  - `enforced`: `true` for `http` sources with `modelsOnly: true` or `freeOnly: true`; `false` for unconstrained `http` sources and for all `cli` sources. For `cli` sources, `modelsOnly`, `freeOnly`, and `models[].approved` are always `false`, `models[].status` is `"not_enforced"`, and `note` states clearly that approved model lists are not enforced for CLI sources.
+  - `models[]`: `{ id, approved (enforced && modelsOnly && configured), status ("approved" | "unapproved" | "not_enforced"), configured, discoveredFree (boolean | null) }`
   - `discovery`: `{ available, message, discoveredFree, diff: { onlyInDiscovered, onlyInModels } }` comparing `configuredModels` with `<dataDir>/discovered/<source>.json` (populated by `keysmith discover` when `discovery.enabled` is true).
 
 ### `keysmith_test`
@@ -111,8 +104,10 @@ Reports per-source requests, token counts, spend, and remaining headroom to conf
 Returns approved models (`modelsOnly: true` HTTP sources) and pending "free flag changed" catalogue review entries for HTTP sources.
 
 - **Arguments:** `{ source?: string }`
-- **Returns:** `{ ok, configLoaded, approved, pending }`
-  - `approved`: `{ [source]: string[] }` mapping for HTTP sources with `modelsOnly: true` (CLI sources are excluded because approved model lists are enforced only on HTTP sources).
+- **Returns:** `{ ok, configLoaded, approved, unenforcedCliSources?, kind?, enforced?, note, pending }`
+  - `approved`: `{ [source]: string[] }` mapping for HTTP sources with `modelsOnly: true` (CLI sources are never included in `approved` and never report `approved: true` or `enforced: true`).
+  - `unenforcedCliSources`: array of configured CLI source ids (present when CLI sources match), plus `kind: "cli"` and `enforced: false` when filtered to a CLI source.
+  - `note`: states clearly that approved model lists are enforced only on HTTP sources and the list is not enforced for CLI sources.
   - `pending`: array of `{ source, model, oldFree, newFree }` entries for HTTP sources derived from `catalogue.json`, cached `<dataDir>/discovered/<source>.json`, and configured model baselines.
 
 ## Write & reload tools (`readOnlyHint: false`, `destructiveHint: true`, all require `confirm: true`)
@@ -126,9 +121,10 @@ Attaches a built-in source profile (`tokenrouter`, `groq`, `mistral`, `cloudflar
   security add-generic-password -s groq-api -a keysmith -w
   ```
 - **Arguments:** `{ profile: string, keyRef: string, keyAccount?: string, as?: string, models?: string[], accountId?: string, force?: boolean, confirm: true }` (`required: ["profile", "keyRef"]`)
+  - `profile`: built-in profile name (must match `^[A-Za-z][A-Za-z0-9_-]*$`; invalid names such as dotted or path-like strings are refused up front with `invalid profile name "<profile>"`).
   - `keyRef`: Keychain service name (`-s`, cannot start with `-`), never a key value or `{…}` reference.
   - `keyAccount`: Keychain account name (`-a`, cannot start with `-`, defaults to `"keysmith"`).
-  - `as`: custom adapter id (defaults to `profile`).
+  - `as`: custom adapter id (must match `^[A-Za-z][A-Za-z0-9_-]*$`; defaults to `profile`).
   - `models`: initial model ids to allow (must not contain whitespace or commas). For non-`freeOnly` profiles (`groq`, `mistral`, `cloudflare`), omitting `models` selects a default small chat model from the provider's `/models` endpoint.
   - `accountId`: 32-hex Cloudflare account id (required only for `cloudflare`; never echoed back).
   - `force`: overwrite an existing source entry with the same id.
@@ -147,7 +143,7 @@ Enables (`disabled: false`) or disables (`disabled: true`) an attached source wi
 Replaces an attached HTTP source's `models` list while keeping `modelsOnly: true`.
 
 - **Arguments:** `{ source: string, models: string[], confirm: true }` (`required: ["source", "models"]`; `source` must match `^[A-Za-z][A-Za-z0-9_-]*$`, and model ids must not contain whitespace or commas)
-- **Restrictions:** refuses `cli` sources (`"approved model lists are enforced only on HTTP sources"`).
+- **Restrictions:** refuses `cli` sources even with `confirm: true` (`"approved model lists are not enforced for CLI sources; enforcement applies only to HTTP sources"`), leaving config untouched.
 - **Behavior:** deduplicates model ids and preserves per-model metadata objects when `models` was configured as an object or array of `{ id, … }` objects.
 - **Returns:** `{ ok, changed, source, modelsOnly: true, previousModels, models, added, removed, backup, reloadRequired }`
 
@@ -156,7 +152,7 @@ Replaces an attached HTTP source's `models` list while keeping `modelsOnly: true
 Adds (`keysmith_model_approve`) or removes (`keysmith_model_revoke`) a single model id on an attached HTTP source while keeping `modelsOnly: true`.
 
 - **Arguments:** `{ source: string, model: string, confirm: true }` (`required: ["source", "model"]`; `source` must match `^[A-Za-z][A-Za-z0-9_-]*$`, and `model` must not contain whitespace or commas)
-- **Restrictions:** refuses `cli` sources (`"approved model lists are enforced only on HTTP sources"`).
+- **Restrictions:** refuses `cli` sources even with `confirm: true` (`"approved model lists are not enforced for CLI sources; enforcement applies only to HTTP sources"`), leaving config untouched.
 - **Behavior:** `keysmith_model_approve` also updates a configured `catalogue.json` (with a mode-`0600` backup first) so the approved model is recorded with `tier: "free"` for `keysmith_approved` pending-diff tracking.
 - **Returns:** `{ ok, changed, source, model, approved, modelsOnly, models, backup, reloadRequired }`
 
@@ -168,6 +164,10 @@ Validates config, restarts the macOS `launchd` gateway LaunchAgent (`dev.keysmit
 - **Prerequisites:** macOS with `~/Library/LaunchAgents/dev.keysmith.gateway.plist` installed (`keysmith install-service`).
 - **Behavior:** validates the config with `loadConfig({ mint: false })` before touching `launchd`; checks active in-flight requests (via `/healthz` or gateway child process count) and refuses without restarting when `inFlight > 0` unless `force: true` is passed; runs `launchctl bootout` followed by `launchctl bootstrap` (retrying while launchd releases the old process), and polls `GET /healthz` until `ok: true` (up to 15 s).
 - **Returns:** `{ ok, restarted, label: "dev.keysmith.gateway", previousPid, pid, pidChanged, port, healthzStatus, healthz, latencyMs, inFlight, inFlightWarning, enabledSources, disabledSources, totalSources }`
+- **Test hooks (stdio startup environment overrides):** for isolated end-to-end stdio testing without touching real `launchd` or a live gateway, the MCP server reads these variables at startup:
+  - `KEYSMITH_MCP_LAUNCHCTL`: path/command invoked in place of `launchctl`.
+  - `KEYSMITH_MCP_GATEWAY_URL`: base URL probed for `/healthz` instead of `http://127.0.0.1:<port>`.
+  - `KEYSMITH_MCP_PLIST`: path to the gateway LaunchAgent plist instead of `~/Library/LaunchAgents/dev.keysmith.gateway.plist`.
 
 ## Never returned
 
