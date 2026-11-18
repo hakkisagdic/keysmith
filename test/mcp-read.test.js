@@ -85,7 +85,7 @@ test('loadBuiltInTools registers all 6 read-only tools and CLI exposes them in t
   }
   assert.equal(tools.filter((t) => t.annotations.readOnlyHint).length, 6);
 
-  // Verify real CLI `keysmith mcp` stdio server discovers both keysmith_ping and all 6 read tools.
+  // Verify real CLI `keysmith mcp` stdio server exposes all 6 read tools within the exact 13-tool list and no keysmith_ping.
   const sb = makeSandbox();
   writeConfig(sb.configFile, { host: '127.0.0.1', port: 8787, auth: { enabled: true, keys: [] }, adapters: {}, aliases: {} });
   const env = { ...process.env, HOME: sb.root, KEYSMITH_CONFIG: sb.configFile, KEYSMITH_DATA: sb.dataDir };
@@ -102,7 +102,8 @@ test('loadBuiltInTools registers all 6 read-only tools and CLI exposes them in t
   assert.equal(code, 0, err);
   const msgs = out.trim().split('\n').map((l) => JSON.parse(l));
   const listedNames = msgs[1].result.tools.map((t) => t.name);
-  assert.ok(listedNames.includes('keysmith_ping'));
+  assert.equal(listedNames.includes('keysmith_ping'), false);
+  assert.equal(listedNames.length, 13);
   for (const expected of names) {
     assert.ok(listedNames.includes(expected), `CLI tools/list includes ${expected}`);
   }

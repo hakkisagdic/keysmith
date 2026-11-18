@@ -145,35 +145,6 @@ export async function writeConfigWithBackup(cfgFile, mutate, { tag = 'mcp' } = {
   return { changed: true, backup, ...(isPlainObject(extra) ? extra : {}) };
 }
 
-registerTool({
-  name: 'keysmith_ping',
-  description: 'Check that the keysmith MCP server is reachable and report non-sensitive config summary counts.',
-  inputSchema: { type: 'object', properties: {} },
-  write: false,
-  handler: async (_args, ctx) => {
-    const configLoaded = fs.existsSync(ctx.configFile);
-    let doc = null;
-    let configError = null;
-    if (configLoaded) {
-      try {
-        doc = readRaw(ctx.configFile);
-      } catch (e) {
-        configError = e.message;
-      }
-    }
-    return {
-      ok: !configError,
-      server: SERVER_INFO.name,
-      version: SERVER_INFO.version,
-      configLoaded,
-      ...(configError ? { configError } : {}),
-      authEnabled: doc ? doc.auth?.enabled !== false : true,
-      adapterCount: doc && isPlainObject(doc.adapters) ? Object.keys(doc.adapters).length : 0,
-      aliasCount: doc && isPlainObject(doc.aliases) ? Object.keys(doc.aliases).length : 0,
-    };
-  },
-});
-
 export async function loadBuiltInTools(registry = defaultRegistry) {
   const registerFn = (def) => registerTool(def, registry);
   for (const relPath of SLICE_MODULES) {

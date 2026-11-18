@@ -13,12 +13,29 @@ import {
   createMcpServer,
   createToolRegistry,
   listRegisteredTools,
+  loadBuiltInTools,
   registerMcpClients,
   registerTool,
   startMcpServer,
   unregisterTool,
   writeConfigWithBackup,
 } from '../src/mcp.js';
+
+const EXPECTED_13_TOOLS = [
+  'keysmith_status',
+  'keysmith_sources',
+  'keysmith_source_models',
+  'keysmith_test',
+  'keysmith_usage',
+  'keysmith_approved',
+  'keysmith_source_add',
+  'keysmith_source_enable',
+  'keysmith_source_disable',
+  'keysmith_source_set_models',
+  'keysmith_model_approve',
+  'keysmith_model_revoke',
+  'keysmith_reload',
+];
 
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const cleanups = [];
@@ -174,8 +191,11 @@ test('JSON-RPC lifecycle: initialize, notifications/initialized, ping, tools/lis
   const sb = makeSandbox();
   fs.writeFileSync(sb.configFile, JSON.stringify({ auth: { enabled: true, keys: [] }, adapters: {}, aliases: {} }), { mode: 0o600 });
 
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
   const replies = [];
   const server = createMcpServer({
+    registry: reg,
     configFile: sb.configFile,
     dataDir: sb.dataDir,
     send: (msg) => replies.push(msg),
@@ -201,15 +221,19 @@ test('JSON-RPC lifecycle: initialize, notifications/initialized, ping, tools/lis
   await server.handle({ jsonrpc: '2.0', id: 'p-1', method: 'ping' });
   assert.deepEqual(replies[2], { jsonrpc: '2.0', id: 'p-1', result: {} });
 
-  // tools/list returns keysmith_ping with read-only annotations.
+  // tools/list returns the exact 13 built-in tools and no keysmith_ping.
   await server.handle({ jsonrpc: '2.0', id: 3, method: 'tools/list' });
   const listed = replies[3].result.tools;
-  const pingTool = listed.find((t) => t.name === 'keysmith_ping');
-  assert.ok(pingTool, 'keysmith_ping is listed');
-  assert.deepEqual(pingTool.annotations, { readOnlyHint: true, destructiveHint: false });
-  assert.equal(pingTool.inputSchema.type, 'object');
+  const listedNames = listed.map((t) => t.name);
+  assert.equal(listed.length, 13);
+  assert.deepEqual([...listedNames].sort(), [...EXPECTED_13_TOOLS].sort());
+  assert.equal(listedNames.includes('keysmith_ping'), false, 'keysmith_ping must not be listed');
+  const statusTool = listed.find((t) => t.name === 'keysmith_status');
+  assert.ok(statusTool, 'keysmith_status is listed');
+  assert.deepEqual(statusTool.annotations, { readOnlyHint: true, destructiveHint: false });
+  assert.equal(statusTool.inputSchema.type, 'object');
 
-  // Unknown method returns -32601; parse error returns -32700 without echoing input.
+  // Unknown method returns -32601; parse error returns -32700 without echoing input; calling keysmith_ping returns -32602.
   await server.handle({ jsonrpc: '2.0', id: 4, method: 'server/discover' });
   assert.equal(replies[4].error.code, -32601);
 
@@ -222,6 +246,9 @@ test('JSON-RPC lifecycle: initialize, notifications/initialized, ping, tools/lis
 
   await server.handle({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'keysmith_missing' } });
   assert.equal(replies[7].error.code, -32602);
+
+  await server.handle({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'keysmith_ping', arguments: {} } });
+  assert.equal(replies[8].error.code, -32602);
 });
 
 test('registry, central confirm gate, and backup-first config writes', async () => {
@@ -419,15 +446,24 @@ test('redaction: fake secrets, reference interiors, Keychain args, Cloudflare ac
       '.kiro/agents/fake.json': '[redacted]',
     });
 
-    // Also drive the real stdio server via in-memory streams for keysmith_ping.
+    // Also drive the real stdio server via in-memory streams for keysmith_approved and test redaction.
+    const builtInReg = createToolRegistry();
+    await loadBuiltInTools(builtInReg);
     const input = new PassThrough();
     const output = new PassThrough();
     let stdout = '';
     output.on('data', (c) => (stdout += c));
-    const runPromise = startMcpServer({ input, output, configFile: sb.configFile, dataDir: sb.dataDir, loadSlices: false });
+    const runPromise = startMcpServer({
+      input,
+      output,
+      registry: builtInReg,
+      configFile: sb.configFile,
+      dataDir: sb.dataDir,
+      loadSlices: false,
+    });
     input.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } }) + '\n');
     input.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
-    input.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'keysmith_ping', arguments: {} } }) + '\n');
+    input.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'keysmith_approved', arguments: {} } }) + '\n');
     input.end();
     await runPromise;
 
@@ -435,10 +471,8 @@ test('redaction: fake secrets, reference interiors, Keychain args, Cloudflare ac
     assert.equal(lines.length, 2);
     assert.equal(lines[1].result.structuredContent.ok, true);
     assert.equal(lines[1].result.structuredContent.configLoaded, true);
-    assert.equal(lines[1].result.structuredContent.adapterCount, 6);
-    assert.equal(lines[1].result.structuredContent.aliasCount, 1);
     for (const secret of fake.forbidden) {
-      assert.equal(stdout.includes(secret), false, `secret leaked in stdio ping output: ${secret}`);
+      assert.equal(stdout.includes(secret), false, `secret leaked in stdio output: ${secret}`);
     }
     assert.equal(fs.existsSync(secCalled), false, 'Keychain binary still never executed');
   } finally {
@@ -475,7 +509,7 @@ test('CLI `keysmith mcp` stdio subprocess and `--help` work without leaking secr
   proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } }) + '\n');
   proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
   proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }) + '\n');
-  proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'keysmith_ping', arguments: {} } }) + '\n');
+  proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'keysmith_approved', arguments: {} } }) + '\n');
   proc.stdin.end();
 
   const code = await new Promise((resolve) => proc.on('close', resolve));
@@ -483,8 +517,12 @@ test('CLI `keysmith mcp` stdio subprocess and `--help` work without leaking secr
   const msgs = out.trim().split('\n').map((l) => JSON.parse(l));
   assert.equal(msgs.length, 3);
   assert.equal(msgs[0].result.serverInfo.name, 'keysmith');
-  assert.ok(msgs[1].result.tools.some((t) => t.name === 'keysmith_ping'));
-  assert.equal(msgs[2].result.structuredContent.adapterCount, 6);
+  const cliToolNames = msgs[1].result.tools.map((t) => t.name);
+  assert.equal(cliToolNames.length, 13);
+  assert.deepEqual([...cliToolNames].sort(), [...EXPECTED_13_TOOLS].sort());
+  assert.equal(cliToolNames.includes('keysmith_ping'), false, 'CLI tools/list must not include keysmith_ping');
+  assert.equal(msgs[2].result.structuredContent.ok, true);
+  assert.equal(msgs[2].result.structuredContent.configLoaded, true);
   for (const secret of fake.forbidden) {
     assert.equal((out + err).includes(secret), false, `CLI subprocess leaked secret: ${secret}`);
   }
