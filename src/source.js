@@ -145,7 +145,12 @@ export async function sourceEnable(cfgFile, name, flags = {}) {
   if (!keychainHas(service, account)) throw new Error(`no Keychain item "${service}" for account "${account}": nothing written (add it with \`security add-generic-password -s ${service} -a ${account} -w\`)`);
 
   const entry = structuredClone(getProfile(name));
-  if (facts.needsAccount) entry.baseUrl = fillAccount(entry.baseUrl, flags.accountId);
+  if (facts.needsAccount) {
+    entry.baseUrl = fillAccount(entry.baseUrl, flags.accountId);
+    if (typeof entry.health?.path === 'string' && entry.health.path.includes('{account}')) {
+      entry.health.path = fillAccount(entry.health.path, flags.accountId);
+    }
+  }
   const notes = facts.note ? [`note: ${name}: ${facts.note}`] : [];
   if (!facts.freeOnly) {
     const listed = await providerModels(entry.baseUrl, keychainValue(service, account), typeof flags.modelsUrl === 'string' ? flags.modelsUrl : null);

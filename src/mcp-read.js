@@ -19,6 +19,7 @@ import { catalogueSettings, discoveredPath, readDiscovered } from './catalogue.j
 import { which } from './cli-adapter.js';
 import { DEFAULTS, jsonErrorWithoutText, loadConfig, resolveSecret } from './config.js';
 import { checkAdapter, kindOf } from './gateway.js';
+import { DEFAULT_HEALTH_TIMEOUT_MS, probeHttpHealth } from './http-adapter.js';
 import { computePendingFreeChanges } from './mcp-reload.js';
 import { registerTool } from './mcp.js';
 import { SOURCE_FACTS } from './profiles.js';
@@ -702,56 +703,22 @@ async function handleTest(args, ctx) {
     }
 
     adapter._apiKey = cred.key;
-    const modelsPath = adapter.wire === 'traycer' ? '/api/traycer/models' : '/models';
-    const url = adapter.route(modelsPath);
-    const headers = { accept: 'application/json', ...adapter.authHeaders(), ...adapter.headers };
     const fetchFn = typeof ctx?.fetch === 'function' ? ctx.fetch : globalThis.fetch;
-    const timeoutMs = Number.isFinite(ctx?.testTimeoutMs) ? ctx.testTimeoutMs : 10_000;
-
-    let res;
-    try {
-      res = await fetchFn(url, {
-        method: 'GET',
-        headers,
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-    } catch (e) {
-      return scrubOutput(
-        {
-          ok: false,
-          source,
-          kind: 'http',
-          status: 'unreachable',
-          httpStatus: null,
-          latencyMs: latency(),
-          error: scrubString(e?.message || String(e), extraLiterals),
-        },
-        extraLiterals,
-      );
-    }
-
-    // Never read or return HTTP response bodies.
-    try {
-      await res.body?.cancel?.();
-    } catch {}
-
-    let status;
-    if (res.ok) status = 'ok';
-    else if (res.status === 401 || res.status === 403) status = 'unauthorized';
-    else if (res.status === 404 || res.status === 405) status = 'no_models_endpoint';
-    else if (res.status === 429) status = 'rate_limited';
-    else status = 'http_error';
+    const timeoutMs = Number.isFinite(ctx?.testTimeoutMs) ? ctx.testTimeoutMs : DEFAULT_HEALTH_TIMEOUT_MS;
+    const probe = await probeHttpHealth(source, raw, adapter, { fetchFn, timeoutMs });
+    const literals = probe.target?.account ? [...extraLiterals, probe.target.account] : extraLiterals;
 
     return scrubOutput(
       {
-        ok: Boolean(res.ok),
+        ok: probe.ok,
         source,
         kind: 'http',
-        status,
-        httpStatus: res.status,
-        latencyMs: latency(),
+        status: probe.status,
+        httpStatus: probe.httpStatus,
+        latencyMs: probe.latencyMs,
+        ...(probe.error !== undefined ? { error: scrubString(probe.error, literals) } : {}),
       },
-      extraLiterals,
+      literals,
     );
   });
 }

@@ -2,11 +2,13 @@ import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { discoveredPath, writeDiscovered } from '../src/catalogue.js';
+import { DEFAULT_HEALTH_TIMEOUT_MS } from '../src/http-adapter.js';
 import { createMcpServer, createToolRegistry, loadBuiltInTools } from '../src/mcp.js';
 import { UsageLog } from '../src/usage.js';
 
@@ -1004,4 +1006,318 @@ test('keysmith_approved and keysmith_source_models do not present CLI sources as
   assert.equal(groqModels.modelsOnly, true);
   assert.equal(groqModels.models[0].approved, true);
   assert.equal(groqModels.note, undefined);
+});
+
+async function startHealthServer(t, handler) {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    requests.push({ method: req.method, url: req.url });
+    handler(req, res);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  t.after(() => {
+    try {
+      server.closeAllConnections?.();
+      server.close();
+    } catch {}
+  });
+  return { server, port, baseUrl: `http://127.0.0.1:${port}`, requests };
+}
+
+async function getClosedPort() {
+  const srv = http.createServer();
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const { port } = srv.address();
+  await new Promise((resolve) => srv.close(resolve));
+  return port;
+}
+
+function runCliAsync(args, env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CLI, ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => {
+      stdout += d;
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d;
+    });
+    child.on('error', reject);
+    child.on('close', (status) => resolve({ status, stdout, stderr, all: `${stdout}\n${stderr}` }));
+  });
+}
+
+test('keysmith_test uses per-profile health path (Cloudflare token verify), respects explicit healthPath, never POSTs or reads bodies', async (t) => {
+  assert.equal(DEFAULT_HEALTH_TIMEOUT_MS, 15_000);
+  const sb = makeSandbox();
+  const cfAcct = 'cfae0123456789ab' + 'cdef0123456789ab';
+  const cfToken = 'tok_' + 'cloudflare_secret_987654';
+  const bodySecret = 'ks_' + 'BodySecretValueNeverShown1234';
+  const prevCfEnv = process.env.TEST_CF_HEALTH_KEY;
+  process.env.TEST_CF_HEALTH_KEY = cfToken;
+  t.after(() => {
+    if (prevCfEnv === undefined) delete process.env.TEST_CF_HEALTH_KEY;
+    else process.env.TEST_CF_HEALTH_KEY = prevCfEnv;
+  });
+
+  const srv = await startHealthServer(t, (req, res) => {
+    if (req.url === `/client/v4/accounts/${cfAcct}/ai/v1/models`) {
+      res.writeHead(405, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'method not allowed' }));
+      return;
+    }
+    if (req.url === `/client/v4/accounts/${cfAcct}/tokens/verify`) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ success: true, result: { status: 'active' }, secret: bodySecret }));
+      return;
+    }
+    if (req.url === `/client/v4/accounts/${cfAcct}/ai/v1/custom-ping`) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  writeConfig(sb.configFile, {
+    adapters: {
+      cf_live: {
+        kind: 'http',
+        wire: 'openai',
+        baseUrl: `${srv.baseUrl}/client/v4/accounts/${cfAcct}/ai/v1`,
+        apiKey: '{env:TEST_CF_HEALTH_KEY}',
+        models: ['@cf/meta/llama-3.1-8b-instruct-fast'],
+      },
+      cf_override: {
+        kind: 'http',
+        wire: 'openai',
+        baseUrl: `${srv.baseUrl}/client/v4/accounts/${cfAcct}/ai/v1`,
+        apiKey: '{env:TEST_CF_HEALTH_KEY}',
+        healthPath: '/custom-ping',
+        models: ['@cf/meta/llama-3.1-8b-instruct-fast'],
+      },
+    },
+  });
+
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
+  const replies = [];
+  const server = createMcpServer({
+    registry: reg,
+    configFile: sb.configFile,
+    dataDir: sb.dataDir,
+    send: (m) => replies.push(m),
+  });
+
+  await callTool(server, 'keysmith_test', { source: 'cf_live' }, 1);
+  await callTool(server, 'keysmith_test', { source: 'cf_override' }, 2);
+
+  const cfRes = replies[0].result.structuredContent;
+  assert.equal(cfRes.ok, true);
+  assert.equal(cfRes.status, 'ok');
+  assert.equal(cfRes.httpStatus, 200);
+  const ovRes = replies[1].result.structuredContent;
+  assert.equal(ovRes.ok, true);
+  assert.equal(ovRes.status, 'ok');
+
+  assert.deepEqual(srv.requests, [
+    { method: 'GET', url: `/client/v4/accounts/${cfAcct}/tokens/verify` },
+    { method: 'GET', url: `/client/v4/accounts/${cfAcct}/ai/v1/custom-ping` },
+  ]);
+  const serialized = JSON.stringify(replies);
+  assert.equal(serialized.includes(cfAcct), false, 'account ID must not appear in output');
+  assert.equal(serialized.includes(cfToken), false, 'API key must not appear in output');
+  assert.equal(serialized.includes(bodySecret), false, 'HTTP response body must never be read or returned');
+
+  // Verify response stream is cancelled unread when a body stream is present.
+  let cancelled = false;
+  let bodyRead = false;
+  const regMock = createToolRegistry();
+  await loadBuiltInTools(regMock);
+  const mockReplies = [];
+  const mockServer = createMcpServer({
+    registry: regMock,
+    configFile: sb.configFile,
+    dataDir: sb.dataDir,
+    send: (m) => mockReplies.push(m),
+    context: {
+      fetch: async () => ({
+        ok: true,
+        status: 200,
+        body: {
+          cancel: async () => {
+            cancelled = true;
+          },
+          getReader: () => {
+            bodyRead = true;
+            throw new Error('body must not be read');
+          },
+        },
+        text: async () => {
+          bodyRead = true;
+          throw new Error('body must not be read');
+        },
+      }),
+    },
+  });
+  await callTool(mockServer, 'keysmith_test', { source: 'cf_live' }, 3);
+  assert.equal(cancelled, true);
+  assert.equal(bodyRead, false);
+  assert.equal(mockReplies[0].result.structuredContent.status, 'ok');
+});
+
+test('keysmith_test classifies timeout, unreachable, unauthorized, no_such_endpoint vs no_models_endpoint, rate_limited, and http_error', async (t) => {
+  const sb = makeSandbox();
+  const cfAcct = 'def00123456789ab' + 'cdef0123456789cd';
+  const genericToken = 'tok_' + 'generic_health_123456';
+  const prevEnv = process.env.TEST_HEALTH_GENERIC_KEY;
+  process.env.TEST_HEALTH_GENERIC_KEY = genericToken;
+  t.after(() => {
+    if (prevEnv === undefined) delete process.env.TEST_HEALTH_GENERIC_KEY;
+    else process.env.TEST_HEALTH_GENERIC_KEY = prevEnv;
+  });
+
+  const srv = await startHealthServer(t, (req, res) => {
+    if (req.url === '/slow/v1/models') {
+      const timer = setTimeout(() => {
+        try {
+          res.writeHead(200);
+          res.end('{}');
+        } catch {}
+      }, 600);
+      timer.unref?.();
+      req.on('close', () => clearTimeout(timer));
+      return;
+    }
+    if (req.url === '/auth401/v1/models') return res.writeHead(401).end();
+    if (req.url === '/missing-health/v1/health') return res.writeHead(404).end();
+    if (req.url === `/client/v4/accounts/${cfAcct}/tokens/verify`) return res.writeHead(404).end();
+    if (req.url === '/no-models-405/v1/models') return res.writeHead(405).end();
+    if (req.url === '/rate429/v1/models') return res.writeHead(429).end();
+    if (req.url === '/err500/v1/models') return res.writeHead(500).end();
+    res.writeHead(404).end();
+  });
+  const closedPort = await getClosedPort();
+
+  writeConfig(sb.configFile, {
+    adapters: {
+      slow: { kind: 'http', wire: 'openai', baseUrl: `${srv.baseUrl}/slow/v1`, apiKey: '{env:TEST_HEALTH_GENERIC_KEY}' },
+      closed: { kind: 'http', wire: 'openai', baseUrl: `http://127.0.0.1:${closedPort}/v1`, apiKey: '{env:TEST_HEALTH_GENERIC_KEY}' },
+      unauth: { kind: 'http', wire: 'openai', baseUrl: `${srv.baseUrl}/auth401/v1`, apiKey: '{env:TEST_HEALTH_GENERIC_KEY}' },
+      bad_health: { kind: 'http', wire: 'openai', baseUrl: `${srv.baseUrl}/missing-health/v1`, healthPath: '/health', apiKey: '{env:TEST_HEALTH_GENERIC_KEY}' },
+      cf_bad: { kind: 'http', wire: 'openai', baseUrl: `${srv.baseUrl}/client/v4/accounts/${cfAcct}/ai/v1`, apiKey: '{env:TEST_HEALTH_GENERIC_KEY}' },
+      fallback_405: { kind: 'http', wire: 'openai', baseUrl: `${srv.baseUrl}/no-models-405/v1`, apiKey: '{env:TEST_HEALTH_GENERIC_KEY}' },
+      rate: { kind: 'http', wire: 'openai', baseUrl: `${srv.baseUrl}/rate429/v1`, apiKey: '{env:TEST_HEALTH_GENERIC_KEY}' },
+      err500: { kind: 'http', wire: 'openai', baseUrl: `${srv.baseUrl}/err500/v1`, apiKey: '{env:TEST_HEALTH_GENERIC_KEY}' },
+    },
+  });
+
+  const reg = createToolRegistry();
+  await loadBuiltInTools(reg);
+  const replies = [];
+  const server = createMcpServer({
+    registry: reg,
+    configFile: sb.configFile,
+    dataDir: sb.dataDir,
+    context: { testTimeoutMs: 120 },
+    send: (m) => replies.push(m),
+  });
+
+  const sources = ['slow', 'closed', 'unauth', 'bad_health', 'cf_bad', 'fallback_405', 'rate', 'err500'];
+  for (let i = 0; i < sources.length; i++) {
+    await callTool(server, 'keysmith_test', { source: sources[i] }, i + 1);
+  }
+  const bySource = Object.fromEntries(replies.map((r) => [r.result.structuredContent.source, r.result.structuredContent]));
+
+  assert.equal(bySource.slow.status, 'timeout');
+  assert.equal(bySource.slow.ok, false);
+  assert.equal(bySource.slow.httpStatus, null);
+  assert.equal(bySource.slow.error, 'no answer in 0.12 s');
+
+  assert.equal(bySource.closed.status, 'unreachable');
+  assert.equal(bySource.closed.httpStatus, null);
+  assert.equal(bySource.closed.error, 'ECONNREFUSED');
+
+  assert.equal(bySource.unauth.status, 'unauthorized');
+  assert.equal(bySource.unauth.httpStatus, 401);
+
+  assert.equal(bySource.bad_health.status, 'no_such_endpoint');
+  assert.equal(bySource.bad_health.httpStatus, 404);
+
+  assert.equal(bySource.cf_bad.status, 'no_such_endpoint');
+  assert.equal(bySource.cf_bad.httpStatus, 404);
+
+  assert.equal(bySource.fallback_405.status, 'no_models_endpoint');
+  assert.equal(bySource.fallback_405.httpStatus, 405);
+
+  assert.equal(bySource.rate.status, 'rate_limited');
+  assert.equal(bySource.rate.httpStatus, 429);
+
+  assert.equal(bySource.err500.status, 'http_error');
+  assert.equal(bySource.err500.httpStatus, 500);
+});
+
+test('keysmith doctor shares health probe, distinguishes timeout/unreachable/auth/missing-endpoint, and never leaks keys or account IDs', async (t) => {
+  const sb = makeSandbox();
+  const cfAcct = '1122334455667788' + '99aabbccddeeff00';
+  const doctorKey = 'tok_' + 'doctor_secret_xyz999';
+  const srv = await startHealthServer(t, (req, res) => {
+    if (req.url === `/client/v4/accounts/${cfAcct}/ai/v1/models`) return res.writeHead(405).end();
+    if (req.url === `/client/v4/accounts/${cfAcct}/tokens/verify`) return res.writeHead(200).end('{"success":true}');
+    if (req.url === '/auth/v1/models') return res.writeHead(401).end();
+    if (req.url === '/missing/v1/custom-health') return res.writeHead(404).end();
+    if (req.url === '/hang/v1/models') {
+      const timer = setTimeout(() => {
+        try {
+          res.writeHead(200).end('{}');
+        } catch {}
+      }, 1500);
+      timer.unref?.();
+      req.on('close', () => clearTimeout(timer));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  const closedPort = await getClosedPort();
+
+  writeConfig(sb.configFile, {
+    adapters: {
+      cloudflare: {
+        kind: 'http',
+        wire: 'openai',
+        baseUrl: `${srv.baseUrl}/client/v4/accounts/${cfAcct}/ai/v1`,
+        apiKey: '{env:DOCTOR_PROBE_KEY}',
+        explicitOnly: true,
+        models: ['@cf/meta/llama-3.1-8b-instruct-fast'],
+      },
+      auth_bad: { kind: 'http', wire: 'openai', baseUrl: `${srv.baseUrl}/auth/v1`, apiKey: '{env:DOCTOR_PROBE_KEY}' },
+      bad_health: { kind: 'http', wire: 'openai', baseUrl: `${srv.baseUrl}/missing/v1`, healthPath: '/custom-health', apiKey: '{env:DOCTOR_PROBE_KEY}' },
+      slow_api: { kind: 'http', wire: 'openai', baseUrl: `${srv.baseUrl}/hang/v1`, apiKey: '{env:DOCTOR_PROBE_KEY}' },
+      down_api: { kind: 'http', wire: 'openai', baseUrl: `http://127.0.0.1:${closedPort}/v1`, apiKey: '{env:DOCTOR_PROBE_KEY}' },
+    },
+  });
+
+  const env = {
+    ...process.env,
+    HOME: sb.root,
+    KEYSMITH_DIR: sb.root,
+    KEYSMITH_CONFIG: sb.configFile,
+    KEYSMITH_DATA: sb.dataDir,
+    KEYSMITH_TEST_TIMEOUT_MS: '250',
+    DOCTOR_PROBE_KEY: doctorKey,
+  };
+  const r = await runCliAsync(['doctor'], env);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /cloudflare\s+ok/);
+  assert.match(r.stdout, /tokens\/verify/);
+  assert.match(r.stdout, /auth_bad\s+unauthorized/);
+  assert.match(r.stdout, /bad_health\s+no_such_endpoint/);
+  assert.match(r.stdout, /slow_api\s+timeout\s+no answer in 0\.25 s/);
+  assert.match(r.stdout, /down_api\s+unreachable\s+ECONNREFUSED/);
+  assert.equal(srv.requests.some((x) => x.method === 'POST' || x.url.includes('/chat/completions')), false, 'doctor must never POST or call completions');
+  assert.equal(r.all.includes(doctorKey), false, 'doctor output must never contain secret key');
+  assert.equal(r.all.includes(cfAcct), false, 'doctor output must never contain raw account ID');
 });

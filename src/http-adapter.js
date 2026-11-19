@@ -6,6 +6,9 @@ import { credentialAccount, hostOf } from './usage.js';
 import { catalogueLimitError, discoveredPath, readDiscovered } from './catalogue.js';
 import { dataDir } from './config.js';
 import { cachePlanScope, checkPromptCache, planCache } from './prompt-cache.js';
+import { resolveHttpHealthTarget } from './profiles.js';
+
+export const DEFAULT_HEALTH_TIMEOUT_MS = 15_000;
 
 const UHP_TOOL_MODES = ['off', 'emulate', 'uhp', 'auto'];
 
@@ -101,6 +104,25 @@ export class HttpAdapter {
     if (this.promptCache && this.wire !== 'anthropic') {
       process.stderr.write(`keysmith: adapter "${id}" sets promptCache but its wire is ${this.wire}: only the anthropic wire carries cache_control, so nothing is cached (switch its wire to "anthropic")\n`);
     }
+    if (cfg.healthPath != null) {
+      if (typeof cfg.healthPath !== 'string' || !cfg.healthPath.startsWith('/') || /\s/.test(cfg.healthPath)) {
+        throw new Error(`adapter "${id}": healthPath must be a path starting with "/" (e.g. "/health")`);
+      }
+    }
+    this.healthPath = cfg.healthPath ?? null;
+    if (cfg.health != null) {
+      if (
+        typeof cfg.health !== 'object' ||
+        Array.isArray(cfg.health) ||
+        typeof cfg.health.path !== 'string' ||
+        !cfg.health.path.startsWith('/') ||
+        /\s/.test(cfg.health.path) ||
+        (cfg.health.method != null && cfg.health.method !== 'GET')
+      ) {
+        throw new Error(`adapter "${id}": health must be { path: "/...", method?: "GET", origin?: boolean }`);
+      }
+    }
+    this.health = cfg.health ?? null;
   }
 
   /** The body with cache breakpoints (when `promptCache` is on); counts what was planned. */
@@ -1558,4 +1580,58 @@ export function pickChatRelayFields(body) {
     out.extra_body = { google: body.extra_body.google };
   }
   return out;
+}
+
+/**
+ * Shared HTTP adapter reachability check (`keysmith_test` MCP tool and `keysmith doctor`).
+ * Always issues a single cheap GET request without reading response bodies or sending a paid model call.
+ */
+export async function probeHttpHealth(id, raw, adapter, { fetchFn = globalThis.fetch, timeoutMs = DEFAULT_HEALTH_TIMEOUT_MS } = {}) {
+  const target = resolveHttpHealthTarget(id, raw, adapter);
+  const headers = {
+    accept: 'application/json',
+    ...(adapter && typeof adapter.authHeaders === 'function' ? adapter.authHeaders() : {}),
+    ...(adapter?.headers || {}),
+  };
+  const ms = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_HEALTH_TIMEOUT_MS;
+  const t0 = Date.now();
+  const latency = () => Math.max(0, Date.now() - t0);
+
+  let res;
+  try {
+    res = await fetchFn(target.url, {
+      method: 'GET',
+      headers,
+      signal: AbortSignal.timeout(ms),
+    });
+  } catch (e) {
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError' || e?.code === 'ABORT_ERR') {
+      const secs = Number((ms / 1000).toFixed(3));
+      return { ok: false, status: 'timeout', httpStatus: null, latencyMs: latency(), error: `no answer in ${secs} s`, target };
+    }
+    const rawMsg = String(e?.cause?.message || e?.message || '');
+    const code = e?.cause?.code || e?.code || rawMsg.match(/\b(E[A-Z0-9_]{2,}|ERR_[A-Z0-9_]+|CERT_[A-Z0-9_]+|DEPTH_ZERO_[A-Z0-9_]+|UNABLE_TO_[A-Z0-9_]+)\b/)?.[1] || null;
+    return {
+      ok: false,
+      status: 'unreachable',
+      httpStatus: null,
+      latencyMs: latency(),
+      error: code ? String(code) : e?.message || String(e),
+      target,
+    };
+  }
+
+  // Never read or return HTTP response bodies.
+  try {
+    await res.body?.cancel?.();
+  } catch {}
+
+  let status;
+  if (res.ok) status = 'ok';
+  else if (res.status === 401 || res.status === 403) status = 'unauthorized';
+  else if (res.status === 404 || res.status === 405) status = target.isFallback ? 'no_models_endpoint' : 'no_such_endpoint';
+  else if (res.status === 429) status = 'rate_limited';
+  else status = 'http_error';
+
+  return { ok: Boolean(res.ok), status, httpStatus: res.status, latencyMs: latency(), target };
 }

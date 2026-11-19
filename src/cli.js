@@ -4,6 +4,7 @@ import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { loadConfig, saveConfig, configPath, dataDir, newApiKey, newUniqueApiKey, configExists, expand, resolveSecret } from './config.js';
 import { Gateway, checkAdapter, formatRouteExplain, kindOf, own } from './gateway.js';
+import { DEFAULT_HEALTH_TIMEOUT_MS, probeHttpHealth } from './http-adapter.js';
 import { createServer, hasTunnelConfigured, isLoopbackHost, LEGACY_MAX_CONCURRENT_WARNING } from './server.js';
 import { UsageLog, accountHmacKey, execAccountMigrationWarnings, formatUsageCsv, formatUsageTable } from './usage.js';
 import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
@@ -287,6 +288,9 @@ function cmdAdd(flags) {
   if (typeof entry.baseUrl === 'string' && entry.baseUrl.includes('{account}')) {
     entry.baseUrl = fillAccount(entry.baseUrl, flags.accountId);
   }
+  if (typeof entry.health?.path === 'string' && entry.health.path.includes('{account}')) {
+    entry.health.path = fillAccount(entry.health.path, flags.accountId);
+  }
   if (flags.bin) entry.bin = flags.bin;
   if (flags.args) entry.args = JSON.parse(flags.args);
   if (flags.parser) entry.parser = flags.parser;
@@ -561,7 +565,7 @@ function showValue(field, v) {
 /** Fields worth knowing about that an entry may not have yet, by kind (docs/adapters.md has them all). */
 const SETTABLE = {
   cli: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'models', 'defaultModel', 'toolMode', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'stopAtToolCall', 'workspaceFilesCustom', 'allowUnverifiedVersion', 'stripSystemPrompt', 'systemFlag', 'promptVia', 'env'],
-  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'streamUsage', 'promptCache', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
+  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'healthPath', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'streamUsage', 'promptCache', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
 };
 
 /**
@@ -1374,11 +1378,15 @@ async function cmdDoctor(flags) {
       if (wsCheck?.warning) rows.push([id, 'workspace warning', wsCheck.warning]);
       if (ver?.warning) rows.push([id, 'version warning', ver.warning]);
     } else {
-      try {
-        const models = await adapter.models();
-        rows.push([id, 'ok', `${adapter.baseUrl} · ${models.length} models${tag}`]);
-      } catch (e) {
-        rows.push([id, 'unreachable', truncate(e.message, 70)]);
+      const rawTimeout = flags.timeout != null ? Number(flags.timeout) : process.env.KEYSMITH_TEST_TIMEOUT_MS ? Number(process.env.KEYSMITH_TEST_TIMEOUT_MS) : DEFAULT_HEALTH_TIMEOUT_MS;
+      const doctorTimeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : DEFAULT_HEALTH_TIMEOUT_MS;
+      const probe = await probeHttpHealth(id, raw, adapter, { timeoutMs: doctorTimeoutMs });
+      const safeBase = probe.target?.account ? adapter.baseUrl.split(probe.target.account).join('<account>') : adapter.baseUrl;
+      if (probe.ok) {
+        rows.push([id, 'ok', `${safeBase} · ${probe.target.displayPath} (${probe.httpStatus}, ${probe.latencyMs} ms)${tag}`]);
+      } else {
+        const detail = probe.error ? truncate(probe.error, 70) : `HTTP ${probe.httpStatus} (${probe.target.displayPath})`;
+        rows.push([id, probe.status, detail]);
         continue;
       }
     }

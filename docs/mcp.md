@@ -84,12 +84,12 @@ Inspects one source's configured models, approval flags, and difference against 
 
 ### `keysmith_test`
 
-Runs a non-destructive health check on a single configured source without reading or returning HTTP bodies.
+Runs a non-destructive health check on a single configured source without reading or returning HTTP bodies or sending paid model requests.
 
 - **Arguments:** `{ source: string }` (`required: ["source"]`)
 - **Returns:** `{ ok, source, kind, status, httpStatus, latencyMs, disabled?, error? }`
   - For `cli` sources: checks `PATH` for the configured binary (`status: "ok" | "binary_missing"`).
-  - For `http` sources: resolves credentials, sends `GET <baseUrl>/models` (or `/api/traycer/models` for `wire: "traycer"`), immediately cancels the response stream (`res.body?.cancel?.()`) without reading or returning any body, and reports latency plus classified status (`"ok"`, `"unauthorized"`, `"no_models_endpoint"`, `"rate_limited"`, `"http_error"`, `"unreachable"`, `"missing_credentials"`, `"invalid_credentials"`, `"invalid_config"`, `"disabled"`).
+  - For `http` sources: resolves credentials, picks the cheap `GET` health endpoint (`healthPath` override > `health` config > built-in profile health path such as Cloudflare's `/client/v4/accounts/<account>/tokens/verify` > `/models` fallback, or `/api/traycer/models` for `wire: "traycer"`), waits at most 15 s by default, immediately cancels the response stream (`res.body?.cancel?.()`) without reading or returning any body, and reports latency plus classified status (`"ok"`, `"unauthorized"`, `"no_such_endpoint"`, `"no_models_endpoint"`, `"rate_limited"`, `"http_error"`, `"timeout"`, `"unreachable"`, `"missing_credentials"`, `"invalid_credentials"`, `"invalid_config"`, `"disabled"`).
 
 ### `keysmith_usage`
 

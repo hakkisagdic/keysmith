@@ -901,12 +901,20 @@ export const HTTP_PROFILES = {
   openai: { kind: 'http', wire: 'openai', baseUrl: 'https://api.openai.com/v1', apiKey: '{env:OPENAI_API_KEY}', media: ['image', 'pdf', 'audio'] },
   anthropic: { kind: 'http', wire: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', apiKey: '{env:ANTHROPIC_API_KEY}', media: ['image', 'pdf'] },
   openrouter: { kind: 'http', wire: 'openai', baseUrl: 'https://openrouter.ai/api/v1', apiKey: '{env:OPENROUTER_API_KEY}' },
-  groq: { kind: 'http', wire: 'openai', baseUrl: 'https://api.groq.com/openai/v1', apiKey: '{env:GROQ_API_KEY}' },
+  groq: { kind: 'http', wire: 'openai', baseUrl: 'https://api.groq.com/openai/v1', apiKey: '{env:GROQ_API_KEY}', health: { path: '/models', method: 'GET' } },
   tokenrouter: { kind: 'http', wire: 'openai', baseUrl: 'https://api.tokenrouter.com/v1', apiKey: '{env:TOKENROUTER_API_KEY}' },
-  mistral: { kind: 'http', wire: 'openai', baseUrl: 'https://api.mistral.ai/v1', apiKey: '{env:MISTRAL_API_KEY}' },
+  mistral: { kind: 'http', wire: 'openai', baseUrl: 'https://api.mistral.ai/v1', apiKey: '{env:MISTRAL_API_KEY}', health: { path: '/models', method: 'GET' } },
   // Workers AI's OpenAI-compatible endpoint: the account id sits in the URL, so `{account}` is
   // filled in by `keysmith add cloudflare --account-id <id>` / `source enable cloudflare --account-id <id>`.
-  cloudflare: { kind: 'http', wire: 'openai', baseUrl: 'https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1', apiKey: '{env:CLOUDFLARE_API_TOKEN}' },
+  // Workers AI (/ai/v1) exposes chat/embeddings/responses and rejects GET /models with 405; verify the
+  // account-owned token instead (Cloudflare docs: /client/v4/accounts/{account_id}/tokens/verify).
+  cloudflare: {
+    kind: 'http',
+    wire: 'openai',
+    baseUrl: 'https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1',
+    apiKey: '{env:CLOUDFLARE_API_TOKEN}',
+    health: { path: '/client/v4/accounts/{account}/tokens/verify', origin: true, method: 'GET' },
+  },
   deepseek: { kind: 'http', wire: 'openai', baseUrl: 'https://api.deepseek.com/v1', apiKey: '{env:DEEPSEEK_API_KEY}' },
   together: { kind: 'http', wire: 'openai', baseUrl: 'https://api.together.xyz/v1', apiKey: '{env:TOGETHER_API_KEY}' },
   google: {
@@ -1027,4 +1035,116 @@ export function getProfile(name) {
 
 export function profileNames() {
   return [...Object.keys(CLI_PROFILES), ...Object.keys(HTTP_PROFILES)];
+}
+
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+/**
+ * Look up the built-in HTTP profile for an attached adapter, matching Cloudflare Workers AI's URL
+ * shape first, then non-loopback profile hostnames, then profile id/alias.
+ */
+export function httpProfileFor(id, raw = {}) {
+  const baseUrl = String(raw?.baseUrl || raw?.url || '');
+  if (baseUrl) {
+    try {
+      const u = new URL(baseUrl);
+      if (/\/client\/v4\/accounts\/[^/]+\/ai(?:\/|$)/.test(u.pathname)) {
+        return HTTP_PROFILES.cloudflare;
+      }
+      const host = u.hostname.toLowerCase();
+      if (host && !LOOPBACK_HOSTS.has(host)) {
+        for (const prof of Object.values(HTTP_PROFILES)) {
+          try {
+            if (new URL(prof.baseUrl).hostname.toLowerCase() === host) return prof;
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+  if (id) {
+    const canonical = Object.hasOwn(PROFILE_ALIASES, id) ? PROFILE_ALIASES[id] : id;
+    if (Object.hasOwn(HTTP_PROFILES, canonical)) return HTTP_PROFILES[canonical];
+  }
+  return null;
+}
+
+/**
+ * Resolve the cheap GET health URL for an HTTP adapter (`healthPath` override > `raw.health` >
+ * built-in profile `health` > `/models` fallback). Never emits a paid model call.
+ */
+export function resolveHttpHealthTarget(id, raw = {}, adapter = null) {
+  const baseUrl = String(adapter?.baseUrl || raw?.baseUrl || raw?.url || '');
+  const wire = String(adapter?.wire || raw?.wire || 'openai');
+  let account = null;
+  if (baseUrl) {
+    try {
+      const pathname = new URL(baseUrl).pathname;
+      const m = pathname.match(/\/accounts\/([^/]+)(?:\/|$)/);
+      if (m && m[1] && !m[1].includes('{')) account = m[1];
+    } catch {
+      const m = baseUrl.match(/\/accounts\/([^/]+)(?:\/|$)/);
+      if (m && m[1] && !m[1].includes('{')) account = m[1];
+    }
+  }
+
+  const routeTo = (suffix, originOnly = false) => {
+    const s = suffix.startsWith('/') ? suffix : `/${suffix}`;
+    if (originOnly && baseUrl) {
+      try {
+        return new URL(s, new URL(baseUrl).origin).toString();
+      } catch {}
+    }
+    if (adapter && typeof adapter.route === 'function') return adapter.route(s);
+    let stripped = baseUrl.replace(/\/+$/, '');
+    if (wire === 'traycer') stripped = stripped.replace(/\/(?:api\/traycer\/models|inference\/.*)$/, '');
+    else {
+      const tail = wire === 'anthropic' ? '/messages' : wire === 'uhp' ? '/responses' : '/chat/completions';
+      stripped = stripped.replace(new RegExp(`${tail}$`), '');
+    }
+    return stripped + s;
+  };
+
+  let chosenPath = null;
+  let originOnly = false;
+  let isFallback = false;
+
+  const explicitPath = adapter?.healthPath ?? raw?.healthPath ?? null;
+  if (typeof explicitPath === 'string' && explicitPath.trim()) {
+    let p = explicitPath.trim();
+    if (account && p.includes('{account}')) p = p.replaceAll('{account}', account);
+    chosenPath = p;
+  } else if (raw?.health && typeof raw.health === 'object' && typeof raw.health.path === 'string' && raw.health.path.trim()) {
+    let p = raw.health.path.trim();
+    if (p.includes('{account}')) p = account ? p.replaceAll('{account}', account) : null;
+    if (p) {
+      chosenPath = p;
+      originOnly = Boolean(raw.health.origin);
+    }
+  }
+
+  if (!chosenPath) {
+    const profile = httpProfileFor(id, { ...raw, baseUrl });
+    if (profile?.health?.path) {
+      let p = profile.health.path;
+      if (p.includes('{account}')) p = account ? p.replaceAll('{account}', account) : null;
+      if (p) {
+        chosenPath = p;
+        originOnly = Boolean(profile.health.origin);
+      }
+    }
+  }
+
+  if (!chosenPath) {
+    chosenPath = wire === 'traycer' ? '/api/traycer/models' : '/models';
+    originOnly = false;
+    isFallback = true;
+  }
+
+  const url = routeTo(chosenPath, originOnly);
+  let displayPath = chosenPath;
+  try {
+    displayPath = new URL(url).pathname;
+  } catch {}
+  if (account) displayPath = displayPath.split(account).join('<account>');
+  return { url, method: 'GET', path: chosenPath, displayPath, isFallback, account };
 }
