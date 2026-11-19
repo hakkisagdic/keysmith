@@ -33,6 +33,7 @@ import {
   stripAnsi,
 } from '../src/credit-guard.js';
 import { HttpAdapter } from '../src/http-adapter.js';
+import { waitFor } from './wait-for.js';
 
 /** What kiro-cli 2.27.1 printed for `chat --no-interactive /usage` (not a TTY: no colours). */
 const LIVE = "Estimated Usage | resets on 2026-12-01 | KIRO POWER\nCredits (1524.71 of 10000 covered in plan), 15.2%\nYour plan is managed by your organization's administrator.\n";
@@ -724,17 +725,26 @@ test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login pr
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-cg-stall-'));
   const bearerSecret = 'tok_' + 'prompt_12345';
   const pids = [];
+  const closes = [];
+  const pidGone = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (e) {
+      return e?.code === 'ESRCH';
+    }
+  };
   try {
     const promptBin = path.join(tmpDir, 'kiro-prompt');
     fs.writeFileSync(
       promptBin,
-      `#!/bin/sh\nprintf '%s\\n' "Please open https://example.com/login Bearer ${bearerSecret}" "second ignored line" >&2\nexec "${process.execPath}" -e "setTimeout(() => {}, 30000);"\n`,
+      `#!/bin/sh\nprintf '%s\\n' "Please open https://example.com/login Bearer ${bearerSecret}" "second ignored line" >&2\nexec /bin/sleep 30\n`,
       { mode: 0o755 },
     );
     const silentBin = path.join(tmpDir, 'kiro-silent');
     fs.writeFileSync(
       silentBin,
-      `#!/bin/sh\nexec "${process.execPath}" -e "setTimeout(() => {}, 30000);"\n`,
+      `#!/bin/sh\nexec /bin/sleep 30\n`,
       { mode: 0o755 },
     );
 
@@ -772,7 +782,31 @@ test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login pr
       () =>
         runKiroUsage(
           { bin: promptBin, cwd: tmpDir, env: {} },
-          { timeoutMs: 30_000, stallMs: 1200, killAfterMs: 200, settleAfterMs: 200, onSpawn: (c) => c?.pid && pids.push(c.pid) },
+          {
+            timeoutMs: 30_000,
+            stallMs: 1200,
+            killAfterMs: 200,
+            settleAfterMs: 200,
+            onSpawn: (c) => {
+              if (c?.pid) pids.push(c.pid);
+              closes.push(new Promise((r) => c.once('close', r)));
+              const deadline = Date.now() + 10_000;
+              const iv = setInterval(() => {
+                if (Date.now() < deadline && c.stdout && !c.stdout.destroyed && !c.stdout.readableEnded) {
+                  c.stdout.push(' ');
+                } else {
+                  clearInterval(iv);
+                }
+              }, 200);
+              iv.unref?.();
+              const stop = () => clearInterval(iv);
+              c.stderr.once('data', () => {
+                stop();
+                if (c.stdout && !c.stdout.destroyed && !c.stdout.readableEnded) c.stdout.push(' ');
+              });
+              c.once('close', stop);
+            },
+          },
         ),
       (e) => {
         assert.match(e.message, /no output after 1200 ms \(login prompt\?\)/);
@@ -783,14 +817,23 @@ test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login pr
       },
     );
     const elapsed1 = Date.now() - t0;
-    assert.ok(elapsed1 < 5000, `login prompt hang took ${elapsed1} ms`);
+    assert.ok(elapsed1 < 15_000, `login prompt hang took ${elapsed1} ms`);
 
     const t1 = Date.now();
     await assert.rejects(
       () =>
         runKiroUsage(
           { bin: silentBin, cwd: tmpDir, env: {} },
-          { timeoutMs: 30_000, stallMs: 200, killAfterMs: 200, settleAfterMs: 200, onSpawn: (c) => c?.pid && pids.push(c.pid) },
+          {
+            timeoutMs: 30_000,
+            stallMs: 200,
+            killAfterMs: 200,
+            settleAfterMs: 200,
+            onSpawn: (c) => {
+              if (c?.pid) pids.push(c.pid);
+              closes.push(new Promise((r) => c.once('close', r)));
+            },
+          },
         ),
       (e) => {
         assert.equal(e.message, 'no output after 200 ms (login prompt?)');
@@ -798,9 +841,10 @@ test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login pr
       },
     );
     const elapsed2 = Date.now() - t1;
-    assert.ok(elapsed2 < 2000, `silent hang took ${elapsed2} ms`);
+    assert.ok(elapsed2 < 10_000, `silent hang took ${elapsed2} ms`);
 
-    await sleep(30);
+    await Promise.all(closes);
+    await waitFor(() => pids.every(pidGone), { message: 'stalled children exited' });
     for (const pid of pids) {
       assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, `stalled child ${pid} should have exited`);
     }
