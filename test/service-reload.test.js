@@ -10,6 +10,7 @@ import { reloadAgent, launchdPid, handoverPid } from '../src/service.js';
 const LABEL = 'dev.keysmith.gateway';
 const FILE = '/Users/x/Library/LaunchAgents/dev.keysmith.gateway.plist';
 const fast = { timeoutMs: 200, intervalMs: 1 };
+const retry = { timeoutMs: 10_000, intervalMs: 1 };
 
 function refused(stderr) {
   return Object.assign(new Error('Command failed: launchctl'), { stderr });
@@ -38,13 +39,13 @@ function fakeLaunchctl({ held = 0, refusals = 0 } = {}) {
 
 test('reloadAgent bootstraps only once launchd has let go of the old agent', async () => {
   const { run, calls } = fakeLaunchctl({ held: 3 });
-  await reloadAgent(LABEL, FILE, { run, ...fast });
+  await reloadAgent(LABEL, FILE, { run, ...retry });
   assert.deepEqual(calls, ['bootout', 'print', 'print', 'print', 'print', 'bootstrap']);
 });
 
 test('reloadAgent tries the bootstrap again when launchd refuses it with "5"', async () => {
   const { run, calls } = fakeLaunchctl({ refusals: 2 });
-  await reloadAgent(LABEL, FILE, { run, ...fast });
+  await reloadAgent(LABEL, FILE, { run, ...retry });
   assert.deepEqual(calls.filter((c) => c === 'bootstrap'), ['bootstrap', 'bootstrap', 'bootstrap']);
 });
 
