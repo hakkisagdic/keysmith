@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { loadConfig, saveConfig, configPath, dataDir, newApiKey, newUniqueApiKey, configExists, expand, resolveSecret } from './config.js';
-import { Gateway, checkAdapter, formatRouteExplain, kindOf, own } from './gateway.js';
+import { Gateway, aliasAllowsExplicitOnly, checkAdapter, formatRouteExplain, kindOf, own } from './gateway.js';
 import { DEFAULT_HEALTH_TIMEOUT_MS, probeHttpHealth } from './http-adapter.js';
 import { createServer, hasTunnelConfigured, isLoopbackHost, LEGACY_MAX_CONCURRENT_WARNING } from './server.js';
 import { UsageLog, accountHmacKey, execAccountMigrationWarnings, formatUsageCsv, formatUsageTable } from './usage.js';
@@ -22,7 +22,7 @@ import { BatchError, batchEnabled, cancel as batchCancel, describeJob, fetchResu
 import { fmtUsd } from './usage.js';
 import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets, streamRedactor } from './redact.js';
 import { ensurePrivateDir, logFiles, openPrivateLog, rotatedLogFiles, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
-import { adapterReach, aliasDecision, authEnabled, describePerDay, describeScope, entryFp, hashKey, keyHashOf, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
+import { adapterReach, aliasDecision, authEnabled, compileScope, describePerDay, describeScope, entryFp, hashKey, keyHashOf, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
 import { runMcpCli } from './mcp.js';
 
 const PKG = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -45,7 +45,7 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith enable|disable <adapter>  serve it, or stop: set <adapter> disabled false|true
   keysmith vision <adapter> on|off   let an adapter see images: set <adapter> vision true|false
   keysmith tools <adapter> <mode>    how a CLI takes tool requests, off|emulate|mcp|auto: set <adapter> toolMode <mode>
-  keysmith alias [<name> <leg>…]     list aliases, or set one; --prepend/--append/--drop <leg>, --delete
+  keysmith alias [<name> <leg>…]     list aliases, or set one; --prepend/--append/--drop <leg>, --allow-explicit-only, --delete
   keysmith route explain <vm> <p>    dry-run virtual model routing decision without calling the target
   keysmith adapters                  list profiles and what is attached
   keysmith models [--refresh]        what this gateway exposes, and from where
@@ -81,7 +81,7 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith source list               the profiles, which are attached, and what to know about each
                                      take that adapter, its catalogue row and discovery entry out again
   keysmith key <add|list> [--reveal] client-facing API keys; --reveal prints them in full, to a terminal only
-  keysmith key add <label> [--allow p,…] [--deny p,…] [--out <file>]
+  keysmith key add <label> [--allow p,…] [--deny p,…] [--per-day N] [--out <file>]
                                      a labelled key with a scope; --out writes the key to a new 0600 file
                                      (--force replaces that file; --allow-unknown saves a pattern that names nothing yet)
   keysmith key scope fp:<8 hex> [--allow p,…] [--deny p,…] [--clear] [--per-day N|--no-per-day]
@@ -335,6 +335,7 @@ function cmdAdd(flags) {
   }
   if (entry.unsafeTools || entry.explicitOnly) {
     for (const [alias, legs] of Object.entries(cfg.aliases || {})) {
+      if (!entry.unsafeTools && aliasAllowsExplicitOnly(cfg, alias)) continue;
       for (const leg of Array.isArray(legs) ? legs : []) {
         if (legAdapter(leg) === id) out(`! alias "${alias}" names ${leg}: keysmith skips that leg — keysmith alias ${alias} --drop ${leg}`);
       }
@@ -781,10 +782,11 @@ function legAdapter(leg) {
  *   keysmith alias <name> --prepend <leg>       put a leg first (moved there if already in it)
  *   keysmith alias <name> --append <leg>        put a leg last (moved there if already in it)
  *   keysmith alias <name> --drop <leg>          take a leg out
+ *   keysmith alias <name> <leg>… --allow-explicit-only  permit explicit-only legs in this chain only
  *   keysmith alias <name> --delete              remove the alias
  *
- * A leg must name an attached adapter (`--force` saves one that is not attached yet), and
- * never an explicit-only or tool-capable one: those answer only requests that name them.
+ * A leg must name an attached adapter (`--force` saves one that is not attached yet). Tool-capable
+ * adapters are never allowed in aliases; explicit-only adapters require `--allow-explicit-only` on the alias.
  */
 function cmdAlias(flags) {
   const [name, ...legs] = flags._;
@@ -793,22 +795,35 @@ function cmdAlias(flags) {
   if (!name) {
     const entries = Object.entries(cfg.aliases);
     if (!entries.length) return out('no aliases — keysmith alias <name> <adapter/model> [<adapter/model>…]');
-    return out(entries.map(([a, l]) => `${a.padEnd(12)} ${(Array.isArray(l) ? l : []).join('  →  ')}`).join('\n'));
+    return out(
+      entries
+        .map(([a, l]) => `${a.padEnd(12)} ${(Array.isArray(l) ? l : []).join('  →  ')}${aliasAllowsExplicitOnly(cfg, a) ? '  [explicit-only legs allowed]' : ''}`)
+        .join('\n'),
+    );
   }
   if (name.includes('/') || /\s/.test(name)) fail(`alias names cannot contain "/" or spaces: "${name}"`);
   if (FORBIDDEN_FIELDS.has(name)) fail(`"${name}" cannot be an alias name`);
   if (own(cfg.adapters, name)) fail(`"${name}" is an adapter: an alias with that name would hide it`);
+  if (flags.allowExplicitOnly && flags.noAllowExplicitOnly) fail('choose one of --allow-explicit-only or --no-allow-explicit-only');
+  if (flags.allowExplicitOnly !== undefined && flags.allowExplicitOnly !== true) fail('--allow-explicit-only takes no value');
+  if (flags.noAllowExplicitOnly !== undefined && flags.noAllowExplicitOnly !== true) fail('--no-allow-explicit-only takes no value');
   const exists = own(cfg.aliases, name);
   const current = exists && Array.isArray(cfg.aliases[name]) ? [...cfg.aliases[name]] : [];
 
   if (flags.delete) {
     if (!exists) fail(`no alias named "${name}"`);
     delete cfg.aliases[name];
+    if (cfg.aliasPolicy && own(cfg.aliasPolicy, name)) {
+      delete cfg.aliasPolicy[name];
+      if (!Object.keys(cfg.aliasPolicy).length) delete cfg.aliasPolicy;
+    }
     saveConfig(cfg);
     out(`removed alias "${name}"`);
     return noteRestart(`removing alias "${name}"`);
   }
 
+  const effectiveAllowExplicit = flags.noAllowExplicitOnly ? false : flags.allowExplicitOnly ? true : aliasAllowsExplicitOnly(cfg, name);
+  const legFlags = { ...flags, _allowExplicitOnly: effectiveAllowExplicit };
   const edits = ['prepend', 'append', 'drop'].filter((k) => flags[k] !== undefined);
   if (edits.length > 1 || (edits.length && legs.length)) fail('one change at a time: legs to set the chain, or one of --prepend / --append / --drop');
   let chain;
@@ -816,23 +831,34 @@ function cmdAlias(flags) {
     const op = edits[0];
     const leg = flags[op];
     if (typeof leg !== 'string' || !leg) fail(`--${op} takes a leg: adapter/model`);
-    if (op !== 'drop') checkAliasLeg(cfg, leg, flags);
+    if (op !== 'drop') checkAliasLeg(cfg, leg, legFlags);
     if (op === 'drop' && !current.includes(leg)) fail(`alias "${name}" has no leg ${leg}`);
     const rest = current.filter((l) => l !== leg);
     chain = op === 'prepend' ? [leg, ...rest] : op === 'append' ? [...rest, leg] : rest;
     if (!chain.length) fail(`that would leave alias "${name}" with no legs — keysmith alias ${name} --delete removes it`);
-  } else {
-    if (!legs.length) {
-      if (!exists) fail(`no alias named "${name}" — keysmith alias ${name} <adapter/model> [<adapter/model>…] creates it`);
-      return out(`${name.padEnd(12)} ${current.join('  →  ')}`);
-    }
-    for (const leg of legs) checkAliasLeg(cfg, leg, flags);
+  } else if (legs.length) {
+    for (const leg of legs) checkAliasLeg(cfg, leg, legFlags);
     if (new Set(legs).size !== legs.length) fail('a leg is named twice: each one is tried once, in order');
     chain = legs;
+  } else if (flags.allowExplicitOnly || flags.noAllowExplicitOnly) {
+    if (!exists) fail(`no alias named "${name}" — keysmith alias ${name} <adapter/model> [<adapter/model>…] creates it`);
+    for (const leg of current) checkAliasLeg(cfg, leg, legFlags);
+    chain = current;
+  } else {
+    if (!exists) fail(`no alias named "${name}" — keysmith alias ${name} <adapter/model> [<adapter/model>…] creates it`);
+    return out(`${name.padEnd(12)} ${current.join('  →  ')}${aliasAllowsExplicitOnly(cfg, name) ? '  [explicit-only legs allowed]' : ''}`);
   }
   cfg.aliases[name] = chain;
+  if (effectiveAllowExplicit) {
+    cfg.aliasPolicy = cfg.aliasPolicy || {};
+    cfg.aliasPolicy[name] = { ...(own(cfg.aliasPolicy, name) ? cfg.aliasPolicy[name] : {}), allowExplicitOnly: true };
+  } else if (cfg.aliasPolicy && own(cfg.aliasPolicy, name)) {
+    delete cfg.aliasPolicy[name].allowExplicitOnly;
+    if (!Object.keys(cfg.aliasPolicy[name]).length) delete cfg.aliasPolicy[name];
+    if (!Object.keys(cfg.aliasPolicy).length) delete cfg.aliasPolicy;
+  }
   saveConfig(cfg);
-  out(`alias "${name}": ${chain.join('  →  ')}`);
+  out(`alias "${name}": ${chain.join('  →  ')}${effectiveAllowExplicit ? '  [explicit-only legs allowed]' : ''}`);
   // The same check doctor and the status page run, so a model the adapter does not list is
   // said now rather than discovered as a slow failover later.
   const { gateway } = buildGateway(cfg);
@@ -855,7 +881,9 @@ function checkAliasLeg(cfg, leg, flags) {
   if (entry.unsafeTools || approving) {
     fail(`${leg}: adapter "${id}" can run commands and edit files (${entry.unsafeTools ? 'unsafeTools' : `its argv passes ${approving}`}), so keysmith keeps it out of every alias`);
   }
-  if (entry.explicitOnly) fail(`${leg}: adapter "${id}" is explicit-only — it answers requests that name it, never an alias. \`keysmith set ${id} explicitOnly false\` first if you mean it`);
+  if (entry.explicitOnly && !flags._allowExplicitOnly) {
+    fail(`${leg}: adapter "${id}" is explicit-only — it answers requests that name it, never an alias. Pass --allow-explicit-only on the alias (or \`keysmith set ${id} explicitOnly false\`) first if you mean it`);
+  }
 }
 
 function cmdAdapters() {
@@ -1768,7 +1796,7 @@ function cmdUsage(flags) {
 
 const KEY_USAGE = [
   'usage: keysmith key list [--reveal]',
-  '       keysmith key add [<label>] [--allow <patterns>] [--deny <patterns>] [--hash] [--out <file> [--force]] [--allow-unknown] [--reveal]',
+  '       keysmith key add [<label>] [--allow <patterns>] [--deny <patterns>] [--per-day <N>] [--hash] [--out <file> [--force]] [--allow-unknown] [--reveal]',
   '       keysmith key scope fp:<8 hex> [--allow <patterns>] [--deny <patterns>] [--no-allow] [--no-deny] [--clear] [--label <name>] [--allow-unknown] [--per-day <N> | --no-per-day]',
   '       keysmith key who-can <adapter> | <adapter/model> | alias:<name>',
   '       keysmith key revoke fp:<8 hex>',
@@ -1837,20 +1865,23 @@ const AUTH_OFF = '! auth is disabled (auth.enabled is false): no key is asked fo
 function keyAdd(cfg, flags) {
   if (flags._[1] !== undefined && flags.label !== undefined) fail('the label once: keysmith key add <label>, or --label <label>');
   if (flags.label === true) fail('--label takes a name');
+  if (flags.noPerDay) fail('--no-per-day is for `keysmith key scope` — a new key has no cap unless --per-day N is given');
   const label = flags._[1] ?? flags.label;
   if (flags._.length > 2) fail(`key add takes one label, got ${flags._.length - 1} words — a list of patterns is comma-separated or a repeated flag: --allow agy,alias:argon\n${KEY_USAGE}`);
   const allow = listFlag(flags, 'allow');
   const deny = listFlag(flags, 'deny');
+  const perDay = perDayFlag(flags);
   if (label !== undefined) checkLabel(cfg, label, null);
   if (allow) checkScopePatterns(cfg, allow, 'allow', flags);
   if (deny) checkScopePatterns(cfg, deny, 'deny', flags);
   if (flags.out === true || flags.out === '') fail('--out takes a file path, e.g. --out ~/.config/<agent>/keysmith.key');
   const key = newUniqueApiKey(cfg.auth.keys.map(entryFp).filter(Boolean));
   const useHash = !!flags.hash;
+  const asObject = useHash || label !== undefined || allow || deny || perDay !== undefined;
   const entry = useHash
-    ? { keyHash: hashKey(key), ...(label !== undefined ? { label } : {}), ...(allow ? { allow } : {}), ...(deny ? { deny } : {}) }
-    : label !== undefined || allow || deny
-      ? { key, ...(label !== undefined ? { label } : {}), ...(allow ? { allow } : {}), ...(deny ? { deny } : {}) }
+    ? { keyHash: hashKey(key), ...(label !== undefined ? { label } : {}), ...(allow ? { allow } : {}), ...(deny ? { deny } : {}), ...(perDay !== undefined ? { perDay } : {}) }
+    : asObject
+      ? { key, ...(label !== undefined ? { label } : {}), ...(allow ? { allow } : {}), ...(deny ? { deny } : {}), ...(perDay !== undefined ? { perDay } : {}) }
       : key;
   const parsed = parseKeys([entry]);
   if (parsed.issues.length) fail(`not added: ${parsed.issues[0]}`);
@@ -1874,6 +1905,8 @@ function keyAdd(cfg, flags) {
   if (typeof entry === 'object') out(`  ${entry.label ? `label ${entry.label} · ` : ''}${describeKey(parsed.entries[0])}`);
   if (outFile) out(`  written to ${rel(outFile)} (0600) — point the agent at that file ({file:${rel(outFile)}}, or KEY=$(cat ${rel(outFile)})); nothing printed the key`);
   if (allow && !allow.length) out('! an empty --allow: this key reaches nothing');
+  if (perDay === 0) out('! --per-day 0: every request of this key is refused (429) until the cap is raised or lifted');
+  if (perDay !== undefined) out('  the cap counts every request this key makes in a local calendar day — each face, adapter and alias, failures included — and starts again at local midnight');
   // The key and its scope are saved, and apply once auth is on; until then they keep nobody out.
   if (!authEnabled(cfg)) warn(AUTH_OFF);
   if (!signalled) return noteRestart('the new key');
@@ -2057,6 +2090,26 @@ function checkScopePatterns(cfg, patterns, field, flags) {
     }
     for (const p of problems) warn(`! --${field} ${p} — saved anyway (--allow-unknown)`);
   }
+  if (field === 'allow') {
+    const compiled = compileScope({ allow: patterns });
+    const warnedAliases = new Set();
+    for (const { raw, pattern } of parsed) {
+      if (pattern.kind !== 'alias') continue;
+      for (const [alias, legs] of Object.entries(cfg.aliases || {})) {
+        if (!pattern.re.test(alias) || warnedAliases.has(alias)) continue;
+        if (!Array.isArray(legs) || !legs.length) continue;
+        const reachable = legs.some((leg) => {
+          const id = legAdapter(leg);
+          const model = legModel(leg);
+          return requestDecision(compiled, id, own(cfg.adapters, id) ? cfg.adapters[id] : null, model).ok;
+        });
+        if (!reachable) {
+          warnedAliases.add(alias);
+          warn(`! --allow "${raw}": alias "${alias}" also checks each leg against --allow, and none of its legs (${legs.join(', ')}) is in --allow yet`);
+        }
+      }
+    }
+  }
   if (field === 'deny') {
     for (const { raw, pattern } of parsed) {
       if (pattern.kind === 'glob' && pattern.glob.includes('/') && !pattern.glob.includes('*')) {
@@ -2145,6 +2198,8 @@ function cmdScrubLogs(flags) {
 /** Every value a flag was given, in order, under `flags[ALL][name]`: `--allow a --allow b`. */
 const ALL = Symbol('every value of each flag');
 
+const BOOL_FLAGS = new Set(['allow-explicit-only', 'no-allow-explicit-only', 'probe-models']);
+
 function parseFlags(args) {
   const out = { _: [] };
   const all = {};
@@ -2157,7 +2212,7 @@ function parseFlags(args) {
     if (a.startsWith('--')) {
       const eq = a.indexOf('=');
       if (eq > 0) set(a.slice(2, eq), a.slice(eq + 1));
-      else if (i + 1 < args.length && !args[i + 1].startsWith('-')) set(a.slice(2), args[++i]);
+      else if (!BOOL_FLAGS.has(a.slice(2)) && i + 1 < args.length && !args[i + 1].startsWith('-')) set(a.slice(2), args[++i]);
       else set(a.slice(2), true);
     } else if (a.startsWith('-') && a.length > 1) {
       set(a.slice(1), true);

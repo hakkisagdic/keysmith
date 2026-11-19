@@ -768,3 +768,99 @@ test('the docs and --help say a scope binds only an agent that cannot read the c
   const help = sb.run('--help').stdout;
   assert.match(help, /A scope binds only an agent that cannot read this config/);
 });
+
+test('keysmith key add --per-day N writes labelled capped 0600 key, enforces daily limit (429 on N+1), and warns on bare alias allow', async (t) => {
+  const sb = sandbox([MAIN]);
+  t.after(sb.cleanup);
+
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => (raw += c));
+    req.on('end', () => {
+      const body = raw ? JSON.parse(raw) : {};
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          id: 'chat-ok',
+          object: 'chat.completion',
+          model: body.model,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+        }),
+      );
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => {
+    server.closeAllConnections?.();
+    server.close();
+  });
+  const base = `http://127.0.0.1:${server.address().port}/v1`;
+
+  sb.edit((cfg) => {
+    cfg.adapters.groq = {
+      kind: 'http',
+      wire: 'openai',
+      baseUrl: base,
+      apiKey: false,
+      explicitOnly: true,
+      modelsOnly: true,
+      models: ['openai/gpt-oss-120b'],
+    };
+    cfg.aliases['cheap-public'] = ['groq/openai/gpt-oss-120b'];
+    cfg.aliasPolicy = { 'cheap-public': { allowExplicitOnly: true } };
+  });
+
+  const badNoCap = sb.run('key', 'add', 'bad', '--no-per-day');
+  assert.notEqual(badNoCap.status, 0);
+
+  const keyFile = path.join(sb.home, 'changelog.key');
+  const add = sb.run('key', 'add', 'changelog', '--allow', 'alias:cheap-public,groq/openai/gpt-oss-120b', '--per-day', '2', '--out', keyFile);
+  assert.equal(add.status, 0, add.stderr);
+  assert.equal(fs.statSync(keyFile).mode & 0o777, 0o600);
+  const changelogKey = fs.readFileSync(keyFile, 'utf8').trim();
+  assert.match(changelogKey, /^ks_/);
+
+  const listed = sb.run('key', 'list');
+  assert.equal(listed.status, 0);
+  assert.match(listed.stdout, /changelog/);
+  assert.match(listed.stdout, /2 requests\/day/);
+
+  const bareFile = path.join(sb.home, 'barecap.key');
+  const bareAdd = sb.run('key', 'add', 'barecap', '--allow', 'alias:cheap-public', '--per-day', '2', '--out', bareFile);
+  assert.equal(bareAdd.status, 0, bareAdd.stderr);
+  assert.match(bareAdd.stderr, /also checks each leg against --allow/);
+  const bareKey = fs.readFileSync(bareFile, 'utf8').trim();
+
+  const liveCfg = sb.read();
+  const dataDir = path.join(sb.home, '.local', 'share', 'keysmith');
+  const usageLog = new UsageLog(path.join(dataDir, 'usage.jsonl'));
+  const gwSrv = createServer(new Gateway(liveCfg), liveCfg, { usage: usageLog });
+  await new Promise((r) => gwSrv.listen(0, '127.0.0.1', r));
+  t.after(() => {
+    gwSrv.closeAllConnections?.();
+    gwSrv.close();
+  });
+  const gwUrl = `http://127.0.0.1:${gwSrv.address().port}/v1/chat/completions`;
+  const ask = (k) =>
+    fetch(gwUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${k}` },
+      body: JSON.stringify({ model: 'cheap-public', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+  const r1 = await ask(changelogKey);
+  const r2 = await ask(changelogKey);
+  const r3 = await ask(changelogKey);
+  assert.equal(r1.status, 200);
+  assert.equal(r2.status, 200);
+  assert.equal(r3.status, 429);
+  assert.ok(r3.headers.get('retry-after'));
+
+  const b1 = await ask(bareKey);
+  const b2 = await ask(bareKey);
+  const b3 = await ask(bareKey);
+  assert.equal(b1.status, 403);
+  assert.equal(b2.status, 403);
+  assert.equal(b3.status, 429);
+});

@@ -13,7 +13,7 @@ import { CatalogueLimiter, catalogueSettings, loadCatalogue } from './catalogue.
 import { CreditGuard, creditGuardError } from './credit-guard.js';
 import { DRIVERS } from './bridge/drivers.js';
 import { resolveEffort, suffixedIds } from './effort.js';
-import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExecCredentialAdapter } from './usage.js';
+import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExecCredentialAdapter, matchPrice } from './usage.js';
 import {
   TIER_ORDER,
   buildVirtualCandidateList,
@@ -436,6 +436,7 @@ export class Gateway {
     const out = {};
     for (const [alias, targets] of Object.entries(this.cfg.aliases || {})) {
       if (scope && !aliasDecision(scope, alias).ok) continue;
+      const allowExplicit = aliasAllowsExplicitOnly(this.cfg, alias);
       const problems = [];
       if (!Array.isArray(targets) || targets.length === 0) {
         problems.push('has no targets, so requesting it can only fail');
@@ -463,13 +464,46 @@ export class Gateway {
             problems.push(`${leg}: adapter "${adapterId}" is disabled`);
             continue;
           }
-          if (adapter.explicitOnly) {
+          if (adapter.unsafeTools || (adapter.explicitOnly && !allowExplicit)) {
             problems.push(`${leg}: ${keptOutOfAliases(adapterId, adapter)} — keysmith skips this leg`);
             continue;
           }
-          const known = knownModels(adapter);
-          if (model && known && !known.ids.includes(model)) {
-            problems.push(`${leg}: "${model}" is not among ${adapterId}'s ${known.from} — it will be sent upstream and rejected`);
+          if (adapter.modelsOnly) {
+            const declared = adapter._declared ?? adapter.declaredModels ?? null;
+            const allowed = Array.isArray(declared)
+              ? declared.map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean)
+              : declared && typeof declared === 'object'
+                ? Object.keys(declared)
+                : [];
+            if (!model || !allowed.includes(model)) {
+              problems.push(`${leg}: "${model || '(default)'}" is not in ${adapterId}'s declared models (modelsOnly) — keysmith refuses unlisted models on this adapter`);
+            }
+          } else {
+            const known = knownModels(adapter);
+            if (model && known && !known.ids.includes(model)) {
+              problems.push(`${leg}: "${model}" is not among ${adapterId}'s ${known.from} — it will be sent upstream and rejected`);
+            }
+          }
+          if (allowExplicit) {
+            const rate = model ? matchPrice(this.cfg?.pricing, adapterId, model) : null;
+            const rawAdapter = own(this.cfg?.adapters, adapterId) ? this.cfg.adapters[adapterId] : null;
+            const rawModelObj = Array.isArray(rawAdapter?.models)
+              ? rawAdapter.models.find((m) => m && typeof m === 'object' && m.id === model)
+              : rawAdapter?.models && typeof rawAdapter.models === 'object' && model && own(rawAdapter.models, model)
+                ? rawAdapter.models[model]
+                : null;
+            const isPaid = Boolean(
+              (rate && ((Number(rate.input) || 0) > 0 || (Number(rate.output) || 0) > 0)) ||
+              rawModelObj?.free === false ||
+              (rawModelObj?.pricing && (Number(rawModelObj.pricing.input) > 0 || Number(rawModelObj.pricing.output) > 0)) ||
+              Number(rawModelObj?.input) > 0 ||
+              Number(rawModelObj?.output) > 0 ||
+              this.catalogue?.info?.(adapterId, model)?.free === false ||
+              rawAdapter?.costBasis === 'paid',
+            );
+            if (isPaid) {
+              problems.push(`${leg}: priced/paid model on explicit chain "${alias}" — verify this leg is free-tier before exposing it`);
+            }
           }
         }
       }
@@ -878,9 +912,11 @@ export class Gateway {
         err = new LlmError(why ? `adapter "${adapterId}" is configured but did not load: ${why}` : `no adapter named "${adapterId}" — try one of: ${live.join(', ')}`, { status: why ? 503 : 404, provider: why ? adapterId : null });
       } else if (adapter.disabled) {
         err = new LlmError(`adapter "${adapterId}" is disabled`, { status: 503, provider: adapterId });
-      } else if (isAlias && adapter.explicitOnly) {
+      } else if (isAlias && adapter.unsafeTools) {
+        err = new LlmError(`alias "${requested}": ${keptOutOfAliases(adapterId, adapter)}`, { status: 403, provider: null });
+      } else if (isAlias && adapter.explicitOnly && !aliasAllowsExplicitOnly(this.cfg, requested)) {
         // An alias is a route the gateway picks legs from on its own; this adapter is only
-        // ever run by a request that names it. A hand-edited leg is a dead leg, not a route.
+        // ever run by a request that names it unless the alias opts in via aliasPolicy.
         err = new LlmError(`alias "${requested}": ${keptOutOfAliases(adapterId, adapter)}`, { status: 403, provider: null });
       }
       if (err) {
@@ -1396,68 +1432,85 @@ export class Gateway {
       yield { type: 'virtual', virtual: snap };
     }
     yield { type: 'leg', leg: legMetaOf(adapter, upstreamModel) };
-    for await (const evt of events) {
-      if (evt.type === 'effort') {
-        effort = evt;
-        continue;
-      }
-      if (effort && (evt.type === 'delta' || evt.type === 'tool_call' || evt.type === 'done')) {
-        yield effort;
-        effort = null;
-      }
-      if (evt.type === 'done') {
-        if (run.virtualState) {
-          run.virtualState.latency = Math.max(0, Date.now() - run.virtualState.t0);
-          const snap = snapshotVirtual(run.virtualState);
-          run.onVirtual?.(snap);
-          yield { type: 'virtual', virtual: snap };
-        }
-        yield { type: 'leg', leg: legMetaOf(adapter, upstreamModel) };
-      }
-      // One rule for both adapter kinds: chain-of-thought is only ever forwarded to
-      // a client that asked for it. Providers and CLIs emit it freely; a UI that
-      // shows it unasked is a surprise, and it costs output tokens.
-      if (evt.type === 'reasoning' && !run.includeReasoning) continue;
-      if (evt.type === 'retry') {
-        // The adapter is already trying again on its own; say so, never silently.
-        this.log(`${adapter.id}/${truncate(upstreamModel, 60)} retried after ${evt.reason}: ${truncate(evt.message, 160)}`);
-        yield evt;
-        continue;
-      }
-      if (evt.type === 'cut') {
-        // Same rule for an answer the adapter ended early: it is in the log and the
-        // usage log, so a harness that keeps calling tools is a number, not a mystery.
-        this.log(`${adapter.id}/${truncate(upstreamModel, 60)} answer ended at a call to ${truncate(evt.tool, 60)}: the process was stopped`);
-        yield evt;
-        continue;
-      }
-      // A tool call handed to the client is an answer as much as text is: from here on this
-      // leg is the one answering, and a failure is reported, never retried on the next leg.
-      if (evt.type === 'delta' || evt.type === 'tool_call') state.emitted = true;
-      if (evt.type === 'error') {
-        // Every streamed face writes this message to its client (an error chunk, an `error`
-        // event, response.failed), so it is redacted here: an adapter that let a provider's
-        // quoted key through is not the last line of defence. collect() keeps what came
-        // before it — a non-streamed answer is the text or calls, as it always was.
-        const message = redactSecrets(evt.message);
-        if (state.emitted) {
-          yield { ...evt, message };
-          return;
-        }
-        throw new LlmError(message, { status: evt.status || 502, provider: adapter.id });
-      }
-      if (evt.type === 'session') {
-        if (!sessions) continue;
-        if (evt.id) {
-          this._remember(run.sessionKey || run.publicId, { target: `${adapter.id}/${upstreamModel}`, upstreamSession: evt.id });
-          if (!run.reportedSession) {
-            run.reportedSession = true;
-            yield { type: 'session', id: run.publicId, resumed: canResume };
-          }
+    let seenUsage = null;
+    let seenUpstreamId = null;
+    try {
+      for await (const evt of events) {
+        if (evt.type === 'usage' && evt.usage) seenUsage = addUsage(seenUsage, evt.usage);
+        if (evt.type === 'upstream' && evt.upstreamId) seenUpstreamId = evt.upstreamId;
+        if (evt.type === 'effort') {
+          effort = evt;
           continue;
         }
+        if (effort && (evt.type === 'delta' || evt.type === 'tool_call' || evt.type === 'done')) {
+          yield effort;
+          effort = null;
+        }
+        if (evt.type === 'done') {
+          if (run.virtualState) {
+            run.virtualState.latency = Math.max(0, Date.now() - run.virtualState.t0);
+            const snap = snapshotVirtual(run.virtualState);
+            run.onVirtual?.(snap);
+            yield { type: 'virtual', virtual: snap };
+          }
+          yield { type: 'leg', leg: legMetaOf(adapter, upstreamModel) };
+        }
+        // One rule for both adapter kinds: chain-of-thought is only ever forwarded to
+        // a client that asked for it. Providers and CLIs emit it freely; a UI that
+        // shows it unasked is a surprise, and it costs output tokens.
+        if (evt.type === 'reasoning' && !run.includeReasoning) continue;
+        if (evt.type === 'retry') {
+          // The adapter is already trying again on its own; say so, never silently.
+          this.log(`${adapter.id}/${truncate(upstreamModel, 60)} retried after ${evt.reason}: ${truncate(evt.message, 160)}`);
+          yield evt;
+          continue;
+        }
+        if (evt.type === 'cut') {
+          // Same rule for an answer the adapter ended early: it is in the log and the
+          // usage log, so a harness that keeps calling tools is a number, not a mystery.
+          this.log(`${adapter.id}/${truncate(upstreamModel, 60)} answer ended at a call to ${truncate(evt.tool, 60)}: the process was stopped`);
+          yield evt;
+          continue;
+        }
+        // A tool call handed to the client is an answer as much as text is: from here on this
+        // leg is the one answering, and a failure is reported, never retried on the next leg.
+        if (evt.type === 'delta' || evt.type === 'tool_call') state.emitted = true;
+        if (evt.type === 'error') {
+          // Every streamed face writes this message to its client (an error chunk, an `error`
+          // event, response.failed), so it is redacted here: an adapter that let a provider's
+          // quoted key through is not the last line of defence. collect() keeps what came
+          // before it — a non-streamed answer is the text or calls, as it always was.
+          const message = redactSecrets(evt.message);
+          if (state.emitted) {
+            yield { ...evt, message };
+            return;
+          }
+          const errObj = new LlmError(message, { status: evt.status || 502, provider: adapter.id });
+          if (seenUsage) errObj.usage = seenUsage;
+          if (seenUpstreamId) errObj.upstreamId = seenUpstreamId;
+          errObj.leg = legMetaOf(adapter, upstreamModel);
+          throw errObj;
+        }
+        if (evt.type === 'session') {
+          if (!sessions) continue;
+          if (evt.id) {
+            this._remember(run.sessionKey || run.publicId, { target: `${adapter.id}/${upstreamModel}`, upstreamSession: evt.id });
+            if (!run.reportedSession) {
+              run.reportedSession = true;
+              yield { type: 'session', id: run.publicId, resumed: canResume };
+            }
+            continue;
+          }
+        }
+        yield evt;
       }
-      yield evt;
+    } catch (e) {
+      if (e && typeof e === 'object') {
+        if (seenUsage && !e.usage) e.usage = seenUsage;
+        if (seenUpstreamId && !e.upstreamId) e.upstreamId = seenUpstreamId;
+        if (!e.leg) e.leg = legMetaOf(adapter, upstreamModel);
+      }
+      throw e;
     }
     if (effort) yield effort;
     if (sessions && !run.reportedSession && run.known) {
@@ -1819,6 +1872,7 @@ export class Gateway {
     }
     if (err && !text && !toolCalls.length) {
       const e = new LlmError(err, { status: 502, provider: leg?.adapter || null });
+      if (usage) e.usage = usage;
       if (leg) e.leg = leg;
       if (upstreamId) e.upstreamId = upstreamId;
       if (virtual) e.virtualRoute = virtual;
@@ -1996,6 +2050,11 @@ export function keptOutOfAliases(id, adapter) {
   return adapter.unsafeTools
     ? `adapter "${id}" can run commands and edit files (unsafeTools), so it is never an alias leg`
     : `adapter "${id}" is explicit-only: it answers a request that names it, never an alias leg`;
+}
+
+/** Whether an alias is explicitly opted in to naming explicit-only (non-unsafeTools) legs via cfg.aliasPolicy. */
+export function aliasAllowsExplicitOnly(cfg, alias) {
+  return !!(own(cfg?.aliasPolicy, alias) && cfg.aliasPolicy[alias]?.allowExplicitOnly === true);
 }
 
 /** `name` is an entry of `obj` itself, not something every object inherits (`constructor`, `toString`). */

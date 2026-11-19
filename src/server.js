@@ -514,9 +514,9 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           client: req.headers['user-agent'],
           ...(pendingErrBody !== null ? { bytesOut: (res._bytesOut || 0) + Buffer.byteLength(pendingErrBody, 'utf8') } : {}),
           ...(meta.via ? { via: meta.via } : {}),
-          ...(e?.leg ? { _leg: e.leg } : {}),
-          ...(e?.upstreamId ? { upstreamId: e.upstreamId } : {}),
-          ...errorMarks(e),
+          ...(e?.leg || meta?.leg ? { _leg: e?.leg || meta.leg } : {}),
+          ...(e?.upstreamId || meta?.upstreamId ? { upstreamId: e?.upstreamId || meta.upstreamId } : {}),
+          ...errorMarks(e, meta),
         });
       } else if (meteredRequest && !meta && who?.fp) {
         usage?.noteUnloggedFailure?.(who.fp, now(), {
@@ -965,8 +965,10 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
       return;
     } else if (evt.type === 'leg') {
       leg = evt.leg;
+      meta.leg = leg;
     } else if (evt.type === 'upstream' && evt.upstreamId) {
       upstreamId = evt.upstreamId;
+      meta.upstreamId = upstreamId;
     } else if (evt.type === 'retry') {
       retries++;
     } else if (evt.type === 'cut') {
@@ -981,6 +983,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
       [toolMode, fallback, bridge] = [evt.mode || null, evt.fallback || null, evt.bridge || null];
     } else if (evt.type === 'usage') {
       u = mergeUsage(u, evt.usage);
+      meta.partialUsage = u;
     } else if (evt.type === 'usage_unknown') {
       uReason ||= evt.reason;
     } else if (evt.type === 'effort') {
@@ -1113,17 +1116,23 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
       meta.done = true;
       return;
     }
-    if (evt.type === 'leg') leg = evt.leg;
-    else if (evt.type === 'upstream' && evt.upstreamId) upstreamId = evt.upstreamId;
-    else if (evt.type === 'retry') retries++;
+    if (evt.type === 'leg') {
+      leg = evt.leg;
+      meta.leg = leg;
+    } else if (evt.type === 'upstream' && evt.upstreamId) {
+      upstreamId = evt.upstreamId;
+      meta.upstreamId = upstreamId;
+    } else if (evt.type === 'retry') retries++;
     else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'usage_unknown') uReason ||= evt.reason;
     else if (evt.type === 'effort') ran = evt;
     else if (evt.type === 'delta') face.text(evt.text);
     else if (evt.type === 'tool_call') face.toolCall(faceCall(evt, 'anthropic'));
     else if (evt.type === 'tool_mode') [toolMode, fallback, bridge] = [evt.mode || null, evt.fallback || null, evt.bridge || null];
-    else if (evt.type === 'usage') u = mergeUsage(u, evt.usage);
-    else if (evt.type === 'error') errMessage = redactSecrets(evt.message); // written to the client below
+    else if (evt.type === 'usage') {
+      u = mergeUsage(u, evt.usage);
+      meta.partialUsage = u;
+    } else if (evt.type === 'error') errMessage = redactSecrets(evt.message); // written to the client below
     else if (evt.type === 'done') break;
   }
   face.finish({ usage: faceUsage(u, uReason), error: errMessage });
@@ -1287,9 +1296,13 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
   let leg = null;
   let upstreamId = null;
   for await (const evt of events) {
-    if (evt.type === 'leg') leg = evt.leg;
-    else if (evt.type === 'upstream' && evt.upstreamId) upstreamId = evt.upstreamId;
-    else if (evt.type === 'retry') retries++;
+    if (evt.type === 'leg') {
+      leg = evt.leg;
+      meta.leg = leg;
+    } else if (evt.type === 'upstream' && evt.upstreamId) {
+      upstreamId = evt.upstreamId;
+      meta.upstreamId = upstreamId;
+    } else if (evt.type === 'retry') retries++;
     else if (evt.type === 'cut') cutAt = evt.tool;
     else if (evt.type === 'usage_unknown') uReason ||= evt.reason;
     else if (evt.type === 'effort') ran = evt;
@@ -1298,8 +1311,10 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
       full += evt.text;
       sseEvent(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: `msg_${id}`, output_index: 0, content_index: 0, delta: evt.text });
     } else if (evt.type === 'tool_call') throw noResponsesToolCalls();
-    else if (evt.type === 'usage') u = mergeUsage(u, evt.usage);
-    else if (evt.type === 'error') errMessage = redactSecrets(evt.message); // written to the client below
+    else if (evt.type === 'usage') {
+      u = mergeUsage(u, evt.usage);
+      meta.partialUsage = u;
+    } else if (evt.type === 'error') errMessage = redactSecrets(evt.message); // written to the client below
     else if (evt.type === 'done') break;
   }
   if (errMessage) sseEvent(res, 'response.failed', { type: 'response.failed', response: { id: `resp_${id}`, object: 'response', model: requestedModel, status: 'failed', error: { message: errMessage } } });
@@ -2037,18 +2052,19 @@ function usageMarks(failed, u, reason) {
   return m;
 }
 
-/** What an error that ends a request says it spent (emulate.js, gateway._toolRoute), for its row. */
-function errorMarks(e) {
-  if (!e || typeof e !== 'object') return {};
+/** What an error that ends a request says it spent (emulate.js, gateway._toolRoute, partial streams), for its row. */
+function errorMarks(e, meta = null) {
+  const usage = (e && typeof e === 'object' ? e.usage : null) || meta?.partialUsage || null;
+  if ((!e || typeof e !== 'object') && !usage) return {};
   const failure = failureOf(e);
   return {
-    ...(e.usage ? { usage: e.usage } : {}),
-    ...(e._ownUsage !== undefined ? { _ownUsage: e._ownUsage } : {}),
-    ...marks({ retries: e.retries || 0, toolMode: e.toolMode || null, fallback: e.fallback || null }),
+    ...(usage ? { usage } : {}),
+    ...(e && typeof e === 'object' && e._ownUsage !== undefined ? { _ownUsage: e._ownUsage } : {}),
+    ...(e && typeof e === 'object' ? marks({ retries: e.retries || 0, toolMode: e.toolMode || null, fallback: e.fallback || null }) : {}),
     // Why the engine failed, as a code (the bridge's: `foreign_tool` for the tripwire): the
     // security event is in the row, not in the gateway log only.
     ...(failure ? { failure } : {}),
-    ...(e.failedLegs?.length ? { failedLegs: e.failedLegs } : {}),
+    ...(e && typeof e === 'object' && e.failedLegs?.length ? { failedLegs: e.failedLegs } : {}),
   };
 }
 
