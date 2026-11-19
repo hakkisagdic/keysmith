@@ -738,15 +738,44 @@ test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login pr
       { mode: 0o755 },
     );
 
+    // Fast deterministic stall check via fake spawnImpl (independent of OS shell startup load).
+    await assert.rejects(
+      () =>
+        runKiroUsage(
+          { bin: 'fake-kiro', cwd: tmpDir, env: {} },
+          {
+            timeoutMs: 30_000,
+            stallMs: 60,
+            killAfterMs: 100,
+            settleAfterMs: 100,
+            spawnImpl: () => {
+              const child = new EventEmitter();
+              child.stdout = new EventEmitter();
+              child.stderr = new EventEmitter();
+              child.kill = () => child.emit('close', null, 'SIGTERM');
+              queueMicrotask(() => child.stderr.emit('data', `Please open https://example.com/login Bearer ${bearerSecret}\nsecond ignored line\n`));
+              return child;
+            },
+          },
+        ),
+      (e) => {
+        assert.match(e.message, /no output after 60 ms \(login prompt\?\)/);
+        assert.ok(e.message.includes('Please open https://example.com/login Bearer [REDACTED]'), `unexpected: ${e.message}`);
+        assert.ok(!e.message.includes(bearerSecret), 'Bearer token in prompt must be scrubbed');
+        assert.ok(!e.message.includes('second ignored line'), 'only first stderr line is kept');
+        return true;
+      },
+    );
+
     const t0 = Date.now();
     await assert.rejects(
       () =>
         runKiroUsage(
           { bin: promptBin, cwd: tmpDir, env: {} },
-          { timeoutMs: 30_000, stallMs: 600, killAfterMs: 200, settleAfterMs: 200, onSpawn: (c) => c?.pid && pids.push(c.pid) },
+          { timeoutMs: 30_000, stallMs: 1200, killAfterMs: 200, settleAfterMs: 200, onSpawn: (c) => c?.pid && pids.push(c.pid) },
         ),
       (e) => {
-        assert.match(e.message, /no output after 600 ms \(login prompt\?\)/);
+        assert.match(e.message, /no output after 1200 ms \(login prompt\?\)/);
         assert.ok(e.message.includes('Please open https://example.com/login Bearer [REDACTED]'), `unexpected: ${e.message}`);
         assert.ok(!e.message.includes(bearerSecret), 'Bearer token in prompt must be scrubbed');
         assert.ok(!e.message.includes('second ignored line'), 'only first stderr line is kept');
@@ -754,7 +783,7 @@ test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login pr
       },
     );
     const elapsed1 = Date.now() - t0;
-    assert.ok(elapsed1 < 2500, `login prompt hang took ${elapsed1} ms`);
+    assert.ok(elapsed1 < 5000, `login prompt hang took ${elapsed1} ms`);
 
     const t1 = Date.now();
     await assert.rejects(
