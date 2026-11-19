@@ -34,13 +34,20 @@ const log = [];
 /** A built-in profile around the stub: its bridge settings as shipped, toolMode mcp (a failure is the bridge's, never EMULATE's). */
 function around(name, cli, { bridge = {}, ...extra } = {}) {
   const p = structuredClone(CLI_PROFILES[name]);
+  const home = path.join(dir, 'home');
   return {
     ...p,
     bin: STUB,
     cwd: path.join(dir, `ws-${name}`),
     toolMode: 'mcp',
     bridge: { ...p.bridge, readyTimeoutMs: 20_000, toolResultTimeoutMs: 60_000, ...bridge },
-    env: { STUB_CLI: cli, CLI_BRIDGE_LOG: path.join(dir, 'bridge.jsonl') },
+    env: {
+      STUB_CLI: cli,
+      CLI_BRIDGE_LOG: path.join(dir, 'bridge.jsonl'),
+      HOME: home,
+      XDG_CONFIG_HOME: path.join(home, '.config'),
+      XDG_DATA_HOME: path.join(home, '.local', 'share'),
+    },
     timeoutMs: 30_000,
     maxConcurrent: 4,
     ...extra,
@@ -53,6 +60,7 @@ const NO_APPROVAL = (args) => args.filter((a, i) => !(a === '-c' && /default_too
 before(async () => {
   // os.tmpdir(): the socket's path must stay under 103 bytes.
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ksbx-'));
+  fs.mkdirSync(path.join(dir, 'home'), { recursive: true, mode: 0o700 });
   const cfg = {
     auth: { enabled: true, keys: [KEY] },
     limits: { streamHoldMs: 300, streamKeepaliveMs: 60, bridge: { socket: path.join(dir, 'b.sock'), maxSessions: 6, maxSessionsPerKey: 6 } },
