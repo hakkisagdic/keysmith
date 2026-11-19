@@ -4,6 +4,9 @@
 
 ### Added
 
+- Add per-profile cheap `GET` health targets (`health` on `groq`, `mistral`, and Cloudflare's `/client/v4/accounts/{account}/tokens/verify`, overridable with `healthPath`) shared by MCP `keysmith_test` and `keysmith doctor`, raising the default timeout to 15 s and classifying `no_such_endpoint` (on health paths) separately from fallback `no_models_endpoint`, plus `timeout` (`no answer in N s`) and error-code-only `unreachable`. Response bodies are never read and no paid model calls are issued.
+- Add `--allow-explicit-only` / `--no-allow-explicit-only` on `keysmith alias` (`aliasPolicy.<name>.allowExplicitOnly`) so curated chains can include `explicitOnly` legs in strict order without exposing `explicitOnly` legs to other aliases, virtual models, or fallback outside the chain; `unsafeTools` stays refused, `modelsOnly` continues enforcing declared models, and `aliasIssues` flags paid legs or unlisted `modelsOnly` targets on explicit chains.
+- Add `--per-day <N>` directly to `keysmith key add` (matching `key scope`), and warn when `--allow alias:<name>` leaves none of the alias's legs permitted.
 - Add an optional catalogue (`catalogue` in `config.json`) with per-adapter `requestsPerMinute`, `requestsPerDay` and `tokensPerMonth`: over a limit a local `429` with `retry-after`, a cooldown after an upstream `429`, and `source`/`tier` on usage rows.
 - Add `keysmith source enable|disable <profile>` (tokenrouter, groq, mistral, cloudflare): the adapter with a Keychain key reference, out of every alias, conservative catalogue limits, discovery on; and `keysmith config get|set|unset <key>` for the top-level settings, with a dated backup first.
 - Add the `cloudflare` (Workers AI) profile (`--account-id`) and the catalogue field `tokensPerDay`.
@@ -28,6 +31,8 @@
 
 ### Fixes
 
+- Expand `~` in `kiro-cli` binary paths (`which`/`expand`) inside the credit guard and `keyOf`/`_entry`, fail immediately (`<name> not found (looked at <expanded path>)`) instead of waiting 30 s on missing binaries, and add a 10 s `STALL_TIMEOUT_MS` check (`no output after 10 s (login prompt?)` plus the scrubbed first diagnostic line) when a login prompt or silent hang stalls `/usage` without writing stdout.
+- Preserve provider token `usage` reported on partial streams when a request fails before completing (`Gateway._leg`/`collect` and `errorMarks` in `src/server.js`).
 - Give a virtual model its classifier's instruction (`classifierPrompt`, or `classifier.prompt`), sent as the classifier's system message and part of the prompt cache key, so a rubric saying what `simple`, `medium` and `complex` mean lives in the config (a small local classifier went from 82–90% to 94–96% on a 50-prompt set with one).
 - Add `rules` to a virtual model: a fast path tried after a session's sticky label and before the prompt cache and the classifier, where the first rule whose conditions all hold (`match`, `unless`, `maxChars`, `noTools`, `noMedia`, `noCode`) labels the request without asking the classifier (`reason: "rule:<name>"`); a rule hit is neither cached nor made sticky.
 - Meter a virtual model's classifier calls like any leg: each is held to the classifier adapter's spend cap first (a refusal labels the request `medium` unasked and writes a `limited` row) and writes its own usage row (`purpose: "classifier"`, with its token counts and cost) once its reply ends, while the label is used as soon as it arrives; `keysmith chat`, `keysmith route explain` and a closing gateway wait for those rows.

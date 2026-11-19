@@ -12,8 +12,8 @@ Behind a named tunnel the base URL is `https://llm.example.com/v1` and the key i
 only thing standing between the internet and your agent's quota — see
 [tunnel.md](tunnel.md).
 
-An agent is better off with a key of its own, with a scope, written to a file it reads:
-`keysmith key add <label> --deny claude-api --out <file>` (or `--allow agy,alias:argon`). It sees
+An agent is better off with a key of its own, with a scope and optional daily cap, written to a file it reads:
+`keysmith key add <label> --deny claude-api --per-day 200 --out <file>` (or `--allow agy,alias:argon,agy/gemini-4-argon-high`; when allowing an alias, also include the legs that key may reach because both the alias and each leg are checked against `--allow`). It sees
 only the models that key may reach, and a request outside them is a 403 naming the adapter — see
 "Keys with a scope" in the [README](../README.md#keys-with-a-scope-what-each-key-may-reach). The
 scope binds only an agent that cannot read keysmith's config: one running as the same OS user,

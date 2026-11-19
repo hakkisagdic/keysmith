@@ -139,15 +139,26 @@ keysmith alias argon agy/gemini-4-argon-high google/gemini-4-argon   # set a cha
 keysmith alias chat --prepend agy/gemini-4-argon-high       # a new first leg; the others keep their order
 keysmith alias chat --append ollama/qwen3:4b                # a new last leg (a leg already there moves)
 keysmith alias chat --drop ollama/qwen3:4b                  # take one out
+keysmith alias cheap-public groq/openai/gpt-oss-120b mistral/codestral-latest cloudflare/@cf/meta/llama-3.1-8b-instruct-fast --allow-explicit-only
 keysmith alias chat --delete
 ```
 
 A leg has to name an attached adapter (`--force` saves one you have not attached yet), an
-alias cannot name another alias or share an adapter's name, and an
-[explicit-only or tool-capable adapter](#agents-that-could-act-on-this-machine) is refused —
-`--force` or not; an adapter whose argv carries an auto-approve flag counts as tool-capable
-whether it is marked or not. After a change the same checks `doctor` runs are printed, so a
-model the adapter does not list is said then, not discovered as a slow failover later.
+alias cannot name another alias or share an adapter's name, a
+[tool-capable adapter](#agents-that-could-act-on-this-machine) is always refused (whether
+marked `unsafeTools` or carrying an auto-approve flag), and an `explicitOnly` adapter is
+refused unless that alias opts in with `--allow-explicit-only` (`aliasPolicy.<name>.allowExplicitOnly`).
+After a change the same checks `doctor` runs are printed, so a model the adapter does not
+list is said then, not discovered as a slow failover later.
+
+To expose a curated explicit-only failover chain without weakening other routes, pass
+`--allow-explicit-only` on that alias alone: `modelsOnly` still rejects unlisted models,
+`doctor` and `keysmith alias` flag any paid/priced leg on it, other aliases still skip
+`explicitOnly` legs, and exhausting the chain returns its error without falling through
+elsewhere. Separately, HTTP reachability probes (`keysmith doctor` and MCP `keysmith_test`)
+use each profile's cheap `GET` health path — such as Cloudflare's `/client/v4/accounts/<account>/tokens/verify`,
+with `healthPath` overriding the profile and `/models` as fallback — under a 15 s timeout,
+never reading response bodies or issuing paid chat calls.
 
 The gateway reads its config once, when it starts. `add`, `remove`, `set`, `alias` and
 `key add|scope|revoke` change the file, not the running gateway: while one runs they say so, with
@@ -640,10 +651,11 @@ hand-written adapter one too.
 Two marks keep an adapter out of routes it was not asked for by name:
 
 - **`explicitOnly: true`** — the adapter answers a request that names it (`claude/sonnet`)
-  and nothing else: never an alias leg (`keysmith alias` refuses it; a hand-edited leg is
-  skipped and named in `doctor`, `/v1/models` and the routes endpoint), never probed by
-  `doctor --probe-models`. For an adapter that spends something you keep for yourself; the
-  `claude` profile ships it, and `keysmith add <profile> --explicit-only` sets it on any other.
+  and nothing else: never a general alias leg (`keysmith alias` refuses it unless the alias
+  opts in with `--allow-explicit-only`; a hand-edited leg without opt-in is skipped and named
+  in `doctor`, `/v1/models` and the routes endpoint), never probed by `doctor --probe-models`.
+  For an adapter that spends something you keep for yourself; the `claude` profile ships it,
+  and `keysmith add <profile> --explicit-only` sets it on any other.
 - **`unsafeTools: true`** — keysmith could not take the CLI's tools away. Everything
   `explicitOnly` does, and the profile ships `disabled: true`. Serving it is a decision with
   its own flag: `keysmith set <id> disabled false --allow-unsafe-tools`, and so is any later
@@ -935,6 +947,7 @@ make in one local calendar day:
 ```
 
 ```bash
+keysmith key add changelog --allow alias:cheap-public,groq/openai/gpt-oss-120b,mistral/codestral-latest,cloudflare/@cf/meta/llama-3.1-8b-instruct-fast --per-day 200 --out ~/.config/changelog/keysmith.key
 keysmith key scope fp:3f9a0c12 --per-day 300   # cap it (the scope and the label stay as they are)
 keysmith key scope fp:3f9a0c12 --no-per-day    # lift it; --clear drops the lists and leaves the cap
 keysmith key list                              # … deny: claude-api · 300 requests/day
