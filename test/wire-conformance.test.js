@@ -84,7 +84,7 @@ before(async () => {
         maxConcurrent: 8,
       },
       // Plain stdout: nothing in it says what the run spent.
-      plain: { kind: 'cli', bin: stubCli('plain', "printf '%s' 'plain answer'"), args: ['{prompt}'], parser: 'raw', models: ['m'], cwd: path.join(dir, 'ws-plain'), env: { ...homeEnv }, timeoutMs: 30_000 },
+      plain: { kind: 'cli', bin: stubCli('plain', "printf '%s' 'plain answer'"), args: ['{prompt}'], parser: 'raw', models: ['m'], cwd: path.join(dir, 'ws-plain'), env: { ...homeEnv }, timeoutMs: 30_000, maxConcurrent: 8 },
       // codex exec --json on a turn that fails after its first message went out (exit 1).
       cxfail: {
         kind: 'cli',
@@ -98,6 +98,7 @@ before(async () => {
         cwd: path.join(dir, 'ws-cxfail'),
         env: { ...homeEnv },
         timeoutMs: 30_000,
+        maxConcurrent: 8,
       },
     },
   };
@@ -112,6 +113,7 @@ before(async () => {
 
 /** Close every bridge session a case left waiting (a client that never came back), so the next case has room. */
 afterEach(async () => {
+  if (gateway) await waitFor(() => gateway.inFlight === 0, { message: 'in-flight requests settled' });
   const hub = gateway?.toolEngines?.mcp?.hub;
   if (hub) await Promise.all([...hub.sessions.values()].map((s) => s.close('test_done')));
 });
@@ -135,7 +137,7 @@ const tag = () => `#w${++tags}-${crypto.randomBytes(3).toString('hex')}`;
 /** A model's rows, oldest first (tail() reads newest first). */
 const rowsOf = (model) => usageLog.tail(500).filter((r) => r.model === model).reverse();
 const lastRows = (model, n) => rowsOf(model).slice(-n);
-const waitRows = (model, minCount) => waitFor(() => rowsOf(model).length >= minCount, { message: `usage rows for ${model} >= ${minCount}` });
+const waitRows = (model, minCount) => waitFor(() => gateway.inFlight === 0 && rowsOf(model).length >= minCount, { message: `usage rows for ${model} >= ${minCount}` });
 /** The stub codex's turn.completed: 1100 in, none of them cached, 30 out — the session's whole spend. */
 const RUN = { input: 1100, output: 30, cacheRead: 0, cacheWrite: 0 };
 const CODEX_GAP = /^cx reports a run's tokens once, when the run ends/;
