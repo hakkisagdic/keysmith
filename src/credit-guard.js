@@ -3,6 +3,9 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { expand } from './config.js';
+import { which } from './cli-adapter.js';
+import { redactSecrets } from './redact.js';
 import { LlmError, truncate } from './util.js';
 
 /**
@@ -47,6 +50,7 @@ export const CREDIT_GUARD_MAX_RETRY_AFTER_S = 300;
 /** The argv of a reading, before the adapter's agent: headless, trusting no tool. */
 export const KIRO_USAGE_ARGS = ['chat', '--no-interactive', '--trust-tools=', '/usage'];
 const FIRST_WAIT_MS = 10_000;
+export const STALL_TIMEOUT_MS = 10_000;
 const RUN_TIMEOUT_MS = 30_000;
 // SIGTERM first, SIGKILL this long after (the adapter's own runs do the same, cli-adapter terminate()).
 const KILL_AFTER_MS = 5_000;
@@ -143,8 +147,66 @@ export function kiroUsageArgs(adapter) {
  * SIGKILL `killAfterMs` later — and the promise settles at the latest a moment after that, whether
  * or not the child ever exits.
  */
-export function runKiroUsage(adapter, { timeoutMs = RUN_TIMEOUT_MS, killAfterMs = KILL_AFTER_MS, settleAfterMs = 2_000, spawnImpl = spawn } = {}) {
+const SAFE_GUARD_ENV_KEYS = new Set([
+  'PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'PWD', 'OLDPWD', 'SHELL', 'USER', 'LOGNAME',
+  'TERM', 'COLORTERM', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'HOSTNAME',
+  'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'NODE_ENV',
+]);
+
+function resolveKiroBin(adapter) {
+  const raw = String(adapter?.bin || '');
+  if (!raw) return { raw: '', expanded: '', found: null };
+  return { raw, expanded: expand(raw), found: which(raw) };
+}
+
+function scrubGuardText(text, adapter, safePath = '') {
+  if (!text) return '';
+  let out = redactSecrets(String(text));
+  out = out.replace(/(\bBearer\s+)[^\s"'`]+/gi, '$1[REDACTED]');
+  out = out.replace(/(https?:\/\/[^:\s/@]+:)[^@\s/]+@/gi, '$1[REDACTED]@');
+  if (typeof adapter?.apiKey === 'string' && adapter.apiKey.length >= 6) {
+    out = out.split(adapter.apiKey).join('[REDACTED]');
+  }
+  const env = adapter?.env;
+  if (env && typeof env === 'object') {
+    const vals = [];
+    for (const [k, v] of Object.entries(env)) {
+      if (typeof v !== 'string' || v.length < 6 || SAFE_GUARD_ENV_KEYS.has(k)) continue;
+      if (safePath && (v === safePath || safePath.startsWith(`${v}/`))) continue;
+      vals.push(v);
+    }
+    vals.sort((a, b) => b.length - a.length);
+    for (const v of vals) out = out.split(v).join('[REDACTED]');
+  }
+  return redactSecrets(out);
+}
+
+function firstDiagnosticLine(stderr, stdout, adapter, safePath) {
+  const src = stripAnsi(stderr || '') || stripAnsi(stdout || '');
+  const line = src
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .find(Boolean);
+  return line ? truncate(scrubGuardText(line, adapter, safePath), 160) : '';
+}
+
+function formatWait(ms) {
+  return ms >= 1000 && ms % 1000 === 0 ? `${ms / 1000} s` : `${ms} ms`;
+}
+
+export function runKiroUsage(
+  adapter,
+  { timeoutMs = RUN_TIMEOUT_MS, stallMs = STALL_TIMEOUT_MS, killAfterMs = KILL_AFTER_MS, settleAfterMs = 2_000, spawnImpl = spawn, onSpawn = null } = {},
+) {
   return new Promise((resolve, reject) => {
+    const resolved = resolveKiroBin(adapter);
+    const binToSpawn = resolved.found || resolved.expanded;
+    const lookedAt = resolved.expanded || resolved.raw || '(empty)';
+    const binName = path.basename(resolved.expanded || resolved.raw) || resolved.raw || 'kiro-cli';
+    const notFoundErr = () => new Error(scrubGuardText(`${binName} not found (looked at ${lookedAt})`, adapter, lookedAt));
+    if (!binToSpawn || (spawnImpl === spawn && !resolved.found)) {
+      return reject(notFoundErr());
+    }
     try {
       adapter._ensureCwd?.();
     } catch {}
@@ -157,45 +219,90 @@ export function runKiroUsage(adapter, { timeoutMs = RUN_TIMEOUT_MS, killAfterMs 
     const env = typeof adapter._childEnv === 'function' ? adapter._childEnv(cwd) : process.env;
     let child;
     try {
-      child = spawnImpl(adapter.bin, kiroUsageArgs(adapter), { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      child = spawnImpl(binToSpawn, kiroUsageArgs(adapter), { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     } catch (e) {
-      return reject(new Error(e?.code === 'ENOENT' ? `${adapter.bin} not found` : e?.message || String(e)));
+      return reject(e?.code === 'ENOENT' ? notFoundErr() : new Error(scrubGuardText(e?.message || String(e), adapter, lookedAt)));
+    }
+    if (typeof onSpawn === 'function') {
+      try {
+        onSpawn(child);
+      } catch {}
     }
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let stalled = false;
+    let stallDiag = '';
     let settled = false;
-    const timers = [];
+    const timers = new Set();
+    let stallTimer = null;
+    const addTimer = (t) => {
+      timers.add(t);
+      return t;
+    };
     const settle = (fn, value) => {
       if (settled) return;
       settled = true;
       for (const t of timers) clearTimeout(t);
+      timers.clear();
       fn(value);
     };
-    const why = () => (stderr ? `: ${truncate(stripAnsi(stderr), 160)}` : '');
-    child.stdout.on('data', (d) => {
+    const why = () => (stderr ? `: ${truncate(scrubGuardText(stripAnsi(stderr), adapter, lookedAt), 160)}` : '');
+    const stallMsg = () => `no output after ${formatWait(stallMs)} (login prompt?)${stallDiag ? `: ${stallDiag}` : ''}`;
+    const armStall = () => {
+      if (!(stallMs > 0 && stallMs < timeoutMs)) return;
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        timers.delete(stallTimer);
+      }
+      stallTimer = addTimer(
+        setTimeout(() => {
+          if (settled || timedOut || stalled) return;
+          stalled = true;
+          stallDiag = firstDiagnosticLine(stderr, stdout, adapter, lookedAt);
+          try {
+            child.kill('SIGTERM');
+          } catch {}
+          addTimer(
+            setTimeout(() => {
+              try {
+                child.kill('SIGKILL');
+              } catch {}
+            }, killAfterMs),
+          );
+          addTimer(setTimeout(() => settle(reject, new Error(stallMsg())), killAfterMs + settleAfterMs));
+        }, stallMs),
+      );
+    };
+    child.stdout?.on('data', (d) => {
       if (stdout.length < 1 << 20) stdout += d;
+      armStall();
     });
-    child.stderr.on('data', (d) => {
+    child.stderr?.on('data', (d) => {
       if (stderr.length < 1 << 16) stderr += d;
     });
-    timers.push(
+    armStall();
+    addTimer(
       setTimeout(() => {
+        if (settled || stalled) return;
         timedOut = true;
         try {
           child.kill('SIGTERM');
         } catch {}
       }, timeoutMs),
+    );
+    addTimer(
       setTimeout(() => {
         try {
           child.kill('SIGKILL');
         } catch {}
       }, timeoutMs + killAfterMs),
-      // A child that outlives SIGKILL (or a grandchild holding its pipes) never pins a reading.
-      setTimeout(() => settle(reject, new Error(`timed out after ${timeoutMs} ms, and kiro-cli did not exit when stopped`)), timeoutMs + killAfterMs + settleAfterMs),
     );
-    child.on('error', (e) => settle(reject, new Error(e?.code === 'ENOENT' ? `${adapter.bin} not found` : e?.message || String(e))));
+    // A child that outlives SIGKILL (or a grandchild holding its pipes) never pins a reading.
+    addTimer(setTimeout(() => settle(reject, new Error(`timed out after ${timeoutMs} ms, and kiro-cli did not exit when stopped`)), timeoutMs + killAfterMs + settleAfterMs));
+    child.on('error', (e) => settle(reject, e?.code === 'ENOENT' ? notFoundErr() : new Error(scrubGuardText(e?.message || String(e), adapter, lookedAt))));
     child.on('close', (code, signal) => {
+      if (stalled) return settle(reject, new Error(stallMsg()));
       if (timedOut) return settle(reject, new Error(`timed out after ${timeoutMs} ms${why()}`));
       if (code !== 0) return settle(reject, new Error(`exited ${code ?? signal}${why()}`));
       settle(resolve, stdout);
@@ -249,16 +356,20 @@ export class CreditGuard {
 
   /** One Kiro login: the binary and the environment the adapter runs it with (a hash of it). */
   keyOf(adapter) {
+    const resolved = resolveKiroBin(adapter);
+    const bin = resolved.found || resolved.expanded || String(adapter?.bin || '');
     const env = Object.entries(adapter.env || {}).sort(([a], [b]) => (a < b ? -1 : 1));
     const h = createHash('sha256').update(JSON.stringify(env)).digest('hex').slice(0, 12);
-    return `${adapter.bin}#${h}`;
+    return `${bin}#${h}`;
   }
 
   _entry(adapter) {
+    const resolved = resolveKiroBin(adapter);
+    const bin = resolved.found || resolved.expanded || String(adapter?.bin || '');
     const key = this.keyOf(adapter);
     let e = this.entries.get(key);
     if (!e) {
-      e = { bin: String(adapter.bin), adapters: [], reading: null, at: 0, error: null, lastAttemptAt: 0, inflight: null, said: {} };
+      e = { bin, adapters: [], reading: null, at: 0, error: null, lastAttemptAt: 0, inflight: null, said: {} };
       this.entries.set(key, e);
     }
     if (adapter.id && !e.adapters.includes(adapter.id)) e.adapters.push(adapter.id);

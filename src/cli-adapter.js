@@ -1391,7 +1391,10 @@ export function sanitizeOpencodeEnv(env, ...overrides) {
 }
 export function which(bin) {
   if (!bin) return null;
-  if (_whichCache.has(bin)) return _whichCache.get(bin);
+  const isPathLike = bin.includes('/') || bin.includes('\\') || bin.startsWith('~');
+  const expanded = isPathLike ? expand(bin) : null;
+  const cacheKey = isPathLike ? `p:${expanded}` : `e:${process.env.PATH || ''}\0${bin}`;
+  if (_whichCache.has(cacheKey)) return _whichCache.get(cacheKey);
   let found = null;
   const ok = (p) => {
     try {
@@ -1401,9 +1404,9 @@ export function which(bin) {
       return false;
     }
   };
-  if (bin.includes('/')) found = ok(expand(bin)) ? expand(bin) : null;
+  if (isPathLike) found = ok(expanded) ? expanded : null;
   else for (const dir of (process.env.PATH || '').split(':')) if (dir && ok(`${dir}/${bin}`)) { found = `${dir}/${bin}`; break; }
-  _whichCache.set(bin, found);
+  if (found) _whichCache.set(cacheKey, found);
   return found;
 }
 

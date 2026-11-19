@@ -21,6 +21,7 @@ import {
   CreditGuard,
   DEFAULT_CREDIT_THRESHOLD,
   MAX_CREDIT_THRESHOLD,
+  STALL_TIMEOUT_MS,
   checkCreditGuard,
   creditGuardError,
   evaluateCredits,
@@ -644,4 +645,142 @@ test('a virtual model\'s classifier under the credit guard is not asked while it
   assert.equal(clfAsked.length, 1);
   assert.equal(r.virtual.label, 'complex');
   assert.match(r.text, /hard answer/);
+});
+
+test('runKiroUsage and CreditGuard expand ~ in bin, run stub in temp HOME, and parse credits', async () => {
+  const prevHome = process.env.HOME;
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-cg-tilde-'));
+  try {
+    process.env.HOME = tmpHome;
+    const binDir = path.join(tmpHome, 'local-bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const binPath = path.join(binDir, 'kiro-cli');
+    fs.writeFileSync(
+      binPath,
+      "#!/bin/sh\nprintf '%s\\n' 'Estimated Usage | resets on 2026-12-01 | KIRO POWER' 'Credits (1250 of 10000 covered in plan), 12.5%'\n",
+      { mode: 0o755 },
+    );
+    const adapter = new CliAdapter('kiro-tilde', { bin: '~/local-bin/kiro-cli', cwd: tmpHome });
+    const statePath = path.join(tmpHome, 'credits.json');
+    const guard = new CreditGuard({ statePath, ttlMs: 0, firstWaitMs: 500 });
+    assert.ok(guard.keyOf(adapter).startsWith(`${binPath}#`), 'keyOf uses expanded binary path');
+    await guard.refresh(adapter);
+    const entry = guard.entries.get(guard.keyOf(adapter));
+    assert.ok(entry, 'guard entry should exist');
+    assert.equal(entry.bin, binPath);
+    assert.equal(entry.error, null);
+    assert.equal(entry.reading.used, 1250);
+    assert.equal(entry.reading.limit, 10000);
+  } finally {
+    process.env.HOME = prevHome;
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test('CreditGuard fails fast (< 1 s) on missing expanded binary without leaking env values and records error in state file', async () => {
+  const prevHome = process.env.HOME;
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-cg-missing-'));
+  const secretVal = 'sec_' + 'env_val_987654';
+  try {
+    process.env.HOME = tmpHome;
+    const missingExpanded = path.join(tmpHome, 'missing-dir', 'kiro-cli');
+    const statePath = path.join(tmpHome, 'credits.json');
+    const adapter = {
+      id: 'kiro-miss',
+      bin: '~/missing-dir/kiro-cli',
+      cwd: tmpHome,
+      env: { HOME: tmpHome, CUSTOM_SECRET_TOKEN: secretVal },
+    };
+    const guard = new CreditGuard({ statePath, ttlMs: 0 });
+    const t0 = Date.now();
+    await assert.rejects(
+      () => runKiroUsage(adapter),
+      (e) => {
+        assert.match(e.message, /kiro-cli not found/);
+        assert.ok(e.message.includes(`looked at ${missingExpanded}`), `expected expanded path in: ${e.message}`);
+        assert.ok(!e.message.includes(secretVal), 'env secret must not leak');
+        return true;
+      },
+    );
+    await guard.refresh(adapter);
+    const entry = guard.entries.get(guard.keyOf(adapter));
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 1000, `expected < 1000 ms failure, got ${elapsed} ms`);
+    assert.ok(entry.error.includes('not found'));
+    assert.ok(entry.error.includes(missingExpanded));
+    assert.ok(!entry.error.includes(secretVal));
+    const state = readCreditState(statePath);
+    const saved = Array.isArray(state) ? state.find((x) => x.bin === missingExpanded) : null;
+    assert.ok(saved?.error?.includes(missingExpanded), `expected expanded path in saved state error, got: ${JSON.stringify(state)}`);
+    assert.ok(!saved?.error?.includes(secretVal));
+  } finally {
+    process.env.HOME = prevHome;
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login prompt hang and on silent hang', async () => {
+  assert.equal(STALL_TIMEOUT_MS, 10_000);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-cg-stall-'));
+  const bearerSecret = 'tok_' + 'prompt_12345';
+  const pids = [];
+  try {
+    const promptBin = path.join(tmpDir, 'kiro-prompt');
+    fs.writeFileSync(
+      promptBin,
+      `#!/bin/sh\nprintf '%s\\n' "Please open https://example.com/login Bearer ${bearerSecret}" "second ignored line" >&2\nexec "${process.execPath}" -e "setTimeout(() => {}, 30000);"\n`,
+      { mode: 0o755 },
+    );
+    const silentBin = path.join(tmpDir, 'kiro-silent');
+    fs.writeFileSync(
+      silentBin,
+      `#!/bin/sh\nexec "${process.execPath}" -e "setTimeout(() => {}, 30000);"\n`,
+      { mode: 0o755 },
+    );
+
+    const t0 = Date.now();
+    await assert.rejects(
+      () =>
+        runKiroUsage(
+          { bin: promptBin, cwd: tmpDir, env: {} },
+          { timeoutMs: 30_000, stallMs: 600, killAfterMs: 200, settleAfterMs: 200, onSpawn: (c) => c?.pid && pids.push(c.pid) },
+        ),
+      (e) => {
+        assert.match(e.message, /no output after 600 ms \(login prompt\?\)/);
+        assert.ok(e.message.includes('Please open https://example.com/login Bearer [REDACTED]'), `unexpected: ${e.message}`);
+        assert.ok(!e.message.includes(bearerSecret), 'Bearer token in prompt must be scrubbed');
+        assert.ok(!e.message.includes('second ignored line'), 'only first stderr line is kept');
+        return true;
+      },
+    );
+    const elapsed1 = Date.now() - t0;
+    assert.ok(elapsed1 < 2500, `login prompt hang took ${elapsed1} ms`);
+
+    const t1 = Date.now();
+    await assert.rejects(
+      () =>
+        runKiroUsage(
+          { bin: silentBin, cwd: tmpDir, env: {} },
+          { timeoutMs: 30_000, stallMs: 200, killAfterMs: 200, settleAfterMs: 200, onSpawn: (c) => c?.pid && pids.push(c.pid) },
+        ),
+      (e) => {
+        assert.equal(e.message, 'no output after 200 ms (login prompt?)');
+        return true;
+      },
+    );
+    const elapsed2 = Date.now() - t1;
+    assert.ok(elapsed2 < 2000, `silent hang took ${elapsed2} ms`);
+
+    await sleep(30);
+    for (const pid of pids) {
+      assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, `stalled child ${pid} should have exited`);
+    }
+  } finally {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {}
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
