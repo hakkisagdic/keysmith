@@ -155,9 +155,9 @@ const GENERATIONS = [
     id: 'openbot',
     ai: 'openbot-ai',
     faces: {
-      messages: (id) => mods['openbot-ai-sdk-anthropic'].createAnthropic({ baseURL: `${base}/v1`, apiKey: KEY })(id),
-      responses: (id) => mods['openbot-ai-sdk-openai'].createOpenAI({ baseURL: `${base}/v1`, apiKey: KEY }).responses(id),
-      chat: (id) => mods['openbot-ai-sdk-openai'].createOpenAI({ baseURL: `${base}/v1`, apiKey: KEY }).chat(id),
+      messages: (id, apiKey = KEY) => mods['openbot-ai-sdk-anthropic'].createAnthropic({ baseURL: `${base}/v1`, apiKey })(id),
+      responses: (id, apiKey = KEY) => mods['openbot-ai-sdk-openai'].createOpenAI({ baseURL: `${base}/v1`, apiKey }).responses(id),
+      chat: (id, apiKey = KEY) => mods['openbot-ai-sdk-openai'].createOpenAI({ baseURL: `${base}/v1`, apiKey }).chat(id),
     },
     packages: { messages: 'openbot-ai-sdk-anthropic', responses: 'openbot-ai-sdk-openai', chat: 'openbot-ai-sdk-openai' },
   },
@@ -165,10 +165,10 @@ const GENERATIONS = [
     id: 'latest',
     ai: 'ai',
     faces: {
-      messages: (id) => mods['@ai-sdk/anthropic'].createAnthropic({ baseURL: `${base}/v1`, apiKey: KEY })(id),
-      responses: (id) => mods['@ai-sdk/openai'].createOpenAI({ baseURL: `${base}/v1`, apiKey: KEY }).responses(id),
-      chat: (id) => mods['@ai-sdk/openai'].createOpenAI({ baseURL: `${base}/v1`, apiKey: KEY }).chat(id),
-      compatible: (id) => mods['@ai-sdk/openai-compatible'].createOpenAICompatible({ name: 'keysmith', baseURL: `${base}/v1`, apiKey: KEY, includeUsage: true }).chatModel(id),
+      messages: (id, apiKey = KEY) => mods['@ai-sdk/anthropic'].createAnthropic({ baseURL: `${base}/v1`, apiKey })(id),
+      responses: (id, apiKey = KEY) => mods['@ai-sdk/openai'].createOpenAI({ baseURL: `${base}/v1`, apiKey }).responses(id),
+      chat: (id, apiKey = KEY) => mods['@ai-sdk/openai'].createOpenAI({ baseURL: `${base}/v1`, apiKey }).chat(id),
+      compatible: (id, apiKey = KEY) => mods['@ai-sdk/openai-compatible'].createOpenAICompatible({ name: 'keysmith', baseURL: `${base}/v1`, apiKey, includeUsage: true }).chatModel(id),
     },
     packages: { messages: '@ai-sdk/anthropic', responses: '@ai-sdk/openai', chat: '@ai-sdk/openai', compatible: '@ai-sdk/openai-compatible' },
   },
@@ -206,9 +206,6 @@ const noErrors = (errors, label) => assert.deepEqual(errors.map(message), [], `$
 const counts = (u) => [u?.inputTokens, u?.outputTokens];
 
 /* ------------------------------------------------------------- the AI SDK, per face */
-
-/** The /v1/messages error body, read by @ai-sdk/anthropic (a finding of this re-check). */
-const ERROR_BODY_TODO = 'server.js: the error body on /v1/messages is OpenAI-shaped ({ error: { message, type, param, code } }); @ai-sdk/anthropic\'s error schema wants { type: "error", error: { type, message } }, so the client\'s message is the HTTP status text and keysmith\'s reason is only in responseBody';
 
 for (const gen of GENERATIONS) {
   for (const [face, make] of Object.entries(gen.faces)) {
@@ -356,19 +353,32 @@ for (const gen of GENERATIONS) {
         assert.match(row.usageReason ?? '', RAW_GAP, `${label()}: ${JSON.stringify(row)}`);
       });
 
-      test('a request refused before its stream starts (no such adapter): the client is told keysmith\'s reason', { todo: face === 'messages' ? ERROR_BODY_TODO : false }, async () => {
+      test('a request refused before its stream starts (no such adapter): the client is told keysmith\'s reason', async () => {
         const ai = mods[gen.ai];
         const run = await streamRun(ai, { model: make('nosuch/m'), prompt: `Hi ${tag()}`, providerOptions: providerOptions(face) });
         assert.ok(run.errors.length > 0, label());
         assert.match(message(run.errors[0]), /no adapter named "nosuch"/, `${label()}: ${message(run.errors[0])}`);
       });
 
-      test('not streamed, a CLI that dies before a word: a 502 with keysmith\'s reason', { todo: face === 'messages' ? ERROR_BODY_TODO : false }, async () => {
+      test('not streamed, a CLI that dies before a word: a 502 with keysmith\'s reason', async () => {
         const ai = mods[gen.ai];
         const { error } = await generate(ai, { model: make('dead/m'), prompt: `Hi ${tag()}`, providerOptions: providerOptions(face) });
         assert.ok(error, label());
         assert.match(message(error), /dead exited 1: stub CLI died before answering/, `${label()}: ${message(error)}`);
         assert.equal(lastRows('dead/m', 1)[0].status, 'error', label());
+      });
+
+      test('401 (bad key), streamed and not streamed: the client is told keysmith\'s reason and no usage row is written', async () => {
+        const ai = mods[gen.ai];
+        const badKey = ['ks', 'wrong', crypto.randomBytes(12).toString('hex')].join('_');
+        const beforeRows = usageLog.tail(500).length;
+        const run = await streamRun(ai, { model: make('plain/m', badKey), prompt: `Hi ${tag()}`, providerOptions: providerOptions(face) });
+        assert.ok(run.errors.length > 0, label());
+        assert.match(message(run.errors[0]), /missing or invalid API key/, `${label()}: ${message(run.errors[0])}`);
+        const { error } = await generate(ai, { model: make('plain/m', badKey), prompt: `Hi ${tag()}`, providerOptions: providerOptions(face) });
+        assert.ok(error, label());
+        assert.match(message(error), /missing or invalid API key/, `${label()}: ${message(error)}`);
+        assert.equal(usageLog.tail(500).length, beforeRows, `${label()}: 401 must write no usage row`);
       });
 
       test('streamed, a CLI that dies before a word: the client is told it failed', { todo: 'cli-adapter.js/server.js: a streamed face stops reading at the parser\'s `done`, so the exit-code check after the parse loop (CliAdapter.complete: "exited 1") never runs — the client gets an empty answer that ends normally (stop / end_turn / completed) with unknown usage, and the row is `ok`' }, async () => {
