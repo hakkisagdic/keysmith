@@ -777,7 +777,7 @@ test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login pr
       },
     );
 
-    const t0 = Date.now();
+    let t0 = Date.now();
     await assert.rejects(
       () =>
         runKiroUsage(
@@ -802,6 +802,7 @@ test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login pr
               const stop = () => clearInterval(iv);
               c.stderr.once('data', () => {
                 stop();
+                t0 = Date.now();
                 if (c.stdout && !c.stdout.destroyed && !c.stdout.readableEnded) c.stdout.push(' ');
               });
               c.once('close', stop);
@@ -817,9 +818,9 @@ test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login pr
       },
     );
     const elapsed1 = Date.now() - t0;
-    assert.ok(elapsed1 < 15_000, `login prompt hang took ${elapsed1} ms`);
+    assert.ok(elapsed1 < 5000, `login prompt hang took ${elapsed1} ms`);
 
-    const t1 = Date.now();
+    let t1 = Date.now();
     await assert.rejects(
       () =>
         runKiroUsage(
@@ -830,6 +831,7 @@ test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login pr
             killAfterMs: 200,
             settleAfterMs: 200,
             onSpawn: (c) => {
+              t1 = Date.now();
               if (c?.pid) pids.push(c.pid);
               closes.push(new Promise((r) => c.once('close', r)));
             },
@@ -841,7 +843,7 @@ test('runKiroUsage fails at ~stallMs with scrubbed first stderr line on login pr
       },
     );
     const elapsed2 = Date.now() - t1;
-    assert.ok(elapsed2 < 10_000, `silent hang took ${elapsed2} ms`);
+    assert.ok(elapsed2 < 2000, `silent hang took ${elapsed2} ms`);
 
     await Promise.all(closes);
     await waitFor(() => pids.every(pidGone), { message: 'stalled children exited' });
