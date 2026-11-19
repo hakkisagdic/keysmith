@@ -16,6 +16,7 @@ import { createServer } from '../src/server.js';
 import { HTTP_PROFILES } from '../src/profiles.js';
 import { signatureOf } from '../src/thought-signatures.js';
 import { redactKey } from '../src/redact.js';
+import { waitFor } from './wait-for.js';
 
 const K1 = 'ks_' + crypto.randomBytes(24).toString('base64url');
 const K2 = 'ks_' + crypto.randomBytes(24).toString('base64url');
@@ -33,6 +34,8 @@ function assertNoKey(text, key, where) {
 const seen = []; // { url, key, body }
 const next = []; // tool calls the stub hands out, in order: { id, name, args, sig }
 const quotaKeys = new Set();
+const slowReached = new Set();
+const slowRelease = new Set();
 
 function geminiError(res, status, code, message, headers = {}) {
   res.writeHead(status, { 'content-type': 'application/json', ...headers });
@@ -55,7 +58,11 @@ function stub(req, res) {
     }
     if (req.url.endsWith('/embeddings') && body.model === 'echo-key') return geminiError(res, 400, 'INVALID_ARGUMENT', `API key ${key} not valid`);
     if (!req.url.endsWith('/chat/completions')) return geminiError(res, 404, 'NOT_FOUND', 'no such route');
-    if (String(body.model).startsWith('slow')) await new Promise((r) => setTimeout(r, 700));
+    if (String(body.model).startsWith('slow')) {
+      const tag = body.messages?.[0]?.content || body.model;
+      slowReached.add(tag);
+      await waitFor(() => slowRelease.has(tag), { message: `slow gate for ${tag}` });
+    }
     if (body.model === 'quota' || body.model === 'slow-quota' || quotaKeys.has(key)) {
       return geminiError(res, 429, 'RESOURCE_EXHAUSTED', 'You exceeded your current quota. Please retry in 38s.', { 'retry-after': '38' });
     }
@@ -110,7 +117,7 @@ before(async () => {
   const upstreamBase = `http://127.0.0.1:${upstream.address().port}/v1beta/openai`;
   const cfg = {
     auth: { enabled: true, keys: [K1, K2] },
-    limits: { streamHoldMs: 250 },
+    limits: { streamHoldMs: 10_000 },
     adapters: {
       google: { ...structuredClone(HTTP_PROFILES.google), baseUrl: upstreamBase, apiKey: KEY_A },
       // The same endpoint under a second key (a second free-tier project), written with a
@@ -274,14 +281,63 @@ test('a streamed request without tools: a refusal before the first event keeps i
 });
 
 test('a streamed answer slower than limits.streamHoldMs still opens, and a refusal after that is an SSE error frame', async () => {
-  const ok = await post({ model: 'google/slow', messages: [{ role: 'user', content: 'hi' }], stream: true });
-  assert.equal(ok.status, 200, ok.text);
-  assert.match(ok.text, /^: stream open/);
-  assert.match(ok.text, /"content":"done"/);
-  const late = await post({ model: 'google/slow-quota', messages: [{ role: 'user', content: 'hi' }], stream: true });
-  assert.equal(late.status, 200);
-  assert.match(late.text, /"error":\{"message":"keysmith: google 429: RESOURCE_EXHAUSTED/);
-  assert.ok(late.text.trimEnd().endsWith('data: [DONE]'));
+  const heldServer = createServer(gateway, { auth: { enabled: true, keys: [K1, K2] }, limits: { streamHoldMs: 50 } }, { log: (m) => log.push(m) });
+  await new Promise((r) => heldServer.listen(0, '127.0.0.1', r));
+  const heldBase = `http://127.0.0.1:${heldServer.address().port}`;
+  const postSlow = async (model, tag) => {
+    let fetchErr = null;
+    let earlyRes = null;
+    const resPromise = fetch(heldBase + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${K1}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: tag }], stream: true }),
+    }).then(
+      (r) => {
+        if (!slowReached.has(tag)) earlyRes = r;
+        return r;
+      },
+      (err) => {
+        fetchErr = err;
+        return null;
+      },
+    );
+    await waitFor(() => fetchErr || earlyRes || slowReached.has(tag), { message: `stub saw ${tag}` });
+    if (fetchErr) throw fetchErr;
+    const res = await resPromise;
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let text = '';
+    await waitFor(
+      async () => {
+        const { value, done } = await reader.read();
+        if (value) text += dec.decode(value, { stream: true });
+        return done || text.includes(': stream open');
+      },
+      { message: `stream open for ${tag}` },
+    );
+    slowRelease.add(tag);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (value) text += dec.decode(value, { stream: true });
+      if (done) break;
+    }
+    text += dec.decode();
+    return { status: res.status, text };
+  };
+  try {
+    const ok = await postSlow('google/slow', 'slow-ok');
+    assert.equal(ok.status, 200, ok.text);
+    assert.match(ok.text, /^: stream open/);
+    assert.match(ok.text, /"content":"done"/);
+    const late = await postSlow('google/slow-quota', 'slow-quota');
+    assert.equal(late.status, 200);
+    assert.match(late.text, /"error":\{"message":"keysmith: google 429: RESOURCE_EXHAUSTED/);
+    assert.ok(late.text.trimEnd().endsWith('data: [DONE]'));
+  } finally {
+    slowRelease.add('slow-ok');
+    slowRelease.add('slow-quota');
+    await new Promise((r) => heldServer.close(r));
+  }
 });
 
 test('an upstream error in the middle of a stream reaches no client with the provider key in it', async () => {
