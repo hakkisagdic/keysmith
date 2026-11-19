@@ -65,7 +65,8 @@ function client(env) {
   const notes = [];
   let next = 1;
   let stderr = '';
-  readline.createInterface({ input: child.stdout }).on('line', (l) => {
+  const rl = readline.createInterface({ input: child.stdout });
+  rl.on('line', (l) => {
     const m = JSON.parse(l);
     if (m.id !== undefined && pending.has(m.id)) {
       pending.get(m.id)(m);
@@ -75,12 +76,12 @@ function client(env) {
   child.stderr.on('data', (c) => (stderr += c));
   child.stdin.on('error', () => {});
   let exitCode = null;
-  const exited = new Promise((r) =>
-    child.on('exit', (code) => {
-      exitCode = code ?? -1;
-      r(code);
-    }),
-  );
+  const rlClosed = new Promise((r) => rl.once('close', r));
+  const childClosed = new Promise((r) => child.once('close', (code) => r(code)));
+  const exited = Promise.all([rlClosed, childClosed]).then(([, code]) => {
+    exitCode = code ?? -1;
+    return code;
+  });
   return {
     child,
     notes,
@@ -193,9 +194,14 @@ test('tools/call waits for the client\'s result, which goes back as the call\'s 
   const call = await s.next();
   assert.deepEqual([call.type, call.name, call.args], ['call', 'get_weather', { city: 'Ankara', unit: null }]);
   let pendingAnswered = false;
-  void pending.then(() => {
-    pendingAnswered = true;
-  });
+  void pending.then(
+    () => {
+      pendingAnswered = true;
+    },
+    () => {
+      pendingAnswered = true;
+    },
+  );
   await c.rpc('ping');
   assert.equal(pendingAnswered, false, 'held: no answer until the client has one');
   s.hold({ id: 'call_abc', mcpId: call.mcpId, name: call.name });
@@ -221,9 +227,14 @@ test('a wrong or missing token is refused, so is a second connection; a dropped 
   // Wrong token: the connection is closed unanswered, and the shim ends with it.
   const wrong = client({ ...s.env, KEYSMITH_BRIDGE_TOKEN: 'not-the-token-' + 'x'.repeat(30) });
   let wrongAnswered = false;
-  void wrong.rpc('ping').then(() => {
-    wrongAnswered = true;
-  });
+  void wrong.rpc('ping').then(
+    () => {
+      wrongAnswered = true;
+    },
+    () => {
+      wrongAnswered = true;
+    },
+  );
   await waitFor(() => wrong.exitCode !== null, { message: 'wrong-token shim exited' });
   assert.equal(wrongAnswered, false);
   assert.equal(wrong.exitCode, 0);
@@ -237,9 +248,14 @@ test('a wrong or missing token is refused, so is a second connection; a dropped 
   assert.deepEqual((await first.rpc('ping')).result, {});
   const second = client(s.env);
   let secondAnswered = false;
-  void second.rpc('ping').then(() => {
-    secondAnswered = true;
-  });
+  void second.rpc('ping').then(
+    () => {
+      secondAnswered = true;
+    },
+    () => {
+      secondAnswered = true;
+    },
+  );
   await waitFor(() => second.exitCode !== null, { message: 'second-connection shim exited' });
   assert.equal(secondAnswered, false);
   assert.equal(second.exitCode, 0);
@@ -262,10 +278,22 @@ test('the token from a file (KEYSMITH_BRIDGE_TOKEN_FILE, for a CLI that takes it
   fs.writeFileSync(file, `${s.token}\n`, { mode: 0o600 });
   const c = client({ KEYSMITH_BRIDGE_SOCK: s.env.KEYSMITH_BRIDGE_SOCK, KEYSMITH_BRIDGE_TOKEN_FILE: file });
   let hs = null;
-  void handshake(c).then((v) => {
-    hs = v;
-  });
-  await waitFor(() => hs !== null, { message: `the shim did not connect with the token from the file: ${c.stderr}` });
+  let hsErr = null;
+  void handshake(c).then(
+    (v) => {
+      hs = v;
+    },
+    (err) => {
+      hsErr = err;
+    },
+  );
+  await waitFor(
+    () => {
+      if (hsErr) throw hsErr;
+      return hs !== null;
+    },
+    { message: `the shim did not connect with the token from the file: ${c.stderr}` },
+  );
   assert.notEqual(hs, null, `the shim did not connect with the token from the file: ${c.stderr}`);
   assert.deepEqual(hs.list.result.tools.map((t) => t.name), ['get_weather', 'note']);
   c.close();
