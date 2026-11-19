@@ -31,6 +31,7 @@ import { Gateway } from '../src/gateway.js';
 import { createServer } from '../src/server.js';
 import { UsageLog } from '../src/usage.js';
 import { CLI_PROFILES } from '../src/profiles.js';
+import { waitFor } from './wait-for.js';
 
 const STUB = fileURLToPath(new URL('./stubs/cli-bridge.mjs', import.meta.url));
 const KEY = 'ks_' + crypto.randomBytes(24).toString('base64url');
@@ -51,7 +52,7 @@ const mods = {};
 
 function stubCli(name, body) {
   const file = path.join(dir, name);
-  fs.writeFileSync(file, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 });
+  fs.writeFileSync(file, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
   return file;
 }
 
@@ -59,6 +60,13 @@ before(async () => {
   for (const name of ['ai', 'openbot-ai', '@ai-sdk/anthropic', 'openbot-ai-sdk-anthropic', '@ai-sdk/openai', 'openbot-ai-sdk-openai', '@ai-sdk/openai-compatible', '@anthropic-ai/sdk', 'openai', 'openbot-openai']) mods[name] = await load(name);
   // os.tmpdir(): the bridge socket's path must stay under 103 bytes.
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kswc-'));
+  const home = path.join(dir, 'home');
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  const homeEnv = {
+    HOME: home,
+    XDG_CONFIG_HOME: path.join(home, '.config'),
+    XDG_DATA_HOME: path.join(home, '.local', 'share'),
+  };
   const codex = structuredClone(CLI_PROFILES.codex);
   const cfg = {
     auth: { enabled: true, keys: [KEY] },
@@ -70,26 +78,32 @@ before(async () => {
         bin: STUB,
         cwd: path.join(dir, 'ws-codex'),
         toolMode: 'mcp',
-        bridge: { ...codex.bridge, readyTimeoutMs: 10_000, toolResultTimeoutMs: 60_000 },
-        env: { STUB_CLI: 'codex', CLI_BRIDGE_LOG: path.join(dir, 'bridge.jsonl') },
-        timeoutMs: 20_000,
+        bridge: { ...codex.bridge, readyTimeoutMs: 30_000, toolResultTimeoutMs: 60_000 },
+        env: { STUB_CLI: 'codex', CLI_BRIDGE_LOG: path.join(dir, 'bridge.jsonl'), ...homeEnv },
+        timeoutMs: 45_000,
         maxConcurrent: 8,
       },
       // Plain stdout: nothing in it says what the run spent.
-      plain: { kind: 'cli', bin: stubCli('plain', `process.stdout.write('plain answer');`), args: ['{prompt}'], parser: 'raw', models: ['m'], cwd: path.join(dir, 'ws-plain') },
+      plain: { kind: 'cli', bin: stubCli('plain', "printf '%s' 'plain answer'"), args: ['{prompt}'], parser: 'raw', models: ['m'], cwd: path.join(dir, 'ws-plain'), env: { ...homeEnv }, timeoutMs: 30_000 },
       // codex exec --json on a turn that fails after its first message went out (exit 1).
       cxfail: {
         kind: 'cli',
-        bin: stubCli('cxfail', `for (const l of [{ type: 'thread.started', thread_id: 'th' }, { type: 'turn.started' }, { type: 'item.completed', item: { id: 'i0', type: 'agent_message', text: 'Half an answer.' } }, { type: 'turn.failed', error: { message: 'stub upstream broke mid-answer' } }]) process.stdout.write(JSON.stringify(l) + '\\n');
-process.exitCode = 1;`),
+        bin: stubCli(
+          'cxfail',
+          `cat <<'EOF'\n{"type":"thread.started","thread_id":"th"}\n{"type":"turn.started"}\n{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"Half an answer."}}\n{"type":"turn.failed","error":{"message":"stub upstream broke mid-answer"}}\nEOF\nexit 1`,
+        ),
         args: ['exec', '--json', '--', '{prompt}'],
         parser: 'codex-json',
         models: ['m'],
         cwd: path.join(dir, 'ws-cxfail'),
+        env: { ...homeEnv },
+        timeoutMs: 30_000,
       },
     },
   };
   gateway = new Gateway(cfg, { log: () => {} });
+  gateway.toolEngines.mcp.killGraceMs = 1_000;
+  gateway.toolEngines.mcp.stepGraceMs = 10_000;
   usageLog = new UsageLog(path.join(dir, 'usage.jsonl'));
   server = createServer(gateway, cfg, { usage: usageLog, log: () => {} });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -121,6 +135,7 @@ const tag = () => `#w${++tags}-${crypto.randomBytes(3).toString('hex')}`;
 /** A model's rows, oldest first (tail() reads newest first). */
 const rowsOf = (model) => usageLog.tail(500).filter((r) => r.model === model).reverse();
 const lastRows = (model, n) => rowsOf(model).slice(-n);
+const waitRows = (model, minCount) => waitFor(() => rowsOf(model).length >= minCount, { message: `usage rows for ${model} >= ${minCount}` });
 /** The stub codex's turn.completed: 1100 in, none of them cached, 30 out — the session's whole spend. */
 const RUN = { input: 1100, output: 30, cacheRead: 0, cacheWrite: 0 };
 const CODEX_GAP = /^cx reports a run's tokens once, when the run ends/;
@@ -205,6 +220,7 @@ for (const gen of GENERATIONS) {
 
       test('streamed: the tool turn codex has no tokens for yet parses; the tool runs; the answer after it carries the run\'s usage', async () => {
         const ai = mods[gen.ai];
+        const prev = rowsOf('cx/m').length;
         const run = await streamRun(ai, { model: make(), prompt: `Weather ${tag()}`, tools: aiTools(ai), stopWhen: ai.stepCountIs(3), providerOptions: providerOptions(face) });
         noErrors(run.errors, label());
         assert.equal(run.steps.length, 2, `${label()}: the call, then the answer`);
@@ -218,23 +234,28 @@ for (const gen of GENERATIONS) {
           assert.equal(raw?.keysmith_usage, 'unknown', label());
           assert.match(raw?.reason, CODEX_GAP, label());
         }
+        await waitRows('cx/m', prev + 2);
         assertLoopRows('cx/m', label());
       });
 
       test('not streamed: the same round trip through generateText', async () => {
         const ai = mods[gen.ai];
+        const prev = rowsOf('cx/m').length;
         const out = await ai.generateText({ maxRetries: 0, model: make(), prompt: `Weather ${tag()}`, tools: aiTools(ai), stopWhen: ai.stepCountIs(3), providerOptions: providerOptions(face) });
         assert.equal(out.steps.length, 2, label());
         assert.equal(out.steps[0].finishReason, 'tool-calls', label());
         assert.equal(out.text, 'Weather: RESULT for Ankara', label());
         assert.deepEqual([out.totalUsage.inputTokens, out.totalUsage.outputTokens], [RUN.input, RUN.output], label());
+        await waitRows('cx/m', prev + 2);
         assertLoopRows('cx/m', label());
       });
 
       test('a text answer from a CLI that reports no tokens at all, not streamed: parsed, and the row null with the reason', async () => {
         const ai = mods[gen.ai];
+        const prev = rowsOf('plain/m').length;
         const out = await ai.generateText({ maxRetries: 0, model: make('plain/m'), prompt: 'hi', providerOptions: providerOptions(face) });
         assert.equal(out.text, 'plain answer', label());
+        await waitRows('plain/m', prev + 1);
         const [row] = lastRows('plain/m', 1);
         assert.equal(row.usage, null, label());
         assert.match(row.usageReason, RAW_GAP, label());
@@ -242,9 +263,11 @@ for (const gen of GENERATIONS) {
 
       test('the same text answer, streamed', { todo: plainResponsesStream(gen, face, 'text') }, async () => {
         const ai = mods[gen.ai];
+        const prev = rowsOf('plain/m').length;
         const run = await streamRun(ai, { model: make('plain/m'), prompt: 'hi', providerOptions: providerOptions(face) });
         noErrors(run.errors, label());
         assert.equal(run.text, 'plain answer', label());
+        await waitRows('plain/m', prev + 1);
         const [row] = lastRows('plain/m', 1);
         assert.equal(row.usage, null, label());
         assert.match(row.usageReason, RAW_GAP, label());
@@ -256,12 +279,14 @@ for (const gen of GENERATIONS) {
         // tool faces. With auto it could not carry them, and the request would fail before a word.
         test(`a stream that fails after it started${tools ? ', tools offered (the tool faces, src/tools/faces.js)' : ''}: the client gets keysmith's error, and nothing it cannot parse`, { todo }, async () => {
           const ai = mods[gen.ai];
+          const prev = rowsOf('cxfail/m').length;
           const run = await streamRun(ai, { model: make('cxfail/m'), prompt: 'hi', ...(tools ? { tools: aiTools(ai), toolChoice: 'none' } : {}), providerOptions: providerOptions(face) });
           assert.ok(run.errors.length > 0, `${label()}: the failure reached the client`);
           for (const e of run.errors) {
             assert.doesNotMatch(message(e), /Type validation failed|Invalid JSON response/, label());
             assert.match(message(e), /stub upstream broke mid-answer/, label());
           }
+          await waitRows('cxfail/m', prev + 1);
           assert.equal(lastRows('cxfail/m', 1)[0].status, 'error', label());
         });
       }
@@ -304,6 +329,7 @@ describe(`@anthropic-ai/sdk · messages (/v1/messages)`, () => {
         for await (const e of s) events.push(e);
         return { msg: await s.finalMessage(), delta: events.find((e) => e.type === 'message_delta') };
       };
+      const prev = rowsOf('cx/m').length;
       const history = [{ role: 'user', content: `Weather ${tag()}` }];
       const first = await ask(history);
       assert.equal(first.msg.stop_reason, 'tool_use', label());
@@ -323,6 +349,7 @@ describe(`@anthropic-ai/sdk · messages (/v1/messages)`, () => {
       assert.equal(second.msg.content.map((b) => b.text).join(''), 'Weather: RESULT for Ankara', label());
       assert.deepEqual([second.msg.usage.input_tokens, second.msg.usage.output_tokens], [RUN.input, RUN.output], label());
       assert.equal(second.msg.usage.keysmith_usage, undefined, label());
+      await waitRows('cx/m', prev + 2);
       assertLoopRows('cx/m', label());
     });
   }
@@ -348,6 +375,7 @@ for (const pkg of ['openai', 'openbot-openai']) {
           const s = c.chat.completions.stream({ ...body, stream_options: { include_usage: true } });
           return s.finalChatCompletion();
         };
+        const prev = rowsOf('cx/m').length;
         const history = [{ role: 'user', content: `Weather ${tag()}` }];
         const first = await ask(history);
         const msg = first.choices[0].message;
@@ -363,6 +391,7 @@ for (const pkg of ['openai', 'openbot-openai']) {
         assert.equal(second.choices[0].message.content, 'Weather: RESULT for Ankara', label());
         assert.deepEqual([second.usage.prompt_tokens, second.usage.completion_tokens, second.usage.total_tokens], [1100, 30, 1130], label());
         assert.equal(second.usage.keysmith_usage, undefined, label());
+        await waitRows('cx/m', prev + 2);
         assertLoopRows('cx/m', label());
       });
 
@@ -373,6 +402,7 @@ for (const pkg of ['openai', 'openbot-openai']) {
           if (!stream) return c.responses.create(body);
           return c.responses.stream(body).finalResponse();
         };
+        const prev = rowsOf('cx/m').length;
         const history = [{ role: 'user', content: `Weather ${tag()}` }];
         const first = await ask(history);
         const calls = first.output.filter((o) => o.type === 'function_call');
@@ -389,6 +419,7 @@ for (const pkg of ['openai', 'openbot-openai']) {
         assert.equal(second.output_text, 'Weather: RESULT for Ankara', label());
         assert.deepEqual([second.usage.input_tokens, second.usage.output_tokens, second.usage.total_tokens], [1100, 30, 1130], label());
         assert.equal(second.usage.keysmith_usage, undefined, label());
+        await waitRows('cx/m', prev + 2);
         assertLoopRows('cx/m', label());
       });
     }
