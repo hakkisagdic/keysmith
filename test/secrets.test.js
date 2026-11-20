@@ -54,6 +54,28 @@ function sandbox({ keys = [KEY], extra = {}, rawConfig = null } = {}) {
 }
 
 /**
+ * `sb.run` is spawnSync, which freezes this process. `doctor` probes each HTTP adapter
+ * with a GET (15s each): a stub in this process cannot answer while that runs, so four
+ * probes outlast the 20s limit and the status comes back null. This leaves the loop free.
+ */
+function runAsync(sb, args) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [CLI, ...args], { env: sb.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => child.kill('SIGKILL'), 20_000);
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('close', (status) => {
+      clearTimeout(timer);
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
+
+/**
  * Not the key, and no 6 characters in a row of its random part either: V8 quotes 7 of them
  * around a JSON syntax error, and a quoted fragment is a leak too. (A redacted form shows
  * the first 4 characters, then `…`, so it never matches a window starting at index 3.)
@@ -833,22 +855,26 @@ test('an upstream error that echoes a header secret is redacted in the client JS
   const bearerSecret = headerValue();
   const bearerHeader = `Bearer ${bearerSecret}`;
   const seen = [];
+  // Answer as soon as the request arrives. Waiting for 'end' stalls `doctor`'s health GET
+  // (it never reads a body, and a paused request may not end), and each probe then sits
+  // for its full timeout.
   const stub = http.createServer((req, res) => {
-    req.on('data', () => {});
-    req.on('end', () => {
-      seen.push({ method: req.method, url: req.url || '', headers: req.headers });
-      let message = 'nope';
-      const url = req.url || '';
-      if (url.startsWith('/keyed/')) message = `upstream echoed ${apiSecret}`;
-      else if (url.startsWith('/media/')) message = `upstream echoed ${mediaSecret}`;
-      else if (url.startsWith('/bearer/')) message = `upstream echoed ${bearerHeader} and bare ${bearerSecret}`;
-      else if (url.startsWith('/plain/')) message = 'upstream echoed anthropic-version 2023-06-01';
-      res.writeHead(500, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: { message } }));
-    });
+    req.resume();
+    const url = req.url || '';
+    seen.push({ method: req.method, url, headers: req.headers });
+    let message = 'nope';
+    if (url.startsWith('/keyed/')) message = `upstream echoed ${apiSecret}`;
+    else if (url.startsWith('/media/')) message = `upstream echoed ${mediaSecret}`;
+    else if (url.startsWith('/bearer/')) message = `upstream echoed ${bearerHeader} and bare ${bearerSecret}`;
+    else if (url.startsWith('/plain/')) message = 'upstream echoed anthropic-version 2023-06-01';
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message } }));
   });
   await new Promise((r) => stub.listen(0, '127.0.0.1', r));
-  t.after(() => new Promise((r) => stub.close(r)));
+  t.after(() => new Promise((r) => {
+    stub.closeAllConnections?.();
+    stub.close(r);
+  }));
   const root = `http://127.0.0.1:${stub.address().port}`;
   const httpAdapter = (id, extra) => ({ kind: 'http', wire: 'openai', baseUrl: `${root}/${id}/v1`, apiKey: false, models: ['m'], ...extra });
   const adapters = {
@@ -859,7 +885,7 @@ test('an upstream error that echoes a header secret is redacted in the client JS
   };
 
   const sb = sandbox({ extra: { adapters } });
-  const doctor = sb.run('doctor');
+  const doctor = await runAsync(sb, ['doctor']);
   assert.equal(doctor.status, 0, doctor.stderr);
   const doctorText = doctor.stdout + doctor.stderr;
   for (const secret of [apiSecret, mediaSecret, bearerSecret, bearerHeader]) {
