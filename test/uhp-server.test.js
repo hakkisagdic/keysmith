@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import http from 'node:http';
 import { Gateway } from '../src/gateway.js';
 import { createServer } from '../src/server.js';
@@ -307,6 +308,125 @@ test('UHP Server: stateful /v1/responses, GET /v1/responses/:id, previous_respon
     assert.equal(resp2.output_text, 'Turn 2 answer');
     assert.equal(upstreamCalls.length, 2);
     assert.equal(upstreamCalls[1].body.previous_response_id, 'resp_up_1');
+  } finally {
+    await ks.close();
+    await upstream.close();
+  }
+});
+
+test('UHP Server: a client harness_id cannot override the harness a scoped key authorised', async () => {
+  // Same key shape as test/scopes.test.js: mint() plus { key, label, allow }.
+  // A bare string is an open key (no scope), as MAIN is there.
+  const mint = () => 'ks_' + crypto.randomBytes(24).toString('base64url');
+  const scopedKey = mint();
+  const openKey = mint();
+  const upstreamCalls = [];
+  const upstream = await startMockUhpUpstream((req, res, body) => {
+    if (req.url === '/v1/responses' && req.method === 'POST') {
+      upstreamCalls.push(body);
+      const turn = upstreamCalls.length;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          id: `resp_up_${turn}`,
+          object: 'response',
+          status: 'completed',
+          model: body.model || 'claude-sonnet-4-6',
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: `Turn ${turn} answer` }],
+            },
+          ],
+          usage: { input_tokens: 10, output_tokens: 5 },
+        }),
+      );
+      return;
+    }
+    res.writeHead(404).end();
+  });
+
+  const ks = await startKeysmith({
+    auth: {
+      enabled: true,
+      keys: [{ key: scopedKey, label: 'scoped', allow: ['uhp/chrn_x'] }, openKey],
+    },
+    adapters: {
+      uhp: {
+        kind: 'http',
+        wire: 'uhp',
+        baseUrl: upstream.url,
+        apiKey: false,
+        enabled: true,
+      },
+    },
+  });
+
+  const post = async (key, body, headers = {}) => {
+    const res = await fetch(`${ks.base}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}`, ...headers },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    return { status: res.status, text, json: text ? JSON.parse(text) : null };
+  };
+  const harness = () => upstreamCalls.at(-1)?.metadata?.harness_id;
+
+  try {
+    // 1. Model names chrn_x; metadata.harness_id chrn_y must not win upstream.
+    const r1 = await post(scopedKey, {
+      model: 'uhp/chrn_x',
+      input: 'first',
+      metadata: { harness_id: 'chrn_y' },
+    });
+    assert.equal(r1.status, 200, r1.text);
+    assert.equal(r1.json.model, 'uhp/chrn_x');
+    assert.equal(upstreamCalls.length, 1);
+    assert.equal(harness(), 'chrn_x');
+    assert.equal(JSON.stringify(upstreamCalls[0]).includes('chrn_y'), false);
+
+    // 2. The x-harness-id header is the same second source.
+    const r2 = await post(scopedKey, { model: 'uhp/chrn_x', input: 'header' }, { 'x-harness-id': 'chrn_y' });
+    assert.equal(r2.status, 200, r2.text);
+    assert.equal(harness(), 'chrn_x');
+    assert.equal(JSON.stringify(upstreamCalls.at(-1)).includes('chrn_y'), false);
+
+    // 3. A model the allow-list does not name is still refused, and the stub never sees it.
+    const beforeDeny = upstreamCalls.length;
+    const r3 = await post(scopedKey, { model: 'uhp/chrn_y', input: 'other harness' });
+    assert.equal(r3.status, 403, r3.text);
+    assert.equal(r3.json.error.type, 'permission_error');
+    assert.match(r3.json.error.message, /uhp\/chrn_y/);
+    assert.equal(upstreamCalls.length, beforeDeny);
+
+    // 4. No model: harness_id alone resolves to uhp/<id> and the allow-list decides.
+    const r4deny = await post(scopedKey, { input: 'only y', metadata: { harness_id: 'chrn_y' } });
+    assert.equal(r4deny.status, 403, r4deny.text);
+    assert.equal(r4deny.json.error.type, 'permission_error');
+    assert.match(r4deny.json.error.message, /uhp\/chrn_y/);
+    assert.equal(upstreamCalls.length, beforeDeny);
+    const r4ok = await post(scopedKey, { input: 'only x', metadata: { harness_id: 'chrn_x' } });
+    assert.equal(r4ok.status, 200, r4ok.text);
+    assert.equal(r4ok.json.model, 'uhp/chrn_x');
+    assert.equal(harness(), 'chrn_x');
+
+    // 5. An open key still reaches a harness named only by harness_id.
+    const r5 = await post(openKey, { input: 'open', metadata: { harness_id: 'chrn_y' } });
+    assert.equal(r5.status, 200, r5.text);
+    assert.equal(r5.json.model, 'uhp/chrn_y');
+    assert.equal(harness(), 'chrn_y');
+
+    // 6. Continuing the chrn_x response keeps chrn_x. Check 1 stored the client's
+    // harness id (chrn_y); the continuation still follows the authorised model.
+    const r6 = await post(scopedKey, { previous_response_id: r1.json.id, input: 'continue' });
+    assert.equal(r6.status, 200, r6.text);
+    assert.equal(r6.json.previous_response_id, r1.json.id);
+    assert.equal(r6.json.model, 'uhp/chrn_x');
+    assert.equal(harness(), 'chrn_x');
+    assert.equal(upstreamCalls.at(-1).previous_response_id, 'resp_up_1');
+    assert.equal(JSON.stringify(upstreamCalls.at(-1)).includes('chrn_y'), false);
   } finally {
     await ks.close();
     await upstream.close();
