@@ -1485,6 +1485,8 @@ npm test          # 434 tests: parsers, routing, key scopes, tool routing and EM
 node src/cli.js doctor --probe-models   # the truth about which models answer (spends quota)
 ```
 
+Every push runs `npm ci` then `npm test` on Ubuntu and macOS with Node 20 and 22 (`.github/workflows/ci.yml`).
+
 The integration suite spawns a stub script that prints Command-Code-shaped NDJSON, so
 spawning, parsing, SSE framing, session mapping and failover are covered without
 touching a provider or spending a token.
