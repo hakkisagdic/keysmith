@@ -40,6 +40,14 @@ const MIN_REGISTERED = 8;
 /** A run of this many characters of a configured key is taken out wherever it appears. */
 const MIN_FRAGMENT = 12;
 
+/**
+ * Header names whose values are credentials. `cookie` does not match the pattern below;
+ * the others do, and are listed so the set is the contract even if the pattern changes.
+ */
+const SECRET_HEADER_NAMES = new Set(['authorization', 'proxy-authorization', 'x-api-key', 'api-key', 'x-goog-api-key', 'cookie']);
+const SECRET_HEADER_RE = /(key|token|secret|auth|password)/i;
+const HEADER_SCHEME = /^(?:Bearer|Basic) (.*)$/i;
+
 const known = new Set();
 
 export function fingerprint(key) {
@@ -76,6 +84,31 @@ export function registerSecrets(keys) {
     const k = typeof entry === 'string' ? entry : entry && typeof entry === 'object' && typeof entry.key === 'string' ? entry.key : null;
     if (k && k.length >= MIN_REGISTERED) known.add(k);
   }
+}
+
+/**
+ * Values to register from an adapter's `headers` or `mediaHeaders`: a credential header's
+ * full value, and the token after a leading `Bearer ` or `Basic `. A header counts when
+ * its lower-cased name is `authorization`, `proxy-authorization`, `x-api-key`, `api-key`,
+ * `x-goog-api-key` or `cookie`, or when the name matches key / token / secret / auth /
+ * password. Shorter than MIN_REGISTERED is omitted (registerSecrets would drop it); a
+ * non-string is skipped. Non-secret headers (`anthropic-version`, `content-type`) are not
+ * listed, so their text is never rewritten. Pure: it does not register anything itself.
+ */
+export function headerSecrets(headers) {
+  if (!headers || typeof headers !== 'object' || Array.isArray(headers)) return [];
+  const out = [];
+  for (const [name, value] of Object.entries(headers)) {
+    if (typeof value !== 'string' || !secretHeaderName(name)) continue;
+    if (value.length >= MIN_REGISTERED) out.push(value);
+    const scheme = HEADER_SCHEME.exec(value);
+    if (scheme && scheme[1].length >= MIN_REGISTERED) out.push(scheme[1]);
+  }
+  return out;
+}
+
+function secretHeaderName(name) {
+  return SECRET_HEADER_NAMES.has(String(name).toLowerCase()) || SECRET_HEADER_RE.test(name);
 }
 
 /**

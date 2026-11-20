@@ -3,7 +3,7 @@ import { HttpAdapter } from './http-adapter.js';
 import { CliAdapter, which } from './cli-adapter.js';
 import { LlmError, routeError, truncate } from './util.js';
 import { resolveSecret } from './config.js';
-import { redactSecrets, registerSecrets } from './redact.js';
+import { headerSecrets, redactSecrets, registerSecrets } from './redact.js';
 import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { adapterReach, aliasDecision, globCanStartWith, requestDecision, scopeText, virtualDecision } from './keys.js';
 import { describeUnsupported, relaysVerbatim, toolEvents, toolPath, toolSkipReason } from './tools/router.js';
@@ -110,8 +110,12 @@ export class Gateway {
         }
         const prepared = prepareAdapter(id, raw);
         // From here on every log line, usage row and error message takes this key out, the
-        // way it takes out the gateway's own (redact.js).
+        // way it takes out the gateway's own (redact.js). A credential that lives in
+        // headers or mediaHeaders is registered the same way; the headers sent upstream
+        // stay exactly what the adapter was given.
         registerSecrets([prepared._apiKey]);
+        registerSecrets(headerSecrets(prepared.headers));
+        registerSecrets(headerSecrets(prepared.mediaHeaders));
         if (prepared.kind !== 'cli' && prepared.thoughtSignatures) prepared._signatureStore = this._signatureStore(prepared);
         // Whether a media URL a request sends is fetched (public addresses only) or refused: the gateway's call, not an adapter's.
         prepared._fetchMedia = cfg.fetchMedia !== false;
