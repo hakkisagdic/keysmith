@@ -9,6 +9,7 @@ import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -754,6 +755,173 @@ test('a {json:} secret file that is not valid JSON: the load error never quotes 
   const why = gw.loadErrors.evren;
   assert.match(why, /invalid JSON/);
   for (let i = 0; i + 6 <= secret.length; i++) assert.ok(!why.includes(secret.slice(i, i + 6)), `6 characters of the upstream secret are in: ${why.replace(secret.slice(0, 8), '<…>')}`);
+});
+
+/* --------------------------------------- adapter header secrets (headers / mediaHeaders) */
+
+/** A credential built in the test. Not a minted key, and not written down as a literal. */
+const headerValue = () => crypto.randomBytes(12).toString('hex');
+
+test('headerSecrets returns a value for each credential header name, and never for an ordinary header', () => {
+  const named = {
+    authorization: headerValue(),
+    'proxy-authorization': headerValue(),
+    'x-api-key': headerValue(),
+    'api-key': headerValue(),
+    'x-goog-api-key': headerValue(),
+    cookie: headerValue(),
+  };
+  const patterned = {
+    'x-session-token': headerValue(),
+    'X-Custom-Secret': headerValue(),
+    'gateway-password': headerValue(),
+    'X-Internal-Auth': headerValue(),
+  };
+  const ordinary = headerValue();
+  const before = redact.knownSecrets();
+  const got = redact.headerSecrets({
+    ...named,
+    ...patterned,
+    Authorization: named.authorization,
+    'anthropic-version': '2023-06-01',
+    'content-type': `Bearer ${ordinary}`,
+    'copilot-vision-request': 'true',
+  });
+  assert.deepEqual(
+    got.sort(),
+    [...Object.values(named), named.authorization, ...Object.values(patterned)].sort(),
+  );
+  assert.ok(!got.includes('2023-06-01') && !got.includes('true') && !got.includes(ordinary) && !got.includes(`Bearer ${ordinary}`));
+  assert.deepEqual(redact.knownSecrets(), before, 'headerSecrets only lists values; it does not register them');
+});
+
+test('headerSecrets also returns the token after a leading Bearer or Basic scheme', () => {
+  const token = headerValue();
+  const basic = headerValue();
+  const eight = '12345678';
+  assert.deepEqual(redact.headerSecrets({ authorization: `Bearer ${token}` }), [`Bearer ${token}`, token]);
+  assert.deepEqual(redact.headerSecrets({ 'proxy-authorization': `Basic ${basic}` }), [`Basic ${basic}`, basic]);
+  assert.deepEqual(redact.headerSecrets({ 'x-api-key': `bearer ${token}` }), [`bearer ${token}`, token]);
+  assert.deepEqual(redact.headerSecrets({ authorization: `BASIC ${eight}` }), [`BASIC ${eight}`, eight]);
+});
+
+test('headerSecrets ignores a value shorter than 8 characters, and any non-string', () => {
+  const keep = headerValue();
+  assert.deepEqual(redact.headerSecrets({ 'x-api-key': 'short', authorization: '1234567', cookie: '12345678' }), ['12345678']);
+  // The full "Bearer ab" is long enough to register; the token after the scheme is not.
+  assert.deepEqual(redact.headerSecrets({ authorization: 'Bearer ab' }), ['Bearer ab']);
+  assert.deepEqual(
+    redact.headerSecrets({
+      'x-api-key': keep,
+      authorization: 123456789,
+      'proxy-authorization': null,
+      cookie: { session: keep },
+      'api-key': true,
+      'x-goog-api-key': ['abcdefghij'],
+    }),
+    [keep],
+  );
+  assert.deepEqual(redact.headerSecrets(null), []);
+  assert.deepEqual(redact.headerSecrets(undefined), []);
+  assert.deepEqual(redact.headerSecrets(['authorization']), []);
+  assert.deepEqual(redact.headerSecrets('authorization'), []);
+});
+
+test('an upstream error that echoes a header secret is redacted in the client JSON and the gateway log; a non-secret header is not', async (t) => {
+  const apiSecret = headerValue();
+  const mediaSecret = headerValue();
+  const bearerSecret = headerValue();
+  const bearerHeader = `Bearer ${bearerSecret}`;
+  const seen = [];
+  const stub = http.createServer((req, res) => {
+    req.on('data', () => {});
+    req.on('end', () => {
+      seen.push({ method: req.method, url: req.url || '', headers: req.headers });
+      let message = 'nope';
+      const url = req.url || '';
+      if (url.startsWith('/keyed/')) message = `upstream echoed ${apiSecret}`;
+      else if (url.startsWith('/media/')) message = `upstream echoed ${mediaSecret}`;
+      else if (url.startsWith('/bearer/')) message = `upstream echoed ${bearerHeader} and bare ${bearerSecret}`;
+      else if (url.startsWith('/plain/')) message = 'upstream echoed anthropic-version 2023-06-01';
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message } }));
+    });
+  });
+  await new Promise((r) => stub.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => stub.close(r)));
+  const root = `http://127.0.0.1:${stub.address().port}`;
+  const httpAdapter = (id, extra) => ({ kind: 'http', wire: 'openai', baseUrl: `${root}/${id}/v1`, apiKey: false, models: ['m'], ...extra });
+  const adapters = {
+    keyed: httpAdapter('keyed', { headers: { 'x-api-key': apiSecret } }),
+    media: httpAdapter('media', { mediaHeaders: { 'x-api-key': mediaSecret } }),
+    bearer: httpAdapter('bearer', { headers: { authorization: bearerHeader } }),
+    plain: httpAdapter('plain', { headers: { 'anthropic-version': '2023-06-01' } }),
+  };
+
+  const sb = sandbox({ extra: { adapters } });
+  const doctor = sb.run('doctor');
+  assert.equal(doctor.status, 0, doctor.stderr);
+  const doctorText = doctor.stdout + doctor.stderr;
+  for (const secret of [apiSecret, mediaSecret, bearerSecret, bearerHeader]) {
+    assert.ok(!doctorText.includes(secret), `doctor printed a header secret`);
+  }
+  assert.match(doctorText, /keyed/);
+
+  const lines = [];
+  const log = (m) => lines.push(String(m));
+  const cfg = { host: '127.0.0.1', port: 0, auth: { enabled: false }, adapters, aliases: {} };
+  const server = createServer(new Gateway(cfg, { log }), cfg, { usage: null, log });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => server.close(r)));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  const ask = async (model) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const text = await res.text();
+    return { status: res.status, text };
+  };
+  const scrubbed = (text, secret, where) => {
+    assert.equal(text.includes(secret), false, `${where}: header secret was printed`);
+    assert.ok(text.includes(redactKey(secret)), `${where}: expected the redactKey form`);
+  };
+
+  const keyed = await ask('keyed/m');
+  assert.equal(keyed.status, 502, keyed.text);
+  scrubbed(keyed.text, apiSecret, 'client JSON x-api-key');
+  const media = await ask('media/m');
+  assert.equal(media.status, 502, media.text);
+  scrubbed(media.text, mediaSecret, 'client JSON mediaHeaders');
+  const bearer = await ask('bearer/m');
+  assert.equal(bearer.status, 502, bearer.text);
+  scrubbed(bearer.text, bearerHeader, 'client JSON authorization');
+  scrubbed(bearer.text, bearerSecret, 'client JSON bare bearer token');
+  const plain = await ask('plain/m');
+  assert.equal(plain.status, 502, plain.text);
+  assert.ok(plain.text.includes('2023-06-01'), plain.text);
+  assert.equal(plain.text.includes(redactKey('2023-06-01')), false, 'anthropic-version was registered');
+
+  const logged = lines.join('\n');
+  scrubbed(logged, apiSecret, 'gateway log x-api-key');
+  scrubbed(logged, mediaSecret, 'gateway log mediaHeaders');
+  scrubbed(logged, bearerHeader, 'gateway log authorization');
+  scrubbed(logged, bearerSecret, 'gateway log bare bearer token');
+  assert.ok(logged.includes('2023-06-01'), logged);
+
+  const sent = (id) => seen.find((s) => s.method === 'POST' && s.url.startsWith(`/${id}/`));
+  assert.equal(sent('keyed').headers['x-api-key'], apiSecret, 'the header sent upstream is the real value');
+  assert.equal(sent('bearer').headers.authorization, bearerHeader, 'authorization is sent unchanged');
+  assert.equal(sent('plain').headers['anthropic-version'], '2023-06-01');
+
+  const page = await fetch(`${base}/status`);
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  for (const secret of [apiSecret, mediaSecret, bearerSecret, bearerHeader]) {
+    assert.ok(!html.includes(secret), '/status printed a header secret');
+  }
 });
 
 test('the docs never print the key: a command that reads it from the config assigns it to a variable', () => {
