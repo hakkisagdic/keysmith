@@ -852,6 +852,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
   const harnessId = extractHarnessId(req, body);
   const requested = resolveRequestedModel(gateway, body.model, { harnessId, backend: body.backend, scope });
+  const upstreamHarness = upstreamHarnessId(gateway, requested, harnessId, scope);
   const stream = !!body.stream;
   const session = sessionFrom(req, body);
   const trace = extractW3cTrace(req, res);
@@ -899,7 +900,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
   if (!stream) {
-    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
+    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId: upstreamHarness, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     if (relayed) {
       // An HTTP leg's answer went out verbatim, with its own usage row.
@@ -931,7 +932,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     return;
   }
 
-  const events = await held(gateway.complete({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
+  const events = await held(gateway.complete({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId: upstreamHarness, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
   if (meta.virtual?.chosen && !res.headersSent) res.setHeader('x-keysmith-route', meta.virtual.chosen);
   if (res.headersSent) {
     // An HTTP leg is answering verbatim — its status, its headers, its bytes — and writes its
@@ -1027,6 +1028,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   const session = sessionFrom(req, body);
   const harnessId = extractHarnessId(req, body);
   const requested = resolveRequestedModel(gateway, body.model, { harnessId, backend: body.backend, scope });
+  const upstreamHarness = upstreamHarnessId(gateway, requested, harnessId, scope);
   const trace = extractW3cTrace(req, res);
   const meta = track(res, requested, stream, t0, '/v1/messages');
   if (scope) meta.skipped = gateway.resolve(requested, { scope }).skipped;
@@ -1057,7 +1059,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   };
   // The Messages API defaults to a single JSON reply; SSE only when asked.
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId: upstreamHarness, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     if (relayed) {
       // An anthropic-wire leg's answer went out verbatim, with its own usage row.
@@ -1084,7 +1086,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
     });
     return;
   }
-  const events = await held(gateway.complete({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
+  const events = await held(gateway.complete({ model: requested, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, scope, tools, effort, harnessId: upstreamHarness, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
   if (res.headersSent) {
     // An anthropic-wire leg is answering verbatim — its status, its headers, its bytes — and
     // writes its own usage row: what is left here is waiting for it to finish.
@@ -1205,6 +1207,7 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
   const session = sessionFrom(req, effectiveBody) || prev?.session || null;
   const harnessId = extractHarnessId(req, effectiveBody) || prev?.harnessId || null;
   const requestedModel = resolveRequestedModel(gateway, effectiveBody.model, { harnessId, backend: effectiveBody.backend, scope });
+  const upstreamHarness = upstreamHarnessId(gateway, requestedModel, harnessId, scope);
   effectiveBody = { ...effectiveBody, model: requestedModel };
 
   const meta = track(res, requestedModel, stream, t0, '/v1/responses');
@@ -1249,7 +1252,7 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
       meta,
       t0,
       effort,
-      harnessId,
+      harnessId: upstreamHarness,
       trace,
       onStore,
       holdSpend,
@@ -1260,7 +1263,7 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     if (v?.skipped?.length) meta.skipped = v.skipped;
   };
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId: upstreamHarness, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     if (toolCalls.length) throw noResponsesToolCalls();
     meta.done = true;
@@ -1282,7 +1285,7 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     });
     return;
   }
-  const events = await held(gateway.complete({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
+  const events = await held(gateway.complete({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId: upstreamHarness, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
   startSse(res, 'text/event-stream');
   for (const e of responsesStreamEventsHead({ id, model: requestedModel })) sseEvent(res, e.event, e.data);
   let full = '';
@@ -1348,6 +1351,7 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
  * the bridge's session).
  */
 async function responsesWithTools(req, res, gateway, body, { usage, caller, holdMs, keepaliveMs, scope, id, created, stream, session, meta, t0, effort = null, harnessId = null, trace = null, onStore = null, holdSpend = null }) {
+  const upstreamHarness = upstreamHarnessId(gateway, body.model, harnessId, scope);
   const out = { mode: null };
   const tools = { spec: responsesToolSpec(body), messages: responsesToolMessages(body), face: 'responses', state: out, caller, relay: null };
   const messages = responsesMessages(body);
@@ -1357,7 +1361,7 @@ async function responsesWithTools(req, res, gateway, body, { usage, caller, hold
     if (v?.skipped?.length) meta.skipped = v.skipped;
   };
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: body.model, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: body.model, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId: upstreamHarness, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     const calls = toolCalls.map((c) => faceCall(c, 'responses'));
     const payload = responsesBody({ id, model: body.model, created, text, usage: faceUsage(u, usageReason), toolCalls: calls, request });
@@ -1380,7 +1384,7 @@ async function responsesWithTools(req, res, gateway, body, { usage, caller, hold
     });
     return;
   }
-  const events = await held(gateway.complete({ model: body.model, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
+  const events = await held(gateway.complete({ model: body.model, messages, session, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxOutputTokens: body.max_output_tokens, scope, tools, effort, harnessId: upstreamHarness, trace, holdSpend, onVirtual, onSkip: meta.onSkip }), holdMs);
   startSse(res, 'text/event-stream', out.mode ? { 'x-keysmith-mode': out.mode } : {});
   const face = new ResponsesStream(res, { id, model: body.model, created, request, keepaliveMs });
   meta.face = face;
@@ -1997,6 +2001,24 @@ function resolveRequestedModel(gateway, rawModel, { harnessId = null, backend = 
     }
   }
   return model || rawModel;
+}
+
+/**
+ * The harness id to pass beside `requested`, or null when that model string is the harness.
+ * `resolveRequestedModel` folds a `chrn_` id into the string the scope check sees, and a local
+ * id (`gateway.adapters.has`) already selects the adapter, so neither is passed again.
+ * A scoped key has no second source: its allow-list was applied to `requested` only, and a
+ * client `metadata.harness_id` / `x-harness-id` must not ride along and win upstream.
+ * An open key that names a harness the model string does not already contain still passes it
+ * (a UHP client sends `harness_id` beside a bare model). `gateway.js` keeps forwarding whatever
+ * this returns to the adapter.
+ */
+function upstreamHarnessId(gateway, requested, harnessId, scope) {
+  if (!harnessId || scope) return null;
+  if (gateway.adapters.has(harnessId)) return null;
+  const parts = typeof requested === 'string' ? requested.split('/') : [];
+  if (parts.includes(harnessId) || parts.some((part) => part.startsWith('chrn_'))) return null;
+  return harnessId;
 }
 
 /**
