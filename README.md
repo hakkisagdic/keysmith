@@ -1307,8 +1307,11 @@ keep in a repo. Without it, keysmith falls back to a quick tunnel and says so â€
 tunnels for anything you paste into a client you will not reopen. Details:
 [docs/tunnel.md](docs/tunnel.md).
 
-Keep `host: 127.0.0.1`. There are no rate limits here, and a CLI adapter is a process
-spawner: an unauthenticated public gateway is a denial-of-wallet machine.
+Keep `host: "127.0.0.1"`. With auth off, `serve` refuses a null, non-string, blank, or
+non-loopback host, and `tunnel run` refuses to start (the same rule as `serve --tunnel`):
+the tunnel is public even when the gateway binds loopback. There are no rate limits here,
+and a CLI adapter is a process spawner: an unauthenticated public gateway is a
+denial-of-wallet machine.
 
 On macOS, `keysmith install-service` writes two LaunchAgents
 (`~/Library/LaunchAgents/dev.keysmith.{gateway,tunnel}.plist`) so the gateway â€” and

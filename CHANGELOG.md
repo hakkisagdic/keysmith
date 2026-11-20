@@ -31,6 +31,7 @@
 
 ### Fixes
 
+- Refuse `keysmith tunnel run` when `auth.enabled` is false, and refuse `keysmith serve` with auth off when `host` is null, not a string, empty after trim, or not a loopback address (`listen` on a null host binds every interface). An unauthenticated quick or named tunnel no longer starts. Locking out a public tunnel that was running with auth off is intentional.
 - Expand `~` in `kiro-cli` binary paths (`which`/`expand`) inside the credit guard and `keyOf`/`_entry`, fail immediately (`<name> not found (looked at <expanded path>)`) instead of waiting 30 s on missing binaries, and add a 10 s `STALL_TIMEOUT_MS` check (`no output after 10 s (login prompt?)` plus the scrubbed first diagnostic line) when a login prompt or silent hang stalls `/usage` without writing stdout.
 - Preserve provider token `usage` reported on partial streams when a request fails before completing (`Gateway._leg`/`collect` and `errorMarks` in `src/server.js`).
 - Give a virtual model its classifier's instruction (`classifierPrompt`, or `classifier.prompt`), sent as the classifier's system message and part of the prompt cache key, so a rubric saying what `simple`, `medium` and `complex` mean lives in the config (a small local classifier went from 82–90% to 94–96% on a 50-prompt set with one).
