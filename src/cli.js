@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import fs from 'node:fs';
+import fs, { realpathSync } from 'node:fs';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { loadConfig, saveConfig, configPath, dataDir, newApiKey, newUniqueApiKey, configExists, expand, resolveSecret } from './config.js';
 import { Gateway, aliasAllowsExplicitOnly, checkAdapter, formatRouteExplain, kindOf, own } from './gateway.js';
 import { DEFAULT_HEALTH_TIMEOUT_MS, probeHttpHealth } from './http-adapter.js';
@@ -2307,7 +2308,31 @@ export function installCrashHandlers(proc = process) {
   proc.on('unhandledRejection', report('unhandled rejection'));
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * True when this file is the program Node was asked to run.
+ *
+ * npm installs the `keysmith` bin as a symlink, and `import.meta.url` percent-encodes
+ * a space or any other special character. Comparing it with `file://${argv[1]}`
+ * is then false, so `main()` never ran and the command exited 0 with no output.
+ * Compare the real paths instead.
+ *
+ * A missing `argv[1]` (`node -e`, or a test that imports this module) is not the
+ * entrypoint. `realpathSync` can also throw — the path does not resolve, or the
+ * filesystem refuses it — and that is "not the entrypoint" too. Safe, because an
+ * import must not call `main()`, and npm on Windows does not execute the symlink:
+ * it ships a `.cmd` shim that runs node on the real file, so a throw does not hide
+ * a genuine bin launch.
+ */
+export function isEntrypoint(metaUrl, argv1) {
+  try {
+    if (!argv1) return false;
+    return realpathSync(fileURLToPath(metaUrl)) === realpathSync(argv1);
+  } catch {
+    return false;
+  }
+}
+
+if (isEntrypoint(import.meta.url, process.argv[1])) {
   installCrashHandlers();
   main(process.argv.slice(2));
 }

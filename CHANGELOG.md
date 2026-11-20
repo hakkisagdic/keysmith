@@ -31,6 +31,7 @@
 
 ### Fixes
 
+- Run the CLI when `keysmith` is started through npm's bin symlink, or through a path whose `import.meta.url` is percent-encoded (a space or another special character). The entrypoint guard compared `import.meta.url` to `file://${process.argv[1]}`, which is false in both cases, so `main()` never ran and the process exited 0 with no output. It now compares `realpathSync(fileURLToPath(import.meta.url))` with `realpathSync(process.argv[1])`; a missing `argv[1]` or a path `realpathSync` cannot resolve is still not the entrypoint (npm on Windows launches node via a `.cmd` shim on the real file).
 - Expand `~` in `kiro-cli` binary paths (`which`/`expand`) inside the credit guard and `keyOf`/`_entry`, fail immediately (`<name> not found (looked at <expanded path>)`) instead of waiting 30 s on missing binaries, and add a 10 s `STALL_TIMEOUT_MS` check (`no output after 10 s (login prompt?)` plus the scrubbed first diagnostic line) when a login prompt or silent hang stalls `/usage` without writing stdout.
 - Preserve provider token `usage` reported on partial streams when a request fails before completing (`Gateway._leg`/`collect` and `errorMarks` in `src/server.js`).
 - Give a virtual model its classifier's instruction (`classifierPrompt`, or `classifier.prompt`), sent as the classifier's system message and part of the prompt cache key, so a rubric saying what `simple`, `medium` and `complex` mean lives in the config (a small local classifier went from 82–90% to 94–96% on a 50-prompt set with one).
