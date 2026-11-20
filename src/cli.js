@@ -7,7 +7,7 @@ import { loadConfig, saveConfig, configPath, dataDir, newApiKey, newUniqueApiKey
 import { Gateway, aliasAllowsExplicitOnly, checkAdapter, formatRouteExplain, kindOf, own } from './gateway.js';
 import { DEFAULT_HEALTH_TIMEOUT_MS, probeHttpHealth } from './http-adapter.js';
 import { createServer, hasTunnelConfigured, isLoopbackHost, LEGACY_MAX_CONCURRENT_WARNING } from './server.js';
-import { UsageLog, accountHmacKey, execAccountMigrationWarnings, formatUsageCsv, formatUsageTable } from './usage.js';
+import { UsageLog, accountHmacKey, entryFilter, execAccountMigrationWarnings, formatUsageCsv, formatUsageTable, parseFilterNumber } from './usage.js';
 import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
 import { autoApproveFlag, which } from './cli-adapter.js';
 import { CreditGuard, readCreditState } from './credit-guard.js';
@@ -58,8 +58,11 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith chat <model> <prompt>     one-shot request against your own gateway
   keysmith doctor [--probe-models]   is each adapter actually alive, and at what cost
   keysmith tunnel <status|setup|run> cloudflared: named tunnel first, quick as fallback
-  keysmith usage [--by d1[,d2]] [--since t] [--until t] [--format table|csv|json]
-                                     who spent what (by key, label, adapter, model, account, tag, day, client)
+  keysmith usage [--by d1[,d2]] [--since t] [--until t] [--format table|csv|json] [--tail N]
+                                     [--status ok|error|limited|denied] [--tag T] [--key fp:<8 hex>]
+                                     [--model M] [--min-cost USD] [--min-ms N]
+                                     who spent what (by key, label, adapter, model, account, tag, day, client);
+                                     the filters keep --tail's recent rows only, and need --tail
   keysmith batch submit <file.jsonl> --adapter A --name N --cap-usd X [--key fp:<8 hex>|label] [--cache] [--dry-run]
   keysmith batch status [name] | results <name> | cancel <name>
                                      work that can wait, at half price, on an anthropic-wire adapter; off
@@ -1760,12 +1763,48 @@ function cmdUsageRecord(flags) {
 
 /* ------------------------------------------------------------------------- usage */
 
+/**
+ * Recent-row filters for `keysmith usage --tail`. Null when none were given. A value that cannot
+ * be a filter stops the command. These never narrow stats, spend or daily.
+ */
+function recentSpecFromFlags(flags) {
+  const spec = {};
+  if (flags.status !== undefined) spec.status = flags.status;
+  if (flags.tag !== undefined) spec.tag = flags.tag;
+  if (flags.key !== undefined) spec.key = flags.key;
+  if (flags.model !== undefined) spec.model = flags.model;
+  if (flags.minCost !== undefined) {
+    const n = typeof flags.minCost === 'string' ? parseFilterNumber(flags.minCost) : null;
+    if (n === null) fail('--min-cost must be a number of USD, 0 or more');
+    spec.minCostUsd = n;
+  }
+  if (flags.minMs !== undefined) {
+    const n = typeof flags.minMs === 'string' ? parseFilterNumber(flags.minMs) : null;
+    if (n === null) fail('--min-ms must be a number of milliseconds, 0 or more');
+    spec.minMs = n;
+  }
+  return Object.keys(spec).length ? spec : null;
+}
+
 function cmdUsage(flags) {
   const cfg = configExists() ? loadConfig({ mint: false }) : { limits: {}, pricing: {}, adapters: {} };
   const usage = new UsageLog(undefined, { pricing: cfg?.pricing });
   const format = String(flags.format || 'table').toLowerCase();
   if (!['table', 'csv', 'json'].includes(format)) {
     fail(`unknown --format "${flags.format}" — table | csv | json`);
+  }
+  // Filters apply to the recent list and to JSON entries only, and only with --tail.
+  const recent = recentSpecFromFlags(flags);
+  if (recent && flags.tail === undefined) {
+    fail('--status, --tag, --key, --model, --min-cost and --min-ms filter the recent list and need --tail');
+  }
+  let entriesFilter = null;
+  if (recent) {
+    try {
+      entriesFilter = entryFilter(recent);
+    } catch (e) {
+      fail(e.message);
+    }
   }
   const byFlags = flags[ALL]?.by ? [...flags[ALL].by, ...flags._] : ['model'];
   let stats;
@@ -1781,12 +1820,17 @@ function cmdUsage(flags) {
   }
   const spend = usage.spendSummary(cfg?.limits?.spend, { adapters: cfg?.adapters });
   const daily = authEnabled(cfg) ? usage.dailySummary(parseKeys(cfg?.auth?.keys || []).entries) : [];
+  const tailEntries = () => usage.tail(Number(flags.tail), entriesFilter);
   if (format === 'json') {
+    const entries = flags.tail ? tailEntries() : null;
     const payload = {
       ...stats,
       ...(spend.length ? { spend } : {}),
       ...(daily.length ? { daily } : {}),
-      ...(flags.tail ? { entries: usage.tail(Number(flags.tail)) } : {}),
+      ...(flags.tail ? {
+        entries,
+        ...(recent && Object.hasOwn(recent, 'minCostUsd') ? { entriesUnpriced: entriesFilter.unpriced } : {}),
+      } : {}),
     };
     return out(JSON.stringify(payload, null, 2));
   }
@@ -1796,9 +1840,12 @@ function cmdUsage(flags) {
   out(formatUsageTable(stats, { spend, daily }));
   if (flags.tail) {
     out('\nrecent:');
-    for (const e of usage.tail(Number(flags.tail))) {
+    for (const e of tailEntries()) {
       const st = e.status === 'ok' ? 'ok  ' : e.status === 'blocked' ? 'BLK ' : 'ERR ';
       out(`  ${e.ts}  ${st}  ${(e.model || '?').padEnd(40)} ${String(e.ms).padStart(6)}ms  ${e.usage?.input || 0}→${e.usage?.output || 0}  ${truncate(e.error || '', 60)}`);
+    }
+    if (recent && Object.hasOwn(recent, 'minCostUsd')) {
+      out(`  unpriced: ${entriesFilter.unpriced} left out`);
     }
   }
 }

@@ -69,7 +69,7 @@ that is the interesting part.
 | `POST /v1/embeddings` | forwarded to HTTP adapters only |
 | `GET /v1/models` | the whole catalogue, namespaced; `?refresh` re-queries |
 | `GET /v1/keysmith/routes` | adapters, aliases, limits and any unusable alias leg (`alias_warnings`) as JSON |
-| `GET /v1/keysmith/usage` | whole-log audit statistics (`?by=…&since=…&until=…`), spend caps, and `?tail=N` recent entries |
+| `GET /v1/keysmith/usage` | whole-log audit statistics (`?by=…&since=…&until=…`), spend caps, `?tail=N` recent entries, and recent-row filters `status`, `tag`, `key`, `model`, `min_cost`, `min_ms` (with `tail` only) |
 | `GET /` | status page in a browser: post the key once through its form, a cookie opens it for an hour |
 | `GET /healthz` | keyless liveness probe for a supervisor |
 
@@ -1221,7 +1221,14 @@ hour (`granularity: "hour"`, `roundedToWholeHours: true`), and wider windows ans
 cells rounded to whole UTC days (`granularity: "day"`, `roundedToWholeDays: true`, with `since`
 naming the earliest kept day when older days have aged out). `?tail=N` returns recent rows from an
 in-memory ring bounded by both count (at most 2,000 rows, `TAIL_RING_MAX`) and byte size (at most
-2 MiB, `TAIL_RING_MAX_BYTES`; `tail` above 2,000 is refused with HTTP 400). On a verbatim
+2 MiB, `TAIL_RING_MAX_BYTES`; `tail` above 2,000 is refused with HTTP 400). `status`
+(`ok`, `error`, `limited`, `denied`), `tag`, `key` (`fp:` plus 8 hex), `model`, `min_cost` and
+`min_ms` filter those recent rows only — they need `tail`, and they do not change `stats`, `spend`
+or `daily`. A scoped key still sees only its own rows, so `key=fp:<another>` is an empty `entries`
+list. A value that is not a filter is `400 invalid_request_error` naming the parameter; an unknown
+parameter is ignored. `min_cost` leaves out rows with no price and reports how many
+(`entriesUnpriced`). `keysmith usage` takes the same filters as `--status`, `--tag`, `--key`,
+`--model`, `--min-cost` and `--min-ms`, and they need `--tail`. On a verbatim
 OpenAI-wire relay, keysmith reads `usage` from a non-streamed body or asks the upstream for
 `stream_options: {"include_usage": true}` on a stream (stripping any `usage` member, `null`
 included, that the client did not request and dropping a chunk only when nothing else is left
