@@ -7,6 +7,7 @@ import { loadConfig, saveConfig, configPath, dataDir, newApiKey, newUniqueApiKey
 import { Gateway, aliasAllowsExplicitOnly, checkAdapter, formatRouteExplain, kindOf, own } from './gateway.js';
 import { DEFAULT_HEALTH_TIMEOUT_MS, probeHttpHealth } from './http-adapter.js';
 import { createServer, hasTunnelConfigured, isLoopbackHost, LEGACY_MAX_CONCURRENT_WARNING } from './server.js';
+import { resolveCacheConfig } from './response-cache.js';
 import { UsageLog, accountHmacKey, entryFilter, execAccountMigrationWarnings, formatUsageCsv, formatUsageTable, parseFilterNumber } from './usage.js';
 import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
 import { autoApproveFlag, which } from './cli-adapter.js';
@@ -986,6 +987,8 @@ async function cmdServe(flags) {
   // A key whose scope cannot be read reaches nothing: said at start, where the owner looks.
   for (const issue of keyProblems(cfg)) warn(`! auth.keys: ${issue}`);
   if (Number(cfg?.limits?.maxConcurrent) === 4) warn(`! ${LEGACY_MAX_CONCURRENT_WARNING}`);
+  const cacheResolved = resolveCacheConfig(cfg?.cache);
+  if (cacheResolved.error) warn(`! cache: ${cacheResolved.error}`);
   if (!process.env.KEYSMITH_VERBOSE || !gateway._warnedExecMigration) {
     for (const w of execAccountMigrationWarnings(cfg, usage, { checkDisk: true })) warn(`! ${w}`);
   }
@@ -1495,6 +1498,8 @@ async function cmdDoctor(flags) {
   for (const issue of keyIssues) out(`             ✗ ${issue}`);
   for (const w of scopeWarnings(cfg, keyEntries)) out(`             ! ${w.message}`);
   if (Number(cfg?.limits?.maxConcurrent) === 4) out(`  limits     ! ${LEGACY_MAX_CONCURRENT_WARNING}`);
+  const cacheResolved = resolveCacheConfig(cfg?.cache);
+  if (cacheResolved.error) out(`  cache      ✗ cache: ${cacheResolved.error}`);
   for (const w of execAccountMigrationWarnings(cfg, usage, { checkDisk: true })) out(`             ! ${w}`);
 
   if (flags.probeModels) {

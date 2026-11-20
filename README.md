@@ -1101,6 +1101,22 @@ keysmith batch results eval-ref-1
 keysmith usage --by tag                   # batch/eval-ref-1 carries the real cost
 ```
 
+## Exact response cache
+
+Off unless the config says so. A repeated non-streaming `POST /v1/chat/completions` can be answered from memory, at no upstream cost, when the same caller sends the same request again.
+
+```json
+"cache": { "enabled": true, "ttlSeconds": 3600, "maxEntries": 500 }
+```
+
+The default is `"enabled": false` (one hour, 500 entries, when you turn it on). A value that is not that shape is a `keysmith doctor` error and the cache stays off. Nothing is written to disk; a restart empties it. Answers larger than about 1 MB are not stored.
+
+A request is cached only when it is not streamed, offers no tools and has no tool history, carries no session (`x-keysmith-session` or `session`), and is one you opted into: `temperature` is `0`, or the request sends `x-keysmith-cache: use`. The first answer is `x-keysmith-cache: miss`. The next one, while it is still inside `ttlSeconds` and has not been evicted, is `x-keysmith-cache: hit` with a new `id` and `created`, and the upstream is not called. The key is a SHA-256 of the caller's key hash and the fields that change the answer (model, messages, temperature, the token limits, `include_reasoning`, `response_format`, `stop`, `seed`, and the effort fields), so one gateway key never reads another's answers. Streaming, `/v1/messages`, `/v1/responses`, embeddings and tool calls are not cached. A failed or partial upstream answer is not stored.
+
+A hit still counts as one request against a key's daily cap (that count happens before the body is read). It adds no spend: the usage row is `"cache": "hit"` with cost 0, and nothing is reserved against `limits.spend`. While the cache is on, the status page shows `response cache: N hits / M misses, K entries` from those counters.
+
+**A cached answer is the answer of an earlier call.** An agent loop that needs a fresh answer should leave the cache off, or omit both `temperature: 0` and the `x-keysmith-cache: use` header.
+
 ## Usage audit, pricing and spend caps
 
 Every request writes one JSON line to `usage.jsonl` (`0600` in a `0700` directory; every string

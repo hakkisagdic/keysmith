@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { fingerprint, redactKey, registerSecrets } from './redact.js';
 import { CLAUDE_PRICING } from './prices.js';
 import { checkVirtualModel, validateVirtualModels } from './virtual-models.js';
+import { CACHE_DEFAULTS } from './response-cache.js';
 
 export { checkVirtualModel, validateVirtualModels };
 
@@ -153,6 +154,9 @@ export const DEFAULTS = {
   log: { usage: true, body: false },
   guard: { secrets: 'off' },
   limits: { maxConcurrent: 32, timeoutMs: 300_000, spend: {} },
+  // Exact response cache for non-streaming chat. Off. A bad value is a doctor error
+  // and the cache stays off (src/response-cache.js).
+  cache: { ...CACHE_DEFAULTS },
   pricing: structuredClone(CLAUDE_PRICING),
   tunnel: { provider: 'cloudflared', name: null, hostname: null, configFile: null },
   adapters: {},

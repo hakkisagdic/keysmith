@@ -7,7 +7,7 @@ import { fmtUsd, windowCapLabel } from './usage.js';
  * A one-screen status page at `/`. Not a product — a place to see, in a browser,
  * which adapters loaded and what the last requests cost, without opening a terminal.
  */
-export function statusPage({ cfg, models, usage, usageFilter = null, spend = null, usageErrors = [], startedAt, loadErrors = {}, aliasIssues = {}, viewer = null, keys = null, keyIssues = [], failover = null }) {
+export function statusPage({ cfg, models, usage, usageFilter = null, spend = null, usageErrors = [], startedAt, loadErrors = {}, aliasIssues = {}, viewer = null, keys = null, keyIssues = [], failover = null, responseCache = null }) {
   const adapters = Object.entries(cfg.adapters || {});
   const failed = Object.entries(loadErrors);
   const aliasList = Object.entries(aliasIssues);
@@ -48,7 +48,7 @@ export function statusPage({ cfg, models, usage, usageFilter = null, spend = nul
   return `${HEAD}
 <body>
 <h1>key<span>smith</span></h1>
-<div class="sub">OpenAI-compatible front for the agents already on this machine · up ${humanUptime(Date.now() - startedAt)} · config <code>${esc(rel(configPath()))}</code></div>
+<div class="sub">OpenAI-compatible front for the agents already on this machine · up ${humanUptime(Date.now() - startedAt)} · config <code>${esc(rel(configPath()))}</code></div>${responseCacheLine(responseCache)}
 ${viewer && viewer.scope && !/^unscoped/.test(viewer.scope) ? `<div class="sub">viewing as key fp:${esc(viewer.fp)}${viewer.label ? ` (${esc(viewer.label)})` : ''} — its scope: ${esc(viewer.scope)}. This page shows what that key can reach.</div>` : ''}
 ${viewerLine(viewer)}
 ${logErrors.length ? `<p class="bad">${logErrors.map((e) => `usage log unreadable: ${esc(e)}`).join('<br>')}</p>` : ''}
@@ -123,6 +123,17 @@ const HEAD = `<!doctype html>
 function failoverSection({ guards = [], skips = [] }) {
   const row = (l) => `<tr><td class="${l.mark === '✗' ? 'bad' : l.mark === '✓' ? 'ok' : 'muted'}">${esc(l.mark)}</td><td>${esc(l.text)}</td></tr>`;
   return `${guards.length ? `<h2>Kiro credit guard</h2><table><tbody>${guards.map(row).join('')}</tbody></table>` : ''}<h2>Legs passed by (24h)</h2><table><tbody>${skips.map(row).join('')}</tbody></table><p class="muted">A leg that cannot carry a request's tools, or that the credit guard holds back, is passed by and named in the usage row (<code>skippedLegs</code>). <code>keysmith doctor</code> lists which legs of each alias carry tools.</p>`;
+}
+
+/**
+ * One line, and only while the exact response cache is on. The numbers are the live
+ * counters (`hits`, `misses`, `entries`); anything else is not shown.
+ */
+function responseCacheLine(stats) {
+  if (!stats || typeof stats !== 'object') return '';
+  const { hits, misses, entries } = stats;
+  if (![hits, misses, entries].every((n) => Number.isInteger(n) && n >= 0)) return '';
+  return `\n<div class="sub">response cache: ${hits} hits / ${misses} misses, ${entries} entries</div>`;
 }
 
 /** A viewer key's own daily cap, per-minute limit, expiry and disabled state. */

@@ -28,6 +28,7 @@ import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './fai
 import { TAIL_RING_MAX, RECENT_STATUSES, computeCost, credentialAccount, entryFilter, parseFilterNumber, parseTag, roundUsd } from './usage.js';
 import { cachePlanScope, checkPromptCache } from './prompt-cache.js';
 import { applySecretGuard, findSecrets, guardMode } from './secret-guard.js';
+import { ResponseCache, keyFor, resolveCacheConfig } from './response-cache.js';
 
 export function isLoopbackHost(host) {
   if (!host) return true;
@@ -198,6 +199,13 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const minute = new MinuteLimiter({ now });
   const refusalGate = new Map(); // `${fp}:${reason}` -> last logged refusal timestamp (ms)
   if (authOn) quota.seed(usage);
+  // Exact response cache (src/response-cache.js). Off unless cache.enabled is true.
+  // A bad value is logged and the cache stays off — same answer doctor prints.
+  const cacheResolved = resolveCacheConfig(cfg?.cache);
+  if (cacheResolved.error) log(`cache: ${cacheResolved.error}`);
+  const responseCache = cacheResolved.enabled
+    ? new ResponseCache({ maxEntries: cacheResolved.maxEntries, ttlMs: cacheResolved.ttlSeconds * 1000, now })
+    : null;
   const startedAt = Date.now();
   const pages = pageSessions(now);
   const responseStore = createResponseStore({ now });
@@ -359,6 +367,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
             : null,
           keyIssues: scope ? [] : keyIssues,
           failover: scope ? null : failoverOverview(gateway, usage),
+          responseCache: responseCache ? responseCache.stats() : null,
         }));
       }
     }
@@ -528,7 +537,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           } : {}),
         });
       }
-      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode });
+      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode, responseCache, now });
       if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode });
       if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend, guard: secretGuardMode });
       if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend, guard: secretGuardMode });
@@ -1032,7 +1041,25 @@ function guardRequestBody(body, { guard = 'off', req, res, route, gateway = null
   throw new LlmError(message, { status: 400, type: 'invalid_request_error' });
 }
 
-async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, guard = 'off' }) {
+/** Client opt-in for the exact response cache when temperature is not 0: `x-keysmith-cache: use`. */
+function wantsResponseCache(req) {
+  const h = req.headers['x-keysmith-cache'];
+  return typeof h === 'string' && h.trim().toLowerCase() === 'use';
+}
+
+/** Token counts off a cached chat completion, for a hit's usage row. The row's cost is 0. */
+function usageFromCachedCompletion(payload) {
+  const u = payload?.usage;
+  if (!u || typeof u !== 'object' || u.keysmith_usage === 'unknown') return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  return {
+    input: Number(u.prompt_tokens) || 0,
+    output: Number(u.completion_tokens) || 0,
+    cacheRead: Number(u.prompt_tokens_details?.cached_tokens) || 0,
+    cacheWrite: 0,
+  };
+}
+
+async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, guard = 'off', responseCache = null, now = null }) {
   const body = guardRequestBody(await readJson(req), { guard, req, res, route: '/v1/chat/completions', gateway, scope, usage });
   const messages = openaiMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -1086,6 +1113,33 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
   if (!stream) {
+    // Exact cache, this branch only. Cacheable: no tools and no tool history, no session,
+    // and either temperature 0 or `x-keysmith-cache: use`. A hit returns before collect,
+    // so the upstream is not called and holdSpend reserves nothing. meter() already
+    // counted the request. A failed collect throws before anything is stored.
+    const cacheable = !!(responseCache && tools == null && !session && (body.temperature === 0 || wantsResponseCache(req)));
+    const cacheKey = cacheable ? keyFor({ callerHash: caller, body }) : null;
+    if (cacheKey) {
+      const hit = responseCache.get(cacheKey);
+      if (hit) {
+        hit.id = chatId();
+        hit.created = Math.floor((typeof now === 'function' ? now() : Date.now()) / 1000);
+        if (meta.virtual?.chosen) res.setHeader('x-keysmith-route', meta.virtual.chosen);
+        meta.done = true;
+        json(res, 200, hit, hit.keysmith?.session || null, { 'x-keysmith-cache': 'hit' });
+        record(usage, {
+          model: requested,
+          status: 'ok',
+          ms: Date.now() - t0,
+          usage: usageFromCachedCompletion(hit),
+          cost: { usd: 0, basis: 'metered' },
+          cache: 'hit',
+          stream: false,
+          client: req.headers['user-agent'],
+        });
+        return;
+      }
+    }
     const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId: upstreamHarness, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     if (relayed) {
@@ -1101,8 +1155,11 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     if (sid) payload.keysmith = { session: sid, resumed: !!publicId };
     if (toolMode) res.setHeader('x-keysmith-mode', toolMode);
     if (meta.virtual?.chosen) res.setHeader('x-keysmith-route', meta.virtual.chosen);
+    // Store only a finished answer: no tool calls, not a cut-off, and under the size cap.
+    // set() clones. The header is miss only when this answer is now in the cache.
+    const cacheHeader = cacheKey && calls.length === 0 && !cutAt && responseCache.set(cacheKey, payload) ? 'miss' : null;
     meta.done = true;
-    json(res, 200, payload, sid);
+    json(res, 200, payload, sid, cacheHeader ? { 'x-keysmith-cache': cacheHeader } : null);
     record(usage, {
       model: requested,
       status: 'ok',
@@ -2644,9 +2701,10 @@ async function readJson(req) {
   }
 }
 
-function json(res, status, payload, session = null) {
+function json(res, status, payload, session = null, extraHeaders = null) {
   const headers = { 'content-type': 'application/json; charset=utf-8' };
   if (session) headers['x-keysmith-session'] = session;
+  if (extraHeaders) Object.assign(headers, extraHeaders);
   return send(res, status, headers, JSON.stringify(payload));
 }
 
