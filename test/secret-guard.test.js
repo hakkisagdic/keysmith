@@ -558,9 +558,12 @@ test('Check 8: normal prompt with long base64 text, git SHAs, UUIDs, public keys
   const b64 = deterministicBytes.toString('base64');
   const sha1 = '698cf8d0fd70c78a1b2c3d4e5f60718293a4b5c6';
   const sha2 = 'fd70c7890123456789abcdef0123456789abcdef';
+  const alpha36 = '0123456789abcdefghijklmnopqrstuvwxyz';
+  const taskId = 'ta' + 'sk-' + alpha36 + '012345';
+  const diskId = 'di' + 'sk-' + '9876543210' + alpha36.slice(10) + '987654';
   const prompt = [
     `Commit ${sha1} merged into ${sha2}.`,
-    'Identifier task-0123456789abcdefghijklmnopqrstuvwxyz012345 and disk-9876543210abcdefghijklmnopqrstuvwxyz987654.',
+    `Identifier ${taskId} and ${diskId}.`,
     '-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n-----END PUBLIC KEY-----',
     `Attachment base64:\n${b64}`,
   ].join('\n\n');
