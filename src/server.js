@@ -213,8 +213,13 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const server = http.createServer((req, res) => {
     cachePlanScope.run({}, () => handle(req, res)).catch((e) => {
       log(`request crashed: ${e?.stack || e}`);
+      let crashFace = null;
       try {
-        if (!res.headersSent) json(res, 500, errorBody('internal error', 'internal_error', 500));
+        const crashRoute = new URL(req.url, 'http://internal').pathname.replace(/\/+$/, '') || '/';
+        crashFace = faceFromRoute(crashRoute);
+      } catch {}
+      try {
+        if (!res.headersSent) json(res, 500, errorBody('internal error', 'internal_error', 500, null, crashFace));
         else res.end();
       } catch {}
     });
@@ -242,6 +247,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       return json(res, 400, errorBody('malformed request target', 'invalid_request_error', 400));
     }
     const route = url.pathname.replace(/\/+$/, '') || '/';
+    const faceName = faceFromRoute(route);
 
     res.setHeader('access-control-allow-headers', 'authorization,content-type,x-keysmith-session,x-keysmith-tag,x-api-key,anthropic-version,uhp-version,idempotency-key,x-harness-id,traceparent,tracestate');
     res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
@@ -250,7 +256,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     const requestedUhpVersion = typeof req.headers['uhp-version'] === 'string' ? req.headers['uhp-version'].trim() : '';
     if (requestedUhpVersion && !UHP_VERSIONS.includes(requestedUhpVersion)) {
       res.setHeader('UHP-Version', UHP_DEFAULT_VERSION);
-      return json(res, 400, errorBody(`Unsupported UHP-Version "${requestedUhpVersion}". Supported versions: ${UHP_VERSIONS.join(', ')}`, 'unsupported_protocol_version', 400));
+      return json(res, 400, errorBody(`Unsupported UHP-Version "${requestedUhpVersion}". Supported versions: ${UHP_VERSIONS.join(', ')}`, 'unsupported_protocol_version', 400, null, faceName));
     }
     const negotiatedUhpVersion = requestedUhpVersion || UHP_DEFAULT_VERSION;
     res.setHeader('UHP-Version', negotiatedUhpVersion);
@@ -356,7 +362,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
 
     const who = identify(req, keys, url, authOn, cfg);
     if (who === null) {
-      return json(res, 401, errorBody('missing or invalid API key — send `Authorization: Bearer <key>`', 'authentication_error', 401));
+      return json(res, 401, errorBody('missing or invalid API key — send `Authorization: Bearer <key>`', 'authentication_error', 401, null, faceName));
     }
     const { caller, scope } = who;
     const heldSpend = [];
@@ -506,7 +512,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend });
       if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend });
       if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend });
-      return json(res, 404, errorBody(`no route for ${req.method}`, 'invalid_request_error', 404));
+      return json(res, 404, errorBody(`no route for ${req.method}`, faceName === 'messages' ? 'not_found_error' : 'invalid_request_error', 404, null, faceName));
     } catch (e) {
       const status = e instanceof LlmError ? e.status : 500;
       if (status >= 500) log(`${route} crashed: ${e.stack || e.message}`);
@@ -514,7 +520,6 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       // a provider key, and a client of this gateway was never given that key.
       const message = redactSecrets(e.message || String(e));
       const meta = res._keysmith;
-      const faceName = faceFromRoute(route);
       const errProvider = status === 403 || status === 404 ? null : (e?.provider || null);
       let pendingErrBody = null;
       if (res.headersSent) {
@@ -554,7 +559,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
         usage?.noteUnloggedFailure?.(who.fp, now(), {
           label: who.label,
           route,
-          face: faceFromRoute(route),
+          face: faceName,
           client: req.headers['user-agent'],
           tag: parseTag(req.headers['x-keysmith-tag']),
         });
@@ -2337,7 +2342,7 @@ function stampCost(rest, ownUsage, { adapter, upstreamModel, kind, costBasis = n
 function faceFromRoute(route, via = null) {
   const r = route || via || '';
   if (r === '/v1/chat/completions') return 'chat';
-  if (r === '/v1/messages') return 'messages';
+  if (r === '/v1/messages' || r.startsWith('/v1/messages/')) return 'messages';
   if (r === '/v1/responses') return 'responses';
   if (r === '/v1/embeddings') return 'embeddings';
   return null;
