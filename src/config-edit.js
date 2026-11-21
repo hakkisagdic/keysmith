@@ -15,6 +15,7 @@ const T = {
   str: { type: 'string' },
   nstr: { type: 'string', nullable: true },
   int: (min = 1, max = Number.MAX_SAFE_INTEGER) => ({ type: 'int', min, max }),
+  oneOf: (values) => ({ type: 'enum', values }),
 };
 
 /** Known dotted keys. `discovery.<adapter>.<…>` is matched by `schemaFor`. */
@@ -24,6 +25,7 @@ export const SCHEMA = {
   'auth.enabled': T.bool,
   'log.usage': T.bool,
   'log.body': T.bool,
+  'guard.secrets': T.oneOf(['off', 'block', 'mask']),
   'limits.maxConcurrent': T.int(),
   'limits.timeoutMs': T.int(),
   'limits.streamHoldMs': T.int(0),
@@ -63,6 +65,11 @@ export function parseValue(key, schema, raw) {
     if (s === 'true') return true;
     if (s === 'false') return false;
     throw new Error(`${key} takes true or false, not "${s}"`);
+  }
+  if (schema.type === 'enum') {
+    if (schema.values.includes(s)) return s;
+    const shown = s.length <= 20 && !/^(AKIA|gh[po]_|github_pat_|xox[baprs]-|AIza|sk-|ks_|-----)/.test(s) ? `, not "${s}"` : '';
+    throw new Error(`${key} takes ${schema.values.join(' | ')}${shown}`);
   }
   if (schema.type === 'int') {
     if (!/^-?\d+$/.test(s)) throw new Error(`${key} takes a whole number, not "${s}"`);
