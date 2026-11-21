@@ -951,9 +951,14 @@ async function cmdServe(flags) {
   const cfg = loadOrFail();
   if (flags.port) cfg.port = Number(flags.port);
   if (flags.host) cfg.host = flags.host;
-  if (!authEnabled(cfg) && (flags.tunnel || hasTunnelConfigured(cfg) || (cfg.host && !isLoopbackHost(cfg.host)))) {
+  // isLoopbackHost('') is true, but listen(port, null) and listen(port, '') bind every interface.
+  // A null, non-string, or blank host is therefore not a loopback bind. Auth on still listens
+  // on the configured value (including null); auth off never reaches listen in that case.
+  const bindHost = typeof cfg.host === 'string' ? cfg.host.trim() : '';
+  if (!authEnabled(cfg) && (flags.tunnel || hasTunnelConfigured(cfg) || !bindHost || !isLoopbackHost(bindHost))) {
     fail('refusing to start with auth.enabled === false when a tunnel is configured or host is not loopback');
   }
+  const listenHost = bindHost || cfg.host;
   // launchd opened its log before this process started, with the default umask: tighten
   // that, and anything an older keysmith left behind, before the first line is written.
   const secured = secureLogFiles();
@@ -967,9 +972,9 @@ async function cmdServe(flags) {
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(cfg.port, cfg.host, resolve);
+    server.listen(cfg.port, listenHost, resolve);
   });
-  const local = `http://${cfg.host}:${cfg.port}`;
+  const local = `http://${listenHost}:${cfg.port}`;
   out(`keysmith listening on ${local}/v1  (status page at ${local}/)`);
   out(`  adapters: ${gateway.publicAdapters.map((a) => a.id).join(', ') || 'none — keysmith add <profile>'}`);
   // This banner is launchd's log file and keysmith.log: the key is named, never printed.
@@ -1539,6 +1544,7 @@ async function cmdTunnel(flags) {
     return;
   }
   if (sub === 'run') {
+    if (!authEnabled(cfg)) fail('refusing to start a tunnel with auth.enabled === false: the tunnel is public, so authentication has to stay on');
     const named = cfg.tunnel?.name;
     const t = tunnel.startTunnel({
       port: cfg.port,

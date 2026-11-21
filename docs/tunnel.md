@@ -69,7 +69,11 @@ nothing but a 401. Keep:
 
 - `host: "127.0.0.1"` (the default). The tunnel connects to localhost; binding `0.0.0.0`
   additionally exposes the gateway to your whole LAN and makes the tunnel pointless.
-- `auth.enabled: true`. Turning it off is only sane behind a loopback you trust.
+  A `host` of `null`, a non-string, or a blank string is not loopback: with auth off,
+  `keysmith serve` refuses it instead of listening on every interface.
+- `auth.enabled: true`. `keysmith tunnel run` and `keysmith serve --tunnel` refuse to
+  start when it is false. The tunnel is a public entry even though the process binds
+  loopback; turning auth off is only for a loopback listener with no tunnel.
 - `limits.maxConcurrent`, and per-adapter `maxConcurrent`/`timeoutMs`. A CLI adapter is a
   process spawner; without a cap, one busy page on the open internet is a
   denial-of-wallet machine — it burns your agent quota and then your file descriptors.
@@ -83,7 +87,7 @@ hostname you did not choose.
 
 ```bash
 keysmith tunnel status            # installed? logged in? named? on-disk ingress?
-keysmith tunnel run               # just the tunnel, against a gateway already running
+keysmith tunnel run               # the tunnel only, against a gateway already running; refused when auth.enabled is false
 keysmith status                   # process, config, adapters, tunnel, /healthz
 tail -f ~/.local/share/keysmith/keysmith.log
 ```
