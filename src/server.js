@@ -27,6 +27,7 @@ import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
 import { cachePlanScope, checkPromptCache } from './prompt-cache.js';
+import { applySecretGuard, findSecrets, guardMode } from './secret-guard.js';
 
 export function isLoopbackHost(host) {
   if (!host) return true;
@@ -206,6 +207,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const holdMs = Number.isFinite(cfg.limits?.streamHoldMs) && cfg.limits.streamHoldMs >= 0 ? cfg.limits.streamHoldMs : STREAM_HOLD_MS;
   // How long an open stream may go without a byte before it gets a keepalive (faces.js); 0: never.
   const keepaliveMs = Number.isFinite(cfg.limits?.streamKeepaliveMs) && cfg.limits.streamKeepaliveMs >= 0 ? cfg.limits.streamKeepaliveMs : KEEPALIVE_MS;
+  const { mode: secretGuardMode, error: secretGuardError } = guardMode(cfg);
+  if (secretGuardError) log(`guard.secrets: ${secretGuardError}`);
 
   // Whatever one request does, it never takes the process down: launchd would restart it
   // every 10 s for as long as somebody keeps sending the request, and Node's own crash
@@ -508,10 +511,10 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           ...(n ? { entries: usage.tail(n, filter) } : {}),
         });
       }
-      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend });
-      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend });
-      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend });
-      if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend });
+      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode });
+      if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode });
+      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend, guard: secretGuardMode });
+      if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend, guard: secretGuardMode });
       return json(res, 404, errorBody(`no route for ${req.method}`, faceName === 'messages' ? 'not_found_error' : 'invalid_request_error', 404, null, faceName));
     } catch (e) {
       const status = e instanceof LlmError ? e.status : 500;
@@ -935,8 +938,40 @@ function describeHarness(a) {
 
 /* ---------------------------------------------------------------------- handlers */
 
-async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null }) {
-  const body = await readJson(req);
+function guardRequestBody(body, { guard = 'off', req, res, route, gateway = null, scope = null, usage = null } = {}) {
+  if (guard !== 'block' && guard !== 'mask') return body;
+  const { body: nextBody, kinds } = applySecretGuard(body, guard);
+  if (!kinds.length) return body;
+  if (guard === 'mask') {
+    if (req) req._guard = marks({ guard: 'masked', guardKinds: kinds });
+    return nextBody;
+  }
+  const message = `request holds a secret of kind ${kinds.join(', ')} (guard.secrets=block)`;
+  const rawModel = typeof body?.model === 'string' && body.model.trim() && !findSecrets(body.model).length ? body.model.trim() : null;
+  const harnessId = req ? extractHarnessId(req, body) : null;
+  const safeHarness = harnessId && !findSecrets(harnessId).length ? harnessId : null;
+  const safeBackend = typeof body?.backend === 'string' && !findSecrets(body.backend).length ? body.backend : null;
+  const requested = rawModel && gateway ? resolveRequestedModel(gateway, rawModel, { harnessId: safeHarness, backend: safeBackend, scope }) : rawModel;
+  const stream = !!body?.stream;
+  const via = route && route !== '/v1/chat/completions' ? route : null;
+  const errJson = JSON.stringify(errorBody(message, 'invalid_request_error', 400, null, faceFromRoute(route)));
+  if (res) res._keysmith = { model: requested, stream, t0: Date.now(), done: true, via };
+  record(usage, {
+    model: requested,
+    status: 'blocked',
+    ms: 0,
+    stream,
+    ...(via ? { via } : {}),
+    error: message,
+    client: req?.headers?.['user-agent'] || (route === '/v1/messages' ? 'anthropic' : undefined),
+    bytesOut: Buffer.byteLength(errJson, 'utf8'),
+    ...marks({ guard: 'blocked', guardKinds: kinds }),
+  });
+  throw new LlmError(message, { status: 400, type: 'invalid_request_error' });
+}
+
+async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, guard = 'off' }) {
+  const body = guardRequestBody(await readJson(req), { guard, req, res, route: '/v1/chat/completions', gateway, scope, usage });
   const messages = openaiMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
   const harnessId = extractHarnessId(req, body);
@@ -1107,8 +1142,8 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   });
 }
 
-async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null }) {
-  const body = await readJson(req);
+async function handleAnthropic(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, guard = 'off' }) {
+  const body = guardRequestBody(await readJson(req), { guard, req, res, route: '/v1/messages', gateway, scope, usage });
   const messages = anthropicMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
   const t0 = Date.now();
@@ -1245,8 +1280,8 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   void log;
 }
 
-async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null, holdSpend = null }) {
-  const body = await readJson(req);
+async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null, holdSpend = null, guard = 'off' }) {
+  const body = guardRequestBody(await readJson(req), { guard, req, res, route: '/v1/responses', gateway, scope, usage });
   const trace = extractW3cTrace(req, res);
 
   // UHP Idempotency-Key deduplication & conflict detection (409 on payload mismatch).
@@ -1535,8 +1570,8 @@ function noResponsesToolCalls() {
   return new LlmError('this answer is a tool call, and the request offered no tools', { status: 502 });
 }
 
-async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSpend = null } = {}) {
-  const body = await readJson(req);
+async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSpend = null, guard = 'off' } = {}) {
+  const body = guardRequestBody(await readJson(req), { guard, req, res, route: '/v1/embeddings', gateway, scope, usage });
   const t0 = Date.now();
   const meta = track(res, body.model, false, t0, '/v1/embeddings');
   const slash = String(body.model || '').indexOf('/');
@@ -2258,6 +2293,7 @@ function stamp(entry, { who, req, res, route, gateway, cfg } = {}) {
     ...rest,
     ...virtualFields,
     ...(plan && rest.cachePlan === undefined ? { cachePlan: plan } : {}),
+    ...(req?._guard && rest.guard === undefined ? req._guard : {}),
     ...(legSkips?.length ? { skippedLegs: legSkips.map((x) => ({ ...x })) } : {}),
     adapter,
     kind,
@@ -2405,7 +2441,7 @@ function wrapBytesOut(res) {
  * (`bridge.session`, its short id), reached how (`new`, `attached`, `cold`) and on its how-many-th
  * turn — names and counts only: never a tool's arguments or result, which are the client's data.
  */
-function marks({ retries = 0, cutAt = null, toolMode = null, toolCalls = 0, fallback = null, bridge = null } = {}) {
+function marks({ retries = 0, cutAt = null, toolMode = null, toolCalls = 0, fallback = null, bridge = null, guard = null, guardKinds = null } = {}) {
   return {
     ...(retries ? { retries } : {}),
     ...(cutAt ? { cutAt } : {}),
@@ -2413,6 +2449,8 @@ function marks({ retries = 0, cutAt = null, toolMode = null, toolCalls = 0, fall
     ...(toolCalls ? { toolCalls } : {}),
     ...(fallback ? { fallback } : {}),
     ...(bridge ? { bridge } : {}),
+    ...(guard ? { guard } : {}),
+    ...(guardKinds?.length ? { guardKinds } : {}),
   };
 }
 

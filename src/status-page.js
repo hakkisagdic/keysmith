@@ -54,7 +54,7 @@ ${viewerLine(viewer)}
 ${logErrors.length ? `<p class="bad">${logErrors.map((e) => `usage log unreadable: ${esc(e)}`).join('<br>')}</p>` : ''}
 <div class="grid">
   <div class="card"><small>requests 24h (UTC hour)</small><b>${summary.requests}</b></div>
-  <div class="card"><small>failures</small><b class="${summary.failures ? 'bad' : 'ok'}">${summary.failures}</b></div>
+  <div class="card"><small>failures${summary.blocked ? ` (${summary.blocked} blocked)` : ''}</small><b class="${summary.failures ? 'bad' : 'ok'}">${summary.failures}</b></div>
   <div class="card"><small>tokens in / out</small><b>${fmt(summary.tokensIn)} / ${fmt(summary.tokensOut)}</b></div>
   <div class="card"><small>models exposed</small><b>${models.length}</b></div>
 </div>

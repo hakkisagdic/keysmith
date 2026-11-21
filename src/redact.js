@@ -19,7 +19,7 @@ import crypto from 'node:crypto';
  * the character before it: a key glued to `\n` in JSON, to the `m` closing an ANSI colour or
  * to `Bearer_` is still a key.
  */
-const KEY_SHAPE = /ks_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/g;
+export const KEY_SHAPE = /ks_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/g;
 const MINTED_LENGTH = 35;
 
 /**
@@ -65,7 +65,7 @@ export function redactKey(key) {
  * a minted key, it is taken out on its shape alone, so one that was never registered here —
  * read by another process, quoted back in a provider's error — is not printed either.
  */
-const GOOGLE_KEY_SHAPE = /AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/g;
+export const GOOGLE_KEY_SHAPE = /AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/g;
 const GOOGLE_KEY_LENGTH = 39;
 
 /** The start of a Google API key, as the tail of a piece of streamed text. */
