@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { Hub, PROGRESS_MS, RETRY_AFTER_S } from '../src/bridge/hub.js';
 import { LATEST_PROTOCOL, MAX_INVALID_CALLS, toolListing, withToolMeta } from '../src/bridge/mcp.js';
 import { knownSecrets } from '../src/redact.js';
+import { waitFor } from './wait-for.js';
 
 const SHIM = fileURLToPath(new URL('../src/bridge/shim.js', import.meta.url));
 const dirs = [];
@@ -64,7 +65,8 @@ function client(env) {
   const notes = [];
   let next = 1;
   let stderr = '';
-  readline.createInterface({ input: child.stdout }).on('line', (l) => {
+  const rl = readline.createInterface({ input: child.stdout });
+  rl.on('line', (l) => {
     const m = JSON.parse(l);
     if (m.id !== undefined && pending.has(m.id)) {
       pending.get(m.id)(m);
@@ -73,11 +75,20 @@ function client(env) {
   });
   child.stderr.on('data', (c) => (stderr += c));
   child.stdin.on('error', () => {});
-  const exited = new Promise((r) => child.on('exit', (code) => r(code)));
+  let exitCode = null;
+  const rlClosed = new Promise((r) => rl.once('close', r));
+  const childClosed = new Promise((r) => child.once('close', (code) => r(code)));
+  const exited = Promise.all([rlClosed, childClosed]).then(([, code]) => {
+    exitCode = code ?? -1;
+    return code;
+  });
   return {
     child,
     notes,
     exited,
+    get exitCode() {
+      return exitCode;
+    },
     get stderr() {
       return stderr;
     },
@@ -99,17 +110,6 @@ function client(env) {
     },
   };
 }
-
-/** `p`, or 'timeout' after `ms`. */
-const within = (p, ms = 1500) => Promise.race([p, new Promise((r) => setTimeout(() => r('timeout'), ms))]);
-const until = async (fn, ms = 3000) => {
-  const end = Date.now() + ms;
-  while (!fn()) {
-    if (Date.now() > end) return false;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  return true;
-};
 
 /** Up to the tools/list a CLI asks for, the way agy 1.4.2 asks. */
 async function handshake(c) {
@@ -193,7 +193,17 @@ test('tools/call waits for the client\'s result, which goes back as the call\'s 
   const pending = c.rpc('tools/call', { name: 'get_weather', arguments: { city: 'Ankara', unit: null }, _meta: { progressToken: 'tok-1' } });
   const call = await s.next();
   assert.deepEqual([call.type, call.name, call.args], ['call', 'get_weather', { city: 'Ankara', unit: null }]);
-  assert.equal(await within(pending, 300), 'timeout', 'held: no answer until the client has one');
+  let pendingAnswered = false;
+  void pending.then(
+    () => {
+      pendingAnswered = true;
+    },
+    () => {
+      pendingAnswered = true;
+    },
+  );
+  await c.rpc('ping');
+  assert.equal(pendingAnswered, false, 'held: no answer until the client has one');
   s.hold({ id: 'call_abc', mcpId: call.mcpId, name: call.name });
   assert.equal(s.state, 'waiting');
   s.attach();
@@ -216,25 +226,45 @@ test('a wrong or missing token is refused, so is a second connection; a dropped 
   const s = open();
   // Wrong token: the connection is closed unanswered, and the shim ends with it.
   const wrong = client({ ...s.env, KEYSMITH_BRIDGE_TOKEN: 'not-the-token-' + 'x'.repeat(30) });
-  assert.equal(await within(wrong.rpc('ping'), 800), 'timeout');
-  assert.equal(await within(wrong.exited, 2000), 0);
+  let wrongAnswered = false;
+  void wrong.rpc('ping').then(
+    () => {
+      wrongAnswered = true;
+    },
+    () => {
+      wrongAnswered = true;
+    },
+  );
+  await waitFor(() => wrong.exitCode !== null, { message: 'wrong-token shim exited' });
+  assert.equal(wrongAnswered, false);
+  assert.equal(wrong.exitCode, 0);
   // No token at all: the shim refuses to start.
   const none = client({ KEYSMITH_BRIDGE_SOCK: s.env.KEYSMITH_BRIDGE_SOCK });
   assert.equal(await none.exited, 2);
   assert.match(none.stderr, /KEYSMITH_BRIDGE_TOKEN \(or KEYSMITH_BRIDGE_TOKEN_FILE\) must be set/);
-  assert.ok(log.some((l) => /a connection was refused: a wrong or missing token/.test(l)), log.join('\n'));
+  assert.ok(await waitFor(() => log.some((l) => /a connection was refused: a wrong or missing token/.test(l))), log.join('\n'));
   // One connection per session.
   const first = client(s.env);
   assert.deepEqual((await first.rpc('ping')).result, {});
   const second = client(s.env);
-  assert.equal(await within(second.rpc('ping'), 800), 'timeout');
-  assert.equal(await within(second.exited, 2000), 0);
-  assert.ok(log.some((l) => new RegExp(`bridge ${s.server} has a connection already`).test(l)));
+  let secondAnswered = false;
+  void second.rpc('ping').then(
+    () => {
+      secondAnswered = true;
+    },
+    () => {
+      secondAnswered = true;
+    },
+  );
+  await waitFor(() => second.exitCode !== null, { message: 'second-connection shim exited' });
+  assert.equal(secondAnswered, false);
+  assert.equal(second.exitCode, 0);
+  assert.ok(await waitFor(() => log.some((l) => new RegExp(`bridge ${s.server} has a connection already`).test(l))));
   assert.deepEqual((await first.rpc('ping')).result, {}, 'the first one is untouched');
   // It drops; a new one takes its place.
   first.close();
   await first.exited;
-  assert.ok(await until(() => s.conn === null));
+  assert.ok(await waitFor(() => s.conn === null));
   const third = client(s.env);
   assert.deepEqual((await third.rpc('ping')).result, {});
   third.close();
@@ -247,8 +277,24 @@ test('the token from a file (KEYSMITH_BRIDGE_TOKEN_FILE, for a CLI that takes it
   const file = path.join(dir, 'ks-b-token');
   fs.writeFileSync(file, `${s.token}\n`, { mode: 0o600 });
   const c = client({ KEYSMITH_BRIDGE_SOCK: s.env.KEYSMITH_BRIDGE_SOCK, KEYSMITH_BRIDGE_TOKEN_FILE: file });
-  const hs = await within(handshake(c), 3000);
-  assert.notEqual(hs, 'timeout', `the shim did not connect with the token from the file: ${c.stderr}`);
+  let hs = null;
+  let hsErr = null;
+  void handshake(c).then(
+    (v) => {
+      hs = v;
+    },
+    (err) => {
+      hsErr = err;
+    },
+  );
+  await waitFor(
+    () => {
+      if (hsErr) throw hsErr;
+      return hs !== null;
+    },
+    { message: `the shim did not connect with the token from the file: ${c.stderr}` },
+  );
+  assert.notEqual(hs, null, `the shim did not connect with the token from the file: ${c.stderr}`);
   assert.deepEqual(hs.list.result.tools.map((t) => t.name), ['get_weather', 'note']);
   c.close();
   await c.exited;
@@ -307,13 +353,14 @@ test('notifications/cancelled for the waiting call breaks the session: closed, i
   s.hold({ id: 'call_cancelled', mcpId: call.mcpId, name: call.name });
   assert.equal(hub.sessionForCall('call_cancelled'), s);
   c.notify('notifications/cancelled', { requestId: c.lastId, reason: 'user stopped it' });
-  assert.ok(await until(() => s.closed));
+  assert.ok(await waitFor(() => s.closed));
   assert.equal(s.closedReason, 'cancelled');
   assert.equal(hub.sessionForCall('call_cancelled'), null);
   assert.equal(hub.tombstone('call_cancelled').reason, 'cancelled');
   await s.closing;
   assert.equal(cleaned, 'cancelled');
-  assert.equal(await within(c.exited, 2000), 0, 'the connection is closed, and the CLI\'s MCP server ends');
+  await waitFor(() => c.exitCode !== null, { message: 'cancelled shim exited' });
+  assert.equal(c.exitCode, 0, 'the connection is closed, and the CLI\'s MCP server ends');
   // While a turn reads it, a cancel is that turn's event instead.
   const s2 = open({ caller: 'k2' });
   const c2 = client(s2.env);
@@ -337,12 +384,13 @@ test('a client that never comes back: at toolResultTimeoutMs the session closes 
   void c.rpc('tools/call', { name: 'get_weather', arguments: { city: 'Ankara' } });
   const call = await s.next();
   s.hold({ id: 'call_late', mcpId: call.mcpId, name: call.name });
-  assert.ok(await until(() => s.closed, 2000), 'closed by its clock');
+  assert.ok(await waitFor(() => s.closed), 'closed by its clock');
   assert.equal(s.closedReason, 'expired');
   assert.equal(hub.sessionForCall('call_late'), null);
   assert.deepEqual(hub.tombstone('call_late'), { reason: 'expired', at: 0, caller: 'k1' });
   assert.ok(!knownSecrets().includes(s.token), 'a dead token is no secret worth keeping');
-  assert.equal(await within(c.exited, 2000), 0);
+  await waitFor(() => c.exitCode !== null, { message: 'expired shim exited' });
+  assert.equal(c.exitCode, 0);
   clock.tick(3_600_001);
   assert.equal(hub.tombstone('call_late'), null, 'an hour later the id is forgotten');
 });
@@ -393,7 +441,7 @@ test('while a call waits, progress goes to its progressToken every PROGRESS_MS; 
   clock.tick(PROGRESS_MS - 1);
   clock.tick(1);
   clock.tick(PROGRESS_MS);
-  assert.ok(await until(() => c.notes.length >= 2));
+  assert.ok(await waitFor(() => c.notes.length >= 2));
   assert.deepEqual(
     c.notes.map((n) => [n.method, n.params.progressToken, n.params.progress]),
     [
@@ -405,7 +453,7 @@ test('while a call waits, progress goes to its progressToken every PROGRESS_MS; 
   s.answer({ text: 'sunny' });
   await pending;
   clock.tick(PROGRESS_MS * 3);
-  await new Promise((r) => setTimeout(r, 100));
+  await c.rpc('ping');
   assert.equal(c.notes.length, 2, 'no progress for a call that was answered');
   c.close();
   await s.close('done');
@@ -420,14 +468,16 @@ test('the hub\'s log names sessions, tools and reasons — never a token, an arg
   await handshake(c);
   await s.next();
   await c.rpc('tools/call', { name: 'get_weather', arguments: { city: 99_123 } });
-  void c.rpc('tools/call', { name: 'get_weather', arguments: { city: 'ARG-MARKER-Q7' } });
+  const answered = c.rpc('tools/call', { name: 'get_weather', arguments: { city: 'ARG-MARKER-Q7' } });
   let call;
   do call = await s.next();
   while (call.type !== 'call');
   s.hold({ id: 'call_log', mcpId: call.mcpId, name: call.name });
   s.attach();
   s.answer({ text: 'RESULT-MARKER-Z9' });
-  await new Promise((r) => setTimeout(r, 100));
+  await answered;
+  c.close();
+  await c.exited;
   await s.close('done');
   void hub;
   const all = log.join('\n');

@@ -21,6 +21,7 @@ import { CliAdapter } from '../src/cli-adapter.js';
 import { McpBridge } from '../src/bridge/index.js';
 import { agyDriver } from '../src/bridge/agy.js';
 import { agyStreamJson } from '../src/parsers.js';
+import { holdTimer, waitFor } from './wait-for.js';
 
 const STUB = fileURLToPath(new URL('./stubs/agy-bridge.mjs', import.meta.url));
 const KEY = 'ks_' + crypto.randomBytes(24).toString('base64url');
@@ -38,14 +39,14 @@ function agy(mode, limits = {}, extra = {}) {
     bin: STUB,
     args: p.args,
     emulateArgs: p.emulateArgs,
-    bridge: { ...p.bridge, mcpCacheDir: cache, readyTimeoutMs: 10_000, toolResultTimeoutMs: 60_000, ...limits },
+    bridge: { ...p.bridge, mcpCacheDir: cache, readyTimeoutMs: 20_000, toolResultTimeoutMs: 60_000, ...limits },
     parser: p.parser,
     cwd: ws,
     workspaceFiles: p.workspaceFiles,
     stopAtToolCall: true,
     toolMode: mode,
     env: { AGY_BRIDGE_LOG: path.join(dir, 'bridge.jsonl'), AGY_EMU_LOG: path.join(dir, 'emu.jsonl'), STUB_MCP_CACHE: cache },
-    timeoutMs: 20_000,
+    timeoutMs: 30_000,
     maxConcurrent: 4,
     ...extra,
   };
@@ -73,7 +74,7 @@ before(async () => {
       agy: agy('auto'),
       agym: agy('mcp', { maxSessions: 1 }),
       agy1: agy('auto', { maxSessions: 1 }),
-      agyt: agy('auto', { toolResultTimeoutMs: 1_200, readyTimeoutMs: 1_000 }),
+      agyt: agy('auto', { toolResultTimeoutMs: 400, readyTimeoutMs: 1_000 }),
       agy2: agy('auto', { maxTurns: 2 }),
       agys: agy('auto', {}, { maxConcurrent: 1 }),
       // An env value spawn() refuses at once (a NUL): a CLI that cannot be started.
@@ -84,6 +85,8 @@ before(async () => {
     aliases: { pair: ['agy/m', 'agy1/m'], tripemu: ['agy/m', 'agye/m'], triphttp: ['agy/m', 'up/m'] },
   };
   gateway = new Gateway(cfg, { log: (m) => log.push(m) });
+  gateway.toolEngines.mcp.killGraceMs = 1_000;
+  gateway.toolEngines.mcp.stepGraceMs = 8_000;
   usageLog = new UsageLog(path.join(dir, 'usage.jsonl'));
   server = createServer(gateway, cfg, { usage: usageLog, log: (m) => log.push(m) });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -126,14 +129,6 @@ const alive = (pid) => {
   } catch {
     return false;
   }
-};
-const until = async (fn, ms = 8000) => {
-  const end = Date.now() + ms;
-  while (!fn()) {
-    if (Date.now() > end) return false;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  return true;
 };
 /** No session file or schema directory is left, and no stub or shim of `pids` runs. */
 const clean = (pids = []) => {
@@ -284,7 +279,7 @@ for (const [face, stream] of [
     assert.deepEqual([row.toolMode, row.bridge.path, row.bridge.turn, row.bridge.session], ['mcp', 'attached', 2, `ks${run.agent.slice(5, 11)}`]);
     assert.deepEqual([row.usage.input, row.usage.output], [1100, 30]);
     assert.equal(runsOf(t).length, 1, 'both turns on one agy process');
-    assert.ok(await until(() => clean(groupOf(run.pid))), 'its agent file, its schema dir, agy, its helper and the shim: all gone');
+    assert.ok(await waitFor(() => clean(groupOf(run.pid))), 'its agent file, its schema dir, agy, its helper and the shim: all gone');
   });
 }
 
@@ -344,7 +339,7 @@ test('a session that handed out maxTurns calls is closed at the next result, and
   assert.equal(lastRow().bridge.path, 'cold');
   assert.equal(runsOf(t).length, 2);
   assert.ok(log.some((l) => /closed at maxTurns \(2 calls\)/.test(l)));
-  assert.ok(await until(() => !alive(first.pid)));
+  assert.ok(await waitFor(() => !alive(first.pid)));
 });
 
 test('a preamble stays in the answer that carries the call; harness-added arguments are taken off; a call the schema refuses is the model\'s to correct', async () => {
@@ -386,18 +381,24 @@ test('three calls the schema refuses in one turn fail the turn; auto answers the
   assert.deepEqual([lastRow().usage.input, lastRow().usage.output], [2000, 40], 'the row counts both engines');
   assert.deepEqual([json(one.r).usage.prompt_tokens, json(one.r).usage.completion_tokens], [2000, 40], 'and so does the answer\'s usage');
   const [run] = runsOf(t);
-  assert.ok(await until(() => clean([run.pid, shimOf(run.pid)])));
+  assert.ok(await waitFor(() => clean([run.pid, shimOf(run.pid)])));
 });
 
 test('a client that never comes back: the session closes at toolResultTimeoutMs — process group stopped, files gone — and its late result is answered on the cold path', async () => {
   const t = tag();
   const c = conversation('openai', { model: 'agyt/m', user: `Weather? SCENARIO=one-call ${t}` });
-  const one = await c.ask();
-  assert.equal(one.calls.length, 1);
-  const [run] = runsOf(t);
-  const group = groupOf(run.pid);
-  assert.ok(group.every(alive));
-  assert.ok(await until(() => clean(group), 6000), 'the process group stopped and cleaned up after 1.2 s');
+  let run, group;
+  const releaseExpiry = holdTimer(gateway.toolEngines.mcp.hub, (ms) => ms === 400);
+  try {
+    const one = await c.ask();
+    assert.equal(one.calls.length, 1);
+    [run] = runsOf(t);
+    group = groupOf(run.pid);
+    assert.ok(group.every(alive));
+  } finally {
+    releaseExpiry();
+  }
+  assert.ok(await waitFor(() => clean(group)), 'the process group stopped and cleaned up after 1.2 s');
   assert.ok(log.some((l) => /bridge ks[0-9a-f]{6}: call 1 \(get_weather\) handed to the client/.test(l)));
   c.result();
   const late = await c.ask();
@@ -409,7 +410,7 @@ test('a client that never comes back: the session closes at toolResultTimeoutMs 
   assert.match(runs[1].prompt, /<assistant_tool_calls>/);
   assert.deepEqual([lastRow().toolMode, lastRow().bridge.path], ['mcp', 'cold']);
   assert.ok(log.some((l) => /a late result for agyt\/m \(its session is gone: expired\)/.test(l)));
-  assert.ok(await until(() => clean([runs[1].pid])));
+  assert.ok(await waitFor(() => clean([runs[1].pid])));
 });
 
 test('a client that leaves in the middle of a streamed turn: agy is stopped, the session gone', async () => {
@@ -431,20 +432,20 @@ test('a client that leaves in the middle of a streamed turn: agy is stopped, the
   const [run] = runsOf(t);
   assert.ok(alive(run.pid));
   ctrl.abort();
-  assert.ok(await until(() => clean(groupOf(run.pid))), 'the client left: agy, its helper and its shim were stopped');
+  assert.ok(await waitFor(() => clean(groupOf(run.pid))), 'the client left: agy, its helper and its shim were stopped');
 });
 
 test('a client that leaves after the turn spent a model step: agy is stopped, and the row holds what the step cost', async () => {
   const t = tag();
   const ctrl = new AbortController();
   const asked = post('/v1/chat/completions', { model: 'agym/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather? SCENARIO=step-then-hang ${t}` }] }, KEY, ctrl.signal).catch(() => null);
-  assert.ok(await until(() => stub().some((e) => e.event === 'hang' && e.pid === runsOf(t)[0]?.pid)), 'the step was spent');
+  assert.ok(await waitFor(() => stub().some((e) => e.event === 'hang' && e.pid === runsOf(t)[0]?.pid)), 'the step was spent');
   const rowsBefore = rows().length;
   ctrl.abort();
   await asked;
   const [run] = runsOf(t);
-  assert.ok(await until(() => clean(groupOf(run.pid))));
-  assert.ok(await until(() => rows().length > rowsBefore));
+  assert.ok(await waitFor(() => clean(groupOf(run.pid))));
+  assert.ok(await waitFor(() => rows().length > rowsBefore));
   const row = lastRow();
   assert.deepEqual([row.status, row.toolMode, row.usage?.input, row.usage?.output], ['error', 'mcp', 1000, 20]);
 });
@@ -476,7 +477,7 @@ test('a history whose user turns changed is not a continuation: the cold path, a
   const r = await c.ask();
   assert.equal(r.text, 'From the history: RESULT for Ankara');
   assert.equal(lastRow().bridge.path, 'cold');
-  assert.ok(await until(() => !alive(first.pid)), 'one session per key: the old one was closed for the new one');
+  assert.ok(await waitFor(() => !alive(first.pid)), 'one session per key: the old one was closed for the new one');
   assert.ok(log.some((l) => /closed to make room for a new session of the same key/.test(l)));
 });
 
@@ -500,8 +501,8 @@ test('a result with text of the user\'s after it (a Messages API turn holding a 
     assert.match(runs[1].prompt, /<<<END [0-9a-f]{8}>>>\n\n<user>\nThanks, go on\.\n<\/user>/, 'the text is a user turn after the result, never part of it');
     assert.ok(log.some((l) => l.startsWith(`bridge ${server}: closed: the result came with text of the user's`)), face);
     assert.ok(!log.some((l) => l.startsWith(`bridge ${server}: closed to make room`)), 'closed for the conversation, not evicted');
-    assert.ok(await until(() => !alive(first.pid)));
-    assert.ok(await until(() => clean([runs[1].pid])));
+    assert.ok(await waitFor(() => !alive(first.pid)));
+    assert.ok(await waitFor(() => clean([runs[1].pid])));
   }
 });
 
@@ -517,7 +518,7 @@ test('a conversation that goes on after its calls were answered is the cold path
   assert.equal(three.r.status, 200, three.r.text);
   assert.equal(three.text, 'From the history: RESULT for Ankara');
   assert.equal(lastRow().bridge.path, 'cold', 'its prompt carries earlier calls and results: not a new conversation');
-  assert.ok(await until(() => clean([runsOf(t)[1]?.pid])));
+  assert.ok(await waitFor(() => clean([runsOf(t)[1]?.pid])));
 });
 
 test('the older functions/function_call carry no call id a later request could continue: auto answers them with EMULATE from the first turn, and toolMode mcp refuses them', async () => {
@@ -550,7 +551,8 @@ test('a second request for a result another request is answering: 409, and no ot
   c.result();
   const body = { model: 'pair', tools: TOOLS, messages: c.history };
   const first = post('/v1/chat/completions', body);
-  await new Promise((r) => setTimeout(r, 300));
+  const [run] = runsOf(t);
+  await waitFor(() => gateway.toolEngines.mcp.hub.sessions.get(`kb_${run.agent.slice(5)}`)?.state === 'generating');
   const second = await post('/v1/chat/completions', body);
   assert.equal(second.status, 409, second.text);
   assert.match(json(second).error.message, /being answered by another request right now/);
@@ -568,7 +570,7 @@ test('agy that cannot find the agent (rc=1), and one that never lists the tools:
   assert.deepEqual(json(r).choices[0].message.tool_calls.map((c) => c.function.arguments), ['{"city":"Ankara"}']);
   assert.deepEqual([lastRow().toolMode, lastRow().fallback], ['emulate', 'unknown_agent']);
   assert.equal(emuRuns().length, before + 1);
-  assert.ok(await until(() => clean()));
+  assert.ok(await waitFor(() => clean()));
 
   before = emuRuns().length;
   t = tag();
@@ -578,7 +580,7 @@ test('agy that cannot find the agent (rc=1), and one that never lists the tools:
   assert.deepEqual([lastRow().toolMode, lastRow().fallback], ['emulate', 'ready_timeout']);
   assert.equal(emuRuns().length, before + 1);
   const [run] = runsOf(t);
-  assert.ok(await until(() => clean([run.pid])), 'the run that never got ready was stopped');
+  assert.ok(await waitFor(() => clean([run.pid])), 'the run that never got ready was stopped');
 
   // agy that ran without reading the session's server (its default agent, say) answers in text
   // without ever listing the tools: that text is not the answer; EMULATE is.
@@ -595,7 +597,7 @@ test('a waiting session holds no process slot: with maxConcurrent 1, agy still a
   const t = tag();
   const c = conversation('openai', { model: 'agys/m', user: `Weather? SCENARIO=one-call ${t}` });
   await c.ask();
-  const ctrl = AbortSignal.timeout(8000);
+  const ctrl = AbortSignal.timeout(20_000);
   const r = await post('/v1/chat/completions', { model: 'agys/m', messages: [{ role: 'user', content: 'Hi. SCENARIO=plain' }] }, KEY, ctrl);
   assert.equal(json(r).choices[0].message.content, 'plain answer');
   c.result();
@@ -612,7 +614,7 @@ test('agy reaching for a tool of its own: stopped, a 502, logged — and never r
   assert.deepEqual([lastRow().status, lastRow().toolMode, lastRow().fallback, lastRow().failure], ['error', 'mcp', undefined, 'foreign_tool']);
   assert.ok(log.some((l) => /SECURITY: agy reached for a tool of its own \("run_command"\).*foreign tool/.test(l)));
   const [run] = runsOf(t);
-  assert.ok(await until(() => clean([run.pid, shimOf(run.pid)])));
+  assert.ok(await waitFor(() => clean([run.pid, shimOf(run.pid)])));
 });
 
 test('the tripwire ends the route: no later leg answers the request — not EMULATE on another adapter, not an HTTP upstream', async () => {
@@ -626,7 +628,7 @@ test('the tripwire ends the route: no later leg answers the request — not EMUL
     const row = lastRow();
     assert.deepEqual([row.status, row.toolMode, row.failure, row.failedLegs], ['error', 'mcp', 'foreign_tool', undefined], model);
     const [run] = runsOf(t);
-    assert.ok(await until(() => clean([run.pid, shimOf(run.pid)])));
+    assert.ok(await waitFor(() => clean([run.pid, shimOf(run.pid)])));
   }
   assert.equal(emuRuns().length, before, 'agye (EMULATE) was not asked');
   assert.equal(upstreamHits, hits, 'the upstream was not asked');
@@ -634,14 +636,14 @@ test('the tripwire ends the route: no later leg answers the request — not EMUL
 
 test('a foreign tool while a call waits for the client: agy is stopped then and there, and the request that brings the result is the tripwire\'s 502 — the result never reaches agy', async () => {
   const t = tag();
-  const c = conversation('openai', { user: `Weather? SCENARIO=foreign-while-waiting ${t}` });
+  const c = conversation('openai', { user: `Weather? SCENARIO=foreign-while-waiting FOREIGN_AFTER=800 ${t}` });
   const one = await c.ask();
   assert.equal(one.r.status, 200, one.r.text);
   assert.equal(one.calls[0].name, 'get_weather');
   const [run] = runsOf(t);
   const group = groupOf(run.pid);
-  assert.ok(await until(() => stub().some((e) => e.event === 'foreign-shown' && e.pid === run.pid)));
-  assert.ok(await until(() => clean(group), 3000), 'agy, its helper and its shim stopped, its files gone — with no request reading the session');
+  assert.ok(await waitFor(() => stub().some((e) => e.event === 'foreign-shown' && e.pid === run.pid)));
+  assert.ok(await waitFor(() => clean(group)), 'agy, its helper and its shim stopped, its files gone — with no request reading the session');
   assert.ok(log.some((l) => /SECURITY: agy reached for a tool of its own \("run_command"\) while its call was with the client/.test(l)));
   c.result((x) => `CLIENT-RESULT for ${x.args.city}`);
   const two = await c.ask();
@@ -654,32 +656,32 @@ test('a foreign tool while a call waits for the client: agy is stopped then and 
   const other = await post('/v1/chat/completions', { model: 'agy/m', tools: TOOLS, messages: c.history }, OTHER);
   assert.equal(other.status, 200, other.text);
   assert.equal(json(other).choices[0].message.content, 'From the history: CLIENT-RESULT for Ankara');
-  assert.ok(await until(() => clean([runsOf(t)[1]?.pid])));
+  assert.ok(await waitFor(() => clean([runsOf(t)[1]?.pid])));
 });
 
 test('a foreign tool while the result waits for a process slot: the session is closed then, and the result is never written to it', async () => {
   // agys has one process slot. Another key's turn holds it, generating, while this conversation's
   // result waits for it; agy shows a tool of its own in that wait.
   const t = tag();
-  const c = conversation('openai', { model: 'agys/m', user: `Weather? SCENARIO=foreign-while-waiting FOREIGN_AFTER=1500 ${t}` });
+  const c = conversation('openai', { model: 'agys/m', user: `Weather? SCENARIO=foreign-while-waiting FOREIGN_AFTER=4000 ${t}` });
   const one = await c.ask();
   assert.equal(one.calls.length, 1, one.r.text);
   const [run] = runsOf(t);
   const holder = new AbortController();
   const t2 = tag();
   const holding = post('/v1/chat/completions', { model: 'agys/m', tools: TOOLS, messages: [{ role: 'user', content: `Weather? SCENARIO=step-then-hang ${t2}` }] }, OTHER, holder.signal).catch(() => null);
-  assert.ok(await until(() => stub().some((e) => e.event === 'hang' && e.pid === runsOf(t2)[0]?.pid)), 'the slot is taken');
+  assert.ok(await waitFor(() => stub().some((e) => e.event === 'hang' && e.pid === runsOf(t2)[0]?.pid)), 'the slot is taken');
   c.result((x) => `CLIENT-RESULT for ${x.args.city}`);
   const asking = c.ask();
-  assert.ok(await until(() => stub().some((e) => e.event === 'foreign-shown' && e.pid === run.pid)));
-  assert.ok(await until(() => log.some((l) => /SECURITY: agys reached for a tool of its own/.test(l) && l.includes(`ks${run.agent.slice(5, 11)}`))));
+  assert.ok(await waitFor(() => stub().some((e) => e.event === 'foreign-shown' && e.pid === run.pid)));
+  assert.ok(await waitFor(() => log.some((l) => /SECURITY: agys reached for a tool of its own/.test(l) && l.includes(`ks${run.agent.slice(5, 11)}`))));
   holder.abort();
   await holding;
   const two = await asking;
   assert.equal(two.r.status, 502, two.r.text);
   assert.match(json(two.r).error.message, /reached for a tool of its own \("run_command"\)/);
   assert.ok(!stub().some((e) => e.event === 'result' && e.pid === run.pid && /CLIENT-RESULT/.test(e.text)), 'the client\'s result did not reach the flagged run');
-  assert.ok(await until(() => clean([...groupOf(run.pid), runsOf(t2)[0].pid])));
+  assert.ok(await waitFor(() => clean([...groupOf(run.pid), runsOf(t2)[0].pid])));
 });
 
 test('an answer followed by manage_task ends there (stopAtToolCall): the text stands, the row says cutAt', async () => {
@@ -691,7 +693,7 @@ test('an answer followed by manage_task ends there (stopAtToolCall): the text st
   assert.equal(two.text, 'Weather: RESULT for Ankara');
   assert.equal(lastRow().cutAt, 'manage_task');
   const [run] = runsOf(t);
-  assert.ok(await until(() => clean([run.pid])));
+  assert.ok(await waitFor(() => clean([run.pid])));
 });
 
 test('agy 1.4.12\'s list_resources and read_resource before a call are the harness\'s, not the tripwire\'s: the session goes on', async () => {
@@ -707,7 +709,7 @@ test('agy 1.4.12\'s list_resources and read_resource before a call are the harne
   assert.equal((await c.ask()).text, 'Weather: RESULT for Ankara');
   assert.equal(lastRow().failure, undefined);
   assert.ok(!log.some((l) => /SECURITY: agy reached for a tool of its own \("(list|read)_resource/.test(l)));
-  assert.ok(await until(() => clean([run.pid])));
+  assert.ok(await waitFor(() => clean([run.pid])));
 });
 
 test('a tool name too long for mcp_ks<rid6>_ under Gemini\'s 64 is EMULATE\'s; so is a request with no room — and with toolMode mcp, no room is a 503', async () => {
@@ -786,7 +788,7 @@ test('a CLI that cannot be started at all (spawn() throws at once): no agent fil
   assert.equal(r.status, 502, r.text);
   assert.match(json(r).error.message, /could not start agy-bridge\.mjs \(ERR_INVALID_ARG_VALUE\)/);
   assert.ok(!r.text.includes('BROKEN'), 'what spawn() quoted stays out of the message');
-  assert.ok(await until(() => clean()), 'the session\'s agent file (with its token) was removed');
+  assert.ok(await waitFor(() => clean()), 'the session\'s agent file (with its token) was removed');
   assert.equal(gateway.toolEngines.mcp.hub.stats().sessions, 0);
 });
 
@@ -831,7 +833,7 @@ test('the gateway closing (SIGTERM) stops every waiting session: process groups 
   const group = groupOf(run.pid);
   assert.ok(group.every(alive));
   await gateway.close();
-  assert.ok(await until(() => clean(group)));
+  assert.ok(await waitFor(() => clean(group)));
   assert.ok(!fs.existsSync(path.join(dir, 'b.sock')));
   // Its result comes back after the restart: the cold path answers it.
   c.result();

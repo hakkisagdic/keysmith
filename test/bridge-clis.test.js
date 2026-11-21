@@ -22,6 +22,7 @@ import { SHIM } from '../src/bridge/agy.js';
 import { CLAUDE_BRIDGE_ARGS, CLAUDE_RESULT_CEILING, claudeDriver, codexDriver, opencodeDriver, qoderDriver } from '../src/bridge/clis.js';
 import { DRIVERS } from '../src/bridge/drivers.js';
 import { claudeStreamJson, codexJson } from '../src/parsers.js';
+import { holdTimer, waitFor } from './wait-for.js';
 
 const STUB = fileURLToPath(new URL('./stubs/cli-bridge.mjs', import.meta.url));
 const GOLDEN = fileURLToPath(new URL('./fixtures/bridge-plans.json', import.meta.url));
@@ -33,14 +34,21 @@ const log = [];
 /** A built-in profile around the stub: its bridge settings as shipped, toolMode mcp (a failure is the bridge's, never EMULATE's). */
 function around(name, cli, { bridge = {}, ...extra } = {}) {
   const p = structuredClone(CLI_PROFILES[name]);
+  const home = path.join(dir, 'home');
   return {
     ...p,
     bin: STUB,
     cwd: path.join(dir, `ws-${name}`),
     toolMode: 'mcp',
-    bridge: { ...p.bridge, readyTimeoutMs: 10_000, toolResultTimeoutMs: 60_000, ...bridge },
-    env: { STUB_CLI: cli, CLI_BRIDGE_LOG: path.join(dir, 'bridge.jsonl') },
-    timeoutMs: 20_000,
+    bridge: { ...p.bridge, readyTimeoutMs: 20_000, toolResultTimeoutMs: 60_000, ...bridge },
+    env: {
+      STUB_CLI: cli,
+      CLI_BRIDGE_LOG: path.join(dir, 'bridge.jsonl'),
+      HOME: home,
+      XDG_CONFIG_HOME: path.join(home, '.config'),
+      XDG_DATA_HOME: path.join(home, '.local', 'share'),
+    },
+    timeoutMs: 30_000,
     maxConcurrent: 4,
     ...extra,
   };
@@ -52,6 +60,7 @@ const NO_APPROVAL = (args) => args.filter((a, i) => !(a === '-c' && /default_too
 before(async () => {
   // os.tmpdir(): the socket's path must stay under 103 bytes.
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ksbx-'));
+  fs.mkdirSync(path.join(dir, 'home'), { recursive: true, mode: 0o700 });
   const cfg = {
     auth: { enabled: true, keys: [KEY] },
     limits: { streamHoldMs: 300, streamKeepaliveMs: 60, bridge: { socket: path.join(dir, 'b.sock'), maxSessions: 6, maxSessionsPerKey: 6 } },
@@ -64,9 +73,9 @@ before(async () => {
       qd: around('qoder', 'qoder'),
       // Claude Code's profile as shipped (explicit-only, toolMode auto made mcp here), with a catalogue of its own.
       cc: around('claude', 'claude', { models: [{ id: 'm', efforts: ['low', 'high'] }] }),
-      oct: around('opencode', 'opencode', { bridge: { toolResultTimeoutMs: 1_200 }, cwd: path.join(dir, 'ws-opencode-t') }),
+      oct: around('opencode', 'opencode', { bridge: { toolResultTimeoutMs: 400 }, cwd: path.join(dir, 'ws-opencode-t') }),
       // Claude Code's profile with a short clock: a client that never comes back.
-      cct: around('claude', 'claude', { bridge: { toolResultTimeoutMs: 1_200 }, cwd: path.join(dir, 'ws-claude-t'), models: [{ id: 'm', efforts: ['low', 'high'] }] }),
+      cct: around('claude', 'claude', { bridge: { toolResultTimeoutMs: 400 }, cwd: path.join(dir, 'ws-claude-t'), models: [{ id: 'm', efforts: ['low', 'high'] }] }),
       // An entry copied from the profile before auto-memory was off in its argv, with a cap of its own.
       ccx: around('claude', 'claude', { bridge: { args: CLAUDE_BRIDGE_ARGS.map((a) => (a === CLAUDE_SETTINGS ? '{"disableAllHooks":true}' : a)) }, cwd: path.join(dir, 'ws-claude-x'), maxPromptChars: 300_000, models: [{ id: 'm' }] }),
       // An entry whose cap was raised past Claude Code's own ceiling for a tool's _meta (500,000).
@@ -74,6 +83,8 @@ before(async () => {
     },
   };
   gateway = new Gateway(cfg, { log: (m) => log.push(m) });
+  gateway.toolEngines.mcp.killGraceMs = 1_000;
+  gateway.toolEngines.mcp.stepGraceMs = 8_000;
   usageLog = new UsageLog(path.join(dir, 'usage.jsonl'));
   server = createServer(gateway, cfg, { usage: usageLog, log: (m) => log.push(m) });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -107,14 +118,6 @@ const alive = (pid) => {
   } catch {
     return false;
   }
-};
-const until = async (fn, ms = 8000) => {
-  const end = Date.now() + ms;
-  while (!fn()) {
-    if (Date.now() > end) return false;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  return true;
 };
 const sessionFiles = (name) => {
   const d = path.join(dir, `ws-${name}`, '.keysmith-bridge');
@@ -357,7 +360,7 @@ test('opencode: two calls of one step go out in one answer, their results back i
   assert.equal(a2.r.status, 200, a2.r.text);
   assert.equal(a2.text, 'Ankara RESULT for Ankara; Izmir RESULT for Izmir', 'each result went to its own call');
   assert.equal(startsOf(t).length, 1, 'one process for both turns');
-  assert.ok(await until(() => !alive(start.pid) && !sessionFiles('opencode').length), 'the run ended and its file is gone');
+  assert.ok(await waitFor(() => !alive(start.pid) && !sessionFiles('opencode').length), 'the run ended and its file is gone');
   const rows = rowsOf('oc/m').slice(-2);
   assert.deepEqual(rows.map((r) => [r.toolMode, r.toolCalls ?? 0, r.bridge?.path, r.bridge?.turn]), [['mcp', 2, 'new', 1], ['mcp', 0, 'attached', 2]]);
 });
@@ -476,7 +479,7 @@ test('codex: the preamble, then the call shown before it is sent; the result bac
   const a2 = await c.ask();
   assert.equal(a2.text, 'Weather: RESULT for Ankara');
   assert.equal(startsOf(t).length, 1);
-  assert.ok(await until(() => !alive(start.pid) && !sessionFiles('codex').length));
+  assert.ok(await waitFor(() => !alive(start.pid) && !sessionFiles('codex').length));
   assert.ok(rowsOf('cx/m').at(-1).usage?.input > 0, 'the run\'s usage from turn.completed');
 });
 
@@ -585,7 +588,7 @@ test('qoder: the call shown in its assistant message, the result back into the s
     assert.deepEqual([cfg.strict, cfg.allowed, cfg.sources, cfg.settings], [true, `mcp__${eventsOf(start.pid).find((e) => e.event === 'server').server.name}`, 'project', '{"disableAllHooks":true}']);
     assert.equal(startsOf(t).length, 1);
   }
-  assert.ok(await until(() => !sessionFiles('qoder').length));
+  assert.ok(await waitFor(() => !sessionFiles('qoder').length));
 });
 
 /* ----------------------------------------------------------------------------- claude */
@@ -604,7 +607,7 @@ test('claude: a two-turn round trip on every face, streamed or not — the call 
       assert.deepEqual(rowsOf('cc/m').slice(-2).map((r) => [r.toolMode, r.bridge?.path]), [['mcp', 'new'], ['mcp', 'attached']], at);
     }
   }
-  assert.ok(await until(() => !sessionFiles('claude').length), 'nothing left after');
+  assert.ok(await waitFor(() => !sessionFiles('claude').length), 'nothing left after');
 });
 
 test('claude: what its run is given — the session\'s server alone, allowed; no built-in tool, no settings file, no prompt, no session on disk; the token in a 0600 file; Claude Code\'s own clock past keysmith\'s', async () => {
@@ -690,23 +693,29 @@ test('claude: the request\'s own tools may be named like Claude Code\'s built-in
   assert.deepEqual(eventsOf(start.pid).find((e) => e.event === 'mcp').tools, ['Bash', 'Read'], 'the hub lists them under the request\'s names');
   const server = eventsOf(start.pid).find((e) => e.event === 'server').server.name;
   assert.ok(!log.some((l) => l.includes(server) && /SECURITY/.test(l)), 'no tripwire for the request\'s own tools');
-  assert.ok(await until(() => !sessionFiles('claude').length), 'nothing left after');
+  assert.ok(await waitFor(() => !sessionFiles('claude').length), 'nothing left after');
 });
 
 test('claude: a client that never comes back — at toolResultTimeoutMs Claude Code\'s process group is stopped and its MCP config, token and all, removed; the token is in no argv, log line or usage row; the late result runs on the cold path', async () => {
   const t = tag();
   const c = conversation('cct/m', `Weather ${t}`);
-  const a1 = await c.ask();
-  assert.equal(a1.r.status, 200, a1.r.text);
-  assert.equal(a1.calls.length, 1);
-  const [start] = startsOf(t);
-  const shim = eventsOf(start.pid).find((e) => e.event === 'shim').shimPid;
-  const server = eventsOf(start.pid).find((e) => e.event === 'server').server.name;
-  const file = sessionFiles('claude-t').find((f) => f.endsWith('.mcp.json'));
-  const token = JSON.parse(fs.readFileSync(path.join(dir, 'ws-claude-t', '.keysmith-bridge', file), 'utf8')).mcpServers[server].env.KEYSMITH_BRIDGE_TOKEN;
-  assert.ok(token.length > 30);
-  assert.ok(alive(start.pid));
-  assert.ok(await until(() => !alive(start.pid) && !alive(shim) && !sessionFiles('claude-t').length, 6000), 'stopped at its clock, its files gone');
+  let start, shim, server, file, token;
+  const releaseExpiry = holdTimer(gateway.toolEngines.mcp.hub, (ms) => ms === 400);
+  try {
+    const a1 = await c.ask();
+    assert.equal(a1.r.status, 200, a1.r.text);
+    assert.equal(a1.calls.length, 1);
+    [start] = startsOf(t);
+    shim = eventsOf(start.pid).find((e) => e.event === 'shim').shimPid;
+    server = eventsOf(start.pid).find((e) => e.event === 'server').server.name;
+    file = sessionFiles('claude-t').find((f) => f.endsWith('.mcp.json'));
+    token = JSON.parse(fs.readFileSync(path.join(dir, 'ws-claude-t', '.keysmith-bridge', file), 'utf8')).mcpServers[server].env.KEYSMITH_BRIDGE_TOKEN;
+    assert.ok(token.length > 30);
+    assert.ok(alive(start.pid));
+  } finally {
+    releaseExpiry();
+  }
+  assert.ok(await waitFor(() => !alive(start.pid) && !alive(shim) && !sessionFiles('claude-t').length), 'stopped at its clock, its files gone');
   assert.ok(!start.argv.some((a) => a.includes(token)), 'never in the argv');
   assert.ok(!log.some((l) => l.includes(token)), 'never in the gateway\'s log');
   assert.ok(!fs.readFileSync(path.join(dir, 'usage.jsonl'), 'utf8').includes(token), 'never in a usage row');
@@ -716,7 +725,7 @@ test('claude: a client that never comes back — at toolResultTimeoutMs Claude C
   assert.equal(a2.text, 'From the history: LATE-RESULT', 'a new run read the conversation so far');
   assert.equal(startsOf(t).length, 2);
   assert.equal(rowsOf('cct/m').at(-1).bridge.path, 'cold');
-  assert.ok(await until(() => !sessionFiles('claude-t').length), 'nothing left after');
+  assert.ok(await waitFor(() => !sessionFiles('claude-t').length), 'nothing left after');
 });
 
 // Two findings of the independent test of 2026-11-03, against Claude Code 2.1.303 itself (a stub
@@ -766,7 +775,7 @@ test('claude: each tool the hub lists to Claude Code takes a result as long as t
     assert.equal(a2.r.status, 200, a2.r.text);
     assert.equal(a2.text, `Weather: ${big({ args: { city: 'Ankara' } })}`, `${id}: the result reached the model whole`);
     assert.ok(!eventsOf(start.pid).some((e) => e.event === 'spilled'), `${id}: no result left in a file of Claude Code's`);
-    assert.ok(await until(() => !sessionFiles(ws).length), 'nothing left after');
+    assert.ok(await waitFor(() => !sessionFiles(ws).length), 'nothing left after');
   }
   // A result over maxPromptChars never reaches Claude Code: the request is a 400.
   const t = tag();
@@ -850,7 +859,7 @@ for (const [id, ws] of [['oc', 'opencode'], ['cx', 'codex'], ['qd', 'qoder'], ['
     assert.match(JSON.parse(r.text).error.message, /reached for a tool of its own/);
     const [start] = startsOf(t);
     const shim = eventsOf(start.pid).find((e) => e.event === 'shim')?.shimPid;
-    assert.ok(await until(() => !alive(start.pid) && !(shim && alive(shim)) && !sessionFiles(ws).length), 'the process group is stopped and its files removed');
+    assert.ok(await waitFor(() => !alive(start.pid) && !(shim && alive(shim)) && !sessionFiles(ws).length), 'the process group is stopped and its files removed');
     assert.equal(rowsOf(`${id}/m`).at(-1).failure, 'foreign_tool');
     assert.ok(log.some((l) => /SECURITY: .* reached for a tool of its own/.test(l)));
   });
@@ -859,12 +868,18 @@ for (const [id, ws] of [['oc', 'opencode'], ['cx', 'codex'], ['qd', 'qoder'], ['
 test('a client that never comes back: at toolResultTimeoutMs the CLI\'s process group is stopped and its files removed; the late result is answered on the cold path', async () => {
   const t = tag();
   const c = conversation('oct/m', `Weather ${t}`);
-  const a1 = await c.ask();
-  assert.equal(a1.calls.length, 1);
-  const [start] = startsOf(t);
-  const shim = eventsOf(start.pid).find((e) => e.event === 'shim').shimPid;
-  assert.ok(alive(start.pid));
-  assert.ok(await until(() => !alive(start.pid) && !alive(shim) && !sessionFiles('opencode-t').length, 6000), 'stopped at its clock, files gone');
+  let start, shim;
+  const releaseExpiry = holdTimer(gateway.toolEngines.mcp.hub, (ms) => ms === 400);
+  try {
+    const a1 = await c.ask();
+    assert.equal(a1.calls.length, 1);
+    [start] = startsOf(t);
+    shim = eventsOf(start.pid).find((e) => e.event === 'shim').shimPid;
+    assert.ok(alive(start.pid));
+  } finally {
+    releaseExpiry();
+  }
+  assert.ok(await waitFor(() => !alive(start.pid) && !alive(shim) && !sessionFiles('opencode-t').length), 'stopped at its clock, files gone');
   c.results(() => 'LATE-RESULT');
   const a2 = await c.ask();
   assert.equal(a2.r.status, 200, a2.r.text);
