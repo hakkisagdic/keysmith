@@ -22,7 +22,7 @@ import path from 'node:path';
 import { dataDir } from './config.js';
 import { HttpAdapter } from './http-adapter.js';
 import { prepareAdapter } from './gateway.js';
-import { parseKeys, requestDecision } from './keys.js';
+import { isKeyExpired, parseKeys, requestDecision } from './keys.js';
 import { matchPrice, batchFactorOf, cacheWrite1hRate, roundUsd, fmtUsd, UsageLog } from './usage.js';
 import { redactSecrets, registerSecrets } from './redact.js';
 
@@ -241,6 +241,12 @@ export async function submit(cfg, { name, file, adapterId, capUsd, keyRef = null
   let requests = readRequests(file);
   const key = callerKey(cfg, keyRef);
   if (key) {
+    if (key.disabled) {
+      throw new BatchError(`refused for key fp:${key.fp}${key.label ? ` (${key.label})` : ''}: key is disabled`);
+    }
+    if (isKeyExpired(key.expires)) {
+      throw new BatchError(`refused for key fp:${key.fp}${key.label ? ` (${key.label})` : ''}: key expired (${key.expires})`);
+    }
     for (const model of new Set(requests.map((r) => r.params.model))) {
       const d = requestDecision(key.scope, adapterId, adapter, model);
       if (!d.ok) throw new BatchError(`refused for key fp:${key.fp}${key.label ? ` (${key.label})` : ''}: ${d.reason}`);

@@ -22,7 +22,7 @@ import { BatchError, batchEnabled, cancel as batchCancel, describeJob, fetchResu
 import { fmtUsd } from './usage.js';
 import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets, streamRedactor } from './redact.js';
 import { ensurePrivateDir, logFiles, openPrivateLog, rotatedLogFiles, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
-import { adapterReach, aliasDecision, authEnabled, compileScope, describePerDay, describeScope, entryFp, hashKey, keyHashOf, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
+import { adapterReach, aliasDecision, authEnabled, compileScope, describePerDay, describePerMinute, describeScope, entryFp, expiresOf, hashKey, isKeyExpired, keyHashOf, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
 import { runMcpCli } from './mcp.js';
 
 const PKG = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -81,12 +81,12 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith source list               the profiles, which are attached, and what to know about each
                                      take that adapter, its catalogue row and discovery entry out again
   keysmith key <add|list> [--reveal] client-facing API keys; --reveal prints them in full, to a terminal only
-  keysmith key add <label> [--allow p,…] [--deny p,…] [--per-day N] [--out <file>]
-                                     a labelled key with a scope; --out writes the key to a new 0600 file
+  keysmith key add <label> [--allow p,…] [--deny p,…] [--per-day N] [--per-minute N] [--expires <date>] [--disable] [--out <file>]
+                                     a labelled key with a scope and limits; --out writes the key to a new 0600 file
                                      (--force replaces that file; --allow-unknown saves a pattern that names nothing yet)
-  keysmith key scope fp:<8 hex> [--allow p,…] [--deny p,…] [--clear] [--per-day N|--no-per-day]
+  keysmith key scope fp:<8 hex> [--allow p,…] [--deny p,…] [--clear] [--per-day N|--no-per-day] [--per-minute N|--no-per-minute] [--expires <date>|--no-expires] [--disable|--enable]
                                      what an existing key may reach (p: claude-api, 'agy/*', alias:argon),
-                                     and how many requests it may make per local day (over it: 429 until midnight)
+                                     its daily and per-minute caps, its ISO expiry, and whether it is disabled
   keysmith key who-can <adapter>     the keys, by fingerprint, that can reach an adapter (or adapter/model, alias:<name>)
   keysmith key revoke fp:<8 hex>     revoke by the fingerprint list/logs print (never the key itself: argv is public)
   keysmith scrub-logs [file…]        redact keys left in the logs, their rotated copies and any file named; counts only
@@ -1796,8 +1796,8 @@ function cmdUsage(flags) {
 
 const KEY_USAGE = [
   'usage: keysmith key list [--reveal]',
-  '       keysmith key add [<label>] [--allow <patterns>] [--deny <patterns>] [--per-day <N>] [--hash] [--out <file> [--force]] [--allow-unknown] [--reveal]',
-  '       keysmith key scope fp:<8 hex> [--allow <patterns>] [--deny <patterns>] [--no-allow] [--no-deny] [--clear] [--label <name>] [--allow-unknown] [--per-day <N> | --no-per-day]',
+  '       keysmith key add [<label>] [--allow <patterns>] [--deny <patterns>] [--per-day <N>] [--per-minute <N> | --no-per-minute] [--expires <date> | --no-expires] [--disable | --enable] [--hash] [--out <file> [--force]] [--allow-unknown] [--reveal]',
+  '       keysmith key scope fp:<8 hex> [--allow <patterns>] [--deny <patterns>] [--no-allow] [--no-deny] [--clear] [--label <name>] [--allow-unknown] [--per-day <N> | --no-per-day] [--per-minute <N> | --no-per-minute] [--expires <date> | --no-expires] [--disable | --enable]',
   '       keysmith key who-can <adapter> | <adapter/model> | alias:<name>',
   '       keysmith key revoke fp:<8 hex>',
   "  patterns: an adapter id (claude-api), an adapter/model glob ('agy/*', 'google/gemini-3.8-*'), alias:<name>;",
@@ -1847,9 +1847,10 @@ function keyList(cfg, flags) {
   if (!authEnabled(cfg)) warn(AUTH_OFF);
 }
 
-/** A key entry's scope, and its daily cap when it has one: `deny: claude-api · 300 requests/day`. */
+/** A key entry's scope, caps, expiry and disabled state: `deny: claude-api · 300 requests/day · 30 requests/minute`. */
 function describeKey(e) {
-  return `${describeScope(e.scope)}${e.perDay != null ? ` · ${describePerDay(e.perDay)}` : ''}${e.hashed ? ' · hashed (sha256)' : ''}`;
+  const exp = e.expires ? ` · ${isKeyExpired(e.expires) ? `expired (${e.expires})` : `expires ${e.expires}`}` : '';
+  return `${describeScope(e.scope)}${e.perDay != null ? ` · ${describePerDay(e.perDay)}` : ''}${e.perMinute != null ? ` · ${describePerMinute(e.perMinute)}` : ''}${exp}${e.disabled ? ' · disabled' : ''}${e.hashed ? ' · hashed (sha256)' : ''}`;
 }
 
 /** Said wherever a key or a scope is written or listed while auth is off: none of it applies. */
@@ -1871,17 +1872,30 @@ function keyAdd(cfg, flags) {
   const allow = listFlag(flags, 'allow');
   const deny = listFlag(flags, 'deny');
   const perDay = perDayFlag(flags);
+  const perMinute = perMinuteFlag(flags);
+  const expires = expiresFlag(flags);
+  checkKeyLimitFlags(flags, { perMinute, expires });
+  const disabled = flags.disable ? true : undefined;
   if (label !== undefined) checkLabel(cfg, label, null);
   if (allow) checkScopePatterns(cfg, allow, 'allow', flags);
   if (deny) checkScopePatterns(cfg, deny, 'deny', flags);
   if (flags.out === true || flags.out === '') fail('--out takes a file path, e.g. --out ~/.config/<agent>/keysmith.key');
   const key = newUniqueApiKey(cfg.auth.keys.map(entryFp).filter(Boolean));
   const useHash = !!flags.hash;
-  const asObject = useHash || label !== undefined || allow || deny || perDay !== undefined;
+  const extraFields = {
+    ...(label !== undefined ? { label } : {}),
+    ...(allow ? { allow } : {}),
+    ...(deny ? { deny } : {}),
+    ...(perDay !== undefined ? { perDay } : {}),
+    ...(perMinute !== undefined ? { perMinute } : {}),
+    ...(expires !== undefined ? { expires } : {}),
+    ...(disabled ? { disabled: true } : {}),
+  };
+  const asObject = useHash || Object.keys(extraFields).length > 0;
   const entry = useHash
-    ? { keyHash: hashKey(key), ...(label !== undefined ? { label } : {}), ...(allow ? { allow } : {}), ...(deny ? { deny } : {}), ...(perDay !== undefined ? { perDay } : {}) }
+    ? { keyHash: hashKey(key), ...extraFields }
     : asObject
-      ? { key, ...(label !== undefined ? { label } : {}), ...(allow ? { allow } : {}), ...(deny ? { deny } : {}), ...(perDay !== undefined ? { perDay } : {}) }
+      ? { key, ...extraFields }
       : key;
   const parsed = parseKeys([entry]);
   if (parsed.issues.length) fail(`not added: ${parsed.issues[0]}`);
@@ -1907,6 +1921,9 @@ function keyAdd(cfg, flags) {
   if (allow && !allow.length) out('! an empty --allow: this key reaches nothing');
   if (perDay === 0) out('! --per-day 0: every request of this key is refused (429) until the cap is raised or lifted');
   if (perDay !== undefined) out('  the cap counts every request this key makes in a local calendar day — each face, adapter and alias, failures included — and starts again at local midnight');
+  if (perMinute === 0) out('! --per-minute 0: every request of this key is refused (429) until the limit is raised or lifted');
+  if (expires !== undefined && isKeyExpired(expires)) out(`! --expires ${expires} is already in the past: every request of this key is refused (401)`);
+  if (disabled) out('! --disable: every request of this key is refused (403) until --enable is run');
   // The key and its scope are saved, and apply once auth is on; until then they keep nobody out.
   if (!authEnabled(cfg)) warn(AUTH_OFF);
   if (!signalled) return noteRestart('the new key');
@@ -1915,9 +1932,11 @@ function keyAdd(cfg, flags) {
 /**
  * `keysmith key scope fp:<hex> …`: what an existing key may reach. `--allow` / `--deny` replace
  * that list, `--no-allow` / `--no-deny` drop it, `--clear` drops both (the key is unscoped
- * again), `--label` / `--no-label` name it, `--per-day N` caps its requests per local day and
- * `--no-per-day` lifts the cap (`--clear` leaves the cap as it is). With no change asked for, it
- * shows the scope and the cap.
+ * again), `--label` / `--no-label` name it, `--per-day N` / `--no-per-day` set or lift its daily
+ * cap, `--per-minute N` / `--no-per-minute` set or lift its per-minute limit, `--expires <date>`
+ * / `--no-expires` set or clear its expiry, and `--disable` / `--enable` suspend or restore it
+ * (`--clear` leaves caps, expiry and disabled state as they are). With no change asked for, it
+ * shows the scope and limits.
  */
 function keyScope(cfg, flags) {
   const m = String(flags._[1] ?? '').match(/^(?:fp:)?([0-9a-fA-F]{8})$/);
@@ -1932,7 +1951,25 @@ function keyScope(cfg, flags) {
   const deny = listFlag(flags, 'deny');
   const label = flags.label;
   const perDay = perDayFlag(flags);
-  const changing = allow || deny || flags.clear || flags.noAllow || flags.noDeny || flags.noLabel || label !== undefined || perDay !== undefined || flags.noPerDay;
+  const perMinute = perMinuteFlag(flags);
+  const expires = expiresFlag(flags);
+  checkKeyLimitFlags(flags, { perMinute, expires });
+  const changing =
+    allow ||
+    deny ||
+    flags.clear ||
+    flags.noAllow ||
+    flags.noDeny ||
+    flags.noLabel ||
+    label !== undefined ||
+    perDay !== undefined ||
+    flags.noPerDay ||
+    perMinute !== undefined ||
+    flags.noPerMinute ||
+    expires !== undefined ||
+    flags.noExpires ||
+    flags.disable ||
+    flags.enable;
   if (!changing) {
     const e = parseKeys([cur]).entries[0];
     return out(`fp:${fp}  ${e?.label || '-'}  ${e ? describeKey(e) : 'unreadable entry'}`);
@@ -1955,6 +1992,12 @@ function keyScope(cfg, flags) {
   if (deny) next.deny = deny;
   if (flags.noPerDay) delete next.perDay;
   if (perDay !== undefined) next.perDay = perDay;
+  if (flags.noPerMinute) delete next.perMinute;
+  if (perMinute !== undefined) next.perMinute = perMinute;
+  if (flags.noExpires) delete next.expires;
+  if (expires !== undefined) next.expires = expires;
+  if (flags.enable) delete next.disabled;
+  if (flags.disable) next.disabled = true;
   // Back to a bare string when nothing but the key is left: the form every reader knows.
   const entry = Object.keys(next).length === 1 && Object.hasOwn(next, 'key') ? next.key : next;
   const parsed = parseKeys([entry]);
@@ -1967,6 +2010,9 @@ function keyScope(cfg, flags) {
   if (allow && !allow.length) out('! an empty --allow: this key reaches nothing');
   if (perDay === 0) out('! --per-day 0: every request of this key is refused (429) until the cap is raised or lifted');
   if (perDay !== undefined) out('  the cap counts every request this key makes in a local calendar day — each face, adapter and alias, failures included — and starts again at local midnight');
+  if (perMinute === 0) out('! --per-minute 0: every request of this key is refused (429) until the limit is raised or lifted');
+  if (expires !== undefined && isKeyExpired(expires)) out(`! --expires ${expires} is already in the past: every request of this key is refused (401)`);
+  if (flags.disable) out('! --disable: every request of this key is refused (403) until --enable is run');
   if (i === 0 && typeof entry === 'object' && typeof cur === 'string') {
     out("  auth.keys[0] is an object now: a script that reads the key with jq takes .auth.keys[0] | .key? // .");
   }
@@ -1980,6 +2026,40 @@ function perDayFlag(flags) {
   const raw = flags.perDay;
   if (raw === true || !/^\d+$/.test(String(raw)) || !Number.isSafeInteger(Number(raw))) fail(`--per-day takes a whole number of requests, e.g. --per-day 300 (got ${raw === true ? 'nothing' : JSON.stringify(String(raw))})`);
   return Number(raw);
+}
+
+/** `--per-minute N` as a whole number of requests; undefined when the flag is absent. */
+function perMinuteFlag(flags) {
+  if (flags.perMinute === undefined) return undefined;
+  const raw = flags.perMinute;
+  if (raw === true || !/^\d+$/.test(String(raw)) || !Number.isSafeInteger(Number(raw))) fail(`--per-minute takes a whole number of requests, e.g. --per-minute 30 (got ${raw === true ? 'nothing' : JSON.stringify(String(raw))})`);
+  return Number(raw);
+}
+
+/** `--expires <ISO date or date-time>`; undefined when the flag is absent. */
+function expiresFlag(flags) {
+  if (flags.expires === undefined) return undefined;
+  const raw = flags.expires;
+  if (raw === true || typeof raw !== 'string') fail(`--expires takes an ISO date or date-time, e.g. --expires 2027-01-31 (got ${raw === true ? 'nothing' : JSON.stringify(raw)})`);
+  try {
+    return expiresOf({ expires: raw });
+  } catch (e) {
+    fail(`--expires: ${e.message}`);
+  }
+}
+
+function checkKeyLimitFlags(flags, { perMinute, expires }) {
+  for (const [val, name] of [
+    [flags.noPerMinute, '--no-per-minute'],
+    [flags.noExpires, '--no-expires'],
+    [flags.disable, '--disable'],
+    [flags.enable, '--enable'],
+  ]) {
+    if (val !== undefined && val !== true) fail(`${name} takes no value`);
+  }
+  if (perMinute !== undefined && flags.noPerMinute) fail('--per-minute sets the per-minute limit, --no-per-minute lifts it: one of them');
+  if (expires !== undefined && flags.noExpires) fail('--expires sets the expiry, --no-expires clears it: one of them');
+  if (flags.disable && flags.enable) fail('--disable suspends a key, --enable restores it: one of them');
 }
 
 /**
@@ -2198,7 +2278,7 @@ function cmdScrubLogs(flags) {
 /** Every value a flag was given, in order, under `flags[ALL][name]`: `--allow a --allow b`. */
 const ALL = Symbol('every value of each flag');
 
-const BOOL_FLAGS = new Set(['allow-explicit-only', 'no-allow-explicit-only', 'probe-models']);
+const BOOL_FLAGS = new Set(['allow-explicit-only', 'no-allow-explicit-only', 'probe-models', 'no-per-minute', 'no-expires', 'disable', 'enable']);
 
 function parseFlags(args) {
   const out = { _: [] };
