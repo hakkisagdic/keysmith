@@ -24,7 +24,7 @@ import { HttpAdapter } from './http-adapter.js';
 import { prepareAdapter } from './gateway.js';
 import { isKeyExpired, parseKeys, requestDecision } from './keys.js';
 import { matchPrice, batchFactorOf, cacheWrite1hRate, roundUsd, fmtUsd, UsageLog } from './usage.js';
-import { redactSecrets, registerSecrets } from './redact.js';
+import { headerSecrets, redactSecrets, registerSecrets } from './redact.js';
 
 export const MAX_REQUESTS = 100_000;
 export const MAX_BYTES = 256 * 1024 * 1024;
@@ -187,6 +187,8 @@ export function batchAdapter(cfg, id) {
   let prepared;
   try { prepared = prepareAdapter(id, raw); } catch (e) { throw new BatchError(`adapter "${id}": ${e.message}`); }
   registerSecrets([prepared._apiKey]);
+  registerSecrets(headerSecrets(prepared.headers));
+  registerSecrets(headerSecrets(prepared.mediaHeaders));
   return new HttpAdapter(id, prepared);
 }
 
