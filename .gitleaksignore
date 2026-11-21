@@ -1,0 +1,10 @@
+# Baseline of accepted gitleaks findings (2026-11-21). Test fixtures only: synthetic keys built for the tests.
+# Any new finding still stops the push. Format: commit:file:rule:line (gitleaks fingerprint).
+66e5879e74503bfbd2ab34e4a111989e90f3ad80:test/prompts.test.js:generic-api-key:90
+747881e8e940b7308d2f98ad8ecc6d002558d206:test/rate-limit.test.js:generic-api-key:15
+747881e8e940b7308d2f98ad8ecc6d002558d206:test/rate-limit.test.js:generic-api-key:16
+747881e8e940b7308d2f98ad8ecc6d002558d206:test/rate-limit.test.js:generic-api-key:26
+747881e8e940b7308d2f98ad8ecc6d002558d206:test/rate-limit.test.js:generic-api-key:27
+747881e8e940b7308d2f98ad8ecc6d002558d206:test/rate-limit.test.js:generic-api-key:41
+747881e8e940b7308d2f98ad8ecc6d002558d206:test/rate-limit.test.js:generic-api-key:42
+71ffa6859eb6d4d3f394c3b29010845a40693387:test/billing.test.js:generic-api-key:35
