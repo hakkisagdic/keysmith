@@ -84,7 +84,7 @@ and aliases it may reach — and every route above answers it with that share on
 
 Keysmith natively speaks the **Universal Harness Protocol (UHP `2026-10-19`)** in both directions:
 
-1. **As a UHP Server:** Any UHP client or SDK can discover capabilities at `GET /.well-known/uhp` (or `GET /v1/uhp`), inspect attached harnesses at `GET /v1/harnesses` (filtered by the caller key's scope), route to a specific harness via `metadata.harness_id` or `x-harness-id`, chain stateful multi-turn sessions on `POST /v1/responses` with `previous_response_id` (`GET /v1/responses/:id`), enforce `Idempotency-Key` deduplication (`409 idempotency_conflict` on payload mismatch), and propagate W3C `traceparent` / `tracestate` headers.
+1. **As a UHP Server:** Any UHP client or SDK can discover capabilities at `GET /.well-known/uhp` (or `GET /v1/uhp`), inspect attached harnesses at `GET /v1/harnesses` (filtered by the caller key's scope), route to a specific harness via `metadata.harness_id` or `x-harness-id` (folded into the model id the key's scope is checked against; that model string is the harness sent upstream, and a client harness id does not replace one it already names), chain stateful multi-turn sessions on `POST /v1/responses` with `previous_response_id` (`GET /v1/responses/:id`), enforce `Idempotency-Key` deduplication (`409 idempotency_conflict` on payload mismatch), and propagate W3C `traceparent` / `tracestate` headers.
 2. **As a UHP Upstream Relay (`harnessrouter` profile):** Connect a running [HarnessRouter](https://github.com/HarnessRouter/harnessrouter) Community Edition (`http://127.0.0.1:8000/api/harness/v1`) or Cloud (`https://api.harnessrouter.ai/v1`) instance as an upstream HTTP adapter:
 
 ```bash
@@ -95,7 +95,7 @@ keysmith add harnessrouter --base-url https://api.harnessrouter.ai/v1 --key '{en
 Address models across any backend or custom harness:
 - `harnessrouter/<model>` (e.g. `harnessrouter/claude-sonnet-4-6`)
 - `harnessrouter/<backend>/<model>` (e.g. `harnessrouter/claude/claude-sonnet-4-6`, `harnessrouter/gemini/gemini-2.5-pro`)
-- `harnessrouter/chrn_<id>` (routes directly to a custom harness with `metadata.harness_id`)
+- `harnessrouter/chrn_<id>` (routes directly to a custom harness; upstream is sent that harness id, not a different `metadata.harness_id`)
 
 When a request offers client `tools` to a `wire: "uhp"` adapter, Keysmith first forwards them natively over `/v1/responses`; if the upstream CLI backend ignores the tools and replies with plain text, Keysmith automatically falls back to `EMULATE` (`fallback: "uhp_emulate"`).
 3. **Traycer Multi-Provider Gateway (`traycer` HTTP profile):** Attach your Traycer subscription (`~/.traycer/cli/credentials` or `TRAYCER_BEARER_TOKEN`) as an explicit-only multi-provider HTTP adapter:

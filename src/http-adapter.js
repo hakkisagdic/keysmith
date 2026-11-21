@@ -741,9 +741,21 @@ function buildUhpPayload(adapter, baseParams, { model, messages, session, maxTok
   if (target.model) out.model = target.model;
   else delete out.model;
   if (target.backend) out.backend = target.backend;
-  const hid = harnessId || target.harnessId;
-  if (hid) {
-    out.metadata = { ...(baseParams?.metadata || {}), harness_id: hid };
+  // The harness is the one parsed from the model string the scope check authorised.
+  // `harnessId` is only the fallback when that string names none: gateway.js still passes
+  // one for internal callers (failover, tool history, tool engines), and an open key may
+  // name a harness beside a bare model. It never overrides `target.harnessId`. Traycer
+  // passes null (`isTraycer`), so this stays unset there.
+  const hid = target.harnessId === undefined ? harnessId || undefined : target.harnessId;
+  const meta = { ...(baseParams?.metadata || {}) };
+  if (hid) meta.harness_id = hid;
+  else delete meta.harness_id;
+  if (Object.keys(meta).length) out.metadata = meta;
+  else if (baseParams && Object.hasOwn(baseParams, 'metadata')) {
+    // Object.assign keeps a key this object omits. Drop a metadata bag that only carried
+    // a harness id the authorised target did not set. Delete the property, not the nested
+    // object: that object may be the adapter's modelParams.
+    delete baseParams.metadata;
   }
   const eff = effort || baseParams?.reasoning?.effort || baseParams?.reasoning_effort;
   if (eff) {
