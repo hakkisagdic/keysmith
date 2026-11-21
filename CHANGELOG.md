@@ -4,7 +4,7 @@
 
 ### Added
 
-- Filter recent usage rows in `keysmith usage` (`--status`, `--tag`, `--key`, `--model`, `--min-cost`, `--min-ms`, each with `--tail`) and on `GET /v1/keysmith/usage` (`status`, `tag`, `key`, `model`, `min_cost`, `min_ms`, each with `tail`). Aggregates stay whole-log. A scoped key still sees only its own rows. `--min-cost` / `min_cost` leaves out rows with no price and reports how many.
+- Filter recent usage rows in `keysmith usage` (`--status` `ok|error|limited|blocked|denied`, `--tag`, `--key`, `--model`, `--min-cost`, `--min-ms`, each with `--tail`) and on `GET /v1/keysmith/usage` (`status`, `tag`, `key`, `model`, `min_cost`, `min_ms`, each with `tail`). Aggregates stay whole-log. A scoped key still sees only its own rows. `--min-cost` / `min_cost` leaves out rows with no price and reports how many.
 
 - Add opt-in outbound secret guard (`guard.secrets`: `"off" | "block" | "mask"`, default `"off"`, configurable via `keysmith config set guard.secrets <mode>`) across `/v1/chat/completions`, `/v1/messages`, `/v1/responses` and `/v1/embeddings`: scans request strings up to the 32 MB body limit for fixed secret shapes (`pem-private-key`, `aws-access-key`, `github-token`, `slack-token`, `google-api-key`, `sk-api-key`, `keysmith-key`), refuses with `400 invalid_request_error` (`status: "blocked"`) or masks matches as `[REDACTED:<kind>]` while recording `guard` and `guardKinds` in `usage.jsonl` without ever logging secret values, and fails closed to `"block"` with a `keysmith doctor` config error on unknown settings.
 

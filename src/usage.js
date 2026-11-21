@@ -1254,7 +1254,7 @@ const clip = (v) => (typeof v === 'string' ? v.slice(0, EXTERNAL_FIELD_MAX) : v)
 const num = (v) => (Number.isFinite(Number(v)) && v !== '' && v !== null && v !== undefined ? Number(v) : null);
 
 /** Statuses written on a usage row (`stamp()` / `record()` in server.js). */
-export const RECENT_STATUSES = ['ok', 'error', 'limited', 'denied'];
+export const RECENT_STATUSES = ['ok', 'error', 'limited', 'blocked', 'denied'];
 
 const ENTRY_FILTER_KEYS = ['status', 'tag', 'key', 'model', 'route', 'minCostUsd', 'minMs'];
 
@@ -1283,9 +1283,23 @@ function pricedUsd(row) {
 }
 
 /**
+ * Request path for a usage row: `via` when `stamp()` stored a path (`/v1/messages`, `/v1/responses`,
+ * `/v1/embeddings`, or a refusal's `route`), otherwise derived from `face` (`/v1/chat/completions`
+ * omits `via`, and verbatim tool relays write `via: "passthrough"` with `face`).
+ */
+function rowRoute(row) {
+  if (typeof row?.via === 'string' && row.via.startsWith('/')) return row.via;
+  if (row?.face === 'chat') return '/v1/chat/completions';
+  if (row?.face === 'messages') return '/v1/messages';
+  if (row?.face === 'responses') return '/v1/responses';
+  if (row?.face === 'embeddings') return '/v1/embeddings';
+  return typeof row?.via === 'string' ? row.via : null;
+}
+
+/**
  * A predicate for recent usage rows, or null when `spec` names nothing and `viewer` is not a
  * function. `spec` keys are `status`, `tag`, `key` (`fp:` + 8 hex), `model`, `route` (matched
- * against the row's `via`, the path stamp() stored), `minCostUsd` and `minMs`. Any other key
+ * against the row's request path from `via` or `face`), `minCostUsd` and `minMs`. Any other key
  * throws. The predicate ANDs with `viewer` (a scoped key's `usageFilterFor`), and never replaces
  * it. When `minCostUsd` is set, a row with no price fails and `predicate.unpriced` counts how
  * many such rows the scan saw after the viewer and the other fields had matched.
@@ -1339,7 +1353,7 @@ export function entryFilter(spec, viewer = null) {
     if (active.tag !== undefined && row?.tag !== active.tag) return false;
     if (active.key !== undefined && row?.key !== active.key) return false;
     if (active.model !== undefined && row?.model !== active.model) return false;
-    if (active.route !== undefined && row?.via !== active.route) return false;
+    if (active.route !== undefined && rowRoute(row) !== active.route && row?.via !== active.route) return false;
     if (active.minMs !== undefined && (typeof row?.ms !== 'number' || !Number.isFinite(row.ms) || row.ms < active.minMs)) return false;
     if (active.minCostUsd !== undefined) {
       const usd = pricedUsd(row);

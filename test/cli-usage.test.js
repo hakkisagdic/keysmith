@@ -348,12 +348,13 @@ test('EMULATE through a CLI that reports no tokens: the answer says so the same 
 
 describe('keysmith usage recent-row filters', () => {
   const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
-  // Oldest first. Two fingerprints, ok and error, priced and unpriced. Tail reads newest first.
+  // Oldest first. Two fingerprints, ok/error/limited/blocked, priced and unpriced. Tail reads newest first.
   const ROWS = [
     { ts: '2026-11-20T12:00:01.000Z', key: 'fp:aaaa1111', model: 'price-low', status: 'ok', ms: 10, tag: 'ci', usage: { input: 1, output: 1 }, cost: { usd: 0.1, basis: 'list' }, via: '/v1/chat/completions' },
     { ts: '2026-11-20T12:00:02.000Z', key: 'fp:aaaa1111', model: 'err-ci', status: 'error', ms: 20, tag: 'ci', usage: { input: 2, output: 0 }, cost: { usd: 0.6, basis: 'metered' }, error: 'boom', via: '/v1/chat/completions' },
     { ts: '2026-11-20T12:00:03.000Z', key: 'fp:bbbb2222', model: 'price-high', status: 'ok', ms: 30, tag: 'other', usage: { input: 3, output: 3 }, cost: { usd: 1.2, basis: 'list' }, via: '/v1/chat/completions' },
     { ts: '2026-11-20T12:00:04.000Z', key: 'fp:bbbb2222', model: 'lim-row', status: 'limited', ms: 0, tag: null, usage: null, cost: { usd: null, basis: 'unpriced' }, error: 'cap', via: '/v1/chat/completions' },
+    { ts: '2026-11-20T12:00:04.500Z', key: 'fp:aaaa1111', model: 'guard-blk', status: 'blocked', ms: 0, tag: null, usage: null, cost: { usd: null, basis: 'unpriced' }, guard: 'blocked', guardKinds: ['github-token'], error: 'request blocked by secret guard (github-token)', face: 'chat' },
     { ts: '2026-11-20T12:00:05.000Z', key: 'fp:aaaa1111', model: 'err-noprice', status: 'error', ms: 40, tag: 'ci', usage: null, cost: { usd: null, basis: 'unpriced', reason: 'no usage' }, error: 'nope', via: '/v1/chat/completions' },
     { ts: '2026-11-20T12:00:06.000Z', key: 'fp:aaaa1111', model: 'err-slow', status: 'error', ms: 500, tag: 'nightly', usage: { input: 9, output: 1 }, cost: { usd: 0.5, basis: 'metered' }, error: 'slow', via: '/v1/messages' },
   ];
@@ -379,7 +380,8 @@ describe('keysmith usage recent-row filters', () => {
   }
 
   function recentLine(e) {
-    return `  ${e.ts}  ${e.status === 'ok' ? 'ok  ' : 'ERR '}  ${(e.model || '?').padEnd(40)} ${String(e.ms).padStart(6)}ms  ${e.usage?.input || 0}→${e.usage?.output || 0}  ${truncate(e.error || '', 60)}`;
+    const st = e.status === 'ok' ? 'ok  ' : e.status === 'blocked' ? 'BLK ' : 'ERR ';
+    return `  ${e.ts}  ${st}  ${(e.model || '?').padEnd(40)} ${String(e.ms).padStart(6)}ms  ${e.usage?.input || 0}→${e.usage?.output || 0}  ${truncate(e.error || '', 60)}`;
   }
 
   /** The `recent:` block, including the blank line `out('\\nrecent:')` writes before it. */
@@ -397,7 +399,7 @@ describe('keysmith usage recent-row filters', () => {
   test('usage --help names the recent-row flags', () => {
     const help = run(['usage', '--help']);
     assert.equal(help.status, 0, help.stderr);
-    for (const flag of ['--tail', '--status', '--tag', '--key', '--model', '--min-cost', '--min-ms']) {
+    for (const flag of ['--tail', '--status', '--tag', '--key', '--model', '--min-cost', '--min-ms', 'blocked']) {
       assert.ok(help.stdout.includes(flag), flag);
     }
     assert.match(help.stdout, /need --tail/);
@@ -420,6 +422,24 @@ describe('keysmith usage recent-row filters', () => {
     assert.equal(table.stdout.split('\nrecent:\n')[0], run(['usage', '--tail', '50']).stdout.split('\nrecent:\n')[0]);
   });
 
+  test('--status blocked lists only guard-blocked rows, and renders BLK in table output', () => {
+    const plain = run(['usage', '--tail', '50', '--format', 'json']);
+    const filtered = run(['usage', '--tail', '50', '--status', 'blocked', '--format', 'json']);
+    assert.equal(filtered.status, 0, filtered.stderr);
+    const all = JSON.parse(plain.stdout);
+    const body = JSON.parse(filtered.stdout);
+    assert.deepEqual(body.entries.map((e) => e.model), ['guard-blk']);
+    assert.ok(body.entries.every((e) => e.status === 'blocked'));
+    assert.equal(Object.hasOwn(body, 'entriesUnpriced'), false);
+    assert.deepEqual(statsOf(body), statsOf(all));
+    const table = run(['usage', '--tail', '50', '--status', 'blocked']);
+    assert.equal(table.status, 0, table.stderr);
+    const shown = ROWS.filter((e) => e.status === 'blocked').slice().reverse();
+    assert.ok(table.stdout.includes('  BLK   guard-blk'), table.stdout);
+    assert.ok(table.stdout.endsWith(recentBlock(shown)), table.stdout.slice(table.stdout.lastIndexOf('recent:')));
+    assert.equal(table.stdout.split('\nrecent:\n')[0], run(['usage', '--tail', '50']).stdout.split('\nrecent:\n')[0]);
+  });
+
   test('--tag ci lists only rows sent with that tag', () => {
     const runTag = run(['usage', '--tail', '50', '--tag', 'ci', '--format', 'json']);
     assert.equal(runTag.status, 0, runTag.stderr);
@@ -437,13 +457,13 @@ describe('keysmith usage recent-row filters', () => {
     const body = JSON.parse(json.stdout);
     assert.deepEqual(body.entries.map((e) => e.model), ['err-slow', 'price-high', 'err-ci']);
     assert.ok(body.entries.every((e) => e.cost.usd >= 0.5 && e.cost.basis !== 'unpriced'));
-    assert.equal(body.entriesUnpriced, 2);
+    assert.equal(body.entriesUnpriced, 3);
     const plain = JSON.parse(run(['usage', '--tail', '50', '--format', 'json']).stdout);
     assert.deepEqual(statsOf(body), statsOf(plain));
     const table = run(['usage', '--tail', '50', '--min-cost', '0.5']);
     assert.equal(table.status, 0, table.stderr);
     const shown = ROWS.filter((e) => e.model === 'err-slow' || e.model === 'price-high' || e.model === 'err-ci').slice().reverse();
-    assert.ok(table.stdout.endsWith(recentBlock(shown, ['  unpriced: 2 left out'])), table.stdout.slice(table.stdout.lastIndexOf('recent:')));
+    assert.ok(table.stdout.endsWith(recentBlock(shown, ['  unpriced: 3 left out'])), table.stdout.slice(table.stdout.lastIndexOf('recent:')));
     assert.equal(table.stdout.split('\nrecent:\n')[0], run(['usage', '--tail', '50']).stdout.split('\nrecent:\n')[0]);
   });
 
@@ -466,6 +486,10 @@ describe('keysmith usage recent-row filters', () => {
     assert.match(missing.stderr, /need --tail/);
     assert.match(missing.stderr, /--status/);
     assert.equal(missing.stdout, '');
+
+    const bareTail = run(['usage', '--tail', '--status', 'error']);
+    assert.notEqual(bareTail.status, 0);
+    assert.match(bareTail.stderr, /need --tail/);
   });
 
   test('--tail without a new flag matches the unfiltered log, json and the recent lines', () => {

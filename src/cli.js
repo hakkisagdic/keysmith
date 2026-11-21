@@ -59,7 +59,7 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
   keysmith doctor [--probe-models]   is each adapter actually alive, and at what cost
   keysmith tunnel <status|setup|run> cloudflared: named tunnel first, quick as fallback
   keysmith usage [--by d1[,d2]] [--since t] [--until t] [--format table|csv|json] [--tail N]
-                                     [--status ok|error|limited|denied] [--tag T] [--key fp:<8 hex>]
+                                     [--status ok|error|limited|blocked|denied] [--tag T] [--key fp:<8 hex>]
                                      [--model M] [--min-cost USD] [--min-ms N]
                                      who spent what (by key, label, adapter, model, account, tag, day, client);
                                      the filters keep --tail's recent rows only, and need --tail
@@ -1795,7 +1795,7 @@ function cmdUsage(flags) {
   }
   // Filters apply to the recent list and to JSON entries only, and only with --tail.
   const recent = recentSpecFromFlags(flags);
-  if (recent && flags.tail === undefined) {
+  if (recent && (flags.tail === undefined || flags.tail === true || !(Number(flags.tail) > 0))) {
     fail('--status, --tag, --key, --model, --min-cost and --min-ms filter the recent list and need --tail');
   }
   let entriesFilter = null;

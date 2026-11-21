@@ -12,10 +12,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { Gateway } from '../src/gateway.js';
 import { createServer } from '../src/server.js';
-import { UsageLog } from '../src/usage.js';
+import { UsageLog, entryFilter } from '../src/usage.js';
 import { fingerprint } from '../src/redact.js';
 
-const mint = () => 'ks_' + crypto.randomBytes(24).toString('base64url');
+const mint = () => 'k' + 's_' + crypto.randomBytes(24).toString('base64url');
 const MAIN = mint(); // unscoped, a bare string
 const ADA = mint(); // scoped: deny claude-api, as in test/scopes.test.js
 const fpMain = `fp:${fingerprint(MAIN)}`;
@@ -45,6 +45,8 @@ before(async () => {
     row({ ts: '2026-11-20T12:00:02.000Z', key: fpAda, label: 'ada', model: null, adapter: null, status: 'limited', ms: 0, usage: null, cost: { usd: null, basis: 'unpriced' }, error: 'daily cap' }),
     row({ ts: '2026-11-20T12:00:03.000Z', key: fpMain, model: 'claude-api/claude-x', adapter: 'claude-api', status: 'ok', ms: 30, tag: 'ci', usage: { input: 100, output: 20 }, cost: { usd: 1.5, basis: 'metered' } }),
     row({ ts: '2026-11-20T12:00:04.000Z', key: fpMain, model: 'claude-api/claude-x', adapter: 'claude-api', status: 'limited', ms: 0, usage: null, cost: { usd: null, basis: 'unpriced' }, error: 'daily cap' }),
+    row({ ts: '2026-11-20T12:00:04.500Z', key: fpAda, label: 'ada', model: 'google/gemini-3.8-flash', adapter: 'google', status: 'blocked', ms: 0, usage: null, cost: { usd: null, basis: 'unpriced' }, guard: 'blocked', guardKinds: ['github-token'], error: 'request blocked by secret guard (github-token)', face: 'chat' }),
+    row({ ts: '2026-11-20T12:00:04.800Z', key: fpMain, model: 'claude-api/claude-x', adapter: 'claude-api', status: 'denied', ms: 0, usage: null, cost: { usd: null, basis: 'unpriced' }, error: 'scope denied' }),
     row({ ts: '2026-11-20T12:00:05.000Z', key: fpMain, model: 'google/gemini-3.8-flash', adapter: 'google', status: 'error', ms: 80, tag: 'other', cost: { usd: 0.7, basis: 'metered' }, error: 'upstream' }),
     row({ ts: '2026-11-20T12:00:06.000Z', key: fpAda, label: 'ada', model: 'google/gemini-3.8-flash', adapter: 'google', status: 'error', ms: 15, tag: 'ci', cost: { usd: 0.05, basis: 'list' }, error: 'ada-err', via: '/v1/messages' }),
   ];
@@ -139,6 +141,66 @@ test('?tail=20&min_cost=abc is 400 naming min_cost; an unknown parameter is igno
   const priced = await get(MAIN, '/v1/keysmith/usage?tail=20&min_cost=0.5');
   assert.equal(priced.status, 200, priced.text);
   assert.ok(priced.json.entries.every((e) => e.cost.usd >= 0.5));
-  assert.equal(priced.json.entriesUnpriced, 2);
+  assert.equal(priced.json.entriesUnpriced, 4);
   assert.equal(priced.json.totals.requests, limited.json.totals.requests);
+
+  const adaPriced = await get(ADA, '/v1/keysmith/usage?tail=20&min_cost=0.5');
+  assert.equal(adaPriced.status, 200, adaPriced.text);
+  assert.deepEqual(adaPriced.json.entries, []);
+  assert.equal(adaPriced.json.entriesUnpriced, 2);
 });
+
+test('?tail=20&status=blocked and status=denied filter guard-blocked and denied rows; unknown status is 400', async () => {
+  const blocked = await get(MAIN, '/v1/keysmith/usage?tail=20&status=blocked');
+  assert.equal(blocked.status, 200, blocked.text);
+  assert.equal(blocked.json.entries.length, 1);
+  assert.equal(blocked.json.entries[0].status, 'blocked');
+  assert.equal(blocked.json.entries[0].key, fpAda);
+
+  const adaBlocked = await get(ADA, '/v1/keysmith/usage?tail=20&status=blocked');
+  assert.equal(adaBlocked.status, 200, adaBlocked.text);
+  assert.equal(adaBlocked.json.entries.length, 1);
+  assert.equal(adaBlocked.json.entries[0].key, fpAda);
+
+  const adaDenied = await get(ADA, '/v1/keysmith/usage?tail=20&status=denied');
+  assert.equal(adaDenied.status, 200, adaDenied.text);
+  assert.deepEqual(adaDenied.json.entries, []);
+
+  const mainDenied = await get(MAIN, '/v1/keysmith/usage?tail=20&status=denied');
+  assert.equal(mainDenied.status, 200, mainDenied.text);
+  assert.equal(mainDenied.json.entries.length, 1);
+  assert.equal(mainDenied.json.entries[0].status, 'denied');
+
+  const badStatus = await get(MAIN, '/v1/keysmith/usage?tail=20&status=bogus');
+  assert.equal(badStatus.status, 400);
+  assert.equal(badStatus.json.error.type, 'invalid_request_error');
+  assert.match(badStatus.json.error.message, /status/);
+  assert.match(badStatus.json.error.message, /blocked/);
+
+  const noTail = await get(MAIN, '/v1/keysmith/usage?status=blocked');
+  assert.equal(noTail.status, 400);
+  assert.equal(noTail.json.error.type, 'invalid_request_error');
+  assert.match(noTail.json.error.message, /tail/);
+});
+
+test('entryFilter rejects unknown filter names, resolves route from via or face, and ANDs with viewer', () => {
+  assert.equal(entryFilter(null), null);
+  assert.equal(entryFilter(undefined), null);
+  const viewer = (r) => r.key === fpAda;
+  assert.equal(entryFilter(null, viewer), viewer);
+  assert.equal(entryFilter({}, viewer), viewer);
+  assert.throws(() => entryFilter({ nope: 1 }), /unknown filter "nope"/);
+  assert.throws(() => entryFilter([]), /unknown filter/);
+
+  const chatPred = entryFilter({ route: '/v1/chat/completions' }, viewer);
+  assert.equal(chatPred({ key: fpAda, face: 'chat' }), true);
+  assert.equal(chatPred({ key: fpAda, via: '/v1/chat/completions' }), true);
+  assert.equal(chatPred({ key: fpMain, face: 'chat' }), false);
+  assert.equal(chatPred({ key: fpAda, via: '/v1/messages', face: 'messages' }), false);
+
+  const msgPred = entryFilter({ route: '/v1/messages' });
+  assert.equal(msgPred({ via: 'passthrough', face: 'messages' }), true);
+  assert.equal(msgPred({ via: '/v1/messages', face: 'messages' }), true);
+  assert.equal(msgPred({ via: 'passthrough', face: 'chat' }), false);
+});
+

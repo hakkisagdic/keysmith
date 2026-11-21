@@ -1222,7 +1222,7 @@ cells rounded to whole UTC days (`granularity: "day"`, `roundedToWholeDays: true
 naming the earliest kept day when older days have aged out). `?tail=N` returns recent rows from an
 in-memory ring bounded by both count (at most 2,000 rows, `TAIL_RING_MAX`) and byte size (at most
 2 MiB, `TAIL_RING_MAX_BYTES`; `tail` above 2,000 is refused with HTTP 400). `status`
-(`ok`, `error`, `limited`, `denied`), `tag`, `key` (`fp:` plus 8 hex), `model`, `min_cost` and
+(`ok`, `error`, `limited`, `blocked`, `denied`), `tag`, `key` (`fp:` plus 8 hex), `model`, `min_cost` and
 `min_ms` filter those recent rows only — they need `tail`, and they do not change `stats`, `spend`
 or `daily`. A scoped key still sees only its own rows, so `key=fp:<another>` is an empty `entries`
 list. A value that is not a filter is `400 invalid_request_error` naming the parameter; an unknown
