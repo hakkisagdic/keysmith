@@ -2634,42 +2634,60 @@ export class UsageLog {
   }
 
   /**
-   * Status of every configured per-key daily request cap (`perDay` on `auth.keys` entries)
-   * for the current local calendar day, counted consistently across `/status`, `/v1/keysmith/usage`,
-   * and `keysmith usage`.
+   * Status of every configured per-key limit (`perDay`, `perMinute`, `expires`, `disabled` on
+   * `auth.keys` entries) for the current local calendar day, counted consistently across
+   * `/status`, `/v1/keysmith/usage`, and `keysmith usage`.
    */
   dailySummary(keys = [], { who = null, quota = null, now = null } = {}) {
     if (!Array.isArray(keys) || !keys.length) return [];
-    const capped = [];
+    const nowMs = now != null ? (now instanceof Date ? now.getTime() : Number(now)) : this._nowDate().getTime();
+    const listed = [];
     for (const item of keys) {
       if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-      if (!Number.isSafeInteger(item.perDay) || item.perDay < 0) continue;
+      if (item.scope?.invalid) continue;
+      const hasPerDay = Number.isSafeInteger(item.perDay) && item.perDay >= 0;
+      const hasPerMinute = Number.isSafeInteger(item.perMinute) && item.perMinute >= 0;
+      const expMs = typeof item.expires === 'string' && item.expires ? Date.parse(item.expires) : NaN;
+      const hasExpires = Number.isFinite(expMs);
+      const hasDisabled = item.disabled === true;
+      if (!hasPerDay && !hasPerMinute && !hasExpires && !hasDisabled) continue;
       const fp = typeof item.fp === 'string' && item.fp ? item.fp : typeof item.key === 'string' && item.key ? fingerprint(item.key) : null;
       if (!fp) continue;
       if (who?.scope && who.fp && fp !== who.fp) continue;
-      capped.push({ fp, label: typeof item.label === 'string' && item.label ? item.label : null, perDay: item.perDay });
+      listed.push({
+        fp,
+        label: typeof item.label === 'string' && item.label ? item.label : null,
+        perDay: hasPerDay ? item.perDay : null,
+        perMinute: hasPerMinute ? item.perMinute : null,
+        expires: hasExpires ? item.expires : null,
+        expired: hasExpires && nowMs >= expMs,
+        disabled: hasDisabled,
+      });
     }
-    if (!capped.length) return [];
+    if (!listed.length) return [];
 
-    const nowMs = now != null ? (now instanceof Date ? now.getTime() : Number(now)) : this._nowDate().getTime();
     const day = dayOf(nowMs);
     const resetAt = new Date(nextMidnight(nowMs)).toISOString();
     const state = this._ensureDailyState(nowMs);
 
-    return capped.map((c) => {
+    return listed.map((c) => {
       const qToday = quota ? quota.today(c.fp) : null;
       const requests = Math.max(state.counts.get(c.fp) || 0, qToday?.requests || 0);
       const refused = Math.max(state.refused.get(c.fp) || 0, qToday?.refused || 0);
+      const hasCap = c.perDay != null;
       return {
         key: `fp:${c.fp}`,
         fp: c.fp,
         ...(c.label ? { label: c.label } : {}),
         requests,
-        cap: c.perDay,
-        perDay: c.perDay,
-        remaining: Math.max(0, c.perDay - requests),
+        cap: hasCap ? c.perDay : null,
+        perDay: hasCap ? c.perDay : null,
+        remaining: hasCap ? Math.max(0, c.perDay - requests) : null,
         refused,
-        exceeded: requests >= c.perDay,
+        exceeded: hasCap ? requests >= c.perDay : false,
+        ...(c.perMinute != null ? { perMinute: c.perMinute } : {}),
+        ...(c.expires ? { expires: c.expires, expired: c.expired } : {}),
+        ...(c.disabled ? { disabled: true } : {}),
         day,
         resetAt,
       };
@@ -3729,7 +3747,14 @@ export function formatUsageTable(report, { spend = [], daily = [] } = {}) {
     const w = maxWidth(daily, (d) => labelOf(d).length, 8);
     for (const d of daily) {
       const ref = d.refused ? ` (${d.refused} refused)` : '';
-      lines.push(`  ${labelOf(d).padEnd(w)}  ${d.requests} / ${d.perDay} requests${ref}  ${d.exceeded ? 'CAPPED' : 'ok'}`);
+      const reqText = d.perDay != null ? `${d.requests} / ${d.perDay} requests${ref}` : `${d.requests} requests${ref}`;
+      const flags = [d.disabled && 'disabled', d.expired && 'expired'].filter(Boolean);
+      const status = flags.length ? flags.join(', ') : d.exceeded ? 'CAPPED' : 'ok';
+      const extra = [
+        d.perMinute != null ? `${d.perMinute}/min` : '',
+        d.expires ? (d.expired ? `(${d.expires})` : `expires ${d.expires}`) : '',
+      ].filter(Boolean).join(' · ');
+      lines.push(`  ${labelOf(d).padEnd(w)}  ${reqText}  ${status}${extra ? ` · ${extra}` : ''}`);
     }
   }
   return lines.join('\n');

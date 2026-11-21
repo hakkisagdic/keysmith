@@ -977,6 +977,43 @@ keysmith key list                              # … deny: claude-api · 300 req
   otherwise an uncapped copy above a capped entry would quietly lift the cap. `perDay: 0` refuses
   every request. Like every key change, a cap takes effect when the gateway restarts.
 
+### Per-minute limit, expiry and disable switch
+
+Alongside `perDay`, an `auth.keys` entry can carry a rolling 60-second request limit (`perMinute`),
+an ISO expiry (`expires`), and a suspend switch (`disabled`):
+
+```json
+{ "key": "ks_…", "label": "ci", "perMinute": 30, "expires": "2027-01-31", "disabled": false }
+```
+
+```bash
+keysmith key add ci --per-minute 30 --expires 2027-01-31 --out ~/.config/ci/keysmith.key
+keysmith key scope fp:3f9a0c12 --per-minute 60 --expires 2027-06-01T00:00:00Z
+keysmith key scope fp:3f9a0c12 --disable        # refuse every request (403) without deleting the entry
+keysmith key scope fp:3f9a0c12 --enable         # restore it
+keysmith key scope fp:3f9a0c12 --no-per-minute --no-expires
+keysmith key list                               # … 30 requests/minute · expires 2027-01-31
+```
+
+- **Order of refusals:** `disabled` (**403** `permission_error`), then `expires` (**401**
+  `authentication_error`, `"key expired"`), then `perMinute` (**429** `rate_limit_error` with
+  `retry-after` in whole seconds from 1 to 60), then `perDay` (**429** up to local midnight). A
+  refused request counts toward neither `perMinute` nor `perDay`, and messages name the limit,
+  never the key.
+- **`expires` format:** requires an ISO date (`YYYY-MM-DD`) or ISO date-time
+  (`2027-01-31T00:00:00Z`). A date alone is **00:00 UTC** at the start of that date (end of that
+  UTC day is not assumed).
+- **Status page and usage:** a disabled or expired key is refused on `/status` and cookie login as
+  well (403 when disabled, 401 when expired). An unscoped key viewing `/status` — and
+  `keysmith usage` — sees `disabled` or `expired` next to the key's fingerprint, including keys
+  that carry `perMinute`, `expires` or `disabled` without `perDay`.
+- **Disk safety and fail-closed parsing:** like `perDay`, `perMinute` counts the metered routes
+  (listing models/routes and `/status` are not counted), and only the first refusal per key per
+  minute writes a `"status": "limited"` row to `usage.jsonl` and a log line. A malformed
+  `perMinute`, `expires` (`"tomorrow"`) or `disabled` (`"yes"`), or the same key listed twice with
+  different values of any of them, leaves that key reaching nothing and names its fingerprint in
+  `keysmith doctor` and `keysmith key list`.
+
 ### Recipe: an agent key that cannot reach claude-api
 
 Say `claude-api` is an Anthropic HTTP adapter that spends a credit you use on purpose. An agent
@@ -1019,7 +1056,7 @@ keysmith batch cancel eval-1
 - Input: one JSON object per line, `{"custom_id": "r1", "params": {"model": "...", "max_tokens": 1000, "messages": [...]}}` (the Messages request, as the Message Batches API takes it). At most 100,000 requests or 256 MB.
 - Only an adapter on the `anthropic` wire takes a batch; any other is refused with a message. Gemini batches are not built.
 - Before anything is sent, keysmith estimates the most the batch can cost (every input token at the batch rate, every request answering with its full `max_tokens`, characters / 3.5 as tokens, rounded up) and refuses when it is above `--cap-usd`. A model with no entry in `pricing` is refused too: a cap cannot be checked without a price.
-- `--key` applies that key's allow/deny list and daily cap (`perDay`) to the batch, as a live request would. Without `--key` the owner of the config submits, unscoped.
+- `--key` applies that key's allow/deny list, expiry, disabled switch and daily cap (`perDay`) to the batch, as a live request would. Without `--key` the owner of the config submits, unscoped.
 - A job name sends once: the job file under the data dir (`batch/<name>.json`) is created before the request goes out, so a second `submit` of the name sends nothing.
 - Cost: every result is billed at the entry's `batchFactor` (0.5 unless set) of the live price (a 1-hour cache write at the entry's `cacheWrite1h`, 2x the base input rate without one); `usage.jsonl` gets one row per request with `batch: true`, and `batch results` prints the real total beside the estimate. Requests that errored, expired or were canceled are not billed and get a zero row. Whether promotional credit pays for batches is not in Anthropic's documentation: the first small job shows it on the Console.
 - `--cache` puts one 1-hour `cache_control` mark on the system prompt when it is long enough to be cached (512 tokens for the 5.x models, up to 4,096 for others) and nothing carries a mark yet. Cache hits inside a batch are best-effort.

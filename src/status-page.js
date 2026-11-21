@@ -1,5 +1,6 @@
 import { rel } from './util.js';
 import { configPath } from './config.js';
+import { isKeyExpired } from './keys.js';
 import { fmtUsd, windowCapLabel } from './usage.js';
 
 /**
@@ -30,9 +31,14 @@ export function statusPage({ cfg, models, usage, usageFilter = null, spend = nul
   const keyRows = (keys || [])
     .map((k) => {
       const n = perKey.get(`fp:${k.fp}`) || { requests: 0, denied: 0 };
+      const isExpired = k.expired ?? isKeyExpired(k.expires);
+      const stateBadges = [
+        k.disabled ? '<span class="bad">disabled</span>' : '',
+        isExpired ? '<span class="bad">expired</span>' : '',
+      ].filter(Boolean).join(' ');
       // A pattern that names nothing configured (`deny: Claude-API`) is flagged where it is read.
       const warned = (k.warnings || []).map((w) => `<br><span class="bad">! ${esc(w)}</span>`).join('');
-      return `<tr><td>fp:${esc(k.fp)}</td><td>${esc(k.label || '—')}</td><td${/^INVALID/.test(k.scope) ? ' class="bad"' : ''}>${esc(k.scope)}${warned}</td><td class="n">${todayCell(k)}</td><td class="n">${n.requests}</td><td class="n ${n.denied ? 'bad' : ''}">${n.denied}</td></tr>`;
+      return `<tr><td>fp:${esc(k.fp)}${stateBadges ? ` ${stateBadges}` : ''}</td><td>${esc(k.label || '—')}</td><td${/^INVALID/.test(k.scope) ? ' class="bad"' : ''}>${esc(k.scope)}${warned}</td><td class="n">${todayCell(k)}</td><td class="n">${n.requests}</td><td class="n ${n.denied ? 'bad' : ''}">${n.denied}</td></tr>`;
     })
     .join('');
   const rows = (summary.models || [])
@@ -44,7 +50,7 @@ export function statusPage({ cfg, models, usage, usageFilter = null, spend = nul
 <h1>key<span>smith</span></h1>
 <div class="sub">OpenAI-compatible front for the agents already on this machine · up ${humanUptime(Date.now() - startedAt)} · config <code>${esc(rel(configPath()))}</code></div>
 ${viewer && viewer.scope && !/^unscoped/.test(viewer.scope) ? `<div class="sub">viewing as key fp:${esc(viewer.fp)}${viewer.label ? ` (${esc(viewer.label)})` : ''} — its scope: ${esc(viewer.scope)}. This page shows what that key can reach.</div>` : ''}
-${viewer && viewer.perDay != null ? `<div class="sub">this key today: <b class="${(viewer.today?.requests || 0) >= viewer.perDay ? 'bad' : 'ok'}">${viewer.today?.requests || 0} of ${viewer.perDay}</b> requests${viewer.today?.refused ? `, ${viewer.today.refused} refused over the cap` : ''} — the count starts again at local midnight.</div>` : ''}
+${viewerLine(viewer)}
 ${logErrors.length ? `<p class="bad">${logErrors.map((e) => `usage log unreadable: ${esc(e)}`).join('<br>')}</p>` : ''}
 <div class="grid">
   <div class="card"><small>requests 24h (UTC hour)</small><b>${summary.requests}</b></div>
@@ -119,12 +125,37 @@ function failoverSection({ guards = [], skips = [] }) {
   return `${guards.length ? `<h2>Kiro credit guard</h2><table><tbody>${guards.map(row).join('')}</tbody></table>` : ''}<h2>Legs passed by (24h)</h2><table><tbody>${skips.map(row).join('')}</tbody></table><p class="muted">A leg that cannot carry a request's tools, or that the credit guard holds back, is passed by and named in the usage row (<code>skippedLegs</code>). <code>keysmith doctor</code> lists which legs of each alias carry tools.</p>`;
 }
 
-/** A key's requests today, with its daily cap and the refusals over it when it has one. */
+/** A viewer key's own daily cap, per-minute limit, expiry and disabled state. */
+function viewerLine(viewer) {
+  if (!viewer) return '';
+  const isExpired = viewer.expired ?? isKeyExpired(viewer.expires);
+  const extra = [
+    viewer.perMinute != null ? `${viewer.perMinute} request${viewer.perMinute === 1 ? '' : 's'}/minute` : '',
+    viewer.expires ? (isExpired ? `<span class="bad">expired (${esc(viewer.expires)})</span>` : `expires ${esc(viewer.expires)}`) : '',
+    viewer.disabled ? '<span class="bad">disabled</span>' : '',
+  ].filter(Boolean).join(' · ');
+  if (viewer.perDay != null) {
+    return `<div class="sub">this key today: <b class="${(viewer.today?.requests || 0) >= viewer.perDay ? 'bad' : 'ok'}">${viewer.today?.requests || 0} of ${viewer.perDay}</b> requests${viewer.today?.refused ? `, ${viewer.today.refused} refused over the cap` : ''} — the count starts again at local midnight.${extra ? ` · ${extra}` : ''}</div>`;
+  }
+  return extra ? `<div class="sub">this key: ${extra}</div>` : '';
+}
+
+/** A key's requests today, with its daily cap, per-minute limit and expiry/disabled state when set. */
 function todayCell(k) {
   const n = k.today?.requests || 0;
-  if (k.perDay == null) return String(n);
-  const over = n >= k.perDay;
-  return `<span class="${over ? 'bad' : ''}">${n} / ${k.perDay}</span>${k.today?.refused ? `<br><span class="bad">${k.today.refused} refused</span>` : ''}`;
+  const isExpired = k.expired ?? isKeyExpired(k.expires);
+  const parts = [];
+  if (k.perDay == null) {
+    parts.push(String(n));
+  } else {
+    const over = n >= k.perDay;
+    parts.push(`<span class="${over ? 'bad' : ''}">${n} / ${k.perDay}</span>`);
+    if (k.today?.refused) parts.push(`<span class="bad">${k.today.refused} refused</span>`);
+  }
+  if (k.perMinute != null) parts.push(`<span class="muted">${k.perMinute}/min</span>`);
+  if (k.expires && !isExpired) parts.push(`<span class="muted">expires ${esc(k.expires)}</span>`);
+  if (k.expires && isExpired) parts.push(`<span class="bad">expired ${esc(k.expires)}</span>`);
+  return parts.join('<br>');
 }
 
 function esc(s) {

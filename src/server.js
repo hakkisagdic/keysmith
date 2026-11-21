@@ -21,8 +21,8 @@ import { redactSecrets, registerSecrets } from './redact.js';
 import { pickChatRelayFields, upstreamError, upstreamIdFromHeaders } from './http-adapter.js';
 import { toolPath } from './tools/router.js';
 import { failureOf, legMetaOf, scopeError } from './gateway.js';
-import { authEnabled, describeScope, hashKey, parseKeys, scopeWarnings, targetDecision } from './keys.js';
-import { DailyQuota, overCapMessage } from './quota.js';
+import { authEnabled, describeScope, hashKey, isKeyExpired, parseKeys, scopeWarnings, targetDecision } from './keys.js';
+import { DailyQuota, MinuteLimiter, overCapMessage, overMinuteMessage } from './quota.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
@@ -194,9 +194,11 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   // Today's requests per key, rebuilt from today's usage rows: a restart does not hand a capped
   // key a fresh day (quota.js).
   const quota = new DailyQuota({ now });
+  const minute = new MinuteLimiter({ now });
+  const refusalGate = new Map(); // `${fp}:${reason}` -> last logged refusal timestamp (ms)
   if (authOn) quota.seed(usage);
   const startedAt = Date.now();
-  const pages = pageSessions();
+  const pages = pageSessions(now);
   const responseStore = createResponseStore({ now });
   const idempotencyStore = createIdempotencyStore({ now });
   let inFlight = 0;
@@ -303,9 +305,12 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
         const byHeader = authOn ? headerEntry(req, keys) : null;
         const viewer = !authOn ? { entry: null } : byHeader ? { entry: byHeader } : pages.session(cookieFrom(req, PAGE_COOKIE), keys);
         if (!viewer) return send(res, 401, PAGE_HEADERS, loginPage({ action: route }));
+        if (viewer.entry?.disabled) return send(res, 403, PAGE_HEADERS, loginPage({ action: route, failed: true }));
+        if (isKeyExpired(viewer.entry?.expires, now())) return send(res, 401, PAGE_HEADERS, loginPage({ action: route, failed: true }));
         const scope = viewer.entry?.scope || null;
         const { models } = await safeList(gateway, scope);
         const uFilter = usageFilterFor(gateway, viewer.entry);
+        const nowMs = now();
         return send(res, 200, PAGE_HEADERS, statusPage({
           cfg: scope ? { ...cfg, adapters: visibleEntries(cfg.adapters, (id) => gateway.adapterVisible(id, scope)) } : cfg,
           models,
@@ -316,8 +321,33 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           startedAt,
           loadErrors: visibleEntries(gateway.loadErrors, (id) => gateway.adapterVisible(id, scope)),
           aliasIssues: gateway.aliasIssuesFor(scope),
-          viewer: viewer.entry ? { fp: viewer.entry.fp, label: viewer.entry.label, scope: describeScope(scope), perDay: viewer.entry.perDay ?? null, today: quota.today(viewer.entry.fp) } : null,
-          keys: authOn && !scope ? keys.map((k) => ({ fp: k.fp, label: k.label, scope: describeScope(k.scope), perDay: k.perDay ?? null, today: quota.today(k.fp), warnings: keyWarnings.filter((w) => w.fp === k.fp).map((w) => `${w.field} ${w.problem}`) })) : null,
+          viewer: viewer.entry
+            ? {
+                fp: viewer.entry.fp,
+                label: viewer.entry.label,
+                scope: describeScope(scope),
+                perDay: viewer.entry.perDay ?? null,
+                perMinute: viewer.entry.perMinute ?? null,
+                expires: viewer.entry.expires ?? null,
+                disabled: Boolean(viewer.entry.disabled),
+                expired: isKeyExpired(viewer.entry.expires, nowMs),
+                today: quota.today(viewer.entry.fp),
+              }
+            : null,
+          keys: authOn && !scope
+            ? keys.map((k) => ({
+                fp: k.fp,
+                label: k.label,
+                scope: describeScope(k.scope),
+                perDay: k.perDay ?? null,
+                perMinute: k.perMinute ?? null,
+                expires: k.expires ?? null,
+                disabled: Boolean(k.disabled),
+                expired: isKeyExpired(k.expires, nowMs),
+                today: quota.today(k.fp),
+                warnings: keyWarnings.filter((w) => w.fp === k.fp).map((w) => `${w.field} ${w.problem}`),
+              }))
+            : null,
           keyIssues: scope ? [] : keyIssues,
           failover: scope ? null : failoverOverview(gateway, usage),
         }));
@@ -375,6 +405,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       if ((req.method === 'POST' && METERED.has(route)) || (req.method === 'GET' && route === '/v1/keysmith/usage')) {
         meter(who, route, stamped, req);
         meteredRequest = true;
+      } else {
+        ensureKeyUsable(who);
       }
       if (route === '/v1/models' || route === '/models') {
         const { models, errors } = await gateway.listModels({ refresh: url.searchParams.has('refresh'), scope });
@@ -540,34 +572,80 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     }
   }
 
+  function firstInMinute(fp, reason) {
+    const t = now();
+    const k = `${fp}:${reason}`;
+    const prev = refusalGate.get(k);
+    if (prev !== undefined && t - prev < 60_000) return false;
+    refusalGate.set(k, t);
+    return true;
+  }
+
+  function recordLimitedRow(stamped, route, req, message, type, status) {
+    const errJson = JSON.stringify(errorBody(message, type, status, null, faceFromRoute(route)));
+    record(stamped, {
+      model: null,
+      status: 'limited',
+      ms: 0,
+      stream: false,
+      via: route,
+      error: message,
+      client: req?.headers?.['user-agent'],
+      bytesOut: Buffer.byteLength(errJson, 'utf8'),
+    });
+  }
+
+  function ensureKeyUsable(who) {
+    if (!who?.fp) return;
+    if (who.disabled) throw new LlmError('key disabled', { status: 403, type: 'permission_error' });
+    if (isKeyExpired(who.expires, now())) throw new LlmError('key expired', { status: 401, type: 'authentication_error' });
+  }
+
   /**
-   * Count one request of the key `who` came with, or refuse it: over the key's `perDay`, a 429
-   * (`rate_limit_error`) with a `retry-after` up to local midnight, whose message names the cap
-   * and never the key. The day's first refusal of a key writes a usage row (`status: "limited"`)
-   * and a log line; the ones after it are counted (the status page shows them) but write
-   * nothing, so a client that keeps asking cannot fill the disk.
+   * Check and count one metered request of the key `who` came with, in strict order:
+   * disabled (403), expired (401), perMinute (429), then perDay (429). A refused request counts
+   * toward neither limit. Disabled, expired and perMinute write one `limited` usage row and one
+   * log line per key per minute; `perDay` writes one on the day's first refusal.
    */
   function meter(who, route, stamped, req = null) {
     if (!who.fp) return; // auth off: there is no key to count against
+    if (who.disabled) {
+      const message = 'key disabled';
+      if (firstInMinute(who.fp, 'disabled')) {
+        log(`key fp:${who.fp}${who.label ? ` (${who.label})` : ''} is disabled: request refused`);
+        recordLimitedRow(stamped, route, req, message, 'permission_error', 403);
+      }
+      throw new LlmError(message, { status: 403, type: 'permission_error' });
+    }
+    if (isKeyExpired(who.expires, now())) {
+      const message = 'key expired';
+      if (firstInMinute(who.fp, 'expired')) {
+        log(`key fp:${who.fp}${who.label ? ` (${who.label})` : ''} expired (${who.expires}): request refused`);
+        recordLimitedRow(stamped, route, req, message, 'authentication_error', 401);
+      }
+      throw new LlmError(message, { status: 401, type: 'authentication_error' });
+    }
+    const m = minute.admit(who.fp, who.perMinute ?? null);
+    if (!m.ok) {
+      const message = overMinuteMessage(m);
+      if (m.first) {
+        log(`key fp:${who.fp}${who.label ? ` (${who.label})` : ''} reached its per-minute limit of ${m.perMinute} requests`);
+        recordLimitedRow(stamped, route, req, message, 'rate_limit_error', 429);
+      }
+      const e = new LlmError(message, { status: 429, type: 'rate_limit_error' });
+      e.retryAfter = m.retryAfter;
+      throw e;
+    }
     const d = quota.admit(who.fp, who.perDay ?? null);
     if (d.ok) {
       usage?.noteDaily?.(who.fp, quota.today(who.fp), now(), { label: who.label, route });
       return;
     }
+    minute.unadmit(who.fp);
     const message = overCapMessage(d);
     if (d.first) {
       log(`key fp:${who.fp}${who.label ? ` (${who.label})` : ''} reached its daily cap of ${d.perDay} requests: refused until local midnight`);
-      const errJson = JSON.stringify(errorBody(message, 'rate_limit_error', 429, null, faceFromRoute(route)));
-      record(stamped, {
-        model: null,
-        status: 'limited',
-        ms: 0,
-        stream: false,
-        via: route,
-        error: message,
-        client: req?.headers?.['user-agent'],
-        bytesOut: Buffer.byteLength(errJson, 'utf8'),
-      });
+      recordLimitedRow(stamped, route, req, message, 'rate_limit_error', 429);
     }
     usage?.noteDaily?.(who.fp, quota.today(who.fp), now(), {
       label: who.label,
@@ -591,6 +669,12 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     const candidate = new URLSearchParams(body).get('api_key') || '';
     const entry = authOn ? matchKey(keys, candidate) : null;
     if (authOn && !entry) {
+      return send(res, 401, PAGE_HEADERS, loginPage({ action: route, failed: true }));
+    }
+    if (authOn && entry.disabled) {
+      return send(res, 403, PAGE_HEADERS, loginPage({ action: route, failed: true }));
+    }
+    if (authOn && isKeyExpired(entry.expires, now())) {
       return send(res, 401, PAGE_HEADERS, loginPage({ action: route, failed: true }));
     }
     const secure = String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
@@ -621,11 +705,11 @@ const PAGE_SESSIONS_MAX = 64;
  * Each remembers which key logged in (its entry: fingerprint and scope, held in memory only),
  * so the page it opens is that key's page.
  */
-function pageSessions() {
+function pageSessions(clock = () => Date.now()) {
   const live = new Map(); // token -> { exp, entry }
   return {
     create(entry = null) {
-      const now = Date.now();
+      const now = clock();
       for (const [t, s] of live) if (s.exp <= now) live.delete(t);
       while (live.size >= PAGE_SESSIONS_MAX) live.delete(live.keys().next().value);
       const token = randomBytes(32).toString('base64url');
@@ -636,7 +720,7 @@ function pageSessions() {
     session(token, currentKeys = null) {
       const s = token ? live.get(token) : null;
       if (!s) return null;
-      if (s.exp <= Date.now()) {
+      if (s.exp <= clock()) {
         live.delete(token);
         return null;
       }
@@ -2484,7 +2568,7 @@ function isDirectLoopback(req) {
  * `perDay` its daily cap (null: none).
  */
 function identify(req, entries, url, authOn, cfg = null) {
-  if (!authOn) return { caller: '', fp: null, label: null, scope: null, perDay: null };
+  if (!authOn) return { caller: '', fp: null, label: null, scope: null, perDay: null, perMinute: null, expires: null, disabled: false };
   let entry = headerEntry(req, entries);
   if (!entry && req.headers.authorization === undefined && req.headers['x-api-key'] === undefined) {
     const queryAllowed = cfg?.auth?.allowQueryApiKey === true || cfg?.auth?.queryKey === true;
@@ -2497,7 +2581,16 @@ function identify(req, entries, url, authOn, cfg = null) {
   const caller = hex
     ? Buffer.from(hex, 'hex').toString('base64url').slice(0, 22)
     : createHash('sha256').update(String(entry.fp || '')).digest('base64url').slice(0, 22);
-  return { caller, fp: entry.fp, label: entry.label, scope: entry.scope, perDay: entry.perDay ?? null };
+  return {
+    caller,
+    fp: entry.fp,
+    label: entry.label,
+    scope: entry.scope,
+    perDay: entry.perDay ?? null,
+    perMinute: entry.perMinute ?? null,
+    expires: entry.expires ?? null,
+    disabled: Boolean(entry.disabled),
+  };
 }
 
 function safeEqual(a, b) {

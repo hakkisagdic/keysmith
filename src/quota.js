@@ -101,3 +101,60 @@ export function overCapMessage({ perDay, retryAfter }) {
   const wait = h ? `${h} h${m ? ` ${m} min` : ''}` : `${m} min`;
   return `this key's daily cap of ${perDay} request${perDay === 1 ? '' : 's'} is used up for today; it resets at local midnight, in ${wait} (retry-after: ${retryAfter} s)`;
 }
+
+/**
+ * Rolling 60-second request limiter (`perMinute` on an `auth.keys` entry), keyed by fingerprint.
+ * Admitted requests record their timestamp; refused requests are never counted toward the limit.
+ */
+export class MinuteLimiter {
+  /** `now`: the clock (ms), injectable so a test can advance 61 s. */
+  constructor({ now = () => Date.now() } = {}) {
+    this.now = now;
+    this.windows = new Map(); // fp -> ms timestamps of requests let in within the last 60 s
+    this.lastLoggedAt = new Map(); // fp -> ms timestamp of last first-in-minute refusal
+  }
+
+  _prune(fp, t) {
+    const cur = this.windows.get(fp);
+    if (!cur || !cur.length) return [];
+    const cutoff = t - 60_000;
+    if (cur[0] > cutoff) return cur;
+    const next = cur.filter((x) => x > cutoff);
+    if (next.length) this.windows.set(fp, next);
+    else this.windows.delete(fp);
+    return next;
+  }
+
+  /**
+   * Let one request of key `fp` in, or refuse it when `perMinute` requests were already let in
+   * during the last 60 s. `{ ok: true, count }` or `{ ok: false, count, perMinute, retryAfter, first }`.
+   */
+  admit(fp, perMinute = null) {
+    const t = this.now();
+    const hits = this._prune(fp, t);
+    if (perMinute != null && hits.length >= perMinute) {
+      const unblockAt = perMinute === 0 ? t + 60_000 : hits[hits.length - perMinute] + 60_000;
+      const retryAfter = Math.min(60, Math.max(1, Math.ceil((unblockAt - t) / 1000)));
+      const prevLog = this.lastLoggedAt.get(fp);
+      const first = prevLog === undefined || t - prevLog >= 60_000;
+      if (first) this.lastLoggedAt.set(fp, t);
+      return { ok: false, count: hits.length, perMinute, retryAfter, first };
+    }
+    hits.push(t);
+    this.windows.set(fp, hits);
+    return { ok: true, count: hits.length };
+  }
+
+  /** Undo the most recent admission of `fp` when a later limit (`perDay`) refuses the request. */
+  unadmit(fp) {
+    const hits = this.windows.get(fp);
+    if (!hits || !hits.length) return;
+    hits.pop();
+    if (!hits.length) this.windows.delete(fp);
+  }
+}
+
+/** The per-minute refusal's reason: names the limit and retry-after, never the key. */
+export function overMinuteMessage({ perMinute, retryAfter }) {
+  return `this key's per-minute limit of ${perMinute} request${perMinute === 1 ? '' : 's'}/minute is reached; try again in ${retryAfter} s (retry-after: ${retryAfter} s)`;
+}

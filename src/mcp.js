@@ -434,6 +434,9 @@ export function redactMcpValue(value, secretCtx = null, parentHint = '') {
     Object.hasOwn(value, 'allow') ||
     Object.hasOwn(value, 'deny') ||
     Object.hasOwn(value, 'perDay') ||
+    Object.hasOwn(value, 'perMinute') ||
+    Object.hasOwn(value, 'expires') ||
+    Object.hasOwn(value, 'disabled') ||
     Object.hasOwn(value, 'keyHash') ||
     (Object.hasOwn(value, 'key') && Object.keys(value).every((k) => k === 'key' || k === 'label'));
   const isAuthSection = Object.hasOwn(value, 'keys') && Array.isArray(value.keys) && (Object.hasOwn(value, 'enabled') || parentHint === 'auth');

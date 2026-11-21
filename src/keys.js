@@ -21,20 +21,23 @@ import { fingerprint } from './redact.js';
  * is refused (403) only when no leg is left. So an alias that later gains a `claude-api` leg
  * still cannot take a key that is denied `claude-api` there.
  *
- * An entry may also carry a daily cap, `"perDay": 300`: how many requests the key may make in
- * one local calendar day, whatever it asks for (quota.js counts them; over it, a 429 until
- * local midnight). The cap is not part of the scope: a key with a cap and no lists is still
- * unscoped, and `key scope --clear` leaves the cap where it is.
+ * An entry may also carry a daily cap (`"perDay": 300`, counted per local calendar day), a
+ * rolling 60-second limit (`"perMinute": 30`), an ISO expiry date or date-time (`"expires":
+ * "2027-01-31"` or `"2027-01-31T00:00:00Z"`, where a date alone means `00:00` UTC), and a
+ * suspend switch (`"disabled": true`, refusing requests with 403 without deleting the key). None
+ * of these are part of the scope: a key with limits and no lists is still unscoped, and
+ * `key scope --clear` leaves them where they are.
  *
  * Fails closed: an entry with a field keysmith does not know (`"alow"` would otherwise read as
- * "no allow list"), a list that is not a list of patterns, a cap that is not a whole number of
- * requests, or the same key twice with two different scopes or caps, leaves that key reaching
+ * "no allow list"), a list that is not a list of patterns, a cap or limit that is not a whole
+ * number of requests, a malformed `expires` or non-boolean `disabled`, or the same key twice with
+ * two different scopes, caps, limits, expiries or disabled states, leaves that key reaching
  * nothing until the config is fixed — and says so in `doctor`, on the status page and in
  * `keysmith key list`. Nothing here ever puts a key in a message: a key is named by its
  * fingerprint.
  */
 
-const ENTRY_FIELDS = new Set(['key', 'keyHash', 'label', 'allow', 'deny', 'perDay']);
+const ENTRY_FIELDS = new Set(['key', 'keyHash', 'label', 'allow', 'deny', 'perDay', 'perMinute', 'expires', 'disabled']);
 
 /** A key string out of an `auth.keys` entry, or null. */
 export function keyOf(entry) {
@@ -138,10 +141,13 @@ function patternList(value, field) {
 export function compileScope(entry) {
   if (typeof entry === 'string') return null;
   for (const field of Object.keys(entry)) {
-    if (!ENTRY_FIELDS.has(field)) throw new Error(`unknown field "${field}" (a key entry has key, label, allow, deny, perDay)`);
+    if (!ENTRY_FIELDS.has(field)) throw new Error(`unknown field "${field}" (a key entry has key, keyHash, label, allow, deny, perDay, perMinute, expires, disabled)`);
   }
   if (entry.label != null && typeof entry.label !== 'string') throw new Error('"label" must be a string');
   perDayOf(entry);
+  perMinuteOf(entry);
+  expiresOf(entry);
+  disabledOf(entry);
   const allow = entry.allow === undefined ? null : patternList(entry.allow, 'allow');
   const deny = entry.deny === undefined ? [] : patternList(entry.deny, 'deny');
   if (!allow && !deny.length) return null;
@@ -168,8 +174,81 @@ export function describePerDay(perDay) {
 }
 
 /**
- * `auth.keys` as the gateway uses it: `{ entries: [{ key, label, fp, scope, perDay }], issues }`.
- * An entry with no usable key is left out (and named in `issues`); one whose scope or cap cannot
+ * The rolling 60-second request limit an `auth.keys` entry carries: a whole number of requests
+ * (0 refuses every one), or null for none. Throws on anything else so parseKeys fails closed.
+ */
+export function perMinuteOf(entry) {
+  if (!entry || typeof entry !== 'object' || entry.perMinute === undefined) return null;
+  const n = entry.perMinute;
+  if (!Number.isSafeInteger(n) || n < 0) throw new Error(`"perMinute" must be a whole number of requests, e.g. 30 (got ${JSON.stringify(n)})`);
+  return n;
+}
+
+/** One line for a per-minute limit: `30 requests/minute`, or '' for none. */
+export function describePerMinute(perMinute) {
+  return perMinute == null ? '' : `${perMinute} request${perMinute === 1 ? '' : 's'}/minute`;
+}
+
+const ISO_EXPIRES_RE = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(Z|[+-](\d{2}):(\d{2}))?)?$/;
+
+/**
+ * The expiry an `auth.keys` entry carries: an ISO date (`YYYY-MM-DD`, treated as 00:00 UTC) or
+ * full ISO date-time, or null for none. Throws on anything else (`"tomorrow"`, invalid calendar
+ * dates, non-strings) so parseKeys fails closed.
+ */
+export function expiresOf(entry) {
+  if (!entry || typeof entry !== 'object' || entry.expires === undefined) return null;
+  const raw = entry.expires;
+  if (typeof raw !== 'string') {
+    throw new Error(`"expires" must be an ISO date or date-time, e.g. "2027-01-31" or "2027-01-31T00:00:00Z" (got ${JSON.stringify(raw)})`);
+  }
+  const m = ISO_EXPIRES_RE.exec(raw);
+  if (!m) {
+    throw new Error(`"expires" must be an ISO date or date-time, e.g. "2027-01-31" or "2027-01-31T00:00:00Z" (got ${JSON.stringify(raw)})`);
+  }
+  const [, ys, mos, ds, hs, mis, ss, , ohs, omis] = m;
+  const [y, mo, d] = [Number(ys), Number(mos), Number(ds)];
+  const cal = new Date(0);
+  cal.setUTCFullYear(y, mo - 1, d);
+  if (cal.getUTCFullYear() !== y || cal.getUTCMonth() !== mo - 1 || cal.getUTCDate() !== d) {
+    throw new Error(`"expires" is not a valid calendar date: ${JSON.stringify(raw)}`);
+  }
+  if (hs !== undefined) {
+    const [h, mi, s] = [Number(hs), Number(mis), ss !== undefined ? Number(ss) : 0];
+    if (h > 23 || mi > 59 || s > 59) {
+      throw new Error(`"expires" has an out-of-range time: ${JSON.stringify(raw)}`);
+    }
+  }
+  if (ohs !== undefined && (Number(ohs) > 23 || Number(omis) > 59)) {
+    throw new Error(`"expires" has an out-of-range UTC offset: ${JSON.stringify(raw)}`);
+  }
+  const ms = Date.parse(raw);
+  if (!Number.isFinite(ms)) {
+    throw new Error(`"expires" must be an ISO date or date-time, e.g. "2027-01-31" or "2027-01-31T00:00:00Z" (got ${JSON.stringify(raw)})`);
+  }
+  return raw;
+}
+
+/** Whether a validated ISO `expires` string is at or past `now` (ms). */
+export function isKeyExpired(expires, now = Date.now()) {
+  if (typeof expires !== 'string' || !expires) return false;
+  const ms = Date.parse(expires);
+  return Number.isFinite(ms) && now >= ms;
+}
+
+/** Whether an `auth.keys` entry is disabled (`true` / `false`); throws on non-booleans. */
+export function disabledOf(entry) {
+  if (!entry || typeof entry !== 'object' || entry.disabled === undefined) return false;
+  if (typeof entry.disabled !== 'boolean') {
+    throw new Error(`"disabled" must be a boolean, true or false (got ${JSON.stringify(entry.disabled)})`);
+  }
+  return entry.disabled;
+}
+
+/**
+ * `auth.keys` as the gateway uses it:
+ * `{ entries: [{ key, keyHash, hashed, label, fp, scope, perDay, perMinute, expires, disabled }], issues }`.
+ * An entry with no usable key is left out (and named in `issues`); one whose scope or limits cannot
  * be read stays in — it authenticates, so its client hears a 403 that says why, not a 401 — with
  * a scope that reaches nothing.
  */
@@ -192,6 +271,9 @@ export function parseKeys(list) {
     const label = item && typeof item === 'object' && typeof item.label === 'string' ? item.label : null;
     let scope;
     let perDay = null;
+    let perMinute = null;
+    let expires = null;
+    let disabled = false;
     try {
       if (item && typeof item === 'object' && item.key != null && item.keyHash != null) {
         const h = keyHashOf(item);
@@ -199,6 +281,9 @@ export function parseKeys(list) {
       }
       scope = compileScope(item);
       perDay = perDayOf(item);
+      perMinute = perMinuteOf(item);
+      expires = expiresOf(item);
+      disabled = disabledOf(item);
     } catch (e) {
       scope = NOTHING(e.message);
       issues.push(`key fp:${fp}${label ? ` (${label})` : ''}: ${e.message} — it reaches nothing until that is fixed`);
@@ -206,11 +291,11 @@ export function parseKeys(list) {
     if (scope && typeof scope === 'object') {
       Object.defineProperty(scope, '_fp', { value: fp, enumerable: false, configurable: true });
     }
-    entries.push({ key: key || null, keyHash: keyHash || null, hashed, label, fp, scope, perDay });
+    entries.push({ key: key || null, keyHash: keyHash || null, hashed, label, fp, scope, perDay, perMinute, expires, disabled });
   }
   // The same key twice: the gateway would match the first entry, and a hand edit that adds an
   // unscoped (or uncapped) copy above a scoped (or capped) one would quietly widen it. Two
-  // different scopes, or two different caps, is an error.
+  // different scopes, caps, per-minute limits, expiries or disabled flags is an error.
   const byKey = new Map();
   for (const e of entries) {
     const id = e.key ? hashKey(e.key) : e.keyHash;
@@ -220,9 +305,25 @@ export function parseKeys(list) {
     if (same.length < 2) continue;
     const scopes = new Set(same.map((e) => JSON.stringify(scopeText(e.scope))));
     const caps = new Set(same.map((e) => e.perDay));
-    if (scopes.size < 2 && caps.size < 2) continue;
-    const what = scopes.size > 1 ? 'different scopes' : 'different daily caps';
-    for (const e of same) e.scope = NOTHING(`listed ${same.length} times with ${what}`);
+    const rpms = new Set(same.map((e) => e.perMinute));
+    const expiries = new Set(same.map((e) => e.expires));
+    const disableds = new Set(same.map((e) => e.disabled));
+    if (scopes.size < 2 && caps.size < 2 && rpms.size < 2 && expiries.size < 2 && disableds.size < 2) continue;
+    const what =
+      scopes.size > 1
+        ? 'different scopes'
+        : caps.size > 1
+          ? 'different daily caps'
+          : rpms.size > 1
+            ? 'different per-minute limits'
+            : expiries.size > 1
+              ? 'different expiry dates'
+              : 'different disabled states';
+    for (const e of same) {
+      e.scope = NOTHING(`listed ${same.length} times with ${what}`);
+      e.disabled = false;
+      e.expires = null;
+    }
     issues.push(`key fp:${same[0].fp} is listed ${same.length} times with ${what} — it reaches nothing until one entry is left`);
   }
   return { entries, issues };

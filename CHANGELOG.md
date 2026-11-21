@@ -4,6 +4,8 @@
 
 ### Added
 
+- Add per-key `perMinute` (rolling 60-second request limit, `429 rate_limit_error` with `retry-after`), `expires` (ISO date or date-time; date-only = `00:00` UTC, `401 authentication_error` `"key expired"`) and `disabled` (`403 permission_error` without deleting the entry) on `auth.keys` entries, managed via `keysmith key add` and `keysmith key scope` (`--per-minute` / `--no-per-minute`, `--expires` / `--no-expires`, `--disable` / `--enable`), surfaced in `keysmith key list`, `/status` and `keysmith usage`, enforced on batch `--key` and status-page login, and logged at most once per key per minute (`status: "limited"`).
+
 - Add per-profile cheap `GET` health targets (`health` on `groq`, `mistral`, and Cloudflare's `/client/v4/accounts/{account}/tokens/verify`, overridable with `healthPath`) shared by MCP `keysmith_test` and `keysmith doctor`, raising the default timeout to 15 s and classifying `no_such_endpoint` (on health paths) separately from fallback `no_models_endpoint`, plus `timeout` (`no answer in N s`) and error-code-only `unreachable`. Response bodies are never read and no paid model calls are issued.
 - Add `--allow-explicit-only` / `--no-allow-explicit-only` on `keysmith alias` (`aliasPolicy.<name>.allowExplicitOnly`) so curated chains can include `explicitOnly` legs in strict order without exposing `explicitOnly` legs to other aliases, virtual models, or fallback outside the chain; `unsafeTools` stays refused, `modelsOnly` continues enforcing declared models, and `aliasIssues` flags paid legs or unlisted `modelsOnly` targets on explicit chains.
 - Add `--per-day <N>` directly to `keysmith key add` (matching `key scope`), and warn when `--allow alias:<name>` leaves none of the alias's legs permitted.
