@@ -870,7 +870,7 @@ export function computeCost(opts = {}) {
 
 function isRowUsageUnknown(e) {
   if (!e || typeof e !== 'object') return false;
-  if (e.status === 'limited' || e.status === 'denied' || e.scope === 'denied') return false;
+  if (e.status === 'limited' || e.status === 'denied' || e.status === 'blocked' || e.scope === 'denied') return false;
   if (e.usageReason) return true;
   if (e.cost && e.cost.usd === null) return true;
   if ('usage' in e && e.usage === null) return true;
@@ -2928,6 +2928,7 @@ export class UsageLog {
       failures: 0,
       refused: 0,
       denied: 0,
+      blocked: 0,
       unknownUsage: 0,
       knownUsage: 0,
       input: 0,
@@ -3015,6 +3016,7 @@ export class UsageLog {
     }
     if (e.status !== 'ok') cell.failures += n;
     if (isDenied) cell.denied += n;
+    if (e.status === 'blocked' || e.guard === 'blocked') cell.blocked += n;
     if (isRowUsageUnknown(e)) {
       cell.unknownUsage += n;
       if (Array.isArray(e.failedLegs)) {
@@ -3099,6 +3101,7 @@ export class UsageLog {
       ov.failures += c.failures;
       ov.refused += c.refused;
       ov.denied += c.denied;
+      ov.blocked += c.blocked || 0;
       ov.unknownUsage += c.unknownUsage || 0;
       ov.knownUsage += c.knownUsage || 0;
       ov.input += c.input;
@@ -3129,6 +3132,7 @@ export class UsageLog {
       requests: 0,
       failures: 0,
       refused: 0,
+      blocked: 0,
       unknownUsage: 0,
       knownUsage: 0,
       input: 0,
@@ -3159,6 +3163,7 @@ export class UsageLog {
     dst.requests += src.requests;
     dst.failures += src.failures;
     dst.refused += src.refused || 0;
+    dst.blocked = (dst.blocked || 0) + (src.blocked || 0);
     dst.unknownUsage += src.unknownUsage || 0;
     dst.knownUsage += src.knownUsage || 0;
     dst.input += src.input;
@@ -3288,6 +3293,7 @@ export class UsageLog {
         b.planSavingsUsd = roundUsd((b.planSavingsUsd || 0) + plan.usd * n);
       }
       if (row.status !== 'ok') b.failures += n;
+      if (row.status === 'blocked' || row.guard === 'blocked') b.blocked = (b.blocked || 0) + n;
       if (isRowUsageUnknown(row)) {
         b.unknownUsage += n;
         if (Array.isArray(row.failedLegs)) {
@@ -3405,6 +3411,7 @@ export class UsageLog {
         requests: b.requests,
         failures: b.failures,
         refused: b.refused || 0,
+        ...(b.blocked ? { blocked: b.blocked } : {}),
         unknownUsage,
         input,
         output,
@@ -3455,6 +3462,7 @@ export class UsageLog {
       requests: totals.requests,
       failures: totals.failures,
       refused: totals.refused,
+      ...(totals.blocked ? { blocked: totals.blocked } : {}),
       unknownUsage: totals.unknownUsage,
       unpricedRequests: totals.unpricedRequests,
       input: totals.input,
@@ -3695,10 +3703,11 @@ export function formatUsageTable(report, { spend = [], daily = [] } = {}) {
     if (!b?.unpricedRequests) return base;
     return !n ? 'unpriced' : `${base}*`;
   };
+  const blkNote = t.blocked ? `, ${t.blocked} blocked` : '';
   const unkNote = t.unknownUsage ? `, ${t.unknownUsage} unknown usage` : '';
   const unpNote = t.unpricedRequests ? ` + ${t.unpricedRequests} unpriced request(s), not counted` : '';
   lines.push(
-    `requests: ${t.requests} (${t.failures} failed${unkNote}) · tokens: ${fmtTok(t.input)} in / ${fmtTok(t.output)} out / ${fmtTok(t.cacheRead)} cache read / ${fmtTok(t.cacheWrite)} cache write${t.cacheRead || t.cacheWrite ? ` (cache read share ${t.cacheShare == null ? 'unknown' : `${(t.cacheShare * 100).toFixed(1)}%`}, saved at list price ${fmtBucketUsd(t.cacheSavingsUsd)}${unpNote})` : ''} · metered: ${fmtBucketUsd(t.meteredUsd)}${unpNote} · list-equiv: ${fmtBucketUsd(t.listUsd)} · duration: p50 ${t.p50Ms}ms / p95 ${t.p95Ms}ms`,
+    `requests: ${t.requests} (${t.failures} failed${blkNote}${unkNote}) · tokens: ${fmtTok(t.input)} in / ${fmtTok(t.output)} out / ${fmtTok(t.cacheRead)} cache read / ${fmtTok(t.cacheWrite)} cache write${t.cacheRead || t.cacheWrite ? ` (cache read share ${t.cacheShare == null ? 'unknown' : `${(t.cacheShare * 100).toFixed(1)}%`}, saved at list price ${fmtBucketUsd(t.cacheSavingsUsd)}${unpNote})` : ''} · metered: ${fmtBucketUsd(t.meteredUsd)}${unpNote} · list-equiv: ${fmtBucketUsd(t.listUsd)} · duration: p50 ${t.p50Ms}ms / p95 ${t.p95Ms}ms`,
   );
   if (t.cachePlanRequests) {
     lines.push(`cache dry-run (ESTIMATE, not spent or saved): ${t.cachePlanRequests} request(s) would have cached ~${t.cachePlanTokens} tokens; estimated saving at list price if each request were reused once, write premium not subtracted ${fmtUsd(t.cachePlanSavingsUsd)}`);

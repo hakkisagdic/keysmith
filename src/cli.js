@@ -22,6 +22,7 @@ import { BatchError, batchEnabled, cancel as batchCancel, describeJob, fetchResu
 import { fmtUsd } from './usage.js';
 import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets, streamRedactor } from './redact.js';
 import { ensurePrivateDir, logFiles, openPrivateLog, rotatedLogFiles, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
+import { guardMode } from './secret-guard.js';
 import { adapterReach, aliasDecision, authEnabled, compileScope, describePerDay, describePerMinute, describeScope, entryFp, expiresOf, hashKey, isKeyExpired, keyHashOf, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
 import { runMcpCli } from './mcp.js';
 
@@ -1372,6 +1373,8 @@ async function cmdDoctor(flags) {
   const { gateway, usage, log } = buildGateway(cfg);
   const rows = [];
   out(`keysmith ${PKG.version} — config ${rel(configPath())}\n`);
+  const { error: guardErr } = guardMode(cfg);
+  if (guardErr) rows.push(['config', 'config error', `guard.secrets: ${guardErr}`]);
 
   for (const [id, raw] of Object.entries(cfg.adapters || {})) {
     const adapter = gateway.adapters.get(id);
@@ -1787,7 +1790,8 @@ function cmdUsage(flags) {
   if (flags.tail) {
     out('\nrecent:');
     for (const e of usage.tail(Number(flags.tail))) {
-      out(`  ${e.ts}  ${e.status === 'ok' ? 'ok  ' : 'ERR '}  ${(e.model || '?').padEnd(40)} ${String(e.ms).padStart(6)}ms  ${e.usage?.input || 0}→${e.usage?.output || 0}  ${truncate(e.error || '', 60)}`);
+      const st = e.status === 'ok' ? 'ok  ' : e.status === 'blocked' ? 'BLK ' : 'ERR ';
+      out(`  ${e.ts}  ${st}  ${(e.model || '?').padEnd(40)} ${String(e.ms).padStart(6)}ms  ${e.usage?.input || 0}→${e.usage?.output || 0}  ${truncate(e.error || '', 60)}`);
     }
   }
 }

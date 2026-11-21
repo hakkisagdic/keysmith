@@ -151,6 +151,7 @@ export const DEFAULTS = {
   port: 8787,
   auth: { enabled: true, keys: [] },
   log: { usage: true, body: false },
+  guard: { secrets: 'off' },
   limits: { maxConcurrent: 32, timeoutMs: 300_000, spend: {} },
   pricing: structuredClone(CLAUDE_PRICING),
   tunnel: { provider: 'cloudflared', name: null, hostname: null, configFile: null },

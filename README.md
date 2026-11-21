@@ -808,7 +808,7 @@ An agent gets a key of its own instead, written to a file only it reads:
 |---|---|---|
 | `launchd-gateway.log` | launchd: `serve`'s stdout + stderr | start banner (address, adapters, the key redacted, tunnel URL); with `KEYSMITH_VERBOSE=1`, adapter failures, retries and skipped alias legs |
 | `keysmith.log` | `keysmith start`: the same stream | the same, for a gateway started without launchd |
-| `usage.jsonl` | the gateway, one line per request (active UTC month) | time, `key` (`"fp:…"`), `label`, `scope`/`skipped`, `adapter`, `kind` (`http`/`cli`), `host` (HTTP upstream host alone), `account` (credential name, never its value), `model`, `face` (`chat`/`messages`/`responses`/`embeddings`), `status`, `ms`, `bytesIn`/`bytesOut`, `upstreamId`, `tag` (`x-keysmith-tag`), token counts (`input` every input token charged, the cache's included, with `cacheRead` and `cacheWrite` beside it; or `usage: null` with a `usageReason` when the CLI or upstream reported none), `cost` (`{usd, basis, listUsd?, reason?}`), `stream`, `client`, `error`, `retries`/`cutAt`, and for tool requests `toolMode`, `toolCalls`, `fallback`, `failure`, `failedLegs` (see [Tool calls](#tool-calls-thinking)) |
+| `usage.jsonl` | the gateway, one line per request (active UTC month) | time, `key` (`"fp:…"`), `label`, `scope`/`skipped`, `adapter`, `kind` (`http`/`cli`), `host` (HTTP upstream host alone), `account` (credential name, never its value), `model`, `face` (`chat`/`messages`/`responses`/`embeddings`), `status` (`ok`/`error`/`denied`/`limited`/`blocked`), `ms`, `bytesIn`/`bytesOut`, `upstreamId`, `tag` (`x-keysmith-tag`), token counts (`input` every input token charged, the cache's included, with `cacheRead` and `cacheWrite` beside it; or `usage: null` with a `usageReason` when the CLI or upstream reported none), `cost` (`{usd, basis, listUsd?, reason?}`), `stream`, `client`, `error`, `retries`/`cutAt`, `guard`/`guardKinds` when the outbound secret guard fires, and for tool requests `toolMode`, `toolCalls`, `fallback`, `failure`, `failedLegs` (see [Tool calls](#tool-calls-thinking)) |
 | `usage.jsonl.YYYY-MM` | the gateway, on UTC month rollover | closed calendar months of the audit log: the current UTC month always lives at `usage.jsonl` so `tail -F ~/.local/share/keysmith/usage.jsonl` keeps working, and when a new UTC month begins the finished file moves to `usage.jsonl.YYYY-MM`; nothing is ever deleted |
 | `.usage.jsonl.daily` | the gateway, on each metered request | today's live per-key request and daily-cap refusal counts (`0600`, by fingerprint, never a key), so `keysmith usage` and `/status` see refusals that write no JSONL line |
 | `launchd-tunnel.log` | launchd: cloudflared | cloudflared's own output |
@@ -841,6 +841,36 @@ cannot — backups, rotated archives, an agent's transcript — so when `scrub-l
 configured key it says to rotate it: `keysmith key add --reveal` in a terminal, move the
 clients over, `keysmith key revoke fp:<old>`, restart the gateway. `keysmith status` says
 when the running gateway is older than the code or the config on disk and needs that restart.
+
+### Outbound secret guard (`guard.secrets`)
+
+Developers paste API keys into prompts, and coding agents read `.env` files into tool results.
+An opt-in outbound guard checks parsed request bodies before anything is sent upstream:
+
+```bash
+keysmith config set guard.secrets block   # or: mask | off (default: off); restart the gateway to apply
+```
+
+- **Modes**: `"off"` (the default — request bytes sent upstream are untouched), `"block"`
+  (returns `400 invalid_request_error` with `"request holds a secret of kind <kind> (guard.secrets=block)"`
+  before any adapter runs, and writes a `status: "blocked"` usage row with `guard: "blocked"` and
+  `guardKinds`), or `"mask"` (replaces each match with `[REDACTED:<kind>]` before forwarding and
+  marks the usage row with `guard: "masked"` and `guardKinds`). Any other value in `config.json`
+  is reported as a config error by `keysmith doctor` and fails closed to `"block"`.
+- **What is scanned**: every string in the parsed JSON body up to the full `32 MB` request body
+  limit (linear-time anchored patterns, with no size skip), except protocol identifier fields
+  (`model`, `id`, `tool_call_id`, `call_id`, `previous_response_id`). That covers user and system
+  prompts (strings or content-block arrays), tool descriptions, and tool outputs (`tool_result`
+  content, `function_call_output.output` — how `.env` contents read by an agent arrive), as well
+  as headers split across adjacent prompt parts.
+- **Routes covered**: the four live HTTP routes (`/v1/chat/completions`, `/v1/messages`,
+  `/v1/responses`, `/v1/embeddings`) only — not `keysmith batch`.
+- **Known shapes only (not a security promise)**: this filter catches seven fixed shapes —
+  `pem-private-key` (`-----BEGIN … PRIVATE KEY-----`), `aws-access-key` (`AKIA…`),
+  `github-token` (`ghp_…`, `gho_…`, `github_pat_…`), `slack-token` (`xox[baprs]-…`),
+  `google-api-key` (`AIza…`), `sk-api-key` (`sk-…` with 32+ characters after `sk-`), and
+  `keysmith-key` (`ks_…`). It does not catch arbitrary passwords, unprefixed secrets, encoded
+  blobs or PII, and never logs or echoes a matched value.
 
 ## Keys with a scope: what each key may reach
 
@@ -1518,7 +1548,7 @@ Full tool schemas, registration targets, and redaction details: [docs/mcp.md](do
 ## Development
 
 ```bash
-npm test          # 434 tests: parsers, routing, key scopes, tool routing and EMULATE, HTTP suites against stub CLIs and stub upstreams, and no key reaching a log
+npm test          # the suite: parsers, routing, key scopes, tool routing and EMULATE, HTTP suites against stub CLIs and stub upstreams, and no key reaching a log
 node src/cli.js doctor --probe-models   # the truth about which models answer (spends quota)
 ```
 
