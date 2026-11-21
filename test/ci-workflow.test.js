@@ -98,7 +98,8 @@ test('K3: no secrets and no download besides checkout, setup-node and npm ci', (
 test('K4: the workflow matrix is the four OS and Node jobs, and macOS-only tests skip without their tools', () => {
   const src = readWorkflow();
   const lines = codeLines(src).join('\n');
-  assert.ok(codeLines(src).some((line) => line.trim() === 'on: [push]'));
+  const code = codeLines(src).join('\n');
+  assert.match(code, /^on:\n {2}push:\n {4}branches: \[main\]\n {2}pull_request:\n {2}workflow_dispatch:$/m);
   assert.equal(lines.includes('continue-on-error'), false);
   assert.equal(lines.includes('exclude:'), false);
   const jobs = flowList(src, 'os').flatMap((osName) => flowList(src, 'node').map((node) => `${osName} / ${node}`));
