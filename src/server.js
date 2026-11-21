@@ -25,7 +25,7 @@ import { authEnabled, describeScope, hashKey, isKeyExpired, parseKeys, scopeWarn
 import { DailyQuota, MinuteLimiter, overCapMessage, overMinuteMessage } from './quota.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
-import { TAIL_RING_MAX, computeCost, credentialAccount, parseTag, roundUsd } from './usage.js';
+import { TAIL_RING_MAX, RECENT_STATUSES, computeCost, credentialAccount, entryFilter, parseFilterNumber, parseTag, roundUsd } from './usage.js';
 import { cachePlanScope, checkPromptCache } from './prompt-cache.js';
 import { applySecretGuard, findSecrets, guardMode } from './secret-guard.js';
 
@@ -481,8 +481,21 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           n = parsedTail;
         }
         // A scoped key reads its own rows only (usageFilterFor): its summary counts its requests,
-        // and its `keys` holds its own fingerprint and no other.
+        // and its `keys` holds its own fingerprint and no other. Recent-row filters AND with that
+        // predicate; they never replace it, and they do not narrow stats, spend or daily.
         const filter = usageFilterFor(gateway, who);
+        const recent = recentSpecFromQuery(url.searchParams);
+        if (recent && !n) {
+          throw new LlmError('status, tag, key, model, min_cost and min_ms filter tail entries and need tail', { status: 400, type: 'invalid_request_error' });
+        }
+        let entriesFilter = filter;
+        if (recent) {
+          try {
+            entriesFilter = entryFilter(recent, filter);
+          } catch (err) {
+            throw new LlmError(err.message, { status: 400, type: 'invalid_request_error' });
+          }
+        }
         const byParam = url.searchParams.getAll('by');
         const sinceParam = url.searchParams.get('since');
         const untilParam = url.searchParams.get('until');
@@ -503,12 +516,16 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
         }
         const spend = visibleSpend(usage, cfg, gateway, scope, who);
         const daily = authOn ? (usage?.dailySummary?.(keys, { who, quota, now: now() }) || []) : [];
+        const entries = n ? usage.tail(n, entriesFilter) : null;
         return json(res, 200, {
           ...(stats || {}),
           summary: stats,
           ...(spend.length ? { spend } : {}),
           ...(daily.length ? { daily } : {}),
-          ...(n ? { entries: usage.tail(n, filter) } : {}),
+          ...(n ? {
+            entries,
+            ...(recent && Object.hasOwn(recent, 'minCostUsd') ? { entriesUnpriced: entriesFilter.unpriced } : {}),
+          } : {}),
         });
       }
       if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode });
@@ -743,6 +760,51 @@ function pageSessions(clock = () => Date.now()) {
       return { entry: s.entry };
     },
   };
+}
+
+/**
+ * Recent-row filters from the usage query string, or null when none were sent. Unknown parameter
+ * names are left untouched. A value that cannot be a filter is a 400 that names the parameter.
+ */
+function recentSpecFromQuery(params) {
+  const spec = {};
+  const status = params.get('status');
+  if (status !== null) {
+    if (!RECENT_STATUSES.includes(status)) {
+      throw new LlmError(`status must be one of: ${RECENT_STATUSES.join(', ')}`, { status: 400, type: 'invalid_request_error' });
+    }
+    spec.status = status;
+  }
+  const tag = params.get('tag');
+  if (tag !== null) {
+    const parsed = parseTag(tag);
+    if (!parsed) throw new LlmError('tag must be 1–40 characters of letters, digits, ".", "_" or "-"', { status: 400, type: 'invalid_request_error' });
+    spec.tag = parsed;
+  }
+  const key = params.get('key');
+  if (key !== null) {
+    const m = /^fp:([0-9a-fA-F]{8})$/.exec(key);
+    if (!m) throw new LlmError('key must be fp:<8 hex>', { status: 400, type: 'invalid_request_error' });
+    spec.key = `fp:${m[1].toLowerCase()}`;
+  }
+  const model = params.get('model');
+  if (model !== null) {
+    if (!model || model.length > 400) throw new LlmError('model must be a model name', { status: 400, type: 'invalid_request_error' });
+    spec.model = model;
+  }
+  const minCost = params.get('min_cost');
+  if (minCost !== null) {
+    const n = parseFilterNumber(minCost);
+    if (n === null) throw new LlmError('min_cost must be a number of USD, 0 or more', { status: 400, type: 'invalid_request_error' });
+    spec.minCostUsd = n;
+  }
+  const minMs = params.get('min_ms');
+  if (minMs !== null) {
+    const n = parseFilterNumber(minMs);
+    if (n === null) throw new LlmError('min_ms must be a number of milliseconds, 0 or more', { status: 400, type: 'invalid_request_error' });
+    spec.minMs = n;
+  }
+  return Object.keys(spec).length ? spec : null;
 }
 
 /**

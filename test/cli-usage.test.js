@@ -6,17 +6,20 @@
  * src/protocols.js) and the usage row is null, never a 0. No CLI, no model: stub CLIs print each
  * one's stream.
  */
-import { after, before, test } from 'node:test';
+import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { Gateway } from '../src/gateway.js';
 import { createServer } from '../src/server.js';
 import { UsageLog } from '../src/usage.js';
 import { HttpAdapter } from '../src/http-adapter.js';
 import { claudeStreamJson, codexJsonFinal } from '../src/parsers.js';
+import { truncate } from '../src/util.js';
 
 const KEY = 'ks_test_usage_00000000000000000000';
 let dir, server, base, gateway, usageLog;
@@ -339,4 +342,172 @@ test('EMULATE through a CLI that reports no tokens: the answer says so the same 
   assert.match(body.usage.reason, /parser raw/);
   assert.equal(lastRow().toolMode, 'emulate');
   assert.equal(lastRow().usage, null);
+});
+
+/* --------------------------------------- keysmith usage: recent-row filters */
+
+describe('keysmith usage recent-row filters', () => {
+  const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+  // Oldest first. Two fingerprints, ok/error/limited/blocked, priced and unpriced. Tail reads newest first.
+  const ROWS = [
+    { ts: '2026-11-20T12:00:01.000Z', key: 'fp:aaaa1111', model: 'price-low', status: 'ok', ms: 10, tag: 'ci', usage: { input: 1, output: 1 }, cost: { usd: 0.1, basis: 'list' }, via: '/v1/chat/completions' },
+    { ts: '2026-11-20T12:00:02.000Z', key: 'fp:aaaa1111', model: 'err-ci', status: 'error', ms: 20, tag: 'ci', usage: { input: 2, output: 0 }, cost: { usd: 0.6, basis: 'metered' }, error: 'boom', via: '/v1/chat/completions' },
+    { ts: '2026-11-20T12:00:03.000Z', key: 'fp:bbbb2222', model: 'price-high', status: 'ok', ms: 30, tag: 'other', usage: { input: 3, output: 3 }, cost: { usd: 1.2, basis: 'list' }, via: '/v1/chat/completions' },
+    { ts: '2026-11-20T12:00:04.000Z', key: 'fp:bbbb2222', model: 'lim-row', status: 'limited', ms: 0, tag: null, usage: null, cost: { usd: null, basis: 'unpriced' }, error: 'cap', via: '/v1/chat/completions' },
+    { ts: '2026-11-20T12:00:04.500Z', key: 'fp:aaaa1111', model: 'guard-blk', status: 'blocked', ms: 0, tag: null, usage: null, cost: { usd: null, basis: 'unpriced' }, guard: 'blocked', guardKinds: ['github-token'], error: 'request blocked by secret guard (github-token)', face: 'chat' },
+    { ts: '2026-11-20T12:00:05.000Z', key: 'fp:aaaa1111', model: 'err-noprice', status: 'error', ms: 40, tag: 'ci', usage: null, cost: { usd: null, basis: 'unpriced', reason: 'no usage' }, error: 'nope', via: '/v1/chat/completions' },
+    { ts: '2026-11-20T12:00:06.000Z', key: 'fp:aaaa1111', model: 'err-slow', status: 'error', ms: 500, tag: 'nightly', usage: { input: 9, output: 1 }, cost: { usd: 0.5, basis: 'metered' }, error: 'slow', via: '/v1/messages' },
+  ];
+  let dir;
+  let env;
+
+  before(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-cli-usage-filters-'));
+    fs.writeFileSync(path.join(dir, 'usage.jsonl'), ROWS.map((r) => JSON.stringify(r)).join('\n') + '\n', { mode: 0o600 });
+    env = {
+      ...process.env,
+      KEYSMITH_DATA: dir,
+      KEYSMITH_CONFIG: path.join(dir, 'no-such-config.json'),
+    };
+  });
+
+  after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function run(args) {
+    return spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf8' });
+  }
+
+  function recentLine(e) {
+    const st = e.status === 'ok' ? 'ok  ' : e.status === 'blocked' ? 'BLK ' : 'ERR ';
+    return `  ${e.ts}  ${st}  ${(e.model || '?').padEnd(40)} ${String(e.ms).padStart(6)}ms  ${e.usage?.input || 0}→${e.usage?.output || 0}  ${truncate(e.error || '', 60)}`;
+  }
+
+  /** The `recent:` block, including the blank line `out('\\nrecent:')` writes before it. */
+  function recentBlock(entries, extra = []) {
+    return `\nrecent:\n${[...entries.map(recentLine), ...extra].join('\n')}\n`;
+  }
+
+  function statsOf(payload) {
+    const rest = { ...payload };
+    delete rest.entries;
+    delete rest.entriesUnpriced;
+    return rest;
+  }
+
+  test('usage --help names the recent-row flags', () => {
+    const help = run(['usage', '--help']);
+    assert.equal(help.status, 0, help.stderr);
+    for (const flag of ['--tail', '--status', '--tag', '--key', '--model', '--min-cost', '--min-ms', 'blocked']) {
+      assert.ok(help.stdout.includes(flag), flag);
+    }
+    assert.match(help.stdout, /need --tail/);
+  });
+
+  test('--status error lists only error rows, and the totals stay the whole log', () => {
+    const plain = run(['usage', '--tail', '50', '--format', 'json']);
+    const filtered = run(['usage', '--tail', '50', '--status', 'error', '--format', 'json']);
+    assert.equal(filtered.status, 0, filtered.stderr);
+    const all = JSON.parse(plain.stdout);
+    const body = JSON.parse(filtered.stdout);
+    assert.deepEqual(body.entries.map((e) => e.model), ['err-slow', 'err-noprice', 'err-ci']);
+    assert.ok(body.entries.every((e) => e.status === 'error'));
+    assert.equal(Object.hasOwn(body, 'entriesUnpriced'), false);
+    assert.deepEqual(statsOf(body), statsOf(all));
+    const table = run(['usage', '--tail', '50', '--status', 'error']);
+    assert.equal(table.status, 0, table.stderr);
+    const shown = ROWS.filter((e) => e.status === 'error').slice().reverse();
+    assert.ok(table.stdout.endsWith(recentBlock(shown)), table.stdout.slice(table.stdout.lastIndexOf('recent:')));
+    assert.equal(table.stdout.split('\nrecent:\n')[0], run(['usage', '--tail', '50']).stdout.split('\nrecent:\n')[0]);
+  });
+
+  test('--status blocked lists only guard-blocked rows, and renders BLK in table output', () => {
+    const plain = run(['usage', '--tail', '50', '--format', 'json']);
+    const filtered = run(['usage', '--tail', '50', '--status', 'blocked', '--format', 'json']);
+    assert.equal(filtered.status, 0, filtered.stderr);
+    const all = JSON.parse(plain.stdout);
+    const body = JSON.parse(filtered.stdout);
+    assert.deepEqual(body.entries.map((e) => e.model), ['guard-blk']);
+    assert.ok(body.entries.every((e) => e.status === 'blocked'));
+    assert.equal(Object.hasOwn(body, 'entriesUnpriced'), false);
+    assert.deepEqual(statsOf(body), statsOf(all));
+    const table = run(['usage', '--tail', '50', '--status', 'blocked']);
+    assert.equal(table.status, 0, table.stderr);
+    const shown = ROWS.filter((e) => e.status === 'blocked').slice().reverse();
+    assert.ok(table.stdout.includes('  BLK   guard-blk'), table.stdout);
+    assert.ok(table.stdout.endsWith(recentBlock(shown)), table.stdout.slice(table.stdout.lastIndexOf('recent:')));
+    assert.equal(table.stdout.split('\nrecent:\n')[0], run(['usage', '--tail', '50']).stdout.split('\nrecent:\n')[0]);
+  });
+
+  test('--tag ci lists only rows sent with that tag', () => {
+    const runTag = run(['usage', '--tail', '50', '--tag', 'ci', '--format', 'json']);
+    assert.equal(runTag.status, 0, runTag.stderr);
+    const body = JSON.parse(runTag.stdout);
+    assert.deepEqual(body.entries.map((e) => e.model), ['err-noprice', 'err-ci', 'price-low']);
+    assert.ok(body.entries.every((e) => e.tag === 'ci'));
+    const table = run(['usage', '--tail', '50', '--tag', 'ci']);
+    const shown = ROWS.filter((e) => e.tag === 'ci').slice().reverse();
+    assert.ok(table.stdout.endsWith(recentBlock(shown)), table.stdout);
+  });
+
+  test('--min-cost 0.5 lists priced rows at or above 0.5 USD and says how many were unpriced', () => {
+    const json = run(['usage', '--tail', '50', '--min-cost', '0.5', '--format', 'json']);
+    assert.equal(json.status, 0, json.stderr);
+    const body = JSON.parse(json.stdout);
+    assert.deepEqual(body.entries.map((e) => e.model), ['err-slow', 'price-high', 'err-ci']);
+    assert.ok(body.entries.every((e) => e.cost.usd >= 0.5 && e.cost.basis !== 'unpriced'));
+    assert.equal(body.entriesUnpriced, 3);
+    const plain = JSON.parse(run(['usage', '--tail', '50', '--format', 'json']).stdout);
+    assert.deepEqual(statsOf(body), statsOf(plain));
+    const table = run(['usage', '--tail', '50', '--min-cost', '0.5']);
+    assert.equal(table.status, 0, table.stderr);
+    const shown = ROWS.filter((e) => e.model === 'err-slow' || e.model === 'price-high' || e.model === 'err-ci').slice().reverse();
+    assert.ok(table.stdout.endsWith(recentBlock(shown, ['  unpriced: 3 left out'])), table.stdout.slice(table.stdout.lastIndexOf('recent:')));
+    assert.equal(table.stdout.split('\nrecent:\n')[0], run(['usage', '--tail', '50']).stdout.split('\nrecent:\n')[0]);
+  });
+
+  test('--key, --model and --min-ms narrow the same recent list', () => {
+    const byKey = JSON.parse(run(['usage', '--tail', '50', '--key', 'fp:bbbb2222', '--format', 'json']).stdout);
+    assert.deepEqual(byKey.entries.map((e) => e.model), ['lim-row', 'price-high']);
+    const byModel = JSON.parse(run(['usage', '--tail', '50', '--model', 'price-high', '--format', 'json']).stdout);
+    assert.deepEqual(byModel.entries.map((e) => e.model), ['price-high']);
+    const byMs = JSON.parse(run(['usage', '--tail', '50', '--min-ms', '100', '--format', 'json']).stdout);
+    assert.deepEqual(byMs.entries.map((e) => e.model), ['err-slow']);
+    const bad = run(['usage', '--tail', '50', '--min-cost', 'abc']);
+    assert.notEqual(bad.status, 0);
+    assert.match(bad.stderr, /--min-cost/);
+    assert.equal(bad.stdout, '');
+  });
+
+  test('--status error without --tail exits non-zero and explains', () => {
+    const missing = run(['usage', '--status', 'error']);
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /need --tail/);
+    assert.match(missing.stderr, /--status/);
+    assert.equal(missing.stdout, '');
+
+    const bareTail = run(['usage', '--tail', '--status', 'error']);
+    assert.notEqual(bareTail.status, 0);
+    assert.match(bareTail.stderr, /need --tail/);
+  });
+
+  test('--tail without a new flag matches the unfiltered log, json and the recent lines', () => {
+    const json = run(['usage', '--tail', '5', '--format', 'json']);
+    assert.equal(json.status, 0, json.stderr);
+    const usage = new UsageLog(path.join(dir, 'usage.jsonl'), { pricing: {} });
+    const expected = JSON.stringify({ ...usage.query({ by: ['model'], hours: null }), entries: usage.tail(5) }, null, 2) + '\n';
+    assert.equal(json.stdout, expected);
+    assert.equal(Object.hasOwn(JSON.parse(json.stdout), 'entriesUnpriced'), false);
+    assert.deepEqual(JSON.parse(json.stdout).entries.map((e) => e.ts), ROWS.slice(-5).map((e) => e.ts).reverse());
+    const again = run(['usage', '--tail', '5', '--format', 'json']);
+    assert.equal(again.stdout, json.stdout);
+    const table = run(['usage', '--tail', '5']);
+    assert.equal(table.status, 0, table.stderr);
+    assert.ok(table.stdout.endsWith(recentBlock(ROWS.slice(-5).slice().reverse())), table.stdout.slice(table.stdout.lastIndexOf('recent:')));
+    const csvTail = run(['usage', '--tail', '5', '--format', 'csv']);
+    const csvPlain = run(['usage', '--format', 'csv']);
+    assert.equal(csvTail.status, 0, csvTail.stderr);
+    assert.equal(csvTail.stdout, csvPlain.stdout);
+  });
 });

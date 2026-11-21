@@ -1253,6 +1253,122 @@ const EXTERNAL_FIELD_MAX = 128;
 const clip = (v) => (typeof v === 'string' ? v.slice(0, EXTERNAL_FIELD_MAX) : v);
 const num = (v) => (Number.isFinite(Number(v)) && v !== '' && v !== null && v !== undefined ? Number(v) : null);
 
+/** Statuses written on a usage row (`stamp()` / `record()` in server.js). */
+export const RECENT_STATUSES = ['ok', 'error', 'limited', 'blocked', 'denied'];
+
+const ENTRY_FILTER_KEYS = ['status', 'tag', 'key', 'model', 'route', 'minCostUsd', 'minMs'];
+
+/**
+ * A non-negative decimal (`0`, `0.5`, `10`), or null. Blank, signed and exponent forms are rejected
+ * so a query value like `abc` cannot become a number.
+ */
+export function parseFilterNumber(raw) {
+  if (typeof raw !== 'string') return null;
+  const s = raw.trim();
+  if (!/^(?:\d+\.\d+|\d+)$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Priced USD on a row, or null when it has no price: `cost` missing, `usd` not a finite number,
+ * or `basis: "unpriced"`. A subscription row's `usd: 0` is a price of zero, not a missing price.
+ */
+function pricedUsd(row) {
+  const cost = row?.cost;
+  if (!cost || typeof cost !== 'object') return null;
+  if (cost.basis === 'unpriced') return null;
+  if (typeof cost.usd !== 'number' || !Number.isFinite(cost.usd)) return null;
+  return cost.usd;
+}
+
+/**
+ * Request path for a usage row: `via` when `stamp()` stored a path (`/v1/messages`, `/v1/responses`,
+ * `/v1/embeddings`, or a refusal's `route`), otherwise derived from `face` (`/v1/chat/completions`
+ * omits `via`, and verbatim tool relays write `via: "passthrough"` with `face`).
+ */
+function rowRoute(row) {
+  if (typeof row?.via === 'string' && row.via.startsWith('/')) return row.via;
+  if (row?.face === 'chat') return '/v1/chat/completions';
+  if (row?.face === 'messages') return '/v1/messages';
+  if (row?.face === 'responses') return '/v1/responses';
+  if (row?.face === 'embeddings') return '/v1/embeddings';
+  return typeof row?.via === 'string' ? row.via : null;
+}
+
+/**
+ * A predicate for recent usage rows, or null when `spec` names nothing and `viewer` is not a
+ * function. `spec` keys are `status`, `tag`, `key` (`fp:` + 8 hex), `model`, `route` (matched
+ * against the row's request path from `via` or `face`), `minCostUsd` and `minMs`. Any other key
+ * throws. The predicate ANDs with `viewer` (a scoped key's `usageFilterFor`), and never replaces
+ * it. When `minCostUsd` is set, a row with no price fails and `predicate.unpriced` counts how
+ * many such rows the scan saw after the viewer and the other fields had matched.
+ */
+export function entryFilter(spec, viewer = null) {
+  if (spec == null) return typeof viewer === 'function' ? viewer : null;
+  if (typeof spec !== 'object' || Array.isArray(spec)) throw new Error('unknown filter');
+  for (const name of Object.keys(spec)) {
+    if (!ENTRY_FILTER_KEYS.includes(name)) throw new Error(`unknown filter "${name}"`);
+  }
+  const active = {};
+  if (spec.status !== undefined && spec.status !== null) {
+    if (!RECENT_STATUSES.includes(spec.status)) throw new Error(`status must be one of: ${RECENT_STATUSES.join(', ')}`);
+    active.status = spec.status;
+  }
+  if (spec.tag !== undefined && spec.tag !== null) {
+    if (parseTag(spec.tag) !== spec.tag) throw new Error('tag must be 1–40 characters of letters, digits, ".", "_" or "-"');
+    active.tag = spec.tag;
+  }
+  if (spec.key !== undefined && spec.key !== null) {
+    const m = /^fp:([0-9a-fA-F]{8})$/.exec(String(spec.key));
+    if (!m) throw new Error('key must be fp:<8 hex>');
+    active.key = `fp:${m[1].toLowerCase()}`;
+  }
+  if (spec.model !== undefined && spec.model !== null) {
+    if (typeof spec.model !== 'string' || !spec.model || spec.model.length > 400) throw new Error('model must be a model name');
+    active.model = spec.model;
+  }
+  if (spec.route !== undefined && spec.route !== null) {
+    if (typeof spec.route !== 'string' || !spec.route || spec.route.length > 400) throw new Error('route must be a request path');
+    active.route = spec.route;
+  }
+  if (spec.minCostUsd !== undefined && spec.minCostUsd !== null) {
+    if (typeof spec.minCostUsd !== 'number' || !Number.isFinite(spec.minCostUsd) || spec.minCostUsd < 0) {
+      throw new Error('minCostUsd must be a number of USD, 0 or more');
+    }
+    active.minCostUsd = spec.minCostUsd;
+  }
+  if (spec.minMs !== undefined && spec.minMs !== null) {
+    if (typeof spec.minMs !== 'number' || !Number.isFinite(spec.minMs) || spec.minMs < 0) {
+      throw new Error('minMs must be a number of milliseconds, 0 or more');
+    }
+    active.minMs = spec.minMs;
+  }
+  const viewerFn = typeof viewer === 'function' ? viewer : null;
+  if (!Object.keys(active).length) return viewerFn;
+  const seen = { unpriced: 0 };
+  const pred = (row) => {
+    if (viewerFn && !viewerFn(row)) return false;
+    if (active.status !== undefined && row?.status !== active.status) return false;
+    if (active.tag !== undefined && row?.tag !== active.tag) return false;
+    if (active.key !== undefined && row?.key !== active.key) return false;
+    if (active.model !== undefined && row?.model !== active.model) return false;
+    if (active.route !== undefined && rowRoute(row) !== active.route && row?.via !== active.route) return false;
+    if (active.minMs !== undefined && (typeof row?.ms !== 'number' || !Number.isFinite(row.ms) || row.ms < active.minMs)) return false;
+    if (active.minCostUsd !== undefined) {
+      const usd = pricedUsd(row);
+      if (usd === null) {
+        seen.unpriced += 1;
+        return false;
+      }
+      if (usd < active.minCostUsd) return false;
+    }
+    return true;
+  };
+  if (active.minCostUsd !== undefined) Object.defineProperty(pred, 'unpriced', { get() { return seen.unpriced; } });
+  return pred;
+}
+
 export class UsageLog {
   /** `now`: the clock a row's `ts` is read from (ms or Date), injectable for a test. */
   constructor(file = null, { pricing = null, now = null, log = null } = {}) {
