@@ -1118,7 +1118,8 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     // so the upstream is not called and holdSpend reserves nothing. meter() already
     // counted the request. A failed collect throws before anything is stored.
     const cacheable = !!(responseCache && tools == null && !session && (body.temperature === 0 || wantsResponseCache(req)));
-    const cacheKey = cacheable ? keyFor({ callerHash: caller, body }) : null;
+    const cacheModel = upstreamHarness ? `${requested}\0${upstreamHarness}` : requested;
+    const cacheKey = cacheable ? keyFor({ callerHash: caller, body: cacheModel !== body.model ? { ...body, model: cacheModel } : body }) : null;
     if (cacheKey) {
       const hit = responseCache.get(cacheKey);
       if (hit) {

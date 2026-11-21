@@ -18,10 +18,12 @@ import { fileURLToPath } from 'node:url';
 import { Gateway } from '../src/gateway.js';
 import { createServer } from '../src/server.js';
 import { UsageLog } from '../src/usage.js';
+import { fingerprint } from '../src/redact.js';
 import { ResponseCache, keyFor, resolveCacheConfig, MAX_CACHED_BYTES, CACHE_DEFAULTS } from '../src/response-cache.js';
 
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
-const mint = () => 'ks_' + crypto.randomBytes(24).toString('base64url');
+const mint = () => 'k' + 's_' + crypto.randomBytes(24).toString('base64url');
+const fakeGhp = (ch = 'a') => 'gh' + 'p_' + ch.repeat(36);
 const at = (y, mo, d, h = 0, mi = 0, s = 0) => new Date(y, mo - 1, d, h, mi, s).getTime();
 
 /** 2 prompt + 2 completion tokens at $1/token → $4. A hit must not add another $4. */
@@ -52,7 +54,7 @@ function lastUser(body) {
 /* ------------------------------------------------------------------- stub upstream */
 
 async function upstreamServer(t) {
-  const hits = { up: 0, err: 0, fail: false };
+  const hits = { up: 0, err: 0, fail: false, bodies: [] };
   const up = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (c) => (raw += c));
@@ -71,6 +73,7 @@ async function upstreamServer(t) {
         return res.end(JSON.stringify({ error: { message: 'boom' } }));
       }
       hits.up++;
+      hits.bodies.push({ url: req.url, raw, body });
       const answer = lastUser(body);
       if (req.url.includes('/embeddings')) {
         res.writeHead(200, { 'content-type': 'application/json' });
@@ -109,18 +112,20 @@ function tmp(t) {
  * One gateway on `clock`, usage log in a fresh dir. `cache` omitted leaves the setting absent.
  * `pricing` prices `up/m` so a miss has a real dollar cost and a hit must stay at 0.
  */
-async function rig(t, { keys, cache, pricing = null, clock = null } = {}) {
+async function rig(t, { keys, cache, pricing = null, clock = null, guard, spend = null, extraAdapters = null } = {}) {
   const up = await upstreamServer(t);
   const dir = tmp(t);
   const clk = clock || { t: at(2026, 11, 20, 12, 0, 0) };
   const cfg = {
     auth: { enabled: true, keys },
-    limits: { streamHoldMs: 250 },
+    limits: { streamHoldMs: 250, ...(spend ? { spend } : {}) },
     adapters: {
       up: { kind: 'http', wire: 'openai', baseUrl: `${up.root}/up/v1`, apiKey: false, models: ['m', 'e'] },
+      ...(extraAdapters ? extraAdapters(up.root) : {}),
     },
   };
   if (cache !== undefined) cfg.cache = cache;
+  if (guard !== undefined) cfg.guard = guard;
   if (pricing) cfg.pricing = pricing;
   const now = () => clk.t;
   const usage = new UsageLog(path.join(dir, 'usage.jsonl'), { now, pricing });
@@ -143,7 +148,12 @@ async function rig(t, { keys, cache, pricing = null, clock = null } = {}) {
   };
   const get = async (key, route = '/') => {
     const res = await fetch(base + route, { headers: { authorization: `Bearer ${key}` } });
-    return { status: res.status, text: await res.text() };
+    const text = await res.text();
+    let json = null;
+    if (text && text.trim().startsWith('{')) {
+      try { json = JSON.parse(text); } catch { json = null; }
+    }
+    return { status: res.status, text, json };
   };
   return { hits: up.hits, dir, clock: clk, call, get, usage, base };
 }
@@ -449,7 +459,20 @@ test('check 7: a hit writes cache "hit" and cost 0, and keysmith usage does not 
   assert.equal(report.totals.meteredUsd, MISS_USD);
   assert.equal(report.input, 4, 'both rows keep their token counts');
   assert.equal(report.output, 4);
-  assertNoKey(run.stdout + fs.readFileSync(gw.usage.file, 'utf8'), key, 'usage');
+
+  const httpUsage = await gw.get(key, '/v1/keysmith/usage?tail=3');
+  assert.equal(httpUsage.status, 200, httpUsage.text);
+  assert.equal(httpUsage.json.entries.length, 2);
+  const httpHit = httpUsage.json.entries.find((e) => e.cache === 'hit');
+  const httpMiss = httpUsage.json.entries.find((e) => e.status === 'ok' && e.cache !== 'hit');
+  assert.ok(httpHit, 'GET /v1/keysmith/usage?tail=3 returns the hit row');
+  assert.ok(httpMiss, 'GET /v1/keysmith/usage?tail=3 returns the miss row');
+  assert.deepEqual(httpHit.cost, { usd: 0, basis: 'metered' });
+  assert.deepEqual(httpMiss.cost, { usd: MISS_USD, basis: 'metered' });
+  assert.equal(httpUsage.json.totals.requests, 2);
+  assert.equal(httpUsage.json.totals.meteredUsd, MISS_USD);
+
+  assertNoKey(run.stdout + httpUsage.text + fs.readFileSync(gw.usage.file, 'utf8'), key, 'usage');
 });
 
 test('check 8: an upstream 500 is not cached, so the retry and the later success both reach the upstream', async (t) => {
@@ -508,4 +531,203 @@ test('a cache hit counts as one request against perDay, and the request over the
   assert.equal(over.status, 429, over.text);
   assert.equal(over.cache, null);
   assert.equal(gw.hits.up, 1, 'over the cap is refused before the cache and before the upstream');
+});
+
+test('guard.secrets: blocked prompts never reach the cache; masked prompts hash the masked body and stamp key/label/tag/bytes/guard on hits', async (t) => {
+  const secret = fakeGhp('a');
+  const unmaskedBody = chat(`token ${secret}`, { temperature: 0 });
+  const maskedBody = chat('token [REDACTED:github-token]', { temperature: 0 });
+  assert.notEqual(
+    keyFor({ callerHash: 'c1', body: unmaskedBody }),
+    keyFor({ callerHash: 'c1', body: maskedBody }),
+    'masked and unmasked bodies do not share a cache key',
+  );
+
+  // guard.secrets = block: refused before responseCache and before upstream.
+  const bKey = mint();
+  const blockedGw = await rig(t, {
+    keys: [bKey],
+    cache: { enabled: true, ttlSeconds: 3600, maxEntries: 50 },
+    guard: { secrets: 'block' },
+  });
+  const blocked1 = await blockedGw.call(bKey, unmaskedBody);
+  const blocked2 = await blockedGw.call(bKey, unmaskedBody);
+  assert.equal(blocked1.status, 400, blocked1.text);
+  assert.equal(blocked2.status, 400, blocked2.text);
+  assert.equal(blocked1.cache, null);
+  assert.equal(blocked2.cache, null);
+  assert.equal(blockedGw.hits.up, 0);
+  const blockedPage = await blockedGw.get(bKey, '/');
+  assert.match(blockedPage.text, /response cache: 0 hits \/ 0 misses, 0 entries/);
+
+  // guard.secrets = mask: hashed after masking, and hit rows go through stamped usage.
+  const mKey = mint();
+  const fp = `fp:${fingerprint(mKey)}`;
+  const maskedGw = await rig(t, {
+    keys: [{ key: mKey, label: 'ops' }],
+    cache: { enabled: true, ttlSeconds: 3600, maxEntries: 50 },
+    guard: { secrets: 'mask' },
+    pricing: PRICE,
+  });
+  const miss = await maskedGw.call(mKey, unmaskedBody, { 'x-keysmith-tag': 'ci-miss' });
+  assert.equal(miss.status, 200, miss.text);
+  assert.equal(miss.cache, 'miss');
+  assert.equal(maskedGw.hits.up, 1);
+  assert.match(maskedGw.hits.bodies[0].raw, /\[REDACTED:github-token\]/);
+  assert.ok(!maskedGw.hits.bodies[0].raw.includes(secret.slice(4, 16)), 'upstream never saw the secret');
+
+  const hit = await maskedGw.call(mKey, unmaskedBody, { 'x-keysmith-tag': 'ci-hit' });
+  assert.equal(hit.status, 200, hit.text);
+  assert.equal(hit.cache, 'hit');
+  assert.equal(maskedGw.hits.up, 1);
+  assert.equal(hit.json.choices[0].message.content, 'token [REDACTED:github-token]');
+
+  // Sending the already-masked text hits the same entry because keyFor hashed the masked body.
+  const hitPreMasked = await maskedGw.call(mKey, maskedBody, { 'x-keysmith-tag': 'ci-pre' });
+  assert.equal(hitPreMasked.status, 200, hitPreMasked.text);
+  assert.equal(hitPreMasked.cache, 'hit');
+  assert.equal(maskedGw.hits.up, 1);
+
+  const rawLog = fs.readFileSync(maskedGw.usage.file, 'utf8');
+  assert.ok(!rawLog.includes(secret.slice(4, 16)), 'usage.jsonl holds no secret fragment');
+  assertNoKey(rawLog, mKey, 'masked usage.jsonl');
+  const rows = rawLog.trim().split('\n').map((l) => JSON.parse(l));
+  const hitStamped = rows.find((r) => r.tag === 'ci-hit');
+  assert.ok(hitStamped, 'the masked hit row was recorded');
+  assert.equal(hitStamped.cache, 'hit');
+  assert.equal(hitStamped.key, fp);
+  assert.equal(hitStamped.label, 'ops');
+  assert.equal(hitStamped.adapter, 'up');
+  assert.equal(hitStamped.kind, 'http');
+  assert.equal(hitStamped.face, 'chat');
+  assert.ok(hitStamped.bytesIn > 0);
+  assert.ok(hitStamped.bytesOut > 0);
+  assert.equal(hitStamped.guard, 'masked');
+  assert.deepEqual(hitStamped.guardKinds, ['github-token']);
+  assert.deepEqual(hitStamped.cost, { usd: 0, basis: 'metered' });
+});
+
+test('usage filters (--min-cost, --status, --tag, --key, --model) and CLI table/csv totals handle cache "hit" rows cleanly', async (t) => {
+  const key = mint();
+  const fp = `fp:${fingerprint(key)}`;
+  const gw = await rig(t, {
+    keys: [{ key, label: 'dev' }],
+    cache: { enabled: true, ttlSeconds: 3600, maxEntries: 50 },
+    pricing: PRICE,
+  });
+  // Write matching config.json into gw.dir so CLI `keysmith usage` picks up pricing too.
+  const cfgPath = path.join(gw.dir, '.config', 'keysmith', 'config.json');
+  fs.mkdirSync(path.dirname(cfgPath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(cfgPath, JSON.stringify({ auth: { enabled: true, keys: [{ key, label: 'dev' }] }, pricing: PRICE }), { mode: 0o600 });
+
+  const body = chat('filter-me', { temperature: 0 });
+  assert.equal((await gw.call(key, body, { 'x-keysmith-tag': 'eval' })).cache, 'miss');
+  assert.equal((await gw.call(key, body, { 'x-keysmith-tag': 'eval' })).cache, 'hit');
+
+  // min_cost=0 includes both the $0 hit and the $4 miss, with 0 unpriced rows.
+  const httpZero = await gw.get(key, `/v1/keysmith/usage?tail=5&status=ok&tag=eval&key=${fp}&model=up/m&min_cost=0`);
+  assert.equal(httpZero.status, 200, httpZero.text);
+  assert.equal(httpZero.json.entries.length, 2);
+  assert.equal(httpZero.json.entries.some((e) => e.cache === 'hit' && e.cost.usd === 0), true);
+  assert.equal(httpZero.json.entriesUnpriced, 0);
+  assert.equal(httpZero.json.totals.requests, 2);
+  assert.equal(httpZero.json.totals.meteredUsd, MISS_USD);
+
+  // min_cost=1 filters out the $0 hit without counting it as unpriced; aggregates stay whole-log.
+  const httpOne = await gw.get(key, '/v1/keysmith/usage?tail=5&min_cost=1');
+  assert.equal(httpOne.status, 200, httpOne.text);
+  assert.equal(httpOne.json.entries.length, 1);
+  assert.equal(httpOne.json.entries[0].cache, undefined);
+  assert.equal(httpOne.json.entries[0].cost.usd, MISS_USD);
+  assert.equal(httpOne.json.entriesUnpriced, 0);
+  assert.equal(httpOne.json.totals.requests, 2);
+  assert.equal(httpOne.json.totals.meteredUsd, MISS_USD);
+
+  // CLI --min-cost 0 and --min-cost 1 JSON, plus default table and CSV formats.
+  const cliZero = usageCli(gw.dir, ['usage', '--tail', '5', '--status', 'ok', '--tag', 'eval', '--key', fp, '--model', 'up/m', '--min-cost', '0', '--format', 'json']);
+  assert.equal(cliZero.status, 0, cliZero.stderr || cliZero.stdout);
+  const parsedZero = JSON.parse(cliZero.stdout);
+  assert.equal(parsedZero.entries.length, 2);
+  assert.equal(parsedZero.entries.some((e) => e.cache === 'hit'), true);
+  assert.equal(parsedZero.entriesUnpriced, 0);
+  assert.equal(parsedZero.totals.meteredUsd, MISS_USD);
+
+  const cliOne = usageCli(gw.dir, ['usage', '--tail', '5', '--min-cost', '1', '--format', 'json']);
+  assert.equal(cliOne.status, 0, cliOne.stderr || cliOne.stdout);
+  const parsedOne = JSON.parse(cliOne.stdout);
+  assert.equal(parsedOne.entries.length, 1);
+  assert.equal(parsedOne.entries[0].cost.usd, MISS_USD);
+  assert.equal(parsedOne.entriesUnpriced, 0);
+
+  const cliTable = usageCli(gw.dir, ['usage', '--tail', '5', '--min-cost', '0']);
+  assert.equal(cliTable.status, 0, cliTable.stderr || cliTable.stdout);
+  assert.match(cliTable.stdout, /requests: 2 /);
+  assert.match(cliTable.stdout, /metered: \$4\.00/);
+  assert.match(cliTable.stdout, /unpriced: 0 left out/);
+
+  const cliCsv = usageCli(gw.dir, ['usage', '--format', 'csv']);
+  assert.equal(cliCsv.status, 0, cliCsv.stderr || cliCsv.stdout);
+  assert.match(cliCsv.stdout, /^total,2,0,4,4,0,0,4,/m);
+});
+
+test('a cache hit reserves no spend via holdSpend and adds nothing to limits.spend', async (t) => {
+  const key = mint();
+  // Cap is $4 — exact cost of one miss. A cached hit ($0) still succeeds; a new miss is 429.
+  const gw = await rig(t, {
+    keys: [key],
+    cache: { enabled: true, ttlSeconds: 3600, maxEntries: 50 },
+    pricing: PRICE,
+    spend: { up: MISS_USD },
+  });
+  const body = chat('spend-capped', { temperature: 0 });
+  const miss = await gw.call(key, body);
+  assert.equal(miss.status, 200, miss.text);
+  assert.equal(miss.cache, 'miss');
+  assert.equal(gw.hits.up, 1);
+
+  const hit = await gw.call(key, body);
+  assert.equal(hit.status, 200, hit.text);
+  assert.equal(hit.cache, 'hit');
+  assert.equal(gw.hits.up, 1);
+  assert.equal(gw.usage._spendState?.reservedByAdapter?.size || 0, 0, 'nothing left reserved');
+  const [summary] = gw.usage.spendSummary({ up: MISS_USD }, { adapters: { up: {} } });
+  assert.equal(summary.spent, MISS_USD);
+  assert.equal(summary.exceeded, true);
+
+  const secondDistinct = await gw.call(key, chat('new-prompt', { temperature: 0 }));
+  assert.equal(secondDistinct.status, 429, secondDistinct.text);
+  assert.equal(secondDistinct.cache, null);
+  assert.equal(gw.hits.up, 1);
+});
+
+test('keysmith doctor reports invalid cache settings, and x-harness-id resolves model before keyFor', async (t) => {
+  const key = mint();
+  const dir = tmp(t);
+  const cfgPath = path.join(dir, '.config', 'keysmith', 'config.json');
+  fs.mkdirSync(path.dirname(cfgPath), { recursive: true, mode: 0o700 });
+
+  fs.writeFileSync(cfgPath, JSON.stringify({ auth: { enabled: true, keys: [key] }, cache: { enabled: 'yes', ttlSeconds: 0 } }), { mode: 0o600 });
+  const badDoc = usageCli(dir, ['doctor']);
+  assert.match(badDoc.stdout + badDoc.stderr, /cache.*response cache stays off/);
+
+  fs.writeFileSync(cfgPath, JSON.stringify({ auth: { enabled: true, keys: [key] }, cache: { enabled: true, ttlSeconds: 60, maxEntries: 10 } }), { mode: 0o600 });
+  const okDoc = usageCli(dir, ['doctor']);
+  assert.doesNotMatch(okDoc.stdout + okDoc.stderr, /response cache stays off/);
+
+  // Two adapters serving bare model `m`: x-harness-id selects different resolved models, so they must not collide.
+  const gw = await rig(t, {
+    keys: [key],
+    cache: { enabled: true, ttlSeconds: 3600, maxEntries: 50 },
+    extraAdapters: (root) => ({
+      up2: { kind: 'http', wire: 'openai', baseUrl: `${root}/up2/v1`, apiKey: false, models: ['m'] },
+    }),
+  });
+  const bare = { model: 'm', messages: [{ role: 'user', content: 'same' }], temperature: 0 };
+  const fromUp = await gw.call(key, bare, { 'x-harness-id': 'up' });
+  const fromUp2 = await gw.call(key, bare, { 'x-harness-id': 'up2' });
+  assert.equal(fromUp.cache, 'miss');
+  assert.equal(fromUp.json.model, 'up/m');
+  assert.equal(fromUp2.cache, 'miss', 'different x-harness-id resolves to a different model and must not read up\'s entry');
+  assert.equal(fromUp2.json.model, 'up2/m');
+  assert.equal(gw.hits.up, 2);
 });
