@@ -1,5 +1,6 @@
 import { LlmError } from '../util.js';
 import { emulate, renderPrompt } from './emulate.js';
+import { MAX_TOOLS_HARD } from './model.js';
 
 /**
  * Tool routing (design §4, U4): which leg of a route takes a request that offers tools, and how.
@@ -46,6 +47,22 @@ import { emulate, renderPrompt } from './emulate.js';
 
 export const TOOL_MODES = ['off', 'emulate', 'mcp', 'auto'];
 
+/** The default `maxTools` on a leg whose tools a keysmith tool engine renders (CLI, UHP, Traycer). */
+export const DEFAULT_MAX_TOOLS = 512;
+
+/**
+ * An engine leg's `maxTools`: `DEFAULT_MAX_TOOLS` (512) when unset or null, or an integer
+ * from 1 to `MAX_TOOLS_HARD` (4096). Verbatim HTTP legs (`relaysVerbatim`) never run a
+ * keysmith tool engine and ignore this limit.
+ */
+export function checkMaxTools(id, maxTools) {
+  if (maxTools === undefined || maxTools === null) return DEFAULT_MAX_TOOLS;
+  if (!Number.isInteger(maxTools) || maxTools < 1 || maxTools > MAX_TOOLS_HARD) {
+    throw new Error(`adapter "${id}": maxTools must be an integer between 1 and ${MAX_TOOLS_HARD} — got ${JSON.stringify(maxTools)?.slice(0, 40)}`);
+  }
+  return maxTools;
+}
+
 /**
  * A CLI entry's toolMode: 'off' when it has none. A value that is not a mode, any mode but off on
  * an adapter marked `unsafeTools` — a CLI that kept its own tools never answers a tool request —
@@ -76,11 +93,13 @@ export function toolPath(adapter, spec, face) {
     if (adapter.wire === 'uhp' || adapter.wire === 'traycer') {
       const mode = adapter.toolMode || 'auto';
       if (mode === 'off' || spec.unsupported?.length) return 'skip';
+      const maxTools = adapter.maxTools ?? DEFAULT_MAX_TOOLS;
+      if ((spec?.tools?.length || 0) > maxTools) return 'skip';
       return 'engine';
     }
     // Verbatim is the only way an openai- or anthropic-wire HTTP leg takes tools, and only on the
     // face whose body that upstream reads as it is: the chat face's for the openai wire, the
-    // Messages face's for the anthropic wire.
+    // Messages face's for the anthropic wire. No keysmith per-leg tool-count limit applies here.
     return relaysVerbatim(adapter, face) ? 'passthrough' : 'skip';
   }
   const mode = adapter.toolMode || 'off';
@@ -88,6 +107,8 @@ export function toolPath(adapter, spec, face) {
   // A custom tool, an Anthropic server tool, a tool_choice keysmith cannot read: a CLI has no way
   // to honour them, and dropping them would answer a different request.
   if (spec.unsupported?.length) return 'skip';
+  const maxTools = adapter.maxTools ?? DEFAULT_MAX_TOOLS;
+  if ((spec?.tools?.length || 0) > maxTools) return 'skip';
   return 'engine';
 }
 
@@ -104,10 +125,10 @@ export const FACE_ROUTES = { openai: '/v1/chat/completions', anthropic: '/v1/mes
 /**
  * Why `adapter` cannot carry a request's tools on `face`, or null when it can (toolPath is
  * 'engine', or 'passthrough' with a relay): `{ reason, detail }` — a code for the usage row and
- * doctor (`tool_mode_off`, `wire_no_tools`, `unsupported_tools`, `no_relay`) and the words for an
- * error and the log. Such a leg is passed by in a route that offers tools, and is never handed
- * the request as a plain completion in their place (gateway._toolWalk): a text answer to a client
- * that offered tools (Claude Code) breaks it without a word.
+ * doctor (`tool_mode_off`, `wire_no_tools`, `unsupported_tools`, `too_many_tools`, `no_relay`) and
+ * the words for an error and the log. Such a leg is passed by in a route that offers tools, and is
+ * never handed the request as a plain completion in their place (gateway._toolWalk): a text answer
+ * to a client that offered tools (Claude Code) breaks it without a word.
  */
 export function toolSkipReason(adapter, spec, face, { relay = true } = {}) {
   const path = toolPath(adapter, spec, face);
@@ -117,6 +138,9 @@ export function toolSkipReason(adapter, spec, face, { relay = true } = {}) {
   if (adapter.kind === 'http') {
     if (adapter.wire === 'uhp' || adapter.wire === 'traycer') {
       if ((adapter.toolMode || 'auto') === 'off') return { reason: 'tool_mode_off', detail: `toolMode off on this ${adapter.wire} upstream: it answers in text only` };
+      if (!spec?.unsupported?.length && (spec?.tools?.length || 0) > (adapter.maxTools ?? DEFAULT_MAX_TOOLS)) {
+        return tooManyTools(adapter, spec.tools.length, adapter.maxTools ?? DEFAULT_MAX_TOOLS);
+      }
       return { reason: 'unsupported_tools', detail: `it takes plain function tools only, not ${describeUnsupported(spec)}` };
     }
     const wire = adapter.wire || 'openai';
@@ -125,7 +149,17 @@ export function toolSkipReason(adapter, spec, face, { relay = true } = {}) {
     return { reason: 'wire_no_tools', detail: `an HTTP upstream on the ${wire} wire is never handed tools: keysmith has no verbatim relay for that wire` };
   }
   if ((adapter.toolMode || 'off') === 'off') return { reason: 'tool_mode_off', detail: `toolMode off: it answers in text only (keysmith tools ${adapter.id} emulate|auto takes tools)` };
+  if (!spec?.unsupported?.length && (spec?.tools?.length || 0) > (adapter.maxTools ?? DEFAULT_MAX_TOOLS)) {
+    return tooManyTools(adapter, spec.tools.length, adapter.maxTools ?? DEFAULT_MAX_TOOLS);
+  }
   return { reason: 'unsupported_tools', detail: `a CLI takes plain function tools only, not ${describeUnsupported(spec)}` };
+}
+
+function tooManyTools(adapter, count, maxTools) {
+  return {
+    reason: 'too_many_tools',
+    detail: `offers ${count} tools, over maxTools=${maxTools} (at most ${maxTools} tools; keysmith set ${adapter.id} maxTools <n>)`,
+  };
 }
 
 /**

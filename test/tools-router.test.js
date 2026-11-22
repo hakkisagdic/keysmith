@@ -19,11 +19,13 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Gateway, checkAdapter } from '../src/gateway.js';
+import { loadConfig } from '../src/config.js';
 import { createServer } from '../src/server.js';
 import { UsageLog } from '../src/usage.js';
 import { CLI_PROFILES } from '../src/profiles.js';
 import { autoApproveFlag } from '../src/cli-adapter.js';
-import { namesFit, pickEngine } from '../src/tools/router.js';
+import { renderPrompt } from '../src/tools/emulate.js';
+import { DEFAULT_MAX_TOOLS, checkMaxTools, namesFit, pickEngine, toolPath, toolSkipReason } from '../src/tools/router.js';
 
 const STUB = fileURLToPath(new URL('./stubs/agy-emu.mjs', import.meta.url));
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
@@ -713,7 +715,7 @@ test('pickEngine and namesFit, the rules on their own', () => {
 
 /* ------------------------------------------------------------------- /v1/messages */
 
-test('/v1/messages: tools reach a CLI with a toolMode, as tool_use blocks, streamed or not; more than 128 is a 400', async () => {
+test('/v1/messages: tools reach a CLI with a toolMode, as tool_use blocks, streamed or not; 243 tools fit the default 512, and more than 512 is a 400', async () => {
   const body = { model: 'emu/m', max_tokens: 256, messages: [{ role: 'user', content: 'SCENARIO=two-calls' }], tools: A_TOOLS };
   const r = await post('/v1/messages', body);
   assert.equal(r.status, 200, r.text);
@@ -725,9 +727,282 @@ test('/v1/messages: tools reach a CLI with a toolMode, as tool_use blocks, strea
   const s = await post('/v1/messages', { ...body, stream: true });
   assert.match(s.text, /"type":"content_block_start","index":0,"content_block":\{"type":"tool_use","id":"toolu_[0-9a-f]{24}","name":"get_weather"/);
   assert.match(s.text, /"stop_reason":"tool_use"/);
-  const many = await post('/v1/messages', { ...body, tools: Array.from({ length: 129 }, (_, i) => ({ name: `t${i}`, input_schema: { type: 'object' } })) });
+  const cc243 = await post('/v1/messages', { ...body, tools: [...A_TOOLS, ...Array.from({ length: 242 }, (_, i) => ({ name: `t${i}`, input_schema: { type: 'object' } }))] });
+  assert.equal(cc243.status, 200, cc243.text);
+  const many = await post('/v1/messages', { ...body, tools: Array.from({ length: 513 }, (_, i) => ({ name: `t${i}`, input_schema: { type: 'object' } })) });
   assert.equal(many.status, 400);
-  assert.match(json(many).error.message, /129 tools; at most 128/);
+  assert.match(json(many).error.message, /emu\/m cannot carry this request's tools — offers 513 tools, over maxTools=512 \(at most 512 tools/);
+});
+
+test('maxTools: verbatim HTTP legs have no per-leg cap (up to the 4096 count-only ceiling); engine legs skip on too_many_tools, 400 naming every leg when none carry, and fail prompt-size cleanly', async () => {
+  const anthropicHits = [];
+  const oaiHits = [];
+  const up = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => (raw += c));
+    req.on('end', () => {
+      const body = raw ? JSON.parse(raw) : {};
+      if (req.url.endsWith('/messages')) {
+        anthropicHits.push(body);
+        if (body.stream) {
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.write(`event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { id: 'msg_up', type: 'message', role: 'assistant', model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } })}\n\n`);
+          res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
+          res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'anthropic passthrough' } })}\n\n`);
+          res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+          res.write(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 3 } })}\n\n`);
+          return res.end(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ id: 'msg_up', type: 'message', role: 'assistant', model: body.model, content: [{ type: 'text', text: 'anthropic passthrough' }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 10, output_tokens: 3 } }));
+      }
+      oaiHits.push(body);
+      answer(body, res);
+    });
+  });
+  await new Promise((r) => up.listen(0, '127.0.0.1', r));
+  const upBase = `http://127.0.0.1:${up.address().port}/v1`;
+  const runLogFile = path.join(dir, 'maxtools-runs.jsonl');
+  const mtRuns = () => (fs.existsSync(runLogFile) ? fs.readFileSync(runLogFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+  const mtLogs = [];
+  const mtUsage = new UsageLog(path.join(dir, 'maxtools-usage.jsonl'));
+  const mtCfg = {
+    auth: { enabled: true, keys: [KEY] },
+    limits: { streamHoldMs: 400, streamKeepaliveMs: 60 },
+    adapters: {
+      small100: agy('emulate', { cwd: path.join(dir, 'ws-mt-100'), maxTools: 100, env: { AGY_EMU_LOG: runLogFile } }),
+      med150: agy('emulate', { cwd: path.join(dir, 'ws-mt-150'), maxTools: 150, env: { AGY_EMU_LOG: runLogFile } }),
+      big512: agy('emulate', { cwd: path.join(dir, 'ws-mt-512'), env: { AGY_EMU_LOG: runLogFile } }),
+      uhp100: { kind: 'http', wire: 'uhp', baseUrl: upBase, apiKey: false, maxTools: 100 },
+      traycer100: { kind: 'http', wire: 'traycer', baseUrl: `http://127.0.0.1:${up.address().port}`, apiKey: false, maxTools: 100 },
+      plain: agy(null, { cwd: path.join(dir, 'ws-mt-plain'), env: { AGY_EMU_LOG: runLogFile } }),
+      anth: { kind: 'http', wire: 'anthropic', baseUrl: upBase, apiKey: false },
+      anthMax100: { kind: 'http', wire: 'anthropic', baseUrl: upBase, apiKey: false, maxTools: 100 },
+      oai: { kind: 'http', wire: 'openai', baseUrl: upBase, apiKey: false },
+    },
+    aliases: {
+      onlySmall: ['small100/m'],
+      claudeRoute: ['small100/m', 'anth/claude-sonnet-4-6'],
+      chatRoute: ['small100/m', 'oai/gpt-4.1'],
+      cliFallback: ['small100/m', 'big512/m'],
+      uhpFallback: ['uhp100/m', 'big512/m'],
+      allTooSmall: ['small100/m', 'med150/m'],
+      smallThenOff: ['small100/m', 'plain/m'],
+    },
+  };
+  const mtGateway = new Gateway(mtCfg, { log: (m) => mtLogs.push(m) });
+  const mtServer = createServer(mtGateway, mtCfg, { usage: mtUsage, log: (m) => mtLogs.push(m) });
+  await new Promise((r) => mtServer.listen(0, '127.0.0.1', r));
+  const mtBase = `http://127.0.0.1:${mtServer.address().port}`;
+  const mtPost = (route, body) => post(route, body, KEY, mtBase);
+  const anthTools = (n, desc = 'd') => [A_TOOLS[0], ...Array.from({ length: n - 1 }, (_, i) => ({ name: `tool_${i}`, description: desc, input_schema: { type: 'object', properties: {} } }))];
+  const oaiTools = (n) => [TOOLS[0], ...Array.from({ length: n - 1 }, (_, i) => ({ type: 'function', function: { name: `tool_${i}`, parameters: { type: 'object', properties: {} } } }))];
+  const respTools = (n) => [{ type: 'function', name: 'get_weather', parameters: TOOLS[0].function.parameters }, ...Array.from({ length: n - 1 }, (_, i) => ({ type: 'function', name: `tool_${i}`, parameters: { type: 'object', properties: {} } }))];
+
+  try {
+    // K1: Direct unit checks on toolPath / toolSkipReason.
+    const spec200 = { tools: Array.from({ length: 200 }, (_, i) => ({ name: `t${i}` })), choice: { mode: 'auto' }, parallel: true, unsupported: [] };
+    assert.equal(toolPath(mtGateway.adapters.get('big512'), spec200, 'anthropic'), 'engine');
+    assert.equal(toolSkipReason(mtGateway.adapters.get('big512'), spec200, 'anthropic'), null);
+    assert.equal(toolPath(mtGateway.adapters.get('small100'), spec200, 'anthropic'), 'skip');
+    const skipCli = toolSkipReason(mtGateway.adapters.get('small100'), spec200, 'anthropic');
+    assert.equal(skipCli.reason, 'too_many_tools');
+    assert.match(skipCli.detail, /200.*maxTools=100/);
+
+    // UHP and Traycer legs enforce maxTools too; verbatim HTTP legs never do (even if maxTools is set in config).
+    assert.equal(toolPath(mtGateway.adapters.get('uhp100'), spec200, 'openai'), 'skip');
+    assert.equal(toolSkipReason(mtGateway.adapters.get('uhp100'), spec200, 'openai').reason, 'too_many_tools');
+    assert.equal(toolPath(mtGateway.adapters.get('traycer100'), spec200, 'openai'), 'skip');
+    assert.equal(toolSkipReason(mtGateway.adapters.get('traycer100'), spec200, 'openai').reason, 'too_many_tools');
+    const spec600 = { ...spec200, tools: Array.from({ length: 600 }, (_, i) => ({ name: `t${i}` })) };
+    assert.equal(toolPath(mtGateway.adapters.get('anth'), spec600, 'anthropic'), 'passthrough');
+    assert.equal(toolSkipReason(mtGateway.adapters.get('anth'), spec600, 'anthropic'), null);
+    assert.equal(toolPath(mtGateway.adapters.get('anthMax100'), spec600, 'anthropic'), 'passthrough');
+    assert.equal(toolSkipReason(mtGateway.adapters.get('anthMax100'), spec600, 'anthropic'), null);
+    assert.equal(toolPath(mtGateway.adapters.get('oai'), spec600, 'openai'), 'passthrough');
+    assert.equal(toolSkipReason(mtGateway.adapters.get('oai'), spec600, 'openai'), null);
+
+    // Both unsupported and > maxTools keeps reporting unsupported_tools.
+    const specBoth = { ...spec200, unsupported: [{ type: 'custom', name: 'apply_patch' }] };
+    assert.equal(toolSkipReason(mtGateway.adapters.get('small100'), specBoth, 'openai').reason, 'unsupported_tools');
+    assert.equal(toolSkipReason(mtGateway.adapters.get('uhp100'), specBoth, 'openai').reason, 'unsupported_tools');
+
+    // K2 & K3: Verbatim HTTP legs relay 243, 600, and 4096 tools cleanly (and anthropicMax100 ignores maxTools on verbatim relay).
+    for (const count of [243, 600]) {
+      const r1 = await mtPost('/v1/messages', { model: 'anth/claude-sonnet-4-6', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }], tools: anthTools(count) });
+      assert.equal(r1.status, 200, r1.text);
+      assert.equal(json(r1).content[0].text, 'anthropic passthrough');
+      assert.equal(anthropicHits.at(-1).tools.length, count);
+
+      const s1 = await mtPost('/v1/messages', { model: 'anth/claude-sonnet-4-6', stream: true, max_tokens: 64, messages: [{ role: 'user', content: 'hi' }], tools: anthTools(count) });
+      assert.equal(s1.status, 200, s1.text);
+      assert.match(s1.text, /anthropic passthrough/);
+      assert.equal(anthropicHits.at(-1).tools.length, count);
+
+      const r2 = await mtPost('/v1/chat/completions', { model: 'oai/gpt-4.1', messages: [{ role: 'user', content: 'hi' }], tools: oaiTools(count) });
+      assert.equal(r2.status, 200, r2.text);
+      assert.equal(json(r2).choices[0].message.content, 'google answer');
+      assert.equal(oaiHits.at(-1).tools.length, count);
+    }
+    const rMaxIgnored = await mtPost('/v1/messages', { model: 'anthMax100/claude-sonnet-4-6', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }], tools: anthTools(243) });
+    assert.equal(rMaxIgnored.status, 200, rMaxIgnored.text);
+    assert.equal(anthropicHits.at(-1).tools.length, 243);
+    assert.equal(mtRuns().length, 0, 'no CLI ran for verbatim HTTP passthrough');
+
+    // K4: Route [CLI leg maxTools=100, verbatim HTTP leg] with 200 tools -> HTTP leg answers and skippedLegs records too_many_tools.
+    const rClaude = await mtPost('/v1/messages', { model: 'claudeRoute', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }], tools: anthTools(200) });
+    assert.equal(rClaude.status, 200, rClaude.text);
+    assert.equal(json(rClaude).content[0].text, 'anthropic passthrough');
+    assert.equal(anthropicHits.at(-1).tools.length, 200);
+    let row = mtUsage.tail(1)[0];
+    assert.equal(row.status, 'ok');
+    assert.deepEqual(row.skippedLegs.map((s) => [s.target, s.reason]), [['small100/m', 'too_many_tools']]);
+    assert.match(row.skippedLegs[0].detail, /200.*maxTools=100/);
+    assert.ok(mtLogs.some((l) => /small100\/m passed by \(too_many_tools\): .*200.*maxTools=100/.test(l)));
+    assert.equal(mtRuns().length, 0, 'small100 was passed by without spawning');
+
+    const rChat = await mtPost('/v1/chat/completions', { model: 'chatRoute', messages: [{ role: 'user', content: 'hi' }], tools: oaiTools(200) });
+    assert.equal(rChat.status, 200, rChat.text);
+    assert.equal(json(rChat).choices[0].message.content, 'google answer');
+    assert.deepEqual(mtUsage.tail(1)[0].skippedLegs.map((s) => [s.target, s.reason]), [['small100/m', 'too_many_tools']]);
+
+    // Engine leg (maxTools=100) skipped -> larger engine leg (default maxTools=512) answers on all three faces, and UHP leg with maxTools=100 skips too.
+    for (const [route, body] of [
+      ['/v1/messages', { model: 'cliFallback', max_tokens: 128, messages: [{ role: 'user', content: 'SCENARIO=one-call' }], tools: anthTools(200) }],
+      ['/v1/chat/completions', { model: 'cliFallback', messages: [{ role: 'user', content: 'SCENARIO=one-call' }], tools: oaiTools(200) }],
+      ['/v1/responses', { model: 'cliFallback', input: 'SCENARIO=one-call', tools: respTools(200) }],
+      ['/v1/chat/completions', { model: 'uhpFallback', messages: [{ role: 'user', content: 'SCENARIO=one-call' }], tools: oaiTools(200) }],
+    ]) {
+      const r = await mtPost(route, body);
+      assert.equal(r.status, 200, `${route} (${body.model}): ${r.text}`);
+      const skipped = mtUsage.tail(1)[0].skippedLegs;
+      assert.equal(skipped.length, 1);
+      assert.equal(skipped[0].reason, 'too_many_tools');
+      assert.match(skipped[0].detail, /200.*maxTools=100/);
+    }
+    const runsAfterFallback = mtRuns().length;
+    assert.equal(runsAfterFallback, 4, 'only big512 ran once per fallback request');
+
+    // Within small100's limit (100 tools), small100 itself answers without skipping.
+    const within = await mtPost('/v1/messages', { model: 'claudeRoute', max_tokens: 128, messages: [{ role: 'user', content: 'SCENARIO=one-call' }], tools: anthTools(100) });
+    assert.equal(within.status, 200, within.text);
+    assert.equal(json(within).stop_reason, 'tool_use');
+    assert.equal('skippedLegs' in mtUsage.tail(1)[0], false);
+    assert.equal(mtRuns().length, runsAfterFallback + 1);
+
+    // K5: Only the undersized CLI leg (direct or single-leg alias) -> 400 invalid_request_error naming leg and maxTools=100.
+    const runsBeforeRefusal = mtRuns().length;
+    for (const [route, body] of [
+      ['/v1/messages', { model: 'small100/m', max_tokens: 64, messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: anthTools(200) }],
+      ['/v1/chat/completions', { model: 'onlySmall', messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: oaiTools(200) }],
+      ['/v1/responses', { model: 'small100/m', input: 'SCENARIO=plain', tools: respTools(200) }],
+    ]) {
+      const r = await mtPost(route, body);
+      assert.equal(r.status, 400, `${route}: ${r.text}`);
+      const err = json(r).error;
+      assert.equal(err.type, 'invalid_request_error');
+      assert.match(err.message, /small100\/m.*maxTools=100/);
+      assert.deepEqual(mtUsage.tail(1)[0].skippedLegs.map((s) => [s.target, s.reason]), [['small100/m', 'too_many_tools']]);
+    }
+
+    // All legs too small -> 400 invalid_request_error naming each leg and its limit; never drops tools or falls back to plain completion.
+    for (const [route, body] of [
+      ['/v1/messages', { model: 'allTooSmall', max_tokens: 64, messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: anthTools(200) }],
+      ['/v1/messages', { model: 'allTooSmall', stream: true, max_tokens: 64, messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: anthTools(200) }],
+      ['/v1/chat/completions', { model: 'allTooSmall', messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: oaiTools(200) }],
+      ['/v1/responses', { model: 'allTooSmall', input: 'SCENARIO=plain', tools: respTools(200) }],
+    ]) {
+      const r = await mtPost(route, body);
+      assert.equal(r.status, 400, `${route}: ${r.text}`);
+      const err = json(r).error;
+      assert.equal(err.type, 'invalid_request_error');
+      assert.match(err.message, /small100\/m:.*200.*maxTools=100/);
+      assert.match(err.message, /med150\/m:.*200.*maxTools=150/);
+      assert.match(err.message, /raise maxTools on an adapter/);
+      assert.deepEqual(mtUsage.tail(1)[0].skippedLegs.map((s) => [s.target, s.reason]), [['small100/m', 'too_many_tools'], ['med150/m', 'too_many_tools']]);
+    }
+
+    // Mixed route [small100/m, plain/m] offered 200 tools: never falls through to plain/m without tools (except tool_choice: 'none').
+    const mixed = await mtPost('/v1/chat/completions', { model: 'smallThenOff', messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: oaiTools(200) });
+    assert.equal(mixed.status, 400, mixed.text);
+    assert.equal(json(mixed).error.type, 'invalid_request_error');
+    assert.match(json(mixed).error.message, /small100\/m:.*maxTools=100/);
+    assert.match(json(mixed).error.message, /plain\/m: toolMode off/);
+    assert.doesNotMatch(mixed.text, /plain answer/);
+    assert.equal(mtRuns().length, runsBeforeRefusal, 'no CLI or plain completion ran on any refused request');
+
+    const mixedNone = await mtPost('/v1/chat/completions', { model: 'smallThenOff', messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: oaiTools(200), tool_choice: 'none' });
+    assert.equal(mixedNone.status, 200, mixedNone.text);
+    assert.equal(json(mixedNone).choices[0].message.content, 'plain answer');
+
+    // tool_choice required on allTooSmall also names each leg and limit.
+    const reqChoice = await mtPost('/v1/chat/completions', { model: 'allTooSmall', messages: [{ role: 'user', content: 'SCENARIO=plain' }], tools: oaiTools(200), tool_choice: 'required' });
+    assert.equal(reqChoice.status, 400, reqChoice.text);
+    assert.equal(json(reqChoice).error.type, 'invalid_request_error');
+    assert.match(json(reqChoice).error.message, /small100\/m \(.*maxTools=100/);
+    assert.match(json(reqChoice).error.message, /med150\/m \(.*maxTools=150/);
+
+    // K7: Count-only hard ceiling 4096 across all 3 faces (inclusive: 4096 passes ceiling, 4097 & 5000 fail before parsing or running any leg).
+    const r4096Msg = await mtPost('/v1/messages', { model: 'anth/claude-sonnet-4-6', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }], tools: anthTools(4096) });
+    assert.equal(r4096Msg.status, 200, r4096Msg.text);
+    assert.equal(anthropicHits.at(-1).tools.length, 4096);
+    const r4096Chat = await mtPost('/v1/chat/completions', { model: 'oai/gpt-4.1', messages: [{ role: 'user', content: 'hi' }], tools: oaiTools(4096) });
+    assert.equal(r4096Chat.status, 200, r4096Chat.text);
+    assert.equal(oaiHits.at(-1).tools.length, 4096);
+    const r4096Resp = await mtPost('/v1/responses', { model: 'big512/m', input: 'hi', tools: respTools(4096) });
+    assert.equal(r4096Resp.status, 400);
+    assert.match(json(r4096Resp).error.message, /offers 4096 tools, over maxTools=512/, '4096 clears the hard ceiling and reaches per-leg maxTools');
+
+    const upHitsBefore = anthropicHits.length + oaiHits.length;
+    const cliRunsBeforeHard = mtRuns().length;
+    for (const n of [4097, 5000]) {
+      for (const [route, body] of [
+        ['/v1/chat/completions', { model: 'oai/gpt-4.1', messages: [{ role: 'user', content: 'hi' }], tools: oaiTools(n) }],
+        ['/v1/messages', { model: 'anth/claude-sonnet-4-6', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }], tools: anthTools(n) }],
+        ['/v1/responses', { model: 'big512/m', input: 'hi', tools: respTools(n) }],
+      ]) {
+        const t0 = performance.now();
+        const r = await mtPost(route, body);
+        const ms = performance.now() - t0;
+        assert.equal(r.status, 400, `${route} n=${n}: ${r.text}`);
+        assert.ok(ms < 1000, `${route} n=${n} answered in ${ms.toFixed(0)} ms`);
+        const err = json(r).error;
+        assert.equal(err.type, 'invalid_request_error');
+        assert.match(err.message, new RegExp(`offers ${n} tools; keysmith accepts at most 4096 tools per request`));
+      }
+    }
+    // Count-only proof: 5000 unsupported items hit the 4096 ceiling rather than parsing items as unsupported tools.
+    for (const [route, body] of [
+      ['/v1/chat/completions', { model: 'oai/gpt-4.1', messages: [{ role: 'user', content: 'hi' }], tools: Array.from({ length: 5000 }, () => ({ type: 'custom', name: 'bad' })) }],
+      ['/v1/messages', { model: 'anth/claude-sonnet-4-6', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }], tools: Array.from({ length: 5000 }, () => ({ type: 'web_search_20250305', name: 'bad' })) }],
+      ['/v1/responses', { model: 'big512/m', input: 'hi', tools: Array.from({ length: 5000 }, () => ({ type: 'custom', name: 'bad' })) }],
+    ]) {
+      const r = await mtPost(route, body);
+      assert.equal(r.status, 400, `${route} count-only: ${r.text}`);
+      assert.match(json(r).error.message, /offers 5000 tools; keysmith accepts at most 4096 tools per request/);
+      assert.doesNotMatch(json(r).error.message, /unsupported|plain function tools only|apply_patch/);
+    }
+    assert.equal(anthropicHits.length + oaiHits.length, upHitsBefore, 'no upstream hit above 4096');
+    assert.equal(mtRuns().length, cliRunsBeforeHard, 'no CLI run above 4096');
+
+    // K9: 300 tools on maxTools=512 CLI leg: renderPrompt keeps every tool (no truncation), and exceeding maxPromptChars fails cleanly with 400.
+    const tools300Long = anthTools(300, 'x'.repeat(800));
+    const rendered300 = renderPrompt({
+      spec: { tools: tools300Long.map((t) => ({ name: t.name, description: t.description, parameters: t.input_schema })), choice: { mode: 'auto' }, parallel: true, unsupported: [] },
+      messages: [{ role: 'user', text: 'hi' }],
+    });
+    assert.ok(rendered300.length > 200_000, 'rendered 300-tool prompt exceeds default maxPromptChars=200000');
+    assert.ok(rendered300.includes('get_weather') && rendered300.includes('tool_0') && rendered300.includes('tool_298'), 'no silent truncation of tools');
+    const runsBeforePromptLimit = mtRuns().length;
+    const rOverPrompt = await mtPost('/v1/messages', { model: 'big512/m', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }], tools: tools300Long });
+    assert.equal(rOverPrompt.status, 400, rOverPrompt.text);
+    assert.match(json(rOverPrompt).error.message, /over maxPromptChars=200000/);
+    assert.equal(mtRuns().length, runsBeforePromptLimit, 'prompt-size refusal happens before spawning CLI');
+  } finally {
+    await mtGateway.close();
+    await new Promise((r) => mtServer.close(r));
+    await new Promise((r) => up.close(r));
+  }
 });
 
 /* -------------------------------------------------------------- routes and status page */
@@ -753,6 +1028,57 @@ test('toolMode is checked at load: a mode that is not one, on an HTTP upstream, 
   // A tool engine runs the CLI only in a workspace keysmith owns (design §5): not in the gateway's own cwd.
   for (const mode of ['emulate', 'mcp', 'auto']) assert.throws(() => checkAdapter('a', { ...base, toolMode: mode }), new RegExp(`toolMode ${mode} needs a configured cwd`));
   assert.equal(checkAdapter('a', { ...base, toolMode: 'auto', cwd: path.join(dir, 'ws-owned') }).toolMode, 'auto');
+
+  // maxTools: defaults to 512 on CLI, UHP and Traycer adapters (absent or null), validated 1..4096 across all adapter types.
+  assert.equal(DEFAULT_MAX_TOOLS, 512);
+  assert.equal(checkMaxTools('a', undefined), 512);
+  assert.equal(checkMaxTools('a', null), 512);
+  assert.equal(checkAdapter('a', base).maxTools, 512);
+  assert.equal(checkAdapter('a', { ...base, maxTools: null }).maxTools, 512);
+  assert.equal(checkAdapter('a', { ...base, maxTools: 1 }).maxTools, 1);
+  assert.equal(checkAdapter('a', { ...base, maxTools: 128 }).maxTools, 128);
+  assert.equal(checkAdapter('a', { ...base, maxTools: 4096 }).maxTools, 4096);
+  assert.equal(checkAdapter('u', { kind: 'http', wire: 'uhp', baseUrl: 'http://127.0.0.1:9/v1' }).maxTools, 512);
+  assert.equal(checkAdapter('u', { kind: 'http', wire: 'uhp', baseUrl: 'http://127.0.0.1:9/v1', maxTools: null }).maxTools, 512);
+  assert.equal(checkAdapter('u', { kind: 'http', wire: 'uhp', baseUrl: 'http://127.0.0.1:9/v1', maxTools: 256 }).maxTools, 256);
+  assert.equal(checkAdapter('t', { kind: 'http', wire: 'traycer', baseUrl: 'http://127.0.0.1:9' }).maxTools, 512);
+  assert.equal(checkAdapter('t', { kind: 'http', wire: 'traycer', baseUrl: 'http://127.0.0.1:9', maxTools: 64 }).maxTools, 64);
+  assert.doesNotThrow(() => checkAdapter('h', { kind: 'http', wire: 'openai', baseUrl: 'http://127.0.0.1:9/v1', maxTools: 4096 }));
+  assert.doesNotThrow(() => checkAdapter('h2', { kind: 'http', wire: 'anthropic', baseUrl: 'http://127.0.0.1:9/v1', maxTools: 100 }));
+  for (const bad of [0, -1, 1.5, 'x', false, Number.NaN, Number.POSITIVE_INFINITY, 4097, 5000]) {
+    assert.throws(() => checkAdapter('a', { ...base, maxTools: bad }), /maxTools must be an integer between 1 and 4096/, `cli maxTools=${String(bad)}`);
+    assert.throws(() => checkAdapter('u', { kind: 'http', wire: 'uhp', baseUrl: 'http://127.0.0.1:9/v1', maxTools: bad }), /maxTools must be an integer between 1 and 4096/, `uhp maxTools=${String(bad)}`);
+    assert.throws(() => checkAdapter('h', { kind: 'http', wire: 'openai', baseUrl: 'http://127.0.0.1:9/v1', maxTools: bad }), /maxTools must be an integer between 1 and 4096/, `http maxTools=${String(bad)}`);
+  }
+
+  // Config file loading: a config file with maxTools: -1 or maxTools: 5000 fails to load those adapters.
+  const badCfgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'keysmith-bad-maxtools-'));
+  try {
+    const cfgPath = path.join(badCfgDir, 'config.json');
+    fs.writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        host: '127.0.0.1',
+        port: 0,
+        auth: { enabled: true, keys: [KEY] },
+        adapters: {
+          badneg: { ...base, maxTools: -1 },
+          badover: { kind: 'http', wire: 'uhp', baseUrl: 'http://127.0.0.1:9/v1', apiKey: false, maxTools: 5000 },
+          good: { ...base, maxTools: 200 },
+        },
+        aliases: {},
+      }),
+    );
+    const loaded = loadConfig({ path: cfgPath });
+    const gw = new Gateway(loaded, { log: () => {}, deferAdapterChecks: true });
+    assert.equal(gw.adapters.has('badneg'), false);
+    assert.equal(gw.adapters.has('badover'), false);
+    assert.equal(gw.adapters.get('good').maxTools, 200);
+    assert.match(gw.loadErrors.badneg, /maxTools/);
+    assert.match(gw.loadErrors.badover, /maxTools/);
+  } finally {
+    fs.rmSync(badCfgDir, { recursive: true, force: true });
+  }
   assert.throws(() => checkAdapter('g', { kind: 'http', baseUrl: 'http://x/v1', toolMode: 'emulate' }), /toolMode is a CLI adapter's field/);
   assert.throws(() => checkAdapter('a', { ...base, emulateArgs: '-p {prompt}' }), /emulateArgs must be an argv template/);
   assert.throws(() => checkAdapter('a', { ...base, bridge: ['--agent'] }), /bridge must be an object/);

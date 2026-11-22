@@ -14,7 +14,7 @@ import {
   errorBody,
 } from './protocols.js';
 import { AnthropicStream, KEEPALIVE_MS, OpenaiChatStream, ResponsesStream, anthropicMessage, faceCall, openaiCompletion, responsesBody } from './tools/faces.js';
-import { MAX_TOOLS, anthropicToolMessages, anthropicToolSpec, openaiLegacy, openaiToolCount, openaiToolMessages, openaiToolSpec, responsesStateRefusal, responsesToolCount, responsesToolMessages, responsesToolSpec } from './tools/model.js';
+import { MAX_TOOLS_HARD, anthropicToolMessages, anthropicToolSpec, openaiLegacy, openaiToolCount, openaiToolMessages, openaiToolSpec, responsesStateRefusal, responsesToolCount, responsesToolMessages, responsesToolSpec } from './tools/model.js';
 import { addUsage } from './tools/emulate.js';
 import { loginPage, statusPage } from './status-page.js';
 import { redactSecrets, registerSecrets } from './redact.js';
@@ -1075,10 +1075,13 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   const meta = track(res, requested, stream, t0);
   // A scoped key's request is decided before anything runs — the tool relay included.
   if (scope) meta.skipped = gateway.resolve(requested, { scope }).skipped;
-  // OpenAI's own limit, checked before the list is read: a body may be 32 MB, and a read of its
-  // tools runs on the event loop every other client of this gateway shares.
+  // Keysmith's count-only ceiling, checked before the list is read: a body may be 32 MB, and a
+  // read of its tools runs on the event loop every other client of this gateway shares.
+  // Per-leg limits live in tools/router.js (engine legs check adapter.maxTools; verbatim relays have none).
   const offered = openaiToolCount(body);
-  if (offered > MAX_TOOLS) throw new LlmError(`this request offers ${offered} tools; at most ${MAX_TOOLS} are taken (OpenAI's limit)`, { status: 400, type: 'invalid_request_error' });
+  if (offered > MAX_TOOLS_HARD) {
+    throw new LlmError(`this request offers ${offered} tools; keysmith accepts at most ${MAX_TOOLS_HARD} tools per request`, { status: 400, type: 'invalid_request_error' });
+  }
   // The reasoning effort the client chose (reasoning_effort, reasoning.effort): a CLI leg whose argv
   // takes one runs at it, checked against its catalogue (src/effort.js).
   const effort = requestEffort(body, 'openai');
@@ -1276,9 +1279,12 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   const trace = extractW3cTrace(req, res);
   const meta = track(res, requested, stream, t0, '/v1/messages');
   if (scope) meta.skipped = gateway.resolve(requested, { scope }).skipped;
-  // The same bound as the chat face's: what an engine is handed (a prompt, a tools/list) has one.
+  // Keysmith's count-only ceiling before reading tools; verbatim HTTP legs on the anthropic wire
+  // have no per-leg cap, while engine legs check adapter.maxTools in tools/router.js.
   const offered = Array.isArray(body.tools) ? body.tools.length : 0;
-  if (offered > MAX_TOOLS) throw new LlmError(`this request offers ${offered} tools; at most ${MAX_TOOLS} are taken`, { status: 400, type: 'invalid_request_error' });
+  if (offered > MAX_TOOLS_HARD) {
+    throw new LlmError(`this request offers ${offered} tools; keysmith accepts at most ${MAX_TOOLS_HARD} tools per request`, { status: 400, type: 'invalid_request_error' });
+  }
   // The Messages API's effort: output_config.effort.
   const effort = requestEffort(body, 'anthropic');
   // Tools on this face reach a CLI leg with a toolMode through a tool engine, and an HTTP leg on
@@ -1456,9 +1462,11 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
 
   const meta = track(res, requestedModel, stream, t0, '/v1/responses');
   if (scope) meta.skipped = gateway.resolve(requestedModel, { scope }).skipped;
-  // The same bound as the other faces': what an engine is handed (a prompt, a tools/list) has one.
+  // Keysmith's count-only ceiling before reading tools; engine legs check adapter.maxTools in tools/router.js.
   const offered = responsesToolCount(effectiveBody);
-  if (offered > MAX_TOOLS) throw new LlmError(`this request offers ${offered} tools; at most ${MAX_TOOLS} are taken`, { status: 400, type: 'invalid_request_error' });
+  if (offered > MAX_TOOLS_HARD) {
+    throw new LlmError(`this request offers ${offered} tools; keysmith accepts at most ${MAX_TOOLS_HARD} tools per request`, { status: 400, type: 'invalid_request_error' });
+  }
   // The Responses API's effort: reasoning.effort (reasoning_effort read too, as on the chat face).
   const effort = requestEffort(effectiveBody, 'openai');
   const shouldStore = body.store !== false;

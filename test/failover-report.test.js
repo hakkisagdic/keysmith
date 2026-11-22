@@ -59,6 +59,10 @@ test('toolCarriage and carriageLines: per alias and face, the legs that carry a 
     // A route with no leg that carries tools on /v1/messages says so.
     const none = new Gateway({ ...config(dir, '/opt/kiro/bin/kiro-cli'), aliases: { bare: ['copilot/gpt-4.1', 'kiro/m'] } }, { log: () => {}, deferAdapterChecks: true });
     assert.ok(carriageLines(toolCarriage(none)).some((l) => l.mark === '✗' && /^bare: .*\/v1\/messages 0\/2 .* a tool request on \/v1\/messages \(Claude Code\) to it is a 400$/.test(l.text)));
+    // An engine leg with a custom maxTools still carries PROBE_SPEC (1 tool) in doctor/toolCarriage.
+    const baseCfg = config(dir, '/opt/kiro/bin/kiro-cli');
+    const capped = new Gateway({ ...baseCfg, adapters: { ...baseCfg.adapters, agy: { ...baseCfg.adapters.agy, maxTools: 128 } } }, { log: () => {}, deferAdapterChecks: true });
+    assert.equal(toolCarriage(capped).find((x) => x.alias === 'chat' && x.face === 'anthropic').legs[0].carries, true);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -104,6 +108,7 @@ test('recentSkips and skipLines: the last 24 h of skippedLegs, counted per leg a
   const row = (ts, skippedLegs) => ({ ts, model: 'chat', status: 'ok', skippedLegs });
   const rows = [
     row('2026-11-11T11:00:00Z', [{ target: 'kiro/m', reason: 'credit_guard', detail: 'old' }]), // 25 h ago
+    row('2026-11-12T08:00:00Z', [{ target: 'agy/m', reason: 'too_many_tools', detail: 'offers 200 tools, over maxTools=100' }]),
     row('2026-11-12T09:00:00Z', [{ target: 'copilot/gpt-4.1', reason: 'wire_no_tools', detail: 'no relay on /v1/messages' }]),
     row('2026-11-12T10:00:00Z', [{ target: 'copilot/gpt-4.1', reason: 'wire_no_tools', detail: 'no relay on /v1/messages' }, { target: 'kiro/m', reason: 'credit_guard', detail: 'Kiro plan at 96%' }]),
     { ts: '2026-11-12T11:00:00Z', model: 'chat', status: 'ok' },
@@ -112,10 +117,15 @@ test('recentSkips and skipLines: the last 24 h of skippedLegs, counted per leg a
   assert.deepEqual(skips.map((s) => [s.target, s.reason, s.count, s.last]), [
     ['copilot/gpt-4.1', 'wire_no_tools', 2, '2026-11-12T10:00:00.000Z'],
     ['kiro/m', 'credit_guard', 1, '2026-11-12T10:00:00.000Z'],
+    ['agy/m', 'too_many_tools', 1, '2026-11-12T08:00:00.000Z'],
   ]);
   assert.equal(skips.find((s) => s.reason === 'credit_guard').detail, 'Kiro plan at 96%');
   const lines = skipLines(skips).map((l) => `${l.mark} ${l.text}`);
-  assert.deepEqual(lines, ['· copilot/gpt-4.1 wire_no_tools ×2 (last 2026-11-12 10:00Z) — no relay on /v1/messages', '! kiro/m credit_guard ×1 (last 2026-11-12 10:00Z) — Kiro plan at 96%']);
+  assert.deepEqual(lines, [
+    '· copilot/gpt-4.1 wire_no_tools ×2 (last 2026-11-12 10:00Z) — no relay on /v1/messages',
+    '! kiro/m credit_guard ×1 (last 2026-11-12 10:00Z) — Kiro plan at 96%',
+    '· agy/m too_many_tools ×1 (last 2026-11-12 08:00Z) — offers 200 tools, over maxTools=100',
+  ]);
   assert.deepEqual(skipLines([]), [{ mark: '✓', text: 'no leg was passed by in the last 24 h' }]);
 });
 

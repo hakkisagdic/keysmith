@@ -90,14 +90,12 @@ export function toolCallEvent({ id = null, name, args = {}, face = 'openai' }) {
 /* ------------------------------------------------------------------- tool specs */
 
 /**
- * The most tools one request may offer: OpenAI's own limit on `tools`, and so on what an OpenAI
- * client sends. The chat face refuses more with a 400 before any leg runs (server.js), counting
- * `tools` and the older `functions` together (openaiToolCount). Not in the design: a review
- * found one request with 40,000 functions holding every client of the gateway for seconds. The
- * read below is linear, so this is a bound on what an engine is later handed (a prompt, an MCP
- * tools/list), not what keeps the parse cheap.
+ * Keysmith's own count-only ceiling on how many tools one request may offer, checked on every
+ * face before the list is parsed (server.js): a body may be 32 MB, and parsing tens of
+ * thousands of tools runs on the shared event loop. Per-leg limits live in tools/router.js
+ * (adapter.maxTools for engine legs; verbatim HTTP relays have no per-leg cap).
  */
-export const MAX_TOOLS = 128;
+export const MAX_TOOLS_HARD = 4096;
 
 /** How many tools an OpenAI chat body offers, `tools` and `functions` together, without reading one. */
 export function openaiToolCount(body) {
@@ -308,7 +306,7 @@ function emptySpec() {
 /**
  * One offered tool into the spec. `names` holds the names taken so far, so a list is read in one
  * pass: the request is read on the gateway's one event loop, and a list that cost n² to read
- * would hold every other client while it was (see MAX_TOOLS).
+ * would hold every other client while it was (see MAX_TOOLS_HARD).
  */
 function addTool(spec, names, name, description, parameters, type) {
   if (typeof name !== 'string' || !name) {

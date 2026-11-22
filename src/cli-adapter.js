@@ -9,7 +9,7 @@ import { expand, resolveSecret } from './config.js';
 import { registerSecrets } from './redact.js';
 import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, agentCleanEnv } from './util.js';
 import { checkCreditGuard } from './credit-guard.js';
-import { checkToolMode } from './tools/router.js';
+import { checkMaxTools, checkToolMode } from './tools/router.js';
 import { checkMedia, hasMedia, mediaPrompt } from './media.js';
 import { takesEffort } from './effort.js';
 import { CLI_PROFILES, FORMER_PARSERS } from './profiles.js';
@@ -137,6 +137,7 @@ export class CliAdapter {
     this.stripSystemPrompt = !!cfg.stripSystemPrompt;
     this.systemFlag = cfg.systemFlag || null;
     this.maxPromptChars = cfg.maxPromptChars ?? 200_000;
+    this.maxTools = checkMaxTools(id, cfg.maxTools);
     this.modelsFrom = cfg.modelsFrom || null;
     this.declaredModels = cfg.models || null;
     this.defaultModel = cfg.defaultModel || null;

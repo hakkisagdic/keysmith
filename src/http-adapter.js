@@ -2,6 +2,7 @@ import { LlmError } from './util.js';
 import { ThoughtSignatures, limitsFrom } from './thought-signatures.js';
 import { redactSecrets } from './redact.js';
 import { checkMedia, hasMedia, upstreamMessages } from './media.js';
+import { checkMaxTools } from './tools/router.js';
 import { credentialAccount, hostOf } from './usage.js';
 import { catalogueLimitError, discoveredPath, readDiscovered } from './catalogue.js';
 import { dataDir } from './config.js';
@@ -62,12 +63,15 @@ export class HttpAdapter {
       }
       this.toolMode = mode;
       this.maxPromptChars = cfg.maxPromptChars ?? 500_000;
+      this.maxTools = checkMaxTools(id, cfg.maxTools);
       this._uhpToolsIgnored = false;
     } else {
       // An HTTP upstream takes tools one way: verbatim (the chat face's relay). toolMode is a CLI's.
       if (cfg.toolMode != null && cfg.toolMode !== 'off') {
         throw new Error(`adapter "${id}": toolMode is a CLI adapter's field — an HTTP upstream on the openai wire is handed tool requests verbatim`);
       }
+      // Accepted and validated so one config template can carry it, though verbatim HTTP relays have no per-leg tool-count limit.
+      if (cfg.maxTools !== undefined) checkMaxTools(id, cfg.maxTools);
       this.toolMode = 'off';
     }
     // The Kiro credit guard reads a Kiro plan through kiro-cli (src/credit-guard.js): on an HTTP

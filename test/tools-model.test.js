@@ -10,7 +10,7 @@ import { anthropicMessages, openaiMessages } from '../src/protocols.js';
 import { flattenMessages } from '../src/util.js';
 import {
   FINISH_TOOL_CALLS,
-  MAX_TOOLS,
+  MAX_TOOLS_HARD,
   anthropicToolMessages,
   anthropicToolSpec,
   newToolCallId,
@@ -214,7 +214,7 @@ test('OpenAI tool spec: the older functions/function_call map onto the same spec
     const spec = openaiToolSpec(body);
     assert.equal(openaiToolCount(body), spec ? spec.tools.length + spec.unsupported.length : 0, JSON.stringify(body));
   }
-  assert.equal(MAX_TOOLS, 128, 'OpenAI\'s limit on tools');
+  assert.equal(MAX_TOOLS_HARD, 4096, 'keysmith count-only ceiling on tools');
 });
 
 test('what no CLI leg can honour lands in unsupported: custom and server tools, an unknown tool_choice, a name twice', () => {

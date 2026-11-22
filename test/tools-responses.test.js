@@ -183,13 +183,18 @@ test('Responses input: the calls of an unbroken run of function_call and functio
   assert.deepEqual(shape([...head, fc('a'), fco('a'), 'and Izmir?', fco('a')]).map((m) => m[0]), ['user', 'assistant', 'tool', 'user', 'tool']);
 });
 
-test('/v1/responses: a request whose only tool no CLI can honour (Codex\'s freeform apply_patch) is a 400 that names it; more than 128 tools is a 400 before any leg runs', async () => {
+test('/v1/responses: a request whose only tool no CLI can honour (Codex\'s freeform apply_patch) is a 400 that names it; more than the leg\'s maxTools (default 512) is a 400 naming the leg and limit, and over 4096 is refused count-only before any leg runs', async () => {
   const freeform = await post({ model: 'emu/m', tools: [{ type: 'custom', name: 'apply_patch' }], input: 'patch it' });
   assert.equal(freeform.status, 400, freeform.text);
   assert.match(JSON.parse(freeform.text).error.message, /custom "apply_patch"/);
-  const more = await post({ model: 'emu/m', tools: Array.from({ length: 129 }, (_, i) => ({ ...TOOLS[0], name: `t${i}` })), input: 'hi' });
+  const more = await post({ model: 'emu/m', tools: Array.from({ length: 513 }, (_, i) => ({ ...TOOLS[0], name: `t${i}` })), input: 'hi' });
   assert.equal(more.status, 400);
-  assert.match(JSON.parse(more.text).error.message, /at most 128/);
+  assert.match(JSON.parse(more.text).error.message, /emu\/m cannot carry this request's tools — offers 513 tools, over maxTools=512 \(at most 512 tools/);
+  const runsBefore = lines(path.join(dir, 'emu.jsonl')).length;
+  const hard = await post({ model: 'emu/m', tools: Array.from({ length: 4097 }, (_, i) => ({ ...TOOLS[0], name: `t${i}` })), input: 'hi' });
+  assert.equal(hard.status, 400);
+  assert.match(JSON.parse(hard.text).error.message, /this request offers 4097 tools; keysmith accepts at most 4096 tools per request/);
+  assert.equal(lines(path.join(dir, 'emu.jsonl')).length, runsBefore);
 });
 
 /* -------------------------------------------------------- what keysmith never stored */

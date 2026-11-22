@@ -1355,9 +1355,12 @@ export class Gateway {
     const skips = run.skips.filter((x) => x.reason !== 'credit_guard');
     const direct = chain.length === 1 && chain[0].target === requested;
     const why = skips.map((x) => `${x.target}: ${x.detail || x.reason}`).join('; ') || 'no leg takes tools';
+    const hint = skips.length && skips.every((x) => x.reason === 'too_many_tools')
+      ? 'raise maxTools on an adapter (keysmith set <adapter> maxTools <n>), or add a verbatim HTTP leg (the openai wire on /v1/chat/completions, the anthropic wire on /v1/messages)'
+      : 'give the route a leg that takes tools (a CLI with a toolMode: keysmith tools <adapter> auto; on /v1/chat/completions, an HTTP upstream on the openai wire)';
     const msg = direct
       ? `${requested} cannot carry this request's tools — ${skips[0]?.detail || 'it has no way to take them'}. A text answer would drop the tools without a word, so the request fails instead`
-      : `no leg of "${requested}" can carry this request's tools — ${why}. A text answer would drop the tools without a word, so the request fails instead: give the route a leg that takes tools (a CLI with a toolMode: keysmith tools <adapter> auto; on /v1/chat/completions, an HTTP upstream on the openai wire)`;
+      : `no leg of "${requested}" can carry this request's tools — ${why}. A text answer would drop the tools without a word, so the request fails instead: ${hint}`;
     const err = new LlmError(msg, { status: 400, type: 'invalid_request_error', provider: direct ? chain[0].adapter.id : null });
     err.toolsNotCarried = true;
     return err;

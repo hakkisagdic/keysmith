@@ -484,36 +484,56 @@ test('OpenAI, the older functions shape: the call comes back as message.function
   assert.throws(() => openaiAccumulate(twoStream), /one function_call per answer/);
 });
 
-test('more tools than OpenAI takes (128, `tools` and `functions` together) is a 400 before any leg runs — and a huge list is refused at once, never parsed on the shared event loop', async () => {
+test('tool limits: requests over keysmith\'s 4096 hard ceiling are refused count-only before any leg runs, and requests over an engine leg\'s maxTools (default 512) return 400 when no leg can carry them', async () => {
   const fns = (n, from = 0) => Array.from({ length: n }, (_, i) => ({ name: 'f' + (from + i) }));
   const tools = (n) => fns(n).map((f) => ({ type: 'function', function: f }));
   const ask = (extra) => post('/v1/chat/completions', { model: 'fake/text', messages: ASK, ...extra });
   const ran = calls.length;
 
-  // One key holder's 700 KiB body once held every other client of the gateway for seconds.
+  // Hard count-only ceiling (4096): huge requests fail fast before tool specs are parsed or any leg runs.
   for (const [what, extra, n] of [
     ['functions', { functions: fns(40_000) }, 40_000],
     ['tools', { tools: tools(30_000) }, 30_000],
+    ['tools 4097', { tools: tools(4097) }, 4097],
+    ['tools+functions 4097', { tools: tools(4000), functions: fns(97, 4000) }, 4097],
   ]) {
     const t0 = performance.now();
     const r = await ask(extra);
     const ms = performance.now() - t0;
     assert.equal(r.status, 400, `${what}: ${r.text.slice(0, 200)}`);
-    assert.ok(ms < 1500, `${what}: ${n} tools answered in ${ms.toFixed(0)} ms`);
+    assert.ok(ms < 1000, `${what}: ${n} tools answered in ${ms.toFixed(0)} ms`);
     const err = JSON.parse(r.text).error;
     assert.equal(err.type, 'invalid_request_error');
-    const said = `this request offers ${n} tools; at most 128 are taken (OpenAI's limit)`;
+    const said = `this request offers ${n} tools; keysmith accepts at most 4096 tools per request`;
+    assert.equal(err.message, `keysmith: ${said}`);
+    const row = usageLog.tail(1)[0];
+    assert.deepEqual([row.model, row.status, row.error], ['fake/text', 'error', said], 'the hard-ceiling refusal has its usage row');
+    assert.equal('skippedLegs' in row, false, 'count-only refusal happens before route walk');
+  }
+
+  // Per-leg maxTools (default 512 on fake/text): requests up to 4096 pass the hard ceiling and skip undersized engine legs.
+  for (const [what, extra, n] of [
+    ['tools 513', { tools: tools(513) }, 513],
+    ['tools 4096', { tools: tools(4096) }, 4096],
+    ['tools+functions 513', { tools: tools(100), functions: fns(413, 100) }, 513],
+  ]) {
+    const r = await ask(extra);
+    assert.equal(r.status, 400, `${what}: ${r.text.slice(0, 200)}`);
+    const err = JSON.parse(r.text).error;
+    assert.equal(err.type, 'invalid_request_error');
+    const said = `fake/text cannot carry this request's tools — offers ${n} tools, over maxTools=512 (at most 512 tools; keysmith set fake maxTools <n>). A text answer would drop the tools without a word, so the request fails instead`;
     assert.equal(err.message, `keysmith: ${said}`);
     const row = usageLog.tail(1)[0];
     assert.deepEqual([row.model, row.status, row.error], ['fake/text', 'error', said], 'the refusal has its usage row');
+    assert.deepEqual(row.skippedLegs?.map((s) => [s.target, s.reason]), [['fake/text', 'too_many_tools']]);
   }
-  assert.equal((await ask({ tools: tools(100), functions: fns(29, 100) })).status, 400, '100 tools and 29 functions are 129');
-  assert.equal((await ask({ tools: tools(129), stream: true })).status, 400, 'streamed or not');
+  assert.equal((await ask({ tools: tools(513), stream: true })).status, 400, 'streamed or not');
   assert.equal(calls.length, ran, 'no leg was asked');
 
-  // The limit itself is fine, in either shape; `tools: []` next to `functions` is still the older shape.
-  assert.equal((await ask({ tools: tools(128) })).status, 200);
-  const legacy = await post('/v1/chat/completions', { model: 'fake/one-call', messages: ASK, tools: [], functions: fns(128) });
+  // 243 tools (Claude Code) and the default 512 limit itself are fine, in either shape; `tools: []` next to `functions` is still the older shape.
+  assert.equal((await ask({ tools: tools(243) })).status, 200);
+  assert.equal((await ask({ tools: tools(512) })).status, 200);
+  const legacy = await post('/v1/chat/completions', { model: 'fake/one-call', messages: ASK, tools: [], functions: fns(512) });
   assert.equal(legacy.status, 200, legacy.text);
   const choice = JSON.parse(legacy.text).choices[0];
   assert.deepEqual([choice.message.function_call?.name, choice.message.tool_calls, choice.finish_reason], ['get_weather', undefined, 'function_call']);
@@ -523,7 +543,7 @@ test('more tools than OpenAI takes (128, `tools` and `functions` together) is a 
     const c = JSON.parse(r.text).choices[0];
     assert.deepEqual([c.message.function_call, c.message.tool_calls?.[0]?.function.name, c.finish_reason], [undefined, 'get_weather', 'tool_calls'], JSON.stringify(Object.keys(extra)));
   }
-  assert.equal(calls.length, ran + 4);
+  assert.equal(calls.length, ran + 5);
 });
 
 /* ------------------------------------------------------------------ Anthropic face */
