@@ -1171,6 +1171,23 @@ test('keysmith set <id> toolMode: an entry attached before the tool engine gets 
     r = run('set', 'ollama', 'toolMode', 'emulate');
     assert.notEqual(r.status, 0);
     assert.match(r.all, /toolMode is a CLI adapter's field/);
+
+    // K6: keysmith set lists maxTools as settable, accepts 1..4096, shows in keysmith adapters, and rejects invalid/negative values.
+    assert.match(run('set', 'mine').all, /also settable: .*maxTools/);
+    assert.match(run('set', 'ollama').all, /also settable: .*maxTools/);
+    assert.equal(run('set', 'mine', 'maxTools', '256').status, 0);
+    assert.equal(read().adapters.mine.maxTools, 256);
+    assert.match(run('adapters').all, /mine.*maxTools 256/);
+    assert.equal(run('set', 'mine', 'maxTools', '4096').status, 0);
+    assert.equal(read().adapters.mine.maxTools, 4096);
+    assert.equal(run('set', 'mine', 'maxTools', '256').status, 0);
+    assert.equal(run('set', 'warp', 'maxTools', '256').status, 0);
+    for (const bad of ['0', '-1', '1.5', 'abc', '4097', '5000']) {
+      const badRes = run('set', 'mine', 'maxTools', bad);
+      assert.notEqual(badRes.status, 0, `maxTools ${bad} should fail`);
+      assert.match(badRes.all, /maxTools must be an integer between 1 and 4096/);
+    }
+    assert.equal(read().adapters.mine.maxTools, 256, 'rejected values do not overwrite maxTools');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

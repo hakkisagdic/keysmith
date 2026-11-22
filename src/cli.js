@@ -395,7 +395,7 @@ const FORBIDDEN_FIELDS = new Set(['__proto__', 'prototype', 'constructor']);
  * Everything else — `stopAtToolCall`, `args`, `resumeArgs`, `bin`, `env`, `cwd`, `parser`,
  * `modelsFrom`, a field added later — is the same decision as serving it.
  */
-const SAFE_ON_UNSAFE = new Set(['note', 'provenance', 'models', 'defaultModel', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'explicitOnly']);
+const SAFE_ON_UNSAFE = new Set(['note', 'provenance', 'models', 'defaultModel', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'maxTools', 'explicitOnly']);
 
 /** Why setting `field` (entry → next) needs --allow-unsafe-tools, or null when it does not. */
 function unsafeChange(entry, next, field) {
@@ -571,8 +571,8 @@ function showValue(field, v) {
 
 /** Fields worth knowing about that an entry may not have yet, by kind (docs/adapters.md has them all). */
 const SETTABLE = {
-  cli: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'models', 'defaultModel', 'toolMode', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'stopAtToolCall', 'workspaceFilesCustom', 'allowUnverifiedVersion', 'stripSystemPrompt', 'systemFlag', 'promptVia', 'env'],
-  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'models', 'defaultModel', 'healthPath', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'streamUsage', 'promptCache', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
+  cli: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxPromptChars', 'maxTools', 'models', 'defaultModel', 'toolMode', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'stopAtToolCall', 'workspaceFilesCustom', 'allowUnverifiedVersion', 'stripSystemPrompt', 'systemFlag', 'promptVia', 'env'],
+  http: ['disabled', 'explicitOnly', 'priority', 'timeoutMs', 'maxConcurrent', 'maxTools', 'models', 'defaultModel', 'healthPath', 'modelParams', 'modelMap', 'headers', 'stripModelPrefix', 'thoughtSignatures', 'streamUsage', 'promptCache', 'media', 'vision', 'maxImages', 'maxImageBytes', 'maxFiles', 'maxFileBytes', 'mediaHeaders'],
 };
 
 /**
@@ -900,7 +900,7 @@ function cmdAdapters() {
   if (!attached.length) lines.push('  (none — keysmith add <profile>)');
   for (const [id, a] of attached) {
     const state = a.kind === 'cli' ? (which(a.bin || id) ? 'binary ok' : `MISSING ${a.bin || id}`) : `key ${maskRef(a.apiKey)}`;
-    const marks = `${a.disabled ? ' · disabled' : ''}${a.unsafeTools ? ' · unsafeTools' : a.explicitOnly ? ' · explicit-only' : ''}${a.toolMode && a.toolMode !== 'off' ? ` · toolMode ${a.toolMode}` : ''}`;
+    const marks = `${a.disabled ? ' · disabled' : ''}${a.unsafeTools ? ' · unsafeTools' : a.explicitOnly ? ' · explicit-only' : ''}${a.toolMode && a.toolMode !== 'off' ? ` · toolMode ${a.toolMode}` : ''}${a.maxTools != null ? ` · maxTools ${a.maxTools}` : ''}`;
     lines.push(`  ${id.padEnd(14)} ${String(a.kind).padEnd(5)} ${a.wire || a.parser || ''}  ${state}${marks}`);
     if (a.kind === 'http' && a.promptCache && a.promptCache.mode && a.promptCache.mode !== 'off' && (a.wire || 'openai') !== 'anthropic') {
       lines.push(`  ! ${id}: promptCache is on but its wire is ${a.wire || 'openai'}; only the anthropic wire carries cache_control, so nothing is cached`);
@@ -2355,9 +2355,9 @@ function parseFlags(args) {
     if (a.startsWith('--')) {
       const eq = a.indexOf('=');
       if (eq > 0) set(a.slice(2, eq), a.slice(eq + 1));
-      else if (!BOOL_FLAGS.has(a.slice(2)) && i + 1 < args.length && !args[i + 1].startsWith('-')) set(a.slice(2), args[++i]);
+      else if (!BOOL_FLAGS.has(a.slice(2)) && i + 1 < args.length && (!args[i + 1].startsWith('-') || /^-\d/.test(args[i + 1]))) set(a.slice(2), args[++i]);
       else set(a.slice(2), true);
-    } else if (a.startsWith('-') && a.length > 1) {
+    } else if (a.startsWith('-') && a.length > 1 && !/^-\d/.test(a)) {
       set(a.slice(1), true);
     } else out._.push(a);
   }
