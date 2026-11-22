@@ -30,7 +30,7 @@ import { cachePlanScope, checkPromptCache } from './prompt-cache.js';
 import { applySecretGuard, findSecrets, guardConfig } from './secret-guard.js';
 import { applyPiiGuard, hasPii, scanInjection } from './pii-guard.js';
 import { ResponseCache, keyFor, resolveCacheConfig, shapeFor } from './response-cache.js';
-import { buildVector, cosine, lastUserText } from './semantic-vector.js';
+import { MAX_INPUT_BYTES, buildVector, cosine, lastUserText } from './semantic-vector.js';
 import { extractResponseFormatSpec, resolveStructuredConfig } from './structured-output.js';
 
 export function isLoopbackHost(host) {
@@ -1207,7 +1207,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     let semanticMeta = null;
     if (cacheKey && semanticCache) {
       const text = lastUserText(cacheBody);
-      if (text !== null) {
+      if (text !== null && Buffer.byteLength(text, 'utf8') <= MAX_INPUT_BYTES) {
         const vector = buildVector(text);
         if (vector.norm > 0) {
           const shape = shapeFor({ callerHash: caller, body: cacheBody });

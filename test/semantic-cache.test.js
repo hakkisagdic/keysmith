@@ -720,3 +720,55 @@ test('check 10: stream, tools, tool history, sessions, and other faces never get
   }
   assert.equal(gw.hits.up, startHits + checks.length);
 });
+
+test('prompts longer than MAX_INPUT_BYTES that differ only after 4 KB skip semantic cache while keeping exact cache', async (t) => {
+  const key = mint();
+  const gw = await rig(t, {
+    keys: [key],
+    cache: { enabled: true, ttlSeconds: 3600, maxEntries: 50, semantic: { enabled: true } },
+  });
+
+  const doc = 'Clause details for the service agreement. '.repeat(125);
+  assert.ok(Buffer.byteLength(doc, 'utf8') > MAX_INPUT_BYTES);
+  const p1 = `${doc}\nWhat is the termination clause?`;
+  const p2 = `${doc}\nSummarise the payment section.`;
+
+  const r1 = await gw.call(key, chat(p1, { temperature: 0 }));
+  assert.equal(r1.status, 200, r1.text);
+  assert.equal(r1.cache, 'miss');
+  assert.equal(gw.hits.up, 1);
+  assert.equal(r1.json.choices[0].message.content, p1);
+
+  const r2 = await gw.call(key, chat(p2, { temperature: 0 }));
+  assert.equal(r2.status, 200, r2.text);
+  assert.equal(r2.cache, 'miss');
+  assert.equal(gw.hits.up, 2);
+  assert.equal(r2.json.choices[0].message.content, p2);
+
+  // Exact cache continues to serve repeated >4 KB prompts.
+  const exact1 = await gw.call(key, chat(p1, { temperature: 0 }));
+  const exact2 = await gw.call(key, chat(p2, { temperature: 0 }));
+  assert.equal(exact1.cache, 'hit');
+  assert.equal(exact2.cache, 'hit');
+  assert.equal(gw.hits.up, 2);
+  assert.equal(exact1.json.choices[0].message.content, p1);
+  assert.equal(exact2.json.choices[0].message.content, p2);
+
+  // Over-limit entries were not indexed into the semantic bucket.
+  const prefixReq = await gw.call(key, chat(doc.slice(0, MAX_INPUT_BYTES), { temperature: 0 }));
+  assert.equal(prefixReq.status, 200, prefixReq.text);
+  assert.equal(prefixReq.cache, 'miss');
+  assert.equal(gw.hits.up, 3);
+
+  // UTF-8 byte length (not JS UTF-16 .length) enforces MAX_INPUT_BYTES.
+  const mbPrefix = 'ş'.repeat(2100);
+  assert.ok(mbPrefix.length < MAX_INPUT_BYTES);
+  assert.ok(Buffer.byteLength(mbPrefix, 'utf8') > MAX_INPUT_BYTES);
+  const mb1 = await gw.call(key, chat(`${mbPrefix} termination clause`, { temperature: 0 }));
+  const mb2 = await gw.call(key, chat(`${mbPrefix} payment section`, { temperature: 0 }));
+  assert.equal(mb1.status, 200, mb1.text);
+  assert.equal(mb2.status, 200, mb2.text);
+  assert.equal(mb1.cache, 'miss');
+  assert.equal(mb2.cache, 'miss');
+  assert.equal(gw.hits.up, 5);
+});
