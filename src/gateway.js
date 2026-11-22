@@ -11,6 +11,7 @@ import { addUsage } from './tools/emulate.js';
 import { McpBridge } from './bridge/index.js';
 import { CatalogueLimiter, catalogueSettings, loadCatalogue } from './catalogue.js';
 import { CreditGuard, creditGuardError } from './credit-guard.js';
+import { CircuitBreakerRegistry, countsAsFailure, resolveBreakerConfig, retryAfterMs } from './circuit-breaker.js';
 import { DRIVERS } from './bridge/drivers.js';
 import { resolveEffort, suffixedIds } from './effort.js';
 import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExecCredentialAdapter, matchPrice } from './usage.js';
@@ -65,6 +66,9 @@ export class Gateway {
     // by while its plan is at or over its threshold. In memory unless the caller keeps the
     // readings in a file (the CLI does: dataDir()/credit-guard.json).
     this.creditGuard = creditGuard || new CreditGuard({ log: this.log });
+    // Per-adapter circuit breaker (src/circuit-breaker.js): off unless config turns it on. A bad
+    // value leaves it off; `keysmith doctor` prints the error.
+    this.breakers = new CircuitBreakerRegistry({ config: resolveBreakerConfig(cfg?.circuitBreaker, cfg?.adapters), now: this.now, log: this.log });
     if (this.usage && !this.usage.log) this.usage.log = this.log;
     // Catalogue limits (src/catalogue.js): only built when `catalogue` names a file; null otherwise, and every hook is skipped.
     const catPath = catalogueSettings(cfg).path;
@@ -1277,7 +1281,7 @@ export class Gateway {
     let heldBack = null; // a leg the credit guard passed by: the answer only when no other leg had one
     for (const leg of chain) {
       const { adapter, model: upstreamModel } = leg;
-      const held = await this._heldBack(leg, run);
+      const held = (await this._heldBack(leg, run)) || this._breakerOpen(leg, run, chain);
       if (held) {
         heldBack ||= held;
         continue;
@@ -1320,11 +1324,13 @@ export class Gateway {
       } catch (e) {
         releaseSpend();
         if (e?.scopeDenied) {
+          this.breakers.release(adapter.id);
           if (chain.length === 1) throw e;
           lastError = lastError || e;
           continue;
         }
         if (e?.clientError) {
+          this.breakers.release(adapter.id);
           e.leg = e.leg || legMetaOf(adapter, upstreamModel);
           throw e;
         }
@@ -1352,7 +1358,7 @@ export class Gateway {
    * each leg named, with why — never a plain-text answer in its place.
    */
   _noToolLeg(requested, chain, run) {
-    const skips = run.skips.filter((x) => x.reason !== 'credit_guard');
+    const skips = run.skips.filter((x) => x.reason !== 'credit_guard' && x.reason !== 'circuit_open');
     const direct = chain.length === 1 && chain[0].target === requested;
     const why = skips.map((x) => `${x.target}: ${x.detail || x.reason}`).join('; ') || 'no leg takes tools';
     const hint = skips.length && skips.every((x) => x.reason === 'too_many_tools')
@@ -1372,7 +1378,7 @@ export class Gateway {
    */
   _toolsNotCarried(err, run) {
     if (!err || typeof err !== 'object' || err.toolsNotCarried || err.toolSkipsNamed) return err;
-    const skips = run.skips.filter((x) => x.reason !== 'credit_guard');
+    const skips = run.skips.filter((x) => x.reason !== 'credit_guard' && x.reason !== 'circuit_open');
     if (!skips.length) return err;
     err.message = `${err.message} — not asked, as they cannot carry this request's tools: ${skips.map((x) => `${x.target} (${truncate(x.detail || x.reason, 120)})`).join('; ')}`;
     err.toolSkipsNamed = true;
@@ -1417,6 +1423,71 @@ export class Gateway {
       run.onVirtual?.(snapshotVirtual(run.virtualState));
     }
     return err;
+  }
+
+  /**
+   * The circuit breaker's word on a leg (src/circuit-breaker.js): null when it may be asked, else
+   * a 503 the leg is passed by with, the reason recorded as `circuit_open`. A route never fails
+   * without asking anyone: when every leg's adapter is shut, the one whose cooldown ends first is
+   * asked (a request naming one adapter alone is that case), as the probe.
+   */
+  _breakerOpen(leg, run, chain) {
+    const reg = this.breakers;
+    if (!reg?.active || !leg?.adapter) return null;
+    const id = leg.adapter.id;
+    if (!reg.settingsFor(id)) return null;
+    if (run.breakerPick === undefined) {
+      let pick = null;
+      let all = true;
+      for (const l of chain || []) {
+        const p = reg.peek(l.adapter.id);
+        if (!p.blocked) {
+          all = false;
+          break;
+        }
+        if (!pick || p.endsAt < pick.endsAt) pick = { id: l.adapter.id, endsAt: p.endsAt };
+      }
+      run.breakerPick = all && pick ? pick.id : null;
+    }
+    const v = reg.check(id);
+    if (v.allow) return null;
+    if (run.breakerPick === id) {
+      reg.force(id);
+      this.log(`circuit breaker: every leg of this route is shut, asking ${id} (cooldown ends first)`);
+      return null;
+    }
+    const err = new LlmError(`${id} is passed by: its circuit breaker is open after repeated upstream failures; retry in ${Math.max(1, Math.ceil(v.retryAfterMs / 1000))} s`, {
+      status: 503,
+      type: 'upstream_error',
+      provider: id,
+      retriable: true,
+    });
+    err.retryAfter = Math.max(1, Math.ceil(v.retryAfterMs / 1000));
+    err.leg = legMetaOf(leg.adapter, leg.model);
+    this._skipLeg(run, leg, 'circuit_open', `circuit breaker ${v.state}`, { retryAfterMs: v.retryAfterMs });
+    if (run.virtualState) {
+      recordVirtualFallback(run.virtualState, leg, err);
+      run.onVirtual?.(snapshotVirtual(run.virtualState));
+    }
+    return err;
+  }
+
+  /**
+   * What a failed leg means for its adapter's breaker: a failure to count (the upstream could not
+   * answer: network, timeout, 5xx, 429 with its retry-after), or nothing (a client abort, a 4xx
+   * that is the request's own, a refusal made here: spend cap, scope). Frees a half-open probe
+   * either way.
+   */
+  _breakerNote(adapter, err, signal, state = null) {
+    if (!this.breakers?.active || !adapter) return;
+    if (state) state.breakerNoted = true;
+    const status = typeof err?.upstreamStatus === 'number' ? err.upstreamStatus : typeof err?.status === 'number' ? err.status : null;
+    const local = err?.spendCap || err?.scopeDenied || err?.clientError || err?.toolsNotCarried || err?.localFailure;
+    if (signal?.aborted || local || !countsAsFailure(status)) {
+      this.breakers.release(adapter.id);
+      return;
+    }
+    this.breakers.recordFailure(adapter.id, { status, retryAfterMs: retryAfterMs(err?.retryAfter, this.now()) });
   }
 
   /**
@@ -1489,6 +1560,8 @@ export class Gateway {
           // before it — a non-streamed answer is the text or calls, as it always was.
           const message = redactSecrets(evt.message);
           if (state.emitted) {
+            // The upstream started answering and then failed: it counts against the adapter.
+            this._breakerNote(adapter, { status: evt.status || 502 }, null, state);
             yield { ...evt, message };
             return;
           }
@@ -1511,6 +1584,11 @@ export class Gateway {
         }
         yield evt;
       }
+      // The upstream answered to the end.
+      if (!state.breakerNoted) {
+        state.breakerNoted = true;
+        this.breakers.recordSuccess(adapter.id);
+      }
     } catch (e) {
       if (e && typeof e === 'object') {
         if (seenUsage && !e.usage) e.usage = seenUsage;
@@ -1518,6 +1596,10 @@ export class Gateway {
         if (!e.leg) e.leg = legMetaOf(adapter, upstreamModel);
       }
       throw e;
+    } finally {
+      // Ended without a verdict (the client closed the stream, the leg threw before _legFailed
+      // ran): a half-open probe is freed, never left holding the adapter shut.
+      if (!state.breakerNoted) this.breakers.release(adapter.id);
     }
     if (effort) yield effort;
     if (sessions && !run.reportedSession && run.known) {
@@ -1544,6 +1626,7 @@ export class Gateway {
     const err = e instanceof LlmError ? e : Object.assign(new LlmError(e.message, { status: inferredStatus, provider: adapter.id }), engineMarks(e));
     err.leg = e?.leg || legMetaOf(adapter, upstreamModel);
     if (e?.upstreamId && !err.upstreamId) err.upstreamId = e.upstreamId;
+    this._breakerNote(adapter, err, signal, state);
     if (signal?.aborted) throw err;
     if (state.emitted) {
       this.log(`${adapter.id}/${truncate(upstreamModel, 60)} failed after it had started answering, so no other leg is tried: ${truncate(e.message, 160)}`);
@@ -1594,20 +1677,28 @@ export class Gateway {
       if (spec?.historyOnly) {
         tried.add(i);
         if (leg.adapter.kind === 'http' && relaysVerbatim(leg.adapter, face) && relay) {
+          const open = this._breakerOpen(leg, run, chain);
+          if (open) {
+            heldBack ||= open;
+            continue;
+          }
           let releaseSpend = () => {};
           try {
             releaseSpend = this.reserveSpend(leg.adapter, leg.model, run.scope, this.estimateTokens(leg.adapter, leg.model, args, tools));
             run.holdSpend(releaseSpend);
             if (await relay(leg)) {
+              this.breakers.recordSuccess(leg.adapter.id);
               yield { type: 'relayed', target: leg.target };
               return;
             }
             releaseSpend();
+            this.breakers.release(leg.adapter.id);
           } catch (e) {
             releaseSpend();
             const err = e instanceof LlmError ? e : new LlmError(`${leg.adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: leg.adapter.id });
             err.leg = e?.leg || legMetaOf(leg.adapter, leg.model);
             if (e?.upstreamId && !err.upstreamId) err.upstreamId = e.upstreamId;
+            this._breakerNote(leg.adapter, err, args.signal);
             if (args.signal?.aborted) throw err;
             lastError = routeError(lastError, err);
             refused.push({ target: leg.target, status: err.status });
@@ -1615,7 +1706,7 @@ export class Gateway {
           }
           continue;
         }
-        const held = await this._heldBack(leg, run);
+        const held = (await this._heldBack(leg, run)) || this._breakerOpen(leg, run, chain);
         if (held) {
           heldBack ||= held;
           continue;
@@ -1653,12 +1744,14 @@ export class Gateway {
         } catch (e) {
           releaseSpend();
           if (e?.scopeDenied) {
+            this.breakers.release(leg.adapter.id);
             if (chain.length === 1) throw e;
             lastError = lastError || e;
             refused.push({ target: leg.target, status: e.status });
             continue;
           }
           if (e?.clientError) {
+            this.breakers.release(leg.adapter.id);
             e.leg = e.leg || legMetaOf(leg.adapter, leg.model);
             throw e;
           }
@@ -1677,7 +1770,7 @@ export class Gateway {
         continue;
       }
       tried.add(i);
-      const held = await this._heldBack(leg, run);
+      const held = (await this._heldBack(leg, run)) || this._breakerOpen(leg, run, chain);
       if (held) {
         heldBack ||= held;
         continue;
@@ -1697,6 +1790,7 @@ export class Gateway {
             run.onVirtual?.(snapshotVirtual(run.virtualState));
           }
           if (await relay(leg)) {
+            this.breakers.recordSuccess(leg.adapter.id);
             if (run.virtualState) {
               run.virtualState.latency = Math.max(0, Date.now() - run.virtualState.t0);
               const snap = snapshotVirtual(run.virtualState);
@@ -1707,11 +1801,13 @@ export class Gateway {
             return;
           }
           releaseSpend();
+          this.breakers.release(leg.adapter.id);
         } catch (e) {
           releaseSpend();
           const err = e instanceof LlmError ? e : new LlmError(`${leg.adapter.id}: ${e.message}`, { status: /abort|timeout/i.test(e.message ?? '') ? 504 : 502, provider: leg.adapter.id });
           err.leg = e?.leg || legMetaOf(leg.adapter, leg.model);
           if (e?.upstreamId && !err.upstreamId) err.upstreamId = e.upstreamId;
+          this._breakerNote(leg.adapter, err, args.signal);
           if (args.signal?.aborted) throw err;
           if (run.virtualState) {
             recordVirtualFallback(run.virtualState, leg, err);
@@ -1759,6 +1855,7 @@ export class Gateway {
       } catch (e) {
         releaseSpend();
         if (e?.scopeDenied) {
+          this.breakers.release(leg.adapter.id);
           if (chain.length === 1) throw e;
           lastError = lastError || e;
           refused.push({ target: leg.target, status: e.status });

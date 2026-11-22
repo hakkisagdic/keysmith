@@ -1458,6 +1458,7 @@ export function upstreamError(id, res, text, { keepStatus = false } = {}) {
     type: status === 401 || status === 403 ? 'auth_error' : status === 429 ? 'rate_limit_error' : 'upstream_error',
     provider: id,
   });
+  err.upstreamStatus = status; // the provider's own status: err.status is a 502 for most (see above)
   const retryAfter = res.headers?.get?.('retry-after');
   if (retryAfter) err.retryAfter = retryAfter;
   const upstreamId = upstreamIdFromHeaders(res.headers);

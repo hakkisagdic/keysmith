@@ -482,6 +482,16 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           ...visibleCreditGuards(gateway, scope),
         });
       }
+      // The circuit breakers (src/circuit-breaker.js): names, states and times only, never an error
+      // text. A scoped key is not the gateway's operator and may not read or reset them.
+      if (route === '/v1/keysmith/breakers' && req.method === 'GET') {
+        if (scope) throw new LlmError('the circuit breakers are for an unscoped key', { status: 403, type: 'permission_error' });
+        return json(res, 200, { enabled: gateway.breakers.active, breakers: gateway.breakers.snapshot() });
+      }
+      if (route === '/v1/keysmith/breakers/reset' && req.method === 'POST') {
+        if (scope) throw new LlmError('the circuit breakers are for an unscoped key', { status: 403, type: 'permission_error' });
+        return json(res, 200, { reset: gateway.breakers.reset(url.searchParams.get('adapter') || null) });
+      }
       if (route === '/v1/keysmith/usage' && req.method === 'GET') {
         const rawTail = url.searchParams.get('tail');
         let n = 0;
@@ -2178,7 +2188,9 @@ function extractRelayedUsage(rawText) {
 }
 
 function cannotRelay(id, why) {
-  return new LlmError(`${id}: the stream was already open ${why}, so its answer cannot be relayed`, { status: 502, provider: id });
+  const err = new LlmError(`${id}: the stream was already open ${why}, so its answer cannot be relayed`, { status: 502, provider: id });
+  err.localFailure = true; // keysmith's own refusal, not the upstream failing: no circuit-breaker count
+  return err;
 }
 
 /* ---------------------------------------------------------------------- UHP stores & routing */
