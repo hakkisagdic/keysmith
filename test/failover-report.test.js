@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { Gateway } from '../src/gateway.js';
 import { CreditGuard } from '../src/credit-guard.js';
 import { createServer } from '../src/server.js';
-import { carriageLines, creditGuardLines, creditGuardRows, guardShiftLines, recentSkips, skipLines, toolCarriage } from '../src/failover-report.js';
+import { breakerLines, carriageLines, creditGuardLines, creditGuardRows, guardShiftLines, recentSkips, skipLines, toolCarriage } from '../src/failover-report.js';
 
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const KEY = 'ks_' + crypto.randomBytes(24).toString('base64url');
@@ -269,4 +269,18 @@ test('keysmith doctor and status: the tool carriage, the credit guard and the le
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('circuit_open skips are counted and marked, and breakerLines names the open breakers', () => {
+  const now = Date.parse('2026-11-22T12:00:00Z');
+  const row = (ts) => ({ ts, skippedLegs: [{ target: 'a/m', reason: 'circuit_open', detail: 'circuit breaker open', retryAfterMs: 30000 }] });
+  const skips = recentSkips([row('2026-11-22T11:00:00Z'), row('2026-11-22T11:30:00Z')], { now });
+  assert.equal(skips.length, 1);
+  assert.equal(skips[0].count, 2);
+  const [line] = skipLines(skips);
+  assert.equal(line.mark, '!');
+  assert.match(line.text, /^a\/m circuit_open ×2/);
+  assert.deepEqual(breakerLines([{ adapter: 'b', state: 'closed' }]), [{ mark: '✓', text: 'no circuit breaker is open' }]);
+  const [open] = breakerLines([{ adapter: 'a', state: 'open', consecutiveFailures: 3, retryAfterMs: 29_100, lastStatus: 503 }]);
+  assert.equal(open.text, 'a open after 3 failure(s), retry in 30 s (last status 503)');
 });

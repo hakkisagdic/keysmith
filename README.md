@@ -1140,6 +1140,23 @@ keysmith batch results eval-ref-1
 keysmith usage --by tag                   # batch/eval-ref-1 carries the real cost
 ```
 
+## Circuit breaker per adapter
+
+Off unless the config says so. Failover tries each leg of a route in turn, so a dead provider is asked again, and its timeout paid again, on every request. The breaker remembers consecutive upstream failures per adapter (the source, not the model) and passes the adapter by for a cooldown.
+
+```json
+"circuitBreaker": { "enabled": true, "failureThreshold": 3, "cooldownMs": 30000 }
+```
+
+An adapter can override any of the three: `"adapters": { "groq": { "circuitBreaker": { "failureThreshold": 5 } } }` (`"enabled": false` there keeps one adapter out of it).
+
+- **What counts:** a network error, a timeout, a 5xx, a 408 and a 429 (the cooldown is then the longer of `cooldownMs` and the upstream's `retry-after`). A failure after the answer had started streaming counts too. A 400, 401, 403, 404 or any other 4xx, a client that aborts or closes its stream, and a leg keysmith itself refused (spend cap, key scope, credit guard) do not, and they do not reset the count either.
+- **States:** closed, then open after `failureThreshold` failures in a row; open adapters are skipped (the usage row's `skippedLegs` has `reason: "circuit_open"` and `retryAfterMs`); after `cooldownMs` one request is let through as the probe (half-open: a second request meanwhile is passed by) and a success closes the breaker, a failure reopens it.
+- **A route never fails without asking anyone:** when every leg of a route is open (a request that names one adapter alone is the same case), the leg whose cooldown ends first is asked as the probe.
+- **See it:** `GET /v1/keysmith/breakers` lists each adapter that has a state (`state`, `consecutiveFailures`, `retryAfterMs`, `lastStatus`: names and numbers, never an error text); `POST /v1/keysmith/breakers/reset` (optionally `?adapter=<id>`) closes them. Both are for an unscoped key; a scoped key gets 403. `keysmith status` and `keysmith doctor` show the setting and `keysmith status` the open ones.
+- A value that does not validate (`failureThreshold: 0`, say) leaves the breaker off and `keysmith doctor` names the field. The state is in memory; a restart closes every breaker.
+- The catalogue's own cooldown after an upstream 429 is separate and untouched: a leg the catalogue refuses locally is a skip, never a breaker failure.
+
 ## Exact response cache
 
 Off unless the config says so. A repeated non-streaming `POST /v1/chat/completions` can be answered from memory, at no upstream cost, when the same caller sends the same request again.

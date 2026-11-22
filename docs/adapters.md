@@ -26,6 +26,7 @@ Two kinds:
 | `defaultModel` | — | used when the request has no model part (`"cmd"` alone) |
 | `modelMap` | — | `{ "<requested>": "<upstream>" }` rewrite, HTTP only |
 | `explicitOnly` | `false` | answers only a request that names it: never an alias leg (refused by `keysmith alias`, skipped and reported when hand-edited in), never probed by `doctor --probe-models`. The `claude` profile ships it; `keysmith add <profile> --explicit-only` sets it on any other, a re-add keeps it, `keysmith set <id> explicitOnly false` drops it. It does not keep any *key* away from the adapter: a key's scope does that (`keysmith key add <label> --deny <adapter>`, see the README's "Keys with a scope") |
+| `circuitBreaker` | — | `{ "enabled", "failureThreshold", "cooldownMs" }` overriding the top-level `circuitBreaker` for this adapter only (defaults 3 failures, 30000 ms; `"enabled": false` keeps the adapter out of the breaker). See the README's "Circuit breaker per adapter" |
 | `note` | — | shown in listings; the place to write down what you learned |
 | `headers` | `{}` | extra request headers, HTTP only |
 | `media` | — | the kinds of media the adapter takes: any of `image`, `pdf`, `audio`, `video`. A request that carries one goes to it as the thing itself, any other kind as a label. A CLI and the `anthropic` wire take `image` and `pdf` only; anything else there is a load error. `keysmith set <id> media image,pdf` writes the list. See [Media](#media-images-pdfs-audio-video) |

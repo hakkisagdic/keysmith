@@ -8,11 +8,12 @@ import { Gateway, aliasAllowsExplicitOnly, checkAdapter, formatRouteExplain, kin
 import { DEFAULT_HEALTH_TIMEOUT_MS, probeHttpHealth } from './http-adapter.js';
 import { createServer, hasTunnelConfigured, isLoopbackHost, LEGACY_MAX_CONCURRENT_WARNING } from './server.js';
 import { resolveCacheConfig } from './response-cache.js';
+import { resolveBreakerConfig } from './circuit-breaker.js';
 import { UsageLog, accountHmacKey, entryFilter, execAccountMigrationWarnings, formatUsageCsv, formatUsageTable, parseFilterNumber } from './usage.js';
 import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
 import { autoApproveFlag, which } from './cli-adapter.js';
 import { CreditGuard, readCreditState } from './credit-guard.js';
-import { carriageLines, creditGuardLines, creditGuardRows, guardShiftLines, recentSkips, skipLines, toolCarriage } from './failover-report.js';
+import { breakerLines, carriageLines, creditGuardLines, creditGuardRows, guardShiftLines, recentSkips, skipLines, toolCarriage } from './failover-report.js';
 import * as tunnel from './tunnel.js';
 import { catalogueSettings, discoveredPath, freeModels, freeModelsFromPriceTable, writeDiscovered } from './catalogue.js';
 import * as service from './service.js';
@@ -989,6 +990,8 @@ async function cmdServe(flags) {
   if (Number(cfg?.limits?.maxConcurrent) === 4) warn(`! ${LEGACY_MAX_CONCURRENT_WARNING}`);
   const cacheResolved = resolveCacheConfig(cfg?.cache);
   if (cacheResolved.error) warn(`! cache: ${cacheResolved.error}`);
+  const breakerResolved = resolveBreakerConfig(cfg?.circuitBreaker, cfg?.adapters);
+  if (breakerResolved.error) warn(`! circuitBreaker: ${breakerResolved.error}`);
   if (!process.env.KEYSMITH_VERBOSE || !gateway._warnedExecMigration) {
     for (const w of execAccountMigrationWarnings(cfg, usage, { checkDisk: true })) warn(`! ${w}`);
   }
@@ -1250,6 +1253,16 @@ async function cmdStatus() {
     } catch (e) {
       lines.push(`skipped : ! the usage log could not be read (${truncate(e.message, 80)})`);
     }
+    const breaker = resolveBreakerConfig(cfg?.circuitBreaker, cfg?.adapters);
+    if (breaker.error) lines.push(`breaker : ✗ ${breaker.error}`);
+    else if (breaker.enabled || Object.values(breaker.adapters).some((a) => a.enabled)) {
+      lines.push(`breaker : on — ${breaker.failureThreshold} failures open an adapter for ${Math.round(breaker.cooldownMs / 1000)} s`);
+      if (rec && alive(rec.pid)) {
+        const rows = await liveBreakers(cfg, rec.port);
+        if (rows) for (const l of breakerLines(rows)) lines.push(`breaker : ${l.mark} ${l.text}`);
+        else lines.push('breaker : · the running gateway was not asked (no unscoped key in the config)');
+      }
+    }
     if (rec && alive(rec.pid)) {
       const stale = staleCode(rec);
       if (stale) lines.push(`code    : ${stale}`);
@@ -1264,6 +1277,21 @@ async function cmdStatus() {
     }
   }
   out(lines.join('\n'));
+}
+
+/** The running gateway's circuit breakers, read with the config's first unscoped key; null when it cannot be asked. */
+async function liveBreakers(cfg, port) {
+  const { entries } = parseKeys(Array.isArray(cfg?.auth?.keys) ? cfg.auth.keys : []);
+  const key = entries.find((e) => e.key && !e.scope && !e.disabled)?.key;
+  if (cfg?.auth?.enabled !== false && !key) return null;
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/keysmith/breakers`, { headers: key ? { authorization: `Bearer ${key}` } : {}, signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return null;
+    const body = await r.json();
+    return Array.isArray(body?.breakers) ? body.breakers : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1386,6 +1414,9 @@ async function cmdDoctor(flags) {
   const rows = [];
   out(`keysmith ${PKG.version} — config ${rel(configPath())}\n`);
   for (const e of guardConfig(cfg).errors) rows.push(['config', 'config error', `guard.${e.key}: ${e.message}`]);
+  const breakerCfg = resolveBreakerConfig(cfg?.circuitBreaker, cfg?.adapters);
+  if (breakerCfg.error) rows.push(['config', 'config error', `circuitBreaker: ${breakerCfg.error}`]);
+  else if (breakerCfg.enabled || Object.values(breakerCfg.adapters).some((a) => a.enabled)) rows.push(['config', 'circuit breaker', `on: ${breakerCfg.failureThreshold} failures open an adapter for ${Math.round(breakerCfg.cooldownMs / 1000)} s (keysmith status shows the open ones)`]);
 
   for (const [id, raw] of Object.entries(cfg.adapters || {})) {
     const adapter = gateway.adapters.get(id);

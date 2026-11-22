@@ -201,7 +201,20 @@ export function carriageLines(carriage) {
 
 export function skipLines(skips, { limit = 8 } = {}) {
   if (!skips.length) return [{ mark: '✓', text: 'no leg was passed by in the last 24 h' }];
-  const lines = skips.slice(0, limit).map((s) => ({ mark: s.reason === 'credit_guard' ? '!' : '·', text: `${s.target} ${s.reason} ×${s.count} (last ${s.last.slice(0, 16).replace('T', ' ')}Z)${s.detail ? ` — ${s.detail}` : ''}` }));
+  const lines = skips.slice(0, limit).map((s) => ({ mark: s.reason === 'credit_guard' || s.reason === 'circuit_open' ? '!' : '·', text: `${s.target} ${s.reason} ×${s.count} (last ${s.last.slice(0, 16).replace('T', ' ')}Z)${s.detail ? ` — ${s.detail}` : ''}` }));
   if (skips.length > limit) lines.push({ mark: '·', text: `… and ${skips.length - limit} more (keysmith usage --format json --tail N has every row)` });
   return lines;
+}
+
+/**
+ * The circuit breakers that are not closed (GET /v1/keysmith/breakers rows), one line each, for
+ * `keysmith status` and `keysmith doctor`. Closed ones are not worth a line.
+ */
+export function breakerLines(rows) {
+  const shut = (rows || []).filter((r) => r && r.state !== 'closed');
+  if (!shut.length) return [{ mark: '✓', text: 'no circuit breaker is open' }];
+  return shut.map((r) => ({
+    mark: '!',
+    text: `${r.adapter} ${r.state} after ${r.consecutiveFailures} failure(s)${r.retryAfterMs ? `, retry in ${Math.ceil(r.retryAfterMs / 1000)} s` : ''}${r.lastStatus ? ` (last status ${r.lastStatus})` : ''}`,
+  }));
 }
