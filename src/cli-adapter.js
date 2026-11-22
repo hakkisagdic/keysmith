@@ -7,7 +7,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { getParser, toLines } from './parsers.js';
 import { expand, resolveSecret } from './config.js';
 import { registerSecrets } from './redact.js';
-import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, agentCleanEnv } from './util.js';
+import { LlmError, flattenMessages, joinArgs, Semaphore, truncate, keepTail, agentCleanEnv, claudeSubscriptionEnv, isClaudeSubscriptionAdapter } from './util.js';
 import { checkCreditGuard } from './credit-guard.js';
 import { checkMaxTools, checkToolMode } from './tools/router.js';
 import { checkMedia, hasMedia, mediaPrompt } from './media.js';
@@ -82,6 +82,7 @@ export class CliAdapter {
     // agent. And the MCP bridge's own settings, its argv among them (design U7).
     this.emulateArgs = checkTemplate(id, 'emulateArgs', cfg.emulateArgs);
     this.bridge = checkBridge(id, cfg.bridge);
+    this._isClaudeSubscription = isClaudeSubscriptionAdapter(this);
     // A CLI that takes media (`media`, `vision: true` for images): a request that carries some runs
     // `visionArgs`, its prompt on stdin as one stream-json user message with the media in it
     // (src/media.js). Any other CLI reads each item as a label: `[image omitted by keysmith]`.
@@ -717,11 +718,15 @@ export class CliAdapter {
    * `.opencode` upward walks from the scratch directory (so an ancestor `~/opencode.json` is
    * skipped), `OPENCODE_CONFIG` and `OPENCODE_CONFIG_DIR` point back to the adapter's workspace
    * files, and `OPENCODE_CONFIG_CONTENT` re-applies `opencode.json` after `ConfigPaths.directories`.
+   * For Claude Code subscription adapters (`this._isClaudeSubscription`), `claudeSubscriptionEnv`
+   * strips `ANTHROPIC_*`, `CLAUDE_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and
+   * `CLAUDE_CODE_USE_BEDROCK|VERTEX|FOUNDRY|MANTLE` after merging `this._resolvedEnv()`.
    */
   _childEnv(runCwd = this.cwd) {
     const env = this._resolvedEnv();
     if (!this._ownsOpencodeWorkspace) {
-      return { ...agentCleanEnv(), PWD: runCwd, ...env };
+      const out = { ...agentCleanEnv(), PWD: runCwd, ...env };
+      return this._isClaudeSubscription ? claudeSubscriptionEnv(out) : out;
     }
     const baseEnv = { ...agentCleanEnv(), PWD: runCwd };
     const xdgDataHome = env.XDG_DATA_HOME || baseEnv.XDG_DATA_HOME;
@@ -747,7 +752,8 @@ export class CliAdapter {
         ? { OPENCODE_CONFIG_CONTENT: ocConfigContent }
         : {}),
     };
-    return sanitizeOpencodeEnv(baseEnv, ocConfigEnv, env);
+    const out = sanitizeOpencodeEnv(baseEnv, ocConfigEnv, env);
+    return this._isClaudeSubscription ? claudeSubscriptionEnv(out) : out;
   }
 
   _spawn({ args, stdin = null, timeoutMs }) {

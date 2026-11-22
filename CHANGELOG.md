@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Security
+
+- Strip `ANTHROPIC_*` (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, …), `CLAUDE_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and `CLAUDE_CODE_USE_BEDROCK|VERTEX|FOUNDRY|MANTLE` from the child environment of Claude Code adapters (`parser: "claude-stream-json"` with `bin` basename `claude`, or `bridge.driver: "claude"`) across text, vision, EMULATE, `modelsFrom`, and MCP bridge runs after merging the adapter's `env`, via `claudeSubscriptionEnv` / `isClaudeSubscriptionAdapter` in `src/util.js`, `src/cli-adapter.js`, and `src/bridge/clis.js` — keeping `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `CLAUDE_CONFIG_DIR`, and non-`claude` `claude-stream-json` adapters such as `qodercli` intact so inherited or configured API credentials cannot silently bill the API.
+
 ## [0.1.0] - 2026-11-22
 
 ### Added

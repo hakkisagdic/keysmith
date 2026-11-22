@@ -240,6 +240,37 @@ export function agentCleanEnv(base = process.env) {
   return env;
 }
 
+const CLAUDE_SUBSCRIPTION_DROP = /^(?:ANTHROPIC_|CLAUDE_API_KEY$|CLAUDE_CODE_OAUTH_TOKEN$|CLAUDE_CODE_USE_(?:BEDROCK|VERTEX|FOUNDRY|MANTLE)$)/;
+
+/**
+ * Environment for a Claude Code subscription CLI run.
+ *
+ * Strips Anthropic API credentials, endpoint/header overrides, OAuth token overrides, and
+ * Bedrock/Vertex/Foundry/Mantle backend switches so Claude Code always authenticates through
+ * its logged-in subscription and can never silently bill an API key inherited from the gateway
+ * or configured on the adapter. Keeps other `CLAUDE_CODE_*` settings (e.g.
+ * `CLAUDE_CODE_DISABLE_AUTO_MEMORY`) and `CLAUDE_CONFIG_DIR` intact.
+ */
+export function claudeSubscriptionEnv(base = process.env) {
+  const env = { ...base };
+  for (const k of Object.keys(env)) {
+    if (CLAUDE_SUBSCRIPTION_DROP.test(k)) delete env[k];
+  }
+  return env;
+}
+
+/**
+ * Whether a CLI adapter runs Claude Code (not another CLI sharing `claude-stream-json` such as
+ * `qodercli` or `mimo`). Matches `parser === 'claude-stream-json'` with bin basename `claude`,
+ * or an adapter wired to the `claude` MCP bridge driver.
+ */
+export function isClaudeSubscriptionAdapter(adapter) {
+  if (!adapter) return false;
+  if (adapter.bridge?.driver === 'claude') return true;
+  const base = path.basename(String(adapter.bin || '')).replace(/\.exe$/i, '');
+  return adapter.parser === 'claude-stream-json' && base === 'claude';
+}
+
 /** Simple counting semaphore for adapters that must not run more than N processes. */
 export class Semaphore {
   constructor(max = Infinity) {

@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { joinArgs } from '../util.js';
+import { claudeSubscriptionEnv, joinArgs } from '../util.js';
 import { effortIn, refuseNul } from '../cli-adapter.js';
 import { SHIM } from './agy.js';
 import { KILL_GRACE_MS, bridgeEnv, list, older, rm, spawnGroup, writePrivate } from './proc.js';
@@ -271,15 +271,17 @@ export const claudeDriver = fileDriver({
     return { mcpConfig: written[0].file };
   },
   env(adapter, session) {
-    return bridgeEnv(adapter, {
-      drop: /^(CLAUDECODE$|CLAUDE_CODE_|CLAUDE_AGENT_SDK_)/,
-      set: {
-        MCP_TOOL_TIMEOUT: String(session.limits.toolResultTimeoutMs + CALL_TIMEOUT_MARGIN_MS),
-        MCP_TIMEOUT: String(session.limits.readyTimeoutMs),
-        ENABLE_TOOL_SEARCH: 'false',
-        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
-      },
-    });
+    return claudeSubscriptionEnv(
+      bridgeEnv(adapter, {
+        drop: /^(CLAUDECODE$|CLAUDE_CODE_|CLAUDE_AGENT_SDK_)/,
+        set: {
+          MCP_TOOL_TIMEOUT: String(session.limits.toolResultTimeoutMs + CALL_TIMEOUT_MARGIN_MS),
+          MCP_TIMEOUT: String(session.limits.readyTimeoutMs),
+          ENABLE_TOOL_SEARCH: 'false',
+          CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+        },
+      }),
+    );
   },
   toolMeta(adapter) {
     const max = Math.min(adapter.maxPromptChars, CLAUDE_RESULT_CEILING);

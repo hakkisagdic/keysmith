@@ -558,8 +558,11 @@ session's MCP config file). The session's files are in `.keysmith-bridge/` in th
   turns `--mcp-config`'s server off too. Its environment: `MCP_TOOL_TIMEOUT` 30 s past
   `toolResultTimeoutMs` (Claude Code honours it: a 2 s one cancelled a held call at 2 s),
   `MCP_TIMEOUT` the readiness wait, `ENABLE_TOOL_SEARCH=false` (with it on, Claude Code put a
-  tool of its own in front of the request's), `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, and no
-  `CLAUDECODE`/`CLAUDE_CODE_*`/`CLAUDE_AGENT_SDK_*` of a session the gateway was started in.
+  tool of its own in front of the request's), `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, no
+  `CLAUDECODE`/`CLAUDE_CODE_*`/`CLAUDE_AGENT_SDK_*` of a session the gateway was started in, and
+  after merging the adapter's `env`, `ANTHROPIC_*`, `CLAUDE_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  and `CLAUDE_CODE_USE_BEDROCK`/`VERTEX`/`FOUNDRY`/`MANTLE` are stripped so the subscription login
+  stays the only auth path.
   Auto-memory is off twice, in the argv and the environment, because `--setting-sources ""`
   leaves it on: `~/.claude/projects/<workspace>/memory/MEMORY.md` reached the prompt as
   instructions, with ~2,300 chars telling the model to keep memories with the Write tool, and
@@ -820,7 +823,15 @@ another effort (in the id or in a field) is a new session, which reads the conve
   `--no-session-persistence`: 2.1.261 refuses `--no-session` as an unknown option. All of it
   parsed by 2.1.261 with an empty prompt, which it rejects before sending anything; requests
   went through it on 2.1.303 (images, and EMULATE's argv is this one). It spends your Claude subscription, so the profile ships
-  `explicitOnly: true`: no alias, no probe, and a re-add keeps it. A request with an image or
+  `explicitOnly: true`: no alias, no probe, and a re-add keeps it. For any Claude Code adapter
+  (`parser: "claude-stream-json"` with `bin` basename `claude`, or `bridge.driver: "claude"`),
+  keysmith strips `ANTHROPIC_*` (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_CUSTOM_HEADERS`, …), `CLAUDE_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and
+  `CLAUDE_CODE_USE_BEDROCK`/`VERTEX`/`FOUNDRY`/`MANTLE` from the child environment after merging
+  `env` on every path (text, vision, EMULATE, `modelsFrom`, and the MCP bridge) so the logged-in
+  subscription is the only auth path and inherited or configured API variables can never silently
+  bill the API; other CLIs sharing `claude-stream-json` (such as `qodercli`) keep their own
+  environment variables. A request with an image or
   a PDF runs `visionArgs`: the same switches with `--input-format stream-json` and the prompt on
   stdin (see [Media](#media-images-pdfs-audio-video)).
 - `qoder`: `--tools ""` and `--strict-mcp-config`; `{noSession}` is
