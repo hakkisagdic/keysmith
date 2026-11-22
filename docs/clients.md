@@ -211,6 +211,8 @@ for chunk in c.chat.completions.create(model="cmd/gpt-5", stream=True,
 `keysmith.models.list()` is what the CLI's `models` command calls; `?refresh=1` re-queries
 the upstreams instead of using the 10-minute cache.
 
+For non-streaming `response_format` (`json_object` / `json_schema`) on `/v1/chat/completions` and `text.format` on `/v1/responses`, optional JSON healing and failover on `502 invalid_output` are off by default — see [Structured-output healing](../README.md#structured-output-healing).
+
 Tools work the way they do against OpenAI: the model asks, your code runs the tool and sends
 the result back. Through a CLI leg with a `toolMode` (agy: the MCP bridge, or EMULATE) the calls
 come back in the same shape as from an HTTP upstream — keysmith runs none of them:
