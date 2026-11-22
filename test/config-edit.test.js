@@ -3,10 +3,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { Gateway } from '../src/gateway.js';
+import { createServer } from '../src/server.js';
+import { UsageLog } from '../src/usage.js';
 
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const GWKEY = 'ks_configedit_secret_0123456789abcdefghij';
@@ -83,4 +87,58 @@ test('batch.enabled: set, get, reject non-bool, unset', (t) => {
   assert.match(bad.stderr, /true or false/);
   assert.equal(run('config', 'unset', 'batch.enabled').status, 0);
   assert.equal(JSON.parse(fs.readFileSync(config, 'utf8')).batch?.enabled, undefined);
+});
+
+test('Check 8: structuredOutput.mode config edit, doctor error on invalid mode, and server falls back to off', async (t) => {
+  const { home, config, run } = setup(t, { structuredOutput: { mode: 'yes' } });
+  const badDoc = run('doctor');
+  assert.match(badDoc.stdout + badDoc.stderr, /structuredOutput\.mode must be "off" or "heal".*stays off/);
+
+  const badSet = run('config', 'set', 'structuredOutput.mode', 'yes');
+  assert.notEqual(badSet.status, 0);
+  assert.match(badSet.stderr, /off \| heal/);
+
+  assert.equal(run('config', 'set', 'structuredOutput.mode', 'heal').status, 0);
+  assert.equal(run('config', 'get', 'structuredOutput.mode').stdout.trim(), 'heal');
+  const okDoc = run('doctor');
+  assert.doesNotMatch(okDoc.stdout + okDoc.stderr, /structured-output healing stays off/);
+
+  // Server with bad structuredOutput logs an error and treats requests as off
+  const received = [];
+  const rawMalformed = '```json {"a":1,}```';
+  const stub = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => (raw += c));
+    req.on('end', () => {
+      const body = JSON.parse(raw);
+      received.push(body);
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', content: rawMalformed } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } })}\n\n`);
+      res.end('data: [DONE]\n\n');
+    });
+  });
+  await new Promise((r) => stub.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => stub.close(r)));
+  const cfg = {
+    auth: { enabled: true, keys: [GWKEY] },
+    structuredOutput: { mode: 'yes' },
+    adapters: { up: { kind: 'http', wire: 'openai', baseUrl: `http://127.0.0.1:${stub.address().port}/v1`, apiKey: false, models: ['m'] } },
+    aliases: {},
+  };
+  const logs = [];
+  const server = createServer(new Gateway(cfg), cfg, { usage: new UsageLog(path.join(home, 'usage.jsonl')), log: (m) => logs.push(m) });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => server.close(r)));
+
+  const res = await fetch(`http://127.0.0.1:${server.address().port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${GWKEY}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'up/m', messages: [{ role: 'user', content: 'hi' }], response_format: { type: 'json_object' } }),
+  });
+  const json = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(json.choices[0].message.content, rawMalformed);
+  assert.deepEqual(received[0].messages, [{ role: 'user', content: 'hi' }]);
+  assert.ok(logs.some((l) => /structuredOutput.*stays off/.test(l)));
 });
