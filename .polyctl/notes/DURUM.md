@@ -1,5 +1,5 @@
 # keysmith durumu
-Güncelleme: 2026-11-22 03:49
+Güncelleme: 2026-11-22 05:35
 ## Canlıda ne var
 - Çalışan ağ geçidi (launchd dev.keysmith.gateway) 05:45'te başlatılan eski kodla çalışıyor; aşağıdaki iş main'de ama canlıda değil.
 ## Şu an üzerinde çalışılan
@@ -24,3 +24,4 @@ Güncelleme: 2026-11-22 03:49
 - 2026-11-22 main 771f0af (is/20261119-keyflip-keysmith-secret-guard): istek öncesi gizli kalıp koruması, isteğe bağlı engelle ya da maskele (guard.secrets). Hedefli 12/12, tam test 1072/1102 geçti (3 yük zamanlaması dalgası, tek tek geçti). Canlıda değil: ağ geçidi bir sonraki yeniden başlatmada devreye girer (yönetici). Geri alma: git revert -m 1 771f0af (önceki fd70c78).
 - 2026-11-22 main c010509 (is/20261119-keysmith-3-pii-injection-guard): guard.pii (maskele/engelle: TCKN, IBAN, kart, e-posta; telefon isteğe bağlı) ve guard.injection (log/engelle), varsayılan kapalı. Hedefli 34/34, tam test 1002/1184 (kalan kırmızılar eksik devDependency ve CI'da zaten kırmızı olanlar). Açık: ağ geçidi eski kodda, kurulum adminin adımı.
 - 2026-11-22 main 4bd6661 (is/20261119-keysmith-1-circuit-breaker): adaptör başına devre kesici (açık/yarı açık/kapalı), yedek yürüyüşlerine bağlı, breakers uç noktası, status ve doctor çıktısında görünür; varsayılan kapalı. Hedefli 25/25, tam test 1207 toplam, 1184 geçti, 0 kalan. CI bu baş için tetiklenmedi; önceki iki CI koşusu zaten kırmızıydı. Açık: ağ geçidi eski kodda, kurulum adminin adımı. Geri alma: git revert 4bd6661..c010509 sırasıyla (önceki c010509).
+- 2026-11-22 main eedba7e (is/20261119-keysmith-2-structured-output-healing): yapılandırılmış çıktı onarımı (akışsız sohbet ve /v1/responses; bozuk JSON onarılır, şema denetlenir, başarısızlık 502 invalid_output olup sonraki bacağa geçer), structuredOutput.mode varsayılan kapalı. Hedefli 28/28, tam test 1223: 1200 geçti, 0 kalan. CI bu baş için tetiklenmedi. Açık: ağ geçidi eski kodda, kurulum adminin adımı. Geri alma: git revert -m 1 eedba7e (önceki fffa291).
