@@ -131,9 +131,10 @@ function failoverSection({ guards = [], skips = [] }) {
  */
 function responseCacheLine(stats) {
   if (!stats || typeof stats !== 'object') return '';
-  const { hits, misses, entries } = stats;
+  const { hits, misses, entries, semanticHits } = stats;
   if (![hits, misses, entries].every((n) => Number.isInteger(n) && n >= 0)) return '';
-  return `\n<div class="sub">response cache: ${hits} hits / ${misses} misses, ${entries} entries</div>`;
+  const semantic = Number.isInteger(semanticHits) && semanticHits >= 0 ? `, ${semanticHits} semantic hits` : '';
+  return `\n<div class="sub">response cache: ${hits} hits / ${misses} misses, ${entries} entries${semantic}</div>`;
 }
 
 /** A viewer key's own daily cap, per-minute limit, expiry and disabled state. */

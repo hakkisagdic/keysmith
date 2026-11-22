@@ -29,7 +29,8 @@ import { TAIL_RING_MAX, RECENT_STATUSES, computeCost, credentialAccount, entryFi
 import { cachePlanScope, checkPromptCache } from './prompt-cache.js';
 import { applySecretGuard, findSecrets, guardConfig } from './secret-guard.js';
 import { applyPiiGuard, hasPii, scanInjection } from './pii-guard.js';
-import { ResponseCache, keyFor, resolveCacheConfig } from './response-cache.js';
+import { ResponseCache, keyFor, resolveCacheConfig, shapeFor } from './response-cache.js';
+import { buildVector, cosine, lastUserText } from './semantic-vector.js';
 import { extractResponseFormatSpec, resolveStructuredConfig } from './structured-output.js';
 
 export function isLoopbackHost(host) {
@@ -214,12 +215,14 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const minute = new MinuteLimiter({ now });
   const refusalGate = new Map(); // `${fp}:${reason}` -> last logged refusal timestamp (ms)
   if (authOn) quota.seed(usage);
-  // Exact response cache (src/response-cache.js). Off unless cache.enabled is true.
+  // Exact and optional semantic response cache (src/response-cache.js). Off unless cache.enabled is true.
   // A bad value is logged and the cache stays off — same answer doctor prints.
   const cacheResolved = resolveCacheConfig(cfg?.cache);
   if (cacheResolved.error) log(`cache: ${cacheResolved.error}`);
+  else if (cacheResolved.warning) log(`cache: ${cacheResolved.warning}`);
+  const semanticCache = cacheResolved.enabled && cacheResolved.semantic.enabled ? cacheResolved.semantic : null;
   const responseCache = cacheResolved.enabled
-    ? new ResponseCache({ maxEntries: cacheResolved.maxEntries, ttlMs: cacheResolved.ttlSeconds * 1000, now })
+    ? new ResponseCache({ maxEntries: cacheResolved.maxEntries, ttlMs: cacheResolved.ttlSeconds * 1000, now, semantic: !!semanticCache })
     : null;
   let structuredResolved = resolveStructuredConfig(cfg?.structuredOutput);
   if (structuredResolved.error) log(`structuredOutput: ${structuredResolved.error}`);
@@ -566,7 +569,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           } : {}),
         });
       }
-      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode, responseCache, structuredOutput: structuredResolved, now });
+      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode, responseCache, semanticCache, structuredOutput: structuredResolved, now });
       if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode });
       if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend, guard: secretGuardMode, structuredOutput: structuredResolved });
       if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend, guard: secretGuardMode });
@@ -1134,7 +1137,7 @@ function usageFromCachedCompletion(payload) {
   };
 }
 
-async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, guard = 'off', responseCache = null, structuredOutput = null, now = null }) {
+async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, guard = 'off', responseCache = null, semanticCache = null, structuredOutput = null, now = null }) {
   const body = guardRequestBody(await readJson(req), { guard, req, res, route: '/v1/chat/completions', gateway, scope, usage });
   const messages = openaiMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -1192,21 +1195,48 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
 
   const structuredSpec = structuredOutput?.enabled && !tools ? extractResponseFormatSpec(body, 'chat') : null;
   if (!stream) {
-    // Exact cache, this branch only. Cacheable: no tools and no tool history, no session,
-    // and either temperature 0 or `x-keysmith-cache: use`. A hit returns before collect,
-    // so the upstream is not called and holdSpend reserves nothing. meter() already
-    // counted the request. A failed collect throws before anything is stored.
+    // Exact cache (and optional semantic cache on miss), this branch only. Cacheable:
+    // no tools and no tool history, no session, and either temperature 0 or
+    // `x-keysmith-cache: use`. A hit returns before collect, so the upstream is not
+    // called and holdSpend reserves nothing. meter() already counted the request.
+    // A failed collect throws before anything is stored.
     const cacheable = !!(responseCache && tools == null && !session && (body.temperature === 0 || wantsResponseCache(req)));
     const cacheModel = upstreamHarness ? `${requested}\0${upstreamHarness}` : requested;
-    const cacheKey = cacheable ? keyFor({ callerHash: caller, body: cacheModel !== body.model ? { ...body, model: cacheModel } : body }) : null;
+    const cacheBody = cacheable && cacheModel !== body.model ? { ...body, model: cacheModel } : body;
+    const cacheKey = cacheable ? keyFor({ callerHash: caller, body: cacheBody }) : null;
+    let semanticMeta = null;
+    if (cacheKey && semanticCache) {
+      const text = lastUserText(cacheBody);
+      if (text !== null) {
+        const vector = buildVector(text);
+        if (vector.norm > 0) {
+          const shape = shapeFor({ callerHash: caller, body: cacheBody });
+          if (shape) semanticMeta = { shape, vector };
+        }
+      }
+    }
     if (cacheKey) {
-      const hit = responseCache.get(cacheKey);
+      let hit = responseCache.get(cacheKey, { countMiss: !semanticMeta });
+      let hitHeader = 'hit';
+      let similarity = null;
+      if (!hit && semanticMeta) {
+        const sem = responseCache.getSemantic(semanticMeta.shape, semanticMeta.vector, {
+          threshold: semanticCache.threshold,
+          maxProbe: semanticCache.maxProbe,
+          similarity: cosine,
+        });
+        if (sem) {
+          hit = sem.payload;
+          hitHeader = 'hit-semantic';
+          similarity = Math.round(sem.similarity * 1000) / 1000;
+        }
+      }
       if (hit) {
         hit.id = chatId();
         hit.created = Math.floor((typeof now === 'function' ? now() : Date.now()) / 1000);
         if (meta.virtual?.chosen) res.setHeader('x-keysmith-route', meta.virtual.chosen);
         meta.done = true;
-        json(res, 200, hit, hit.keysmith?.session || null, { 'x-keysmith-cache': 'hit' });
+        json(res, 200, hit, hit.keysmith?.session || null, { 'x-keysmith-cache': hitHeader });
         record(usage, {
           model: requested,
           status: 'ok',
@@ -1214,6 +1244,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
           usage: usageFromCachedCompletion(hit),
           cost: { usd: 0, basis: 'metered' },
           cache: 'hit',
+          ...(similarity !== null ? { similarity } : {}),
           stream: false,
           client: req.headers['user-agent'],
         });
@@ -1237,7 +1268,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     if (meta.virtual?.chosen) res.setHeader('x-keysmith-route', meta.virtual.chosen);
     // Store only a finished answer: no tool calls, not a cut-off, and under the size cap.
     // set() clones. The header is miss only when this answer is now in the cache.
-    const cacheHeader = cacheKey && calls.length === 0 && !cutAt && responseCache.set(cacheKey, payload) ? 'miss' : null;
+    const cacheHeader = cacheKey && calls.length === 0 && !cutAt && responseCache.set(cacheKey, payload, semanticMeta) ? 'miss' : null;
     meta.done = true;
     json(res, 200, payload, sid, cacheHeader ? { 'x-keysmith-cache': cacheHeader } : null);
     const rowFailed = out.failed?.length ? out.failed : failedLegs;
