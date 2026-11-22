@@ -1162,16 +1162,23 @@ An adapter can override any of the three: `"adapters": { "groq": { "circuitBreak
 Off unless the config says so. A repeated non-streaming `POST /v1/chat/completions` can be answered from memory, at no upstream cost, when the same caller sends the same request again.
 
 ```json
-"cache": { "enabled": true, "ttlSeconds": 3600, "maxEntries": 500 }
+"cache": {
+  "enabled": true,
+  "ttlSeconds": 3600,
+  "maxEntries": 500,
+  "semantic": { "enabled": false, "threshold": 0.92, "maxProbe": 200 }
+}
 ```
 
 The default is `"enabled": false` (one hour, 500 entries, when you turn it on in `config.json`). A value that is not that shape is a `keysmith doctor` error and the cache stays off. Nothing is written to disk; a restart empties it. Answers larger than about 1 MB are not stored.
 
 A request is cached only when it is not streamed, offers no tools and has no tool history, carries no session (`x-keysmith-session` or `session`), and is one you opted into: `temperature` is `0`, or the request sends `x-keysmith-cache: use`. The first answer is `x-keysmith-cache: miss`. The next one, while it is still inside `ttlSeconds` and has not been evicted, is `x-keysmith-cache: hit` with a new `id` and `created`, and the upstream is not called. The key is a SHA-256 of the caller's key hash and the fields that change the answer (model, messages, temperature, the token limits, `include_reasoning`, `response_format`, `stop`, `seed`, and the effort fields — computed after `guard.secrets` masking or blocking when enabled), so one gateway key never reads another's answers. Streaming, `/v1/messages`, `/v1/responses`, embeddings and tool calls are not cached. A failed or partial upstream answer is not stored.
 
-A hit still counts as one request against a key's daily cap (that count happens before the body is read). It adds no spend: the usage row is `"cache": "hit"` with cost 0 (shown by `keysmith usage --tail` and `GET /v1/keysmith/usage?tail=…`), and nothing is reserved against `limits.spend`. While the cache is on, the status page shows `response cache: N hits / M misses, K entries` from those counters.
+Optional semantic matching (`"semantic": { "enabled": false, "threshold": 0.92, "maxProbe": 200 }`) is off by default and only runs when `cache.enabled` is also `true` (enabling `cache.semantic.enabled` alone has no effect, and `keysmith doctor` warns). An invalid field (such as `cache.semantic.threshold` outside `(0, 1]`) turns the entire response cache off and names the field in `keysmith doctor`. When enabled and exact lookup misses on a cacheable request whose last message is a plain-text `user` turn (requests ending with images, files, or non-`user` turns are excluded from semantic lookup and indexing), Keysmith checks up to `maxProbe` newest entries sharing the exact same shape (caller key hash, resolved model/harness, answer parameters, and canonical JSON of the system prompt and all earlier conversation turns). Only a text-free sparse vector (hashed unigrams and character 3-grams from up to the first 4 KB, after `guard` masking) and a SHA-256 digest of guard tokens (numbers, currencies/operators, negations, and decisive polarity words) are kept in memory — never prompt text. If guard tokens differ, the pair never hits regardless of cosine similarity. No client header activates semantic matching when it is off (`x-keysmith-cache: use` only opts non-zero temperatures into the configured cache). A semantic hit returns `x-keysmith-cache: hit-semantic` with a fresh `id` and `created`, and writes `"cache": "hit"`, numeric `"similarity"` (3 decimals), and cost `0` to the usage row.
 
-**A cached answer is the answer of an earlier call** (and with `guard.secrets` `"off"`, cached answers hold whatever the prompt and reply held, in memory only, until TTL or restart). An agent loop that needs a fresh answer should leave the cache off, or omit both `temperature: 0` and the `x-keysmith-cache: use` header.
+A hit still counts as one request against a key's daily cap (that count happens before the body is read). It adds no spend: the usage row is `"cache": "hit"` with cost 0 (shown by `keysmith usage --tail` and `GET /v1/keysmith/usage?tail=…`, with `"similarity"` on semantic hits), and nothing is reserved against `limits.spend`. While the cache is on, the status page shows `response cache: N hits / M misses, K entries` from those counters (plus `, S semantic hits` when semantic caching is active).
+
+**A cached answer is the answer of an earlier call** (and with `guard.secrets` `"off"`, cached answers hold whatever the prompt and reply held, in memory only, until TTL or restart). **A semantic hit can also return an earlier answer to a slightly different question**, which is why the shape binds every earlier conversation turn and the system prompt identically — multi-turn history must match verbatim so a paraphrased follow-up never reuses an answer from a different conversation context. An agent loop that needs a fresh answer should leave the cache off, or omit both `temperature: 0` and the `x-keysmith-cache: use` header.
 
 ## Structured-output healing
 
@@ -1212,6 +1219,8 @@ records:
 - **`tag`** — the client's `x-keysmith-tag` request header (e.g. `ao-review`), kept when it is
   1–40 characters of letters, digits, `-`, `_` and `.`, dropped otherwise, and absent when not
   sent.
+- **`cache`** / **`similarity`** — `"cache": "hit"` on exact or semantic response-cache hits,
+  with `"similarity"` (3-decimal cosine score) added when the answer came from the semantic cache.
 - **`cost`** — `{usd, basis}` (pricing derives uncached input as `input - cacheRead - cacheWrite`
   at the `input` rate and prices `cacheRead` and `cacheWrite` at their own rates, uniformly across
   every adapter and parser):
