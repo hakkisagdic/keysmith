@@ -152,7 +152,7 @@ export const DEFAULTS = {
   port: 8787,
   auth: { enabled: true, keys: [] },
   log: { usage: true, body: false },
-  guard: { secrets: 'off' },
+  guard: { secrets: 'off', pii: 'off', injection: 'off' },
   limits: { maxConcurrent: 32, timeoutMs: 300_000, spend: {} },
   // Exact response cache for non-streaming chat. Off. A bad value is a doctor error
   // and the cache stays off (src/response-cache.js).

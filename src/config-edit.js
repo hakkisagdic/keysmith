@@ -26,6 +26,8 @@ export const SCHEMA = {
   'log.usage': T.bool,
   'log.body': T.bool,
   'guard.secrets': T.oneOf(['off', 'block', 'mask']),
+  'guard.pii': T.oneOf(['off', 'mask', 'block']),
+  'guard.injection': T.oneOf(['off', 'log', 'block']),
   'limits.maxConcurrent': T.int(),
   'limits.timeoutMs': T.int(),
   'limits.streamHoldMs': T.int(0),

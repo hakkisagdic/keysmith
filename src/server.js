@@ -27,7 +27,8 @@ import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, RECENT_STATUSES, computeCost, credentialAccount, entryFilter, parseFilterNumber, parseTag, roundUsd } from './usage.js';
 import { cachePlanScope, checkPromptCache } from './prompt-cache.js';
-import { applySecretGuard, findSecrets, guardMode } from './secret-guard.js';
+import { applySecretGuard, findSecrets, guardConfig } from './secret-guard.js';
+import { applyPiiGuard, hasPii, scanInjection } from './pii-guard.js';
 import { ResponseCache, keyFor, resolveCacheConfig } from './response-cache.js';
 
 export function isLoopbackHost(host) {
@@ -215,8 +216,10 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const holdMs = Number.isFinite(cfg.limits?.streamHoldMs) && cfg.limits.streamHoldMs >= 0 ? cfg.limits.streamHoldMs : STREAM_HOLD_MS;
   // How long an open stream may go without a byte before it gets a keepalive (faces.js); 0: never.
   const keepaliveMs = Number.isFinite(cfg.limits?.streamKeepaliveMs) && cfg.limits.streamKeepaliveMs >= 0 ? cfg.limits.streamKeepaliveMs : KEEPALIVE_MS;
-  const { mode: secretGuardMode, error: secretGuardError } = guardMode(cfg);
-  if (secretGuardError) log(`guard.secrets: ${secretGuardError}`);
+  const guardCfg = guardConfig(cfg);
+  for (const e of guardCfg.errors) log(`guard.${e.key}: ${e.message}`);
+  // One object for the four handlers: secrets, then pii, then injection (guardRequestBody).
+  const secretGuardMode = { secrets: guardCfg.secrets, pii: guardCfg.pii, injection: guardCfg.injection };
 
   // Whatever one request does, it never takes the process down: launchd would restart it
   // every 10 s for as long as somebody keeps sending the request, and Node's own crash
@@ -1009,23 +1012,69 @@ function describeHarness(a) {
 
 /* ---------------------------------------------------------------------- handlers */
 
+const GUARD_OFF = { secrets: 'off', pii: { mode: 'off', types: [] }, injection: 'off' };
+
+/**
+ * The request-side guards, in order: secrets (`guard.secrets`), personal data (`guard.pii`),
+ * prompt injection (`guard.injection`). Mask forwards the masked copy; block answers 400 before any
+ * upstream call; injection `log` only marks the usage row. Rows carry kinds and pattern ids, never
+ * the matched text.
+ */
 function guardRequestBody(body, { guard = 'off', req, res, route, gateway = null, scope = null, usage = null } = {}) {
-  if (guard !== 'block' && guard !== 'mask') return body;
-  const { body: nextBody, kinds } = applySecretGuard(body, guard);
-  if (!kinds.length) return body;
-  if (guard === 'mask') {
-    if (req) req._guard = marks({ guard: 'masked', guardKinds: kinds });
-    return nextBody;
+  const g = typeof guard === 'string' ? { ...GUARD_OFF, secrets: guard } : guard || GUARD_OFF;
+  const secretsOn = g.secrets === 'block' || g.secrets === 'mask';
+  const piiOn = g.pii?.mode === 'block' || g.pii?.mode === 'mask';
+  const injOn = g.injection === 'log' || g.injection === 'block';
+  if (!secretsOn && !piiOn && !injOn) return body;
+
+  let cur = body;
+  let masked = false;
+  const kinds = [];
+  const addKinds = (list) => { for (const k of list) if (!kinds.includes(k)) kinds.push(k); };
+  let blockMessage = null;
+
+  if (secretsOn) {
+    const r = applySecretGuard(cur, g.secrets);
+    if (r.kinds.length) {
+      addKinds(r.kinds);
+      if (g.secrets === 'mask') { cur = r.body; masked = true; }
+      else blockMessage = `request holds a secret of kind ${r.kinds.join(', ')} (guard.secrets=block)`;
+    }
   }
-  const message = `request holds a secret of kind ${kinds.join(', ')} (guard.secrets=block)`;
-  const rawModel = typeof body?.model === 'string' && body.model.trim() && !findSecrets(body.model).length ? body.model.trim() : null;
+  if (!blockMessage && piiOn) {
+    const r = applyPiiGuard(cur, g.pii);
+    if (r.kinds.length) {
+      addKinds(r.kinds);
+      if (g.pii.mode === 'mask') { cur = r.body; masked = true; }
+      else blockMessage = `request holds personal data of kind ${r.kinds.join(', ')} (guard.pii=block)`;
+    }
+  }
+  let injection = [];
+  if (!blockMessage && injOn) {
+    injection = scanInjection(cur);
+    if (injection.length && g.injection === 'block') {
+      blockMessage = `request holds a prompt-injection pattern ${injection.join(', ')} (guard.injection=block)`;
+    }
+  }
+
+  if (!blockMessage) {
+    if (req && (masked || injection.length)) {
+      req._guard = marks({ guard: masked ? 'masked' : null, guardKinds: masked ? kinds : null, injection });
+    }
+    return cur;
+  }
+
+  // Block. The model, harness id and backend go into the row, so none of them may hold a secret
+  // or personal data of its own.
+  const clean = (v) => !findSecrets(v).length && !(piiOn && hasPii(v, g.pii.types));
+  const rawModel = typeof body?.model === 'string' && body.model.trim() && clean(body.model) ? body.model.trim() : null;
   const harnessId = req ? extractHarnessId(req, body) : null;
-  const safeHarness = harnessId && !findSecrets(harnessId).length ? harnessId : null;
-  const safeBackend = typeof body?.backend === 'string' && !findSecrets(body.backend).length ? body.backend : null;
+  const safeHarness = harnessId && clean(harnessId) ? harnessId : null;
+  const safeBackend = typeof body?.backend === 'string' && clean(body.backend) ? body.backend : null;
   const requested = rawModel && gateway ? resolveRequestedModel(gateway, rawModel, { harnessId: safeHarness, backend: safeBackend, scope }) : rawModel;
   const stream = !!body?.stream;
   const via = route && route !== '/v1/chat/completions' ? route : null;
-  const errJson = JSON.stringify(errorBody(message, 'invalid_request_error', 400, null, faceFromRoute(route)));
+  const errJson = JSON.stringify(errorBody(blockMessage, 'invalid_request_error', 400, null, faceFromRoute(route)));
   if (res) res._keysmith = { model: requested, stream, t0: Date.now(), done: true, via };
   record(usage, {
     model: requested,
@@ -1033,12 +1082,12 @@ function guardRequestBody(body, { guard = 'off', req, res, route, gateway = null
     ms: 0,
     stream,
     ...(via ? { via } : {}),
-    error: message,
+    error: blockMessage,
     client: req?.headers?.['user-agent'] || (route === '/v1/messages' ? 'anthropic' : undefined),
     bytesOut: Buffer.byteLength(errJson, 'utf8'),
-    ...marks({ guard: 'blocked', guardKinds: kinds }),
+    ...marks({ guard: 'blocked', guardKinds: kinds, injection }),
   });
-  throw new LlmError(message, { status: 400, type: 'invalid_request_error' });
+  throw new LlmError(blockMessage, { status: 400, type: 'invalid_request_error' });
 }
 
 /** Client opt-in for the exact response cache when temperature is not 0: `x-keysmith-cache: use`. */
@@ -2569,7 +2618,7 @@ function wrapBytesOut(res) {
  * (`bridge.session`, its short id), reached how (`new`, `attached`, `cold`) and on its how-many-th
  * turn — names and counts only: never a tool's arguments or result, which are the client's data.
  */
-function marks({ retries = 0, cutAt = null, toolMode = null, toolCalls = 0, fallback = null, bridge = null, guard = null, guardKinds = null } = {}) {
+function marks({ retries = 0, cutAt = null, toolMode = null, toolCalls = 0, fallback = null, bridge = null, guard = null, guardKinds = null, injection = null } = {}) {
   return {
     ...(retries ? { retries } : {}),
     ...(cutAt ? { cutAt } : {}),
@@ -2579,6 +2628,7 @@ function marks({ retries = 0, cutAt = null, toolMode = null, toolCalls = 0, fall
     ...(bridge ? { bridge } : {}),
     ...(guard ? { guard } : {}),
     ...(guardKinds?.length ? { guardKinds } : {}),
+    ...(injection?.length ? { injection } : {}),
   };
 }
 
