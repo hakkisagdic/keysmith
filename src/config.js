@@ -155,9 +155,9 @@ export const DEFAULTS = {
   log: { usage: true, body: false },
   guard: { secrets: 'off', pii: 'off', injection: 'off' },
   limits: { maxConcurrent: 32, timeoutMs: 300_000, spend: {} },
-  // Exact response cache for non-streaming chat. Off. A bad value is a doctor error
-  // and the cache stays off (src/response-cache.js).
-  cache: { ...CACHE_DEFAULTS },
+  // Exact and optional semantic response cache for non-streaming chat. Off. A bad value is
+  // a doctor error and the cache stays off (src/response-cache.js).
+  cache: { ...CACHE_DEFAULTS, semantic: { ...CACHE_DEFAULTS.semantic } },
   // Non-streaming JSON healing and schema validation. Off by default.
   structuredOutput: { ...STRUCTURED_DEFAULTS },
   pricing: structuredClone(CLAUDE_PRICING),
