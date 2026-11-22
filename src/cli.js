@@ -24,7 +24,7 @@ import { BatchError, batchEnabled, cancel as batchCancel, describeJob, fetchResu
 import { fmtUsd } from './usage.js';
 import { fingerprint, knownSecrets, redactKey, redactSecrets, registerSecrets, streamRedactor } from './redact.js';
 import { ensurePrivateDir, logFiles, openPrivateLog, rotatedLogFiles, scrubLogFile, secureLogFiles, FILE_MODE } from './logfiles.js';
-import { guardMode } from './secret-guard.js';
+import { guardConfig } from './secret-guard.js';
 import { adapterReach, aliasDecision, authEnabled, compileScope, describePerDay, describePerMinute, describeScope, entryFp, expiresOf, hashKey, isKeyExpired, keyHashOf, keyOf, keyStrings, parseKeys, parsePattern, requestDecision, scopeWarnings, unnamedPatterns } from './keys.js';
 import { runMcpCli } from './mcp.js';
 
@@ -1385,8 +1385,7 @@ async function cmdDoctor(flags) {
   const { gateway, usage, log } = buildGateway(cfg);
   const rows = [];
   out(`keysmith ${PKG.version} — config ${rel(configPath())}\n`);
-  const { error: guardErr } = guardMode(cfg);
-  if (guardErr) rows.push(['config', 'config error', `guard.secrets: ${guardErr}`]);
+  for (const e of guardConfig(cfg).errors) rows.push(['config', 'config error', `guard.${e.key}: ${e.message}`]);
 
   for (const [id, raw] of Object.entries(cfg.adapters || {})) {
     const adapter = gateway.adapters.get(id);

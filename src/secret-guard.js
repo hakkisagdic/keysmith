@@ -22,7 +22,7 @@ const SHAPES = [
 ];
 
 /** Protocol identifier fields whose string values are routing/state IDs, never prompt text. */
-const SKIP_STRING_KEYS = new Set(['model', 'id', 'tool_call_id', 'call_id', 'previous_response_id']);
+export const SKIP_STRING_KEYS = new Set(['model', 'id', 'tool_call_id', 'call_id', 'previous_response_id']);
 
 /** Structural enum fields excluded only from cross-field split assembly so content blocks stay adjacent. */
 const STRUCTURAL_KEYS = new Set(['role', 'type', 'object', 'status', 'finish_reason', 'stop_reason']);
@@ -52,35 +52,85 @@ export function findSecrets(text) {
   return out;
 }
 
+export const PII_MODES = ['off', 'mask', 'block'];
+export const INJECTION_MODES = ['off', 'log', 'block'];
+export const PII_TYPES = ['national-id', 'iban', 'card', 'email', 'phone'];
+/** What `guard.pii` looks for when `types` is not given: phone numbers are opt-in. */
+export const PII_DEFAULT_TYPES = ['national-id', 'iban', 'card', 'email'];
+
+const SECRETS_BAD_SHAPE = 'invalid guard setting (expected { "secrets": "off" | "block" | "mask" }), treated as block';
+const SECRETS_BAD_FIELD = 'unknown field in guard (expected guard.secrets, guard.pii or guard.injection), treated as block';
+const SECRETS_BAD_VALUE = 'invalid value (expected "off", "block" or "mask"), treated as block';
+const PII_BAD_VALUE = 'invalid value (expected "off", "mask", "block" or { mode, types }), treated as block';
+const INJECTION_BAD_VALUE = 'invalid value (expected "off", "log" or "block"), treated as block';
+
+function parsePii(v) {
+  if (v === undefined || v === 'off') return { mode: 'off', types: PII_DEFAULT_TYPES, error: null };
+  if (v === 'mask' || v === 'block') return { mode: v, types: PII_DEFAULT_TYPES, error: null };
+  const bad = { mode: 'block', types: PII_DEFAULT_TYPES, error: PII_BAD_VALUE };
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return bad;
+  for (const k of Object.keys(v)) if (k !== 'mode' && k !== 'types') return bad;
+  if (!PII_MODES.includes(v.mode)) return bad;
+  let types = PII_DEFAULT_TYPES;
+  if (v.types !== undefined) {
+    if (!Array.isArray(v.types) || !v.types.length || !v.types.every((t) => PII_TYPES.includes(t))) return bad;
+    types = [...new Set(v.types)];
+  }
+  return { mode: v.mode, types, error: null };
+}
+
+/**
+ * Resolve the whole `cfg.guard` block into
+ * `{ secrets, pii: { mode, types }, injection, error, errors }`.
+ * Each scanner that gets an invalid value fails closed to "block"; an unknown field or a
+ * non-object block fails closed on secrets. Errors never carry the offending value.
+ * `errors` is `[{ key, message }]`, `error` the first message (or null).
+ */
+export function guardConfig(cfg) {
+  const off = { secrets: 'off', pii: { mode: 'off', types: PII_DEFAULT_TYPES }, injection: 'off', error: null, errors: [] };
+  const g = cfg?.guard;
+  if (g === undefined) return off;
+  const errors = [];
+  const out = { secrets: 'off', pii: { mode: 'off', types: PII_DEFAULT_TYPES }, injection: 'off' };
+  if (!g || typeof g !== 'object' || Array.isArray(g)) {
+    return {
+      secrets: 'block',
+      pii: { mode: 'block', types: PII_DEFAULT_TYPES },
+      injection: 'block',
+      error: SECRETS_BAD_SHAPE,
+      errors: [{ key: 'guard', message: SECRETS_BAD_SHAPE }],
+    };
+  }
+  if (Object.keys(g).some((k) => k !== 'secrets' && k !== 'pii' && k !== 'injection')) {
+    out.secrets = 'block';
+    errors.push({ key: 'secrets', message: SECRETS_BAD_FIELD });
+  } else if (g.secrets === 'block' || g.secrets === 'mask') {
+    out.secrets = g.secrets;
+  } else if (g.secrets !== undefined && g.secrets !== 'off') {
+    out.secrets = 'block';
+    errors.push({ key: 'secrets', message: SECRETS_BAD_VALUE });
+  }
+  const p = parsePii(g.pii);
+  out.pii = { mode: p.mode, types: p.types };
+  if (p.error) errors.push({ key: 'pii', message: p.error });
+  if (g.injection === undefined || g.injection === 'off') out.injection = 'off';
+  else if (g.injection === 'log' || g.injection === 'block') out.injection = g.injection;
+  else {
+    out.injection = 'block';
+    errors.push({ key: 'injection', message: INJECTION_BAD_VALUE });
+  }
+  return { ...out, error: errors[0]?.message ?? null, errors };
+}
+
 /**
  * Resolve `cfg.guard.secrets` into `{ mode, error }`.
  * Absent or `"off"` -> `{ mode: "off", error: null }`.
  * Any invalid shape or value fails closed to `"block"` and returns a value-free error message.
  */
 export function guardMode(cfg) {
-  const g = cfg?.guard;
-  if (g === undefined) return { mode: 'off', error: null };
-  if (!g || typeof g !== 'object' || Array.isArray(g)) {
-    return {
-      mode: 'block',
-      error: 'invalid guard setting (expected { "secrets": "off" | "block" | "mask" }), treated as block',
-    };
-  }
-  for (const k of Object.keys(g)) {
-    if (k !== 'secrets') {
-      return {
-        mode: 'block',
-        error: 'unknown field in guard (expected guard.secrets: "off" | "block" | "mask"), treated as block',
-      };
-    }
-  }
-  const v = g.secrets;
-  if (v === undefined || v === 'off') return { mode: 'off', error: null };
-  if (v === 'block' || v === 'mask') return { mode: v, error: null };
-  return {
-    mode: 'block',
-    error: 'invalid value (expected "off", "block" or "mask"), treated as block',
-  };
+  const c = guardConfig(cfg);
+  const e = c.errors.find((x) => x.key === 'secrets' || x.key === 'guard');
+  return { mode: c.secrets, error: e ? e.message : null };
 }
 
 /**
@@ -179,7 +229,7 @@ function replaceHits(text, hits) {
   return out + text.slice(at);
 }
 
-function cloneJson(v) {
+export function cloneJson(v) {
   if (Array.isArray(v)) return v.map(cloneJson);
   if (v && typeof v === 'object') {
     const out = {};
@@ -203,7 +253,7 @@ function orderedEntries(obj, isRoot) {
   return out;
 }
 
-function collectLeaves(node, parentKey, leaves, isRoot = false) {
+export function collectLeaves(node, parentKey, leaves, isRoot = false) {
   if (Array.isArray(node)) {
     for (let i = 0; i < node.length; i++) {
       const val = node[i];
