@@ -7,6 +7,7 @@
   },
   "log": { "usage": true, "body": false },
   "limits": { "maxConcurrent": 32, "timeoutMs": 300000 },
+  "structuredOutput": { "mode": "off" },
 
   "tunnel": {
     "provider": "cloudflared",

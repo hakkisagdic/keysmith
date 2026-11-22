@@ -39,6 +39,7 @@ export const SCHEMA = {
   catalogue: T.nstr,
   'discovery.enabled': T.bool,
   'batch.enabled': T.bool,
+  'structuredOutput.mode': T.oneOf(['off', 'heal']),
 };
 const DISCOVERY_LEAF = /^discovery\.([A-Za-z0-9_-]+)\.(inputPricePath|outputPricePath|pricingUrl)$/;
 const HTTPS_STR = { type: 'string', https: true };

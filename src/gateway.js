@@ -12,6 +12,7 @@ import { McpBridge } from './bridge/index.js';
 import { CatalogueLimiter, catalogueSettings, loadCatalogue } from './catalogue.js';
 import { CreditGuard, creditGuardError } from './credit-guard.js';
 import { CircuitBreakerRegistry, countsAsFailure, resolveBreakerConfig, retryAfterMs } from './circuit-breaker.js';
+import { MAX_STRUCTURED_CHARS, enforceStructuredOutput, prependStructuredInstruction } from './structured-output.js';
 import { DRIVERS } from './bridge/drivers.js';
 import { resolveEffort, suffixedIds } from './effort.js';
 import { credentialAccount, execAccountMigrationWarnings, fmtUsd, hostOf, isExecCredentialAdapter, matchPrice } from './usage.js';
@@ -1153,6 +1154,7 @@ export class Gateway {
     harnessId = null,
     trace = null,
     holdSpend = null,
+    structured = null,
     onVirtual = null,
     onSkip = null,
   }) {
@@ -1220,7 +1222,7 @@ export class Gateway {
       skips: [],
       onSkip,
     };
-    const args = { messages, maxTokens, maxCompletionTokens, maxOutputTokens, temperature, includeReasoning, signal, effort, harnessId, trace };
+    const args = { messages, maxTokens, maxCompletionTokens, maxOutputTokens, temperature, includeReasoning, signal, effort, harnessId, trace, structured: tools ? null : structured };
     try {
       if (tools) return yield* this._toolRoute(model, chain, args, run, tools);
       yield* this._failover(chain, args, run, null);
@@ -1279,6 +1281,7 @@ export class Gateway {
   async *_failover(chain, args, run, carried) {
     let lastError = carried;
     let heldBack = null; // a leg the credit guard passed by: the answer only when no other leg had one
+    const failed = args.structured ? [] : null;
     for (const leg of chain) {
       const { adapter, model: upstreamModel } = leg;
       const held = (await this._heldBack(leg, run)) || this._breakerOpen(leg, run, chain);
@@ -1302,11 +1305,13 @@ export class Gateway {
           if (!d.ok) throw scopeError(d.reason, adapter.id);
         }
         const legEffort = planned.effort || (adapter.wire === 'uhp' || adapter.wire === 'traycer' ? args.effort : null);
-        releaseSpend = this.reserveSpend(adapter, planned.model, run.scope, this.estimateTokens(adapter, planned.model, args, null));
+        const legMessages = args.structured ? prependStructuredInstruction(args.messages, args.structured) : args.messages;
+        const spendEst = this.estimateTokens(adapter, planned.model, args.structured ? { ...args, messages: legMessages } : args, null);
+        releaseSpend = this.reserveSpend(adapter, planned.model, run.scope, spendEst);
         run.holdSpend(releaseSpend);
         const events = adapter.complete({
           model: planned.model,
-          messages: args.messages,
+          messages: legMessages,
           session: canResume ? run.known.upstreamSession : null,
           sessionKey: adapter.resumable ? run.publicId : null,
           signal: args.signal,
@@ -1319,28 +1324,46 @@ export class Gateway {
           ...(args.harnessId ? { harnessId: args.harnessId } : {}),
           ...(args.trace ? { trace: args.trace } : {}),
         });
-        yield* this._leg({ ...leg, model: planned.model }, withEffort(events, planned), run, state, { canResume, sessions: true });
+        const legEvents = args.structured
+          ? withStructuredOutput(withEffort(events, planned), args.structured, adapter.id)
+          : withEffort(events, planned);
+        yield* this._leg({ ...leg, model: planned.model }, legEvents, run, state, { canResume, sessions: true });
+        if (failed?.length) yield { type: 'failed_legs', failedLegs: failed.map((f) => ({ ...f })) };
         return;
       } catch (e) {
         releaseSpend();
         if (e?.scopeDenied) {
           this.breakers.release(adapter.id);
-          if (chain.length === 1) throw e;
+          if (chain.length === 1) throw failed?.length ? withFailedLegs(e, failed) : e;
           lastError = lastError || e;
           continue;
         }
         if (e?.clientError) {
           this.breakers.release(adapter.id);
           e.leg = e.leg || legMetaOf(adapter, upstreamModel);
-          throw e;
+          throw failed?.length ? withFailedLegs(e, failed) : e;
         }
         const err = this._legFailed(leg, e, state, args.signal, chain.length > 1 ? 'trying next candidate' : 'giving up');
+        if (failed) {
+          const failure = failureOf(err);
+          const entry = {
+            target: leg.target || `${adapter.id}/${upstreamModel}`,
+            status: err.status,
+            ...(failure ? { failure } : {}),
+            ...(err.usage ? { usage: err.usage } : {}),
+          };
+          Object.defineProperty(entry, 'error', { value: err, enumerable: false });
+          failed.push(entry);
+        }
         if (run.virtualState) {
           recordVirtualFallback(run.virtualState, leg, err);
           run.onVirtual?.(snapshotVirtual(run.virtualState));
-          if (!isFallthroughError(err)) throw err;
+          if (!isFallthroughError(err)) throw failed?.length ? withFailedLegs(err, failed) : err;
         }
-        if (chain.length === 1) throw lastError ? routeError(lastError, err) : err;
+        if (chain.length === 1) {
+          const finalErr = lastError ? routeError(lastError, err) : err;
+          throw failed?.length ? withFailedLegs(finalErr, failed) : finalErr;
+        }
         lastError = routeError(lastError, err);
       }
     }
@@ -1350,7 +1373,8 @@ export class Gateway {
       run.virtualState.chosenModel = null;
       run.onVirtual?.(snapshotVirtual(run.virtualState));
     }
-    throw lastError || heldBack || new LlmError('no candidate in this route succeeded', { status: 502 });
+    const finalErr = lastError || heldBack || new LlmError('no candidate in this route succeeded', { status: 502 });
+    throw failed?.length ? withFailedLegs(finalErr, failed) : finalErr;
   }
 
   /**
@@ -1482,7 +1506,7 @@ export class Gateway {
     if (!this.breakers?.active || !adapter) return;
     if (state) state.breakerNoted = true;
     const status = typeof err?.upstreamStatus === 'number' ? err.upstreamStatus : typeof err?.status === 'number' ? err.status : null;
-    const local = err?.spendCap || err?.scopeDenied || err?.clientError || err?.toolsNotCarried || err?.localFailure;
+    const local = err?.spendCap || err?.scopeDenied || err?.clientError || err?.toolsNotCarried || err?.localFailure || err?.invalidOutput;
     if (signal?.aborted || local || !countsAsFailure(status)) {
       this.breakers.release(adapter.id);
       return;
@@ -1952,6 +1976,8 @@ export class Gateway {
     let leg = null;
     let upstreamId = null;
     let virtual = null;
+    let structured = null;
+    let failedLegs = null;
     const skippedLegs = [];
     const onSkip = (x) => {
       skippedLegs.push(x);
@@ -1961,6 +1987,8 @@ export class Gateway {
       if (evt.type === 'relayed') relayed = true;
       else if (evt.type === 'leg') leg = evt.leg;
       else if (evt.type === 'virtual') virtual = evt.virtual;
+      else if (evt.type === 'structured') structured = { healed: !!evt.healed };
+      else if (evt.type === 'failed_legs') failedLegs = evt.failedLegs;
       else if (evt.type === 'upstream' && evt.upstreamId) upstreamId = evt.upstreamId;
       else if (evt.type === 'retry') retries++;
       else if (evt.type === 'cut') cutAt = evt.tool;
@@ -1982,7 +2010,7 @@ export class Gateway {
       if (virtual) e.virtualRoute = virtual;
       throw e;
     }
-    return { text, reasoning, usage, usageReason, effort, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, ...(virtual ? { virtual } : {}), ...(skippedLegs.length ? { skippedLegs } : {}) };
+    return { text, reasoning, usage, usageReason, effort, session: sessionId, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, ...(structured ? { structured } : {}), ...(failedLegs?.length ? { failedLegs } : {}), ...(virtual ? { virtual } : {}), ...(skippedLegs.length ? { skippedLegs } : {}) };
   }
 }
 
@@ -2041,6 +2069,77 @@ async function* withEffort(events, planned) {
   if (planned.effort) yield { type: 'effort', effort: planned.effort };
   else if (planned.ignored) yield { type: 'effort', ignored: planned.ignored };
   yield* events;
+}
+
+/**
+ * Buffer one plain non-streamed leg's text and validate/heal it against `spec` before any delta
+ * is emitted, so a 502 `invalid_output` keeps `state.emitted` false and lets `_failover` try the
+ * next leg (recording this leg's usage without tripping the circuit breaker).
+ */
+async function* withStructuredOutput(events, spec, adapterId) {
+  let seenUsage = null;
+  let seenUpstreamId = null;
+  let text = '';
+  let oversized = false;
+  const buffered = [];
+  const doneEvents = [];
+  try {
+    for await (const evt of events) {
+      if (evt.type === 'usage' && evt.usage) seenUsage = mergeUsage(seenUsage, evt.usage);
+      if (evt.type === 'upstream' && evt.upstreamId) seenUpstreamId = evt.upstreamId;
+      if (evt.type === 'error') {
+        const err = new LlmError(redactSecrets(evt.message), { status: evt.status || 502, provider: adapterId });
+        if (seenUsage) err.usage = seenUsage;
+        if (seenUpstreamId) err.upstreamId = seenUpstreamId;
+        throw err;
+      }
+      if (evt.type === 'delta') {
+        const chunk = typeof evt.text === 'string' ? evt.text : String(evt.text ?? '');
+        if (!oversized) {
+          if (text.length + chunk.length > MAX_STRUCTURED_CHARS) {
+            oversized = true;
+            text = '';
+          } else {
+            text += chunk;
+          }
+        }
+        continue;
+      }
+      if (evt.type === 'done') {
+        doneEvents.push(evt);
+        continue;
+      }
+      buffered.push(evt);
+    }
+  } catch (e) {
+    if (e && typeof e === 'object') {
+      if (seenUsage && !e.usage) e.usage = seenUsage;
+      if (seenUpstreamId && !e.upstreamId) e.upstreamId = seenUpstreamId;
+    }
+    throw e;
+  }
+
+  const result = oversized
+    ? { ok: false, reason: `output exceeds maximum size (${MAX_STRUCTURED_CHARS} characters)` }
+    : enforceStructuredOutput(text, spec);
+  if (!result.ok) {
+    const err = new LlmError(`invalid_output: ${result.reason}`, {
+      status: 502,
+      type: 'invalid_output',
+      provider: adapterId,
+    });
+    err.localFailure = true;
+    err.invalidOutput = true;
+    err.fallbackReason = 'invalid_output';
+    if (seenUsage) err.usage = seenUsage;
+    if (seenUpstreamId) err.upstreamId = seenUpstreamId;
+    throw err;
+  }
+
+  for (const evt of buffered) yield evt;
+  yield { type: 'structured', healed: result.healed };
+  yield { type: 'delta', text: result.text };
+  for (const evt of doneEvents) yield evt;
 }
 
 export function legMetaOf(adapter, upstreamModel = '') {

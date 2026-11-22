@@ -9,6 +9,7 @@ import { DEFAULT_HEALTH_TIMEOUT_MS, probeHttpHealth } from './http-adapter.js';
 import { createServer, hasTunnelConfigured, isLoopbackHost, LEGACY_MAX_CONCURRENT_WARNING } from './server.js';
 import { resolveCacheConfig } from './response-cache.js';
 import { resolveBreakerConfig } from './circuit-breaker.js';
+import { resolveStructuredConfig } from './structured-output.js';
 import { UsageLog, accountHmacKey, entryFilter, execAccountMigrationWarnings, formatUsageCsv, formatUsageTable, parseFilterNumber } from './usage.js';
 import { CLI_PROFILES, FORMER_PARSERS, HTTP_PROFILES, getProfile, profileNames } from './profiles.js';
 import { autoApproveFlag, which } from './cli-adapter.js';
@@ -992,6 +993,8 @@ async function cmdServe(flags) {
   if (cacheResolved.error) warn(`! cache: ${cacheResolved.error}`);
   const breakerResolved = resolveBreakerConfig(cfg?.circuitBreaker, cfg?.adapters);
   if (breakerResolved.error) warn(`! circuitBreaker: ${breakerResolved.error}`);
+  const structuredResolved = resolveStructuredConfig(cfg?.structuredOutput);
+  if (structuredResolved.error) warn(`! structuredOutput: ${structuredResolved.error}`);
   if (!process.env.KEYSMITH_VERBOSE || !gateway._warnedExecMigration) {
     for (const w of execAccountMigrationWarnings(cfg, usage, { checkDisk: true })) warn(`! ${w}`);
   }
@@ -1530,6 +1533,8 @@ async function cmdDoctor(flags) {
   if (Number(cfg?.limits?.maxConcurrent) === 4) out(`  limits     ! ${LEGACY_MAX_CONCURRENT_WARNING}`);
   const cacheResolved = resolveCacheConfig(cfg?.cache);
   if (cacheResolved.error) out(`  cache      ✗ cache: ${cacheResolved.error}`);
+  const structuredResolved = resolveStructuredConfig(cfg?.structuredOutput);
+  if (structuredResolved.error) out(`  structured ✗ structuredOutput: ${structuredResolved.error}`);
   for (const w of execAccountMigrationWarnings(cfg, usage, { checkDisk: true })) out(`             ! ${w}`);
 
   if (flags.probeModels) {
