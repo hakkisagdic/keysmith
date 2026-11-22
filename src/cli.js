@@ -991,6 +991,7 @@ async function cmdServe(flags) {
   if (Number(cfg?.limits?.maxConcurrent) === 4) warn(`! ${LEGACY_MAX_CONCURRENT_WARNING}`);
   const cacheResolved = resolveCacheConfig(cfg?.cache);
   if (cacheResolved.error) warn(`! cache: ${cacheResolved.error}`);
+  else if (cacheResolved.warning) warn(`! cache: ${cacheResolved.warning}`);
   const breakerResolved = resolveBreakerConfig(cfg?.circuitBreaker, cfg?.adapters);
   if (breakerResolved.error) warn(`! circuitBreaker: ${breakerResolved.error}`);
   const structuredResolved = resolveStructuredConfig(cfg?.structuredOutput);
@@ -1533,6 +1534,7 @@ async function cmdDoctor(flags) {
   if (Number(cfg?.limits?.maxConcurrent) === 4) out(`  limits     ! ${LEGACY_MAX_CONCURRENT_WARNING}`);
   const cacheResolved = resolveCacheConfig(cfg?.cache);
   if (cacheResolved.error) out(`  cache      ✗ cache: ${cacheResolved.error}`);
+  else if (cacheResolved.warning) out(`  cache      ! cache: ${cacheResolved.warning}`);
   const structuredResolved = resolveStructuredConfig(cfg?.structuredOutput);
   if (structuredResolved.error) out(`  structured ✗ structuredOutput: ${structuredResolved.error}`);
   for (const w of execAccountMigrationWarnings(cfg, usage, { checkDisk: true })) out(`             ! ${w}`);
