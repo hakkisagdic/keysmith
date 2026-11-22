@@ -23,6 +23,10 @@
 - Add `promptCache` (`{ mode: "off"|"dry-run"|"on", ttl: "5m"|"1h", minTokens }`) on Anthropic-wire adapters: up to three `cache_control` breakpoints (last tool, last system block, the block before the final turn) on a request that has none; off by default. `keysmith usage` shows the cache read share and the list-price saving; `cacheWrite1h` is priced at 2x input.
 - Add `keysmith usage record` for runs made outside the gateway (`face: "external"`, repeat-safe with `--id`).
 
+### Changed
+
+- Replace the hard global 128-tool request limit (`MAX_TOOLS`) with per-leg `maxTools` limits (validated integer `1`–`4096`, default `512`, `null`/absent uses `512`, configurable via `keysmith set <adapter> maxTools <n>`) and a cheap count-only hard ceiling of `4096` tools per request (`MAX_TOOLS_HARD`) across `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`: verbatim HTTP passthrough legs (`anthropic` wire on `/v1/messages`, `openai` wire on `/v1/chat/completions`) ignore `maxTools` and have no per-leg tool-count cap, while tool-engine legs (CLI `emulate`/`mcp`, `uhp`, `traycer`) pass undersized legs by with `too_many_tools` in `skippedLegs` and return `400 invalid_request_error` naming every leg and its limit when no leg can carry the tools.
+
 ### Security
 - Reload `auth.keys` on `SIGHUP` (so `SIGHUP` now reloads keys and no longer stops the gateway on terminal hang-up) and `config.json` `mtime` changes (recording reload state only after valid JSON parse, logging a failed reload once per file stamp, refusing to disable auth on reload when a named or quick tunnel or non-loopback host is active, and writing `config.json` atomically via temp+rename), signal a running `keysmith serve` instance whose pidfile matches `config.json` from `key add`/`key revoke`/`key scope`, and print the restart hint only when no signal was delivered (M1).
 - Re-check caller key scope against the resolved base model after effort-suffix stripping and filter effort-suffixed entries on `/v1/models` (M2).

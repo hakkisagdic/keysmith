@@ -468,9 +468,14 @@ leg and the reason (`kiro/… cannot carry this request's tools — toolMode off
 text — is answered as a plain completion by the legs not tried. A request without tools is
 answered as it always was. A tool no CLI can
 honour (an OpenAI `custom` tool, an Anthropic server tool such as `web_search_*`) passes every
-CLI leg by and is a 400 naming it when no HTTP leg relays it. A request that offers more than
-128 tools (`tools` and the older `functions` together; OpenAI's own limit) is a 400 before any
-leg is asked, on both faces.
+CLI leg by and is a 400 naming it when no HTTP leg relays it. Each tool-engine leg (CLI `emulate`/`mcp`,
+or HTTP `uhp`/`traycer`) enforces its own `maxTools` limit (integer `1`–`4096`, default `512`, set via
+`keysmith set <adapter> maxTools <n>`): a leg with a smaller cap is passed by (`too_many_tools` in
+`skippedLegs`) so later legs — such as a verbatim HTTP relay (`openai` wire on `/v1/chat/completions`,
+`anthropic` wire on `/v1/messages`), which has no per-leg cap — can still answer; only when no leg
+can carry the tools does the request return a 400 naming each leg and its limit. All faces still enforce
+a cheap count-only ceiling of 4096 tools per request (`tools` and `functions` together on chat) before
+reading individual tool schemas.
 
 A streamed request holds its headers for `limits.streamHoldMs` (below). An EMULATE turn on
 Argon takes 9–44 s, so the stream usually opens before its answer is known; an HTTP leg that
