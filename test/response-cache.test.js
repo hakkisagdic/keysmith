@@ -183,7 +183,7 @@ test('resolveCacheConfig: absent is off with the defaults; a bad value is an err
   assert.deepEqual(resolveCacheConfig(undefined), { ...CACHE_DEFAULTS, error: null });
   assert.deepEqual(resolveCacheConfig(null), { ...CACHE_DEFAULTS, error: null });
   assert.deepEqual(resolveCacheConfig({ enabled: true, ttlSeconds: 30, maxEntries: 2 }), {
-    enabled: true, ttlSeconds: 30, maxEntries: 2, error: null,
+    enabled: true, ttlSeconds: 30, maxEntries: 2, semantic: { ...CACHE_DEFAULTS.semantic }, error: null,
   });
   const off = resolveCacheConfig({ enabled: false });
   assert.equal(off.enabled, false);
