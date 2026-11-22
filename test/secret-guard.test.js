@@ -300,6 +300,12 @@ test('guardMode: defaults to off and fails closed to block on invalid values wit
   }
 });
 
+test('guardMode with the extended guard block: pii and injection keys are known, secrets semantics unchanged', () => {
+  assert.deepEqual(guardMode({ guard: { secrets: 'mask', pii: 'block', injection: 'log' } }), { mode: 'mask', error: null });
+  assert.deepEqual(guardMode({ guard: { secrets: 'off', pii: 'off', injection: 'off' } }), { mode: 'off', error: null });
+  assert.equal(guardMode({ guard: { pii: 'mask', other: 1 } }).mode, 'block', 'an unknown field still fails closed');
+});
+
 /* ---------------------------------------------------------- HTTP & CLI checks 1–8 */
 
 test('Checks 1, 2 & 5: block refuses with 400 naming aws-access-key (0 upstream calls); mask sends [REDACTED:aws-access-key]; absent passes unchanged', async (t) => {

@@ -813,7 +813,7 @@ An agent gets a key of its own instead, written to a file only it reads:
 |---|---|---|
 | `launchd-gateway.log` | launchd: `serve`'s stdout + stderr | start banner (address, adapters, the key redacted, tunnel URL); with `KEYSMITH_VERBOSE=1`, adapter failures, retries and skipped alias legs |
 | `keysmith.log` | `keysmith start`: the same stream | the same, for a gateway started without launchd |
-| `usage.jsonl` | the gateway, one line per request (active UTC month) | time, `key` (`"fp:…"`), `label`, `scope`/`skipped`, `adapter`, `kind` (`http`/`cli`), `host` (HTTP upstream host alone), `account` (credential name, never its value), `model`, `face` (`chat`/`messages`/`responses`/`embeddings`), `status` (`ok`/`error`/`denied`/`limited`/`blocked`), `ms`, `bytesIn`/`bytesOut`, `upstreamId`, `tag` (`x-keysmith-tag`), token counts (`input` every input token charged, the cache's included, with `cacheRead` and `cacheWrite` beside it; or `usage: null` with a `usageReason` when the CLI or upstream reported none), `cost` (`{usd, basis, listUsd?, reason?}`), `stream`, `client`, `error`, `retries`/`cutAt`, `guard`/`guardKinds` when the outbound secret guard fires, and for tool requests `toolMode`, `toolCalls`, `fallback`, `failure`, `failedLegs` (see [Tool calls](#tool-calls-thinking)) |
+| `usage.jsonl` | the gateway, one line per request (active UTC month) | time, `key` (`"fp:…"`), `label`, `scope`/`skipped`, `adapter`, `kind` (`http`/`cli`), `host` (HTTP upstream host alone), `account` (credential name, never its value), `model`, `face` (`chat`/`messages`/`responses`/`embeddings`), `status` (`ok`/`error`/`denied`/`limited`/`blocked`), `ms`, `bytesIn`/`bytesOut`, `upstreamId`, `tag` (`x-keysmith-tag`), token counts (`input` every input token charged, the cache's included, with `cacheRead` and `cacheWrite` beside it; or `usage: null` with a `usageReason` when the CLI or upstream reported none), `cost` (`{usd, basis, listUsd?, reason?}`), `stream`, `client`, `error`, `retries`/`cutAt`, `guard`/`guardKinds` when the outbound secret or personal-data guard fires, `injection` (pattern ids, never the text) when the injection guard matches, and for tool requests `toolMode`, `toolCalls`, `fallback`, `failure`, `failedLegs` (see [Tool calls](#tool-calls-thinking)) |
 | `usage.jsonl.YYYY-MM` | the gateway, on UTC month rollover | closed calendar months of the audit log: the current UTC month always lives at `usage.jsonl` so `tail -F ~/.local/share/keysmith/usage.jsonl` keeps working, and when a new UTC month begins the finished file moves to `usage.jsonl.YYYY-MM`; nothing is ever deleted |
 | `.usage.jsonl.daily` | the gateway, on each metered request | today's live per-key request and daily-cap refusal counts (`0600`, by fingerprint, never a key), so `keysmith usage` and `/status` see refusals that write no JSONL line |
 | `launchd-tunnel.log` | launchd: cloudflared | cloudflared's own output |
@@ -876,6 +876,40 @@ keysmith config set guard.secrets block   # or: mask | off (default: off); resta
   `google-api-key` (`AIza…`), `sk-api-key` (`sk-…` with 32+ characters after `sk-`), and
   `keysmith-key` (`ks_…`). It does not catch arbitrary passwords, unprefixed secrets, encoded
   blobs or PII, and never logs or echoes a matched value.
+
+### Personal data and prompt-injection guard (`guard.pii`, `guard.injection`)
+
+Two more opt-in scanners in the same `guard` block, on the same request side, in this order:
+`guard.secrets`, then `guard.pii`, then `guard.injection`. Both are off by default.
+
+```bash
+keysmith config set guard.pii mask         # or: block | off
+keysmith config set guard.injection log    # or: block | off; restart the gateway to apply
+```
+
+- **`guard.pii`** finds checksum-valid Turkish national ids (`national-id`, TCKN), IBANs (`iban`,
+  mod 97), payment card numbers (`card`, Luhn, 13 to 19 digits, spaces or hyphens allowed) and email
+  addresses (`email`). Phone numbers (`phone`) are opt-in only, because a digit run that looks like
+  a phone number is often something else. `"mask"` replaces each match with `[REDACTED:<kind>]`
+  before forwarding; `"block"` answers `400 invalid_request_error` with `request holds personal
+  data of kind <kind> (guard.pii=block)` before any adapter runs. The usage row gets `guard`
+  (`"masked"` or `"blocked"`) and the kinds in `guardKinds`, never the value. To pick the kinds, use
+  the object form in `config.json`: `"pii": { "mode": "mask", "types": ["iban", "card", "phone"] }`.
+- **`guard.injection`** looks for a few well-known phrasings (ignore previous instructions, reveal
+  the system prompt, a system-override marker, a DAN jailbreak, and the Turkish form of the first).
+  `"log"` forwards the request unchanged and writes the pattern ids to the usage row's `injection`
+  field; `"block"` answers 400. Start with `"log"`: phrasing is a weak signal and a block is a
+  refusal of a possibly honest request. The operator's top-level `system` and `instructions` text
+  is not scanned; user, assistant, tool-result and input content is.
+- **Same scope as the secret guard**: every string in the request body except the protocol id fields
+  (`model`, `id`, `tool_call_id`, `call_id`, `previous_response_id`), on the four live HTTP routes;
+  requests only, never replies; JSON structure and tool-call argument validity are kept (the mask
+  text holds no quote or backslash). With the response cache on, cached entries are keyed on and
+  hold only the already-guarded request.
+- **Best effort, not a DLP**: fixed shapes with checksums, so a number that fails its checksum, an
+  id written with words, or a name is not found. A wrong value in `config.json` (`"maskk"`, an unknown
+  field, an unknown type) is a `keysmith doctor` config error and that scanner fails closed to
+  `"block"`. Matched text is never logged, stored or echoed.
 
 ## Keys with a scope: what each key may reach
 
