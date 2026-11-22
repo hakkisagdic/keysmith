@@ -7,6 +7,7 @@ import { fingerprint, redactKey, registerSecrets } from './redact.js';
 import { CLAUDE_PRICING } from './prices.js';
 import { checkVirtualModel, validateVirtualModels } from './virtual-models.js';
 import { CACHE_DEFAULTS } from './response-cache.js';
+import { STRUCTURED_DEFAULTS } from './structured-output.js';
 
 export { checkVirtualModel, validateVirtualModels };
 
@@ -157,6 +158,8 @@ export const DEFAULTS = {
   // Exact response cache for non-streaming chat. Off. A bad value is a doctor error
   // and the cache stays off (src/response-cache.js).
   cache: { ...CACHE_DEFAULTS },
+  // Non-streaming JSON healing and schema validation. Off by default.
+  structuredOutput: { ...STRUCTURED_DEFAULTS },
   pricing: structuredClone(CLAUDE_PRICING),
   tunnel: { provider: 'cloudflared', name: null, hostname: null, configFile: null },
   adapters: {},

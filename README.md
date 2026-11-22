@@ -1173,6 +1173,19 @@ A hit still counts as one request against a key's daily cap (that count happens 
 
 **A cached answer is the answer of an earlier call** (and with `guard.secrets` `"off"`, cached answers hold whatever the prompt and reply held, in memory only, until TTL or restart). An agent loop that needs a fresh answer should leave the cache off, or omit both `temperature: 0` and the `x-keysmith-cache: use` header.
 
+## Structured-output healing
+
+Off by default (`"structuredOutput": { "mode": "off" }`). When enabled (`"mode": "heal"`), non-streaming requests on `POST /v1/chat/completions` with `response_format` (`json_object` or `json_schema`) and `POST /v1/responses` with `text.format` (`json_object` or `json_schema`) prepend a short JSON instruction to a copy of the request's messages and buffer each plain leg's response before emitting it:
+
+```json
+"structuredOutput": { "mode": "heal" }
+```
+
+- **Healing & validation:** strips surrounding markdown code fences and prose, removes trailing commas, closes open brackets/braces only when truncated after a complete value (never after a half-written number, literal, or key), and validates `json_object` or `json_schema` (without running `pattern` regexes). Inputs over 4 MB are refused without scanning.
+- **Failover & circuit breaker:** a healing or schema failure becomes an HTTP `502` with `error.type: "invalid_output"` before any byte goes to the client, so failover tries the next leg in the route (recording the failed leg and its tokens in `failedLegs`). Because invalid JSON is the model's reply rather than an upstream outage, it does not trip the per-adapter circuit breaker.
+- **Usage & cache:** non-streaming rows record `structuredOutput: "valid"` or `"healed"` (with `healed: true`). Failed `502` responses are never written to the exact response cache; healed responses are cached as canonical JSON. Streaming requests with a spec pass through unchanged and record `structuredOutput: "unchecked"`. Requests carrying `tools`, tool history, `response_format: { "type": "text" }`, `/v1/messages`, and `/v1/embeddings` are untouched.
+- **Config & doctor:** `keysmith config set structuredOutput.mode heal|off` updates it (and `SIGHUP` reloads it live); an invalid value logs an error, fails `keysmith doctor`, and leaves healing off.
+
 ## Usage audit, pricing and spend caps
 
 Every request writes one JSON line to `usage.jsonl` (`0600` in a `0700` directory; every string

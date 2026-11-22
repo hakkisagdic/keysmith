@@ -30,6 +30,7 @@ import { cachePlanScope, checkPromptCache } from './prompt-cache.js';
 import { applySecretGuard, findSecrets, guardConfig } from './secret-guard.js';
 import { applyPiiGuard, hasPii, scanInjection } from './pii-guard.js';
 import { ResponseCache, keyFor, resolveCacheConfig } from './response-cache.js';
+import { extractResponseFormatSpec, resolveStructuredConfig } from './structured-output.js';
 
 export function isLoopbackHost(host) {
   if (!host) return true;
@@ -127,6 +128,18 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     }
   }
 
+  function reloadStructuredOutput(disk) {
+    if (!disk || typeof disk !== 'object' || Array.isArray(disk)) return;
+    const next = resolveStructuredConfig(disk.structuredOutput);
+    if (next.error) {
+      log(`structuredOutput reload refused, keeping the previous value: ${next.error}`);
+      return;
+    }
+    if (next.mode === structuredResolved.mode) return;
+    structuredResolved = next;
+    log(`structuredOutput reloaded: ${next.mode}`);
+  }
+
   function reloadKeys(force = false) {
     let st = null;
     try {
@@ -143,6 +156,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
         lastFailedSize = 0;
         lastFailedIno = 0;
         reloadPromptCache(disk);
+        reloadStructuredOutput(disk);
         if (disk && typeof disk === 'object' && !Array.isArray(disk)) {
           const nextAuth = disk.auth && typeof disk.auth === 'object' && !Array.isArray(disk.auth)
             ? { ...disk.auth, enabled: disk.auth.enabled === false ? false : true }
@@ -207,6 +221,8 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
   const responseCache = cacheResolved.enabled
     ? new ResponseCache({ maxEntries: cacheResolved.maxEntries, ttlMs: cacheResolved.ttlSeconds * 1000, now })
     : null;
+  let structuredResolved = resolveStructuredConfig(cfg?.structuredOutput);
+  if (structuredResolved.error) log(`structuredOutput: ${structuredResolved.error}`);
   const startedAt = Date.now();
   const pages = pageSessions(now);
   const responseStore = createResponseStore({ now });
@@ -550,9 +566,9 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
           } : {}),
         });
       }
-      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode, responseCache, now });
+      if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode, responseCache, structuredOutput: structuredResolved, now });
       if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode });
-      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend, guard: secretGuardMode });
+      if (route === '/v1/responses' && req.method === 'POST') return await handleResponses(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, responseStore, idempotencyStore, holdSpend, guard: secretGuardMode, structuredOutput: structuredResolved });
       if (route === '/v1/embeddings' && req.method === 'POST') return await handleEmbeddings(req, res, gateway, { usage: stamped, scope, holdSpend, guard: secretGuardMode });
       return json(res, 404, errorBody(`no route for ${req.method}`, faceName === 'messages' ? 'not_found_error' : 'invalid_request_error', 404, null, faceName));
     } catch (e) {
@@ -1118,7 +1134,7 @@ function usageFromCachedCompletion(payload) {
   };
 }
 
-async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, guard = 'off', responseCache = null, now = null }) {
+async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, holdSpend = null, guard = 'off', responseCache = null, structuredOutput = null, now = null }) {
   const body = guardRequestBody(await readJson(req), { guard, req, res, route: '/v1/chat/completions', gateway, scope, usage });
   const messages = openaiMessages(body);
   if (!messages.length) throw new LlmError('messages is empty', { status: 400 });
@@ -1174,6 +1190,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
   };
   res.setHeader('x-keysmith-route', chain.map((c) => c.target).join(','));
 
+  const structuredSpec = structuredOutput?.enabled && !tools ? extractResponseFormatSpec(body, 'chat') : null;
   if (!stream) {
     // Exact cache, this branch only. Cacheable: no tools and no tool history, no session,
     // and either temperature 0 or `x-keysmith-cache: use`. A hit returns before collect,
@@ -1203,7 +1220,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
         return;
       }
     }
-    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId: upstreamHarness, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
+    const { text, reasoning, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, toolMode, fallback, bridge, relayed, leg, upstreamId, structured, failedLegs, virtual: vRoute } = await gateway.collect({ model: requested, messages, session: publicId, caller, signal: abortSignal(req, res), maxTokens: body.max_tokens, maxCompletionTokens: body.max_completion_tokens, temperature: body.temperature, includeReasoning: !!body.include_reasoning, scope, tools, effort, harnessId: upstreamHarness, trace, holdSpend, ...(structuredSpec ? { structured: structuredSpec } : {}), onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     if (relayed) {
       // An HTTP leg's answer went out verbatim, with its own usage row.
@@ -1223,16 +1240,18 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     const cacheHeader = cacheKey && calls.length === 0 && !cutAt && responseCache.set(cacheKey, payload) ? 'miss' : null;
     meta.done = true;
     json(res, 200, payload, sid, cacheHeader ? { 'x-keysmith-cache': cacheHeader } : null);
+    const rowFailed = out.failed?.length ? out.failed : failedLegs;
+    const soState = structured ? (structured.healed ? 'healed' : 'valid') : null;
     record(usage, {
       model: requested,
       status: 'ok',
       ms: Date.now() - t0,
-      ...usageMarks(out.failed, u, usageReason),
+      ...usageMarks(rowFailed, u, usageReason),
       stream: false,
       client: req.headers['user-agent'],
       ...(leg ? { _leg: leg } : {}),
       ...(upstreamId ? { upstreamId } : {}),
-      ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge }),
+      ...marks({ retries, cutAt, toolMode, toolCalls: calls.length, fallback, bridge, structuredOutput: soState, healed: !!structured?.healed }),
       ...effortMarks(ran),
     });
     return;
@@ -1319,7 +1338,7 @@ async function handleChat(req, res, gateway, { usage, log, caller = '', holdMs =
     client: req.headers['user-agent'],
     ...(leg ? { _leg: leg } : {}),
     ...(upstreamId ? { upstreamId } : {}),
-    ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge }),
+    ...marks({ retries, cutAt, toolMode, toolCalls: face.calls, fallback, bridge, structuredOutput: structuredSpec ? 'unchecked' : null }),
     ...effortMarks(ran),
   });
 }
@@ -1465,7 +1484,7 @@ async function handleAnthropic(req, res, gateway, { usage, log, caller = '', hol
   void log;
 }
 
-async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null, holdSpend = null, guard = 'off' }) {
+async function handleResponses(req, res, gateway, { usage, log, caller = '', holdMs = STREAM_HOLD_MS, keepaliveMs = KEEPALIVE_MS, scope = null, responseStore = null, idempotencyStore = null, holdSpend = null, guard = 'off', structuredOutput = null }) {
   const body = guardRequestBody(await readJson(req), { guard, req, res, route: '/v1/responses', gateway, scope, usage });
   const trace = extractW3cTrace(req, res);
 
@@ -1569,29 +1588,31 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
       holdSpend,
     });
   }
+  const structuredSpec = structuredOutput?.enabled ? extractResponseFormatSpec(effectiveBody, 'responses') : null;
   const onVirtual = (v) => {
     meta.virtual = v;
     if (v?.skipped?.length) meta.skipped = v.skipped;
   };
   if (!stream) {
-    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, leg, upstreamId, virtual: vRoute } = await gateway.collect({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId: upstreamHarness, trace, holdSpend, onVirtual, onSkip: meta.onSkip });
+    const { text, usage: u, usageReason, effort: ran, session: sid, retries, cutAt, toolCalls, leg, upstreamId, structured, failedLegs, virtual: vRoute } = await gateway.collect({ model: requestedModel, messages, session, caller, signal: abortSignal(req, res), maxTokens: effectiveBody.max_tokens, maxOutputTokens: effectiveBody.max_output_tokens, scope, effort, harnessId: upstreamHarness, trace, holdSpend, ...(structuredSpec ? { structured: structuredSpec } : {}), onVirtual, onSkip: meta.onSkip });
     if (vRoute) onVirtual(vRoute);
     if (toolCalls.length) throw noResponsesToolCalls();
     meta.done = true;
     const payload = responsesResult({ id, model: requestedModel, text, usage: faceUsage(u, usageReason), created });
     onStore(payload, sid);
     json(res, 200, payload, sid);
+    const soState = structured ? (structured.healed ? 'healed' : 'valid') : null;
     record(usage, {
       model: requestedModel,
       status: 'ok',
       ms: Date.now() - t0,
-      ...usageMarks(null, u, usageReason),
+      ...usageMarks(failedLegs, u, usageReason),
       stream: false,
       client: req.headers['user-agent'],
       via: '/v1/responses',
       ...(leg ? { _leg: leg } : {}),
       ...(upstreamId ? { upstreamId } : {}),
-      ...marks({ retries, cutAt }),
+      ...marks({ retries, cutAt, structuredOutput: soState, healed: !!structured?.healed }),
       ...effortMarks(ran),
     });
     return;
@@ -1649,7 +1670,7 @@ async function handleResponses(req, res, gateway, { usage, log, caller = '', hol
     via: '/v1/responses',
     ...(leg ? { _leg: leg } : {}),
     ...(upstreamId ? { upstreamId } : {}),
-    ...marks({ retries, cutAt }),
+    ...marks({ retries, cutAt, structuredOutput: structuredSpec ? 'unchecked' : null }),
     ...effortMarks(ran),
   });
   void log;
@@ -2630,7 +2651,7 @@ function wrapBytesOut(res) {
  * (`bridge.session`, its short id), reached how (`new`, `attached`, `cold`) and on its how-many-th
  * turn — names and counts only: never a tool's arguments or result, which are the client's data.
  */
-function marks({ retries = 0, cutAt = null, toolMode = null, toolCalls = 0, fallback = null, bridge = null, guard = null, guardKinds = null, injection = null } = {}) {
+function marks({ retries = 0, cutAt = null, toolMode = null, toolCalls = 0, fallback = null, bridge = null, guard = null, guardKinds = null, injection = null, structuredOutput = null, healed = false } = {}) {
   return {
     ...(retries ? { retries } : {}),
     ...(cutAt ? { cutAt } : {}),
@@ -2641,6 +2662,8 @@ function marks({ retries = 0, cutAt = null, toolMode = null, toolCalls = 0, fall
     ...(guard ? { guard } : {}),
     ...(guardKinds?.length ? { guardKinds } : {}),
     ...(injection?.length ? { injection } : {}),
+    ...(structuredOutput ? { structuredOutput } : {}),
+    ...(healed ? { healed: true } : {}),
   };
 }
 
@@ -2697,7 +2720,7 @@ function sseEvent(res, name, data) {
  * run ended at a tool call (`cut`), which engine runs (`tool_mode`), a session id, a usage
  * report or the reason there is none. None of them is an answer, so none of them opens a held stream.
  */
-const QUIET_EVENTS = new Set(['retry', 'cut', 'tool_mode', 'session', 'usage', 'usage_unknown', 'effort', 'leg', 'upstream', 'virtual']);
+const QUIET_EVENTS = new Set(['retry', 'cut', 'tool_mode', 'session', 'usage', 'usage_unknown', 'effort', 'leg', 'upstream', 'virtual', 'structured', 'failed_legs']);
 const HOLD_EXPIRED = Symbol('hold expired');
 
 /**
