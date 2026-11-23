@@ -1,5 +1,5 @@
 # keysmith durumu
-Güncelleme: 2026-11-23 16:17
+Güncelleme: 2026-11-23 17:55
 ## Canlıda ne var
 - Çalışan ağ geçidi (launchd dev.keysmith.gateway) 05:45'te başlatılan eski kodla çalışıyor; aşağıdaki iş main'de ama canlıda değil.
 ## Şu an üzerinde çalışılan
@@ -30,3 +30,4 @@ Güncelleme: 2026-11-23 16:17
 - 2026-11-23 main 97dd656f636cbd0d026a4377eb4197577581af8e (is/20261119-archon-sg-1-keysmith-token-cap): anahtar başına günlük token sınırı (tokensPerDay; aşımda 429, önbellek isabeti 0, bayt tahmini işaretli) ve keysmith key usage fp:<8 hex> --json tek satır okuma. Hedefli 14/14; tam test yapılmadı (npm ci gerekir, CI'da). Canlıda değil: ağ geçidi eski kodda, kurulum ve yeniden başlatma yönetici adımı. Geri alma: git revert -m 1 97dd656f636cbd0d026a4377eb4197577581af8e (önceki 66e7bca).
 - 2026-11-23 main 0fe3027 (v0.1.1; birleştirme 71669bf, is/20261119-keysmith-kiro-guard-acik): kiro creditGuardThreshold artık üst sınırsız ya da "off" (varsayılan 0.9); SIGHUP ile çalışan kiro bekçisi eşiği yeniden okunur. Hedefli 37/37; tam test 1253: 1072 geçti, kırmızılar eksik devDependency (ai, @anthropic-ai/sdk, npm ci gerekir). CI bu baş için tetiklenmedi. Canlı: kiro ve kiro-emu eşiği off yazıldı (yedek config.json.bak-20261123-kiro-guard-off), status 'guard off'; ağ geçidi eski kodda, yeni kod yönetici yeniden başlatmasıyla yüklenir. Sonda: Kiro kendi taşma sınırını reddetti ('limit for overages'); sahip Kiro hesabında taşma sınırını yükseltmeli. Geri alma: git revert -m 1 71669bf (önceki 090351d).
 - 2026-11-23 main 80809c0 (is/20261123-keysmith-2-modelmap-once): modelMap tam bir kez uygulanır: /v1/embeddings eşlenmiş kimliği yukarı gönderir, UHP telden çift eşleme kalktı (allow/modelsOnly denetimi ile giden kimlik aynı). Hedefli 23/23, tam test 1239 içinde 2 zamanlama dalgası kırmızı (modelMap ile ilgisiz). Canlıda değil: yama sürümü altı kalem inince, ağ geçidi sıcak yeniden yükleme.
+- 2026-11-23 main 745f879 (is/20261123-keysmith-2-status-page-escape): durum sayfasındaki dinamik değerler kaçışlanır (K1-K4 testleri). Hedefli 7/7; tam test 1087 geçti, 2 başarısız (error-shape, main'de de kırmızı) ve 156 iptal. Açık: yama sürümü ve sıcak yükleme son kalemden sonra.
