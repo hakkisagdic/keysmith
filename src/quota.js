@@ -25,6 +25,8 @@ export class DailyQuota {
     this.day = dayOf(this.now());
     this.counts = new Map(); // fp -> requests let in today
     this.refused = new Map(); // fp -> requests refused today, over the cap
+    this.tokens = new Map(); // fp -> tokens spent today (reported, or estimated from bytes)
+    this.estimated = new Set(); // fps with at least one estimated row today
   }
 
   /** Start again at 0 when the local day changed since the last look. */
@@ -34,6 +36,8 @@ export class DailyQuota {
     this.day = d;
     this.counts.clear();
     this.refused.clear();
+    this.tokens.clear();
+    this.estimated.clear();
     return t;
   }
 
@@ -48,7 +52,32 @@ export class DailyQuota {
       if (typeof row.key !== 'string' || !row.key.startsWith('fp:') || row.status === 'limited') continue;
       const fp = row.key.slice(3);
       this.counts.set(fp, (this.counts.get(fp) || 0) + 1);
+      const r = rowTokens(row);
+      this.addTokens(fp, r.tokens, r.estimated);
     }
+  }
+
+  /** Add `n` tokens to key `fp`'s count for today; `estimated` marks a count made from bytes. */
+  addTokens(fp, n, estimated = false) {
+    this._roll();
+    if (!Number.isFinite(n) || n < 0) return;
+    this.tokens.set(fp, (this.tokens.get(fp) || 0) + n);
+    if (estimated && n > 0) this.estimated.add(fp);
+  }
+
+  /**
+   * The token cap's check, without counting a request: `{ ok: true }` when key `fp` is under
+   * `tokensPerDay` (or has none), else `{ ok: false, tokens, tokensPerDay, retryAfter, first }`.
+   * A request already in flight may overshoot the cap by its own size: tokens are known only
+   * after the answer, so the cap refuses the NEXT request once the day's tokens reached it.
+   */
+  admitTokens(fp, tokensPerDay = null) {
+    const t = this._roll();
+    const tokens = this.tokens.get(fp) || 0;
+    if (tokensPerDay == null || tokens < tokensPerDay) return { ok: true, tokens };
+    const refused = (this.refused.get(fp) || 0) + 1;
+    this.refused.set(fp, refused);
+    return { ok: false, tokens, tokensPerDay, retryAfter: Math.max(1, Math.ceil((nextMidnight(t) - t) / 1000)), first: refused === 1 };
   }
 
   /**
@@ -74,6 +103,28 @@ export class DailyQuota {
     this._roll();
     return { requests: this.counts.get(fp) || 0, refused: this.refused.get(fp) || 0 };
   }
+
+  /** `{ tokens, tokensEstimated }` of key `fp` today (kept apart from `today`, whose shape others compare). */
+  tokensToday(fp) {
+    this._roll();
+    return { tokens: this.tokens.get(fp) || 0, tokensEstimated: this.estimated.has(fp) };
+  }
+}
+
+/**
+ * What one usage row spent, in tokens: `usage.input + usage.output` when the row reports both as
+ * numbers; otherwise (usage null, absent or unknown) `max(1, ceil((bytesIn + bytesOut) / 4))`,
+ * marked `estimated`. A cache hit costs 0. Bytes over-count tool-heavy JSON, the safe direction.
+ */
+export function rowTokens(row) {
+  if (!row || typeof row !== 'object') return { tokens: 0, estimated: false };
+  if (row.cache === 'hit' || row.cache === 'hit-semantic') return { tokens: 0, estimated: false };
+  const u = row.usage;
+  if (u && typeof u === 'object' && !u.reason && Number.isFinite(u.input) && Number.isFinite(u.output) && u.input >= 0 && u.output >= 0) {
+    return { tokens: u.input + u.output, estimated: false };
+  }
+  const bytes = (Number.isFinite(row.bytesIn) ? row.bytesIn : 0) + (Number.isFinite(row.bytesOut) ? row.bytesOut : 0);
+  return { tokens: Math.max(1, Math.ceil(bytes / 4)), estimated: true };
 }
 
 /** The local calendar day of `t` (ms), `2026-10-20`. */
@@ -100,6 +151,14 @@ export function overCapMessage({ perDay, retryAfter }) {
   const [h, m] = [Math.floor(minutes / 60), minutes % 60];
   const wait = h ? `${h} h${m ? ` ${m} min` : ''}` : `${m} min`;
   return `this key's daily cap of ${perDay} request${perDay === 1 ? '' : 's'} is used up for today; it resets at local midnight, in ${wait} (retry-after: ${retryAfter} s)`;
+}
+
+/** The token cap's refusal reason: names the cap and when it resets, never the key. */
+export function overTokensMessage({ tokensPerDay, retryAfter }) {
+  const minutes = Math.max(1, Math.ceil(retryAfter / 60));
+  const [h, m] = [Math.floor(minutes / 60), minutes % 60];
+  const wait = h ? `${h} h${m ? ` ${m} min` : ''}` : `${m} min`;
+  return `this key's daily cap of ${tokensPerDay} token${tokensPerDay === 1 ? '' : 's'} is used up for today; it resets at local midnight, in ${wait} (retry-after: ${retryAfter} s)`;
 }
 
 /**
