@@ -13,7 +13,7 @@ import { LlmError, truncate } from './util.js';
  * what a kiro leg spends: the plan's own meter is read instead — `kiro-cli chat --no-interactive
  * --trust-tools= [--agent <the adapter's>] /usage` prints `Credits (X of Y covered in plan)` — and
  * an adapter whose plan is at or over its threshold (`creditGuardThreshold` on the adapter, 0.90
- * by default, up to 1.25: past 1 it runs into Kiro's overage) is unavailable: a route passes it
+ * by default; any number above 0, or "off": past 1 it runs into Kiro's overage) is unavailable: a route passes it
  * by (the reason in the usage row's `skippedLegs`), a request that names it is a 429 whose
  * retry-after is at most five minutes.
  *
@@ -35,11 +35,11 @@ import { LlmError, truncate } from './util.js';
 export const CREDIT_GUARD_TTL_MS = 10 * 60_000;
 export const DEFAULT_CREDIT_THRESHOLD = 0.9;
 /**
- * The highest threshold: 1.25 of the plan. Past 1 the adapter runs into Kiro's overage (credits
- * billed beyond the plan, `Credits (11200 of 10000 covered in plan)`), which a plan may allow up to
- * a share of its own: 1.12 holds the adapter back at 112%.
+ * There is no highest threshold. Past 1 the adapter runs into Kiro's overage (credits billed beyond
+ * the plan, `Credits (11200 of 10000 covered in plan)`), which the account's overage setting pays
+ * for; 1.12 holds the adapter back at 112%, 3 at 300%, "off" never. Kiro's own overage limit still
+ * applies: not holding the adapter back does not stop Kiro refusing.
  */
-export const MAX_CREDIT_THRESHOLD = 1.25;
 /**
  * The longest retry-after (seconds) of a request that names a held-back adapter. The plan's reset
  * can be weeks away, and a client that honours a retry-after that long stops for weeks: the
@@ -95,6 +95,7 @@ export function parseKiroUsage(text) {
 /** Whether a reading is at or over `threshold`: `{ blocked, ratio, threshold }`. */
 export function evaluateCredits(reading, threshold = DEFAULT_CREDIT_THRESHOLD) {
   if (!reading || !Number.isFinite(reading.ratio)) return { blocked: false, ratio: null, threshold };
+  if (threshold === null) return { blocked: false, ratio: reading.ratio, threshold }; // guard off: never held back
   return { blocked: reading.ratio >= threshold, ratio: reading.ratio, threshold };
 }
 
@@ -104,22 +105,25 @@ export function isKiroBin(bin) {
 }
 
 /**
- * A CLI entry's credit guard, at load: `{ kind: 'kiro', threshold }` for an entry that runs
+ * A CLI entry's credit guard, at load: `{ kind: 'kiro', threshold }` (`{ kind: 'kiro', threshold: null, off: true }` when
+ * `creditGuardThreshold` is "off": the meter is still read, nothing is held back) for an entry that runs
  * kiro-cli (whatever its id: `kiro`, `kiro-emu`), null otherwise. `creditGuardThreshold` is a
- * share of the plan, above 0 and at most MAX_CREDIT_THRESHOLD (1: held back once the plan is
- * spent; 1.12: at 112%, into the overage); any other value is a load error, and so is the key on
+ * share of the plan, any finite number above 0 (1: held back once the plan is
+ * spent; 1.12: at 112%, into the overage; 3: at 300%) or the exact string "off"; any other value is a load error, and so is the key on
  * an entry that does not run kiro-cli (it would guard nothing, and say nothing about it).
  */
 export function checkCreditGuard(id, cfg, bin) {
   const raw = cfg?.creditGuardThreshold;
   const kiro = isKiroBin(bin);
   if (raw !== undefined && raw !== null) {
-    if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0 || raw > MAX_CREDIT_THRESHOLD) {
-      throw new Error(`adapter "${id}": creditGuardThreshold must be a share of the plan above 0 and at most ${MAX_CREDIT_THRESHOLD} (0.9 holds the adapter back at 90% of its credits, 1.12 at 112%, into Kiro's overage) — got ${JSON.stringify(raw)?.slice(0, 40)}`);
+    const off = raw === 'off';
+    if (!off && (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0)) {
+      throw new Error(`adapter "${id}": creditGuardThreshold must be a share of the plan above 0 (0.9 holds the adapter back at 90% of its credits, 1.12 at 112%, into Kiro's overage, 3 at 300%) or "off" (never held back) — got ${JSON.stringify(raw)?.slice(0, 40)}`);
     }
     if (!kiro) throw new Error(`adapter "${id}": creditGuardThreshold guards a Kiro plan, and this entry does not run kiro-cli (bin ${JSON.stringify(String(bin)).slice(0, 80)})`);
   }
   if (!kiro) return null;
+  if (raw === 'off') return { kind: 'kiro', threshold: null, off: true };
   return { kind: 'kiro', threshold: typeof raw === 'number' ? raw : DEFAULT_CREDIT_THRESHOLD };
 }
 
@@ -406,7 +410,7 @@ export class CreditGuard {
         e.error = null;
       } catch (err) {
         e.error = truncate(err?.message || String(err), 200);
-        const g = guardState(e, adapter.creditGuard?.threshold ?? DEFAULT_CREDIT_THRESHOLD, this.now());
+        const g = guardState(e, adapter.creditGuard?.off ? null : adapter.creditGuard?.threshold ?? DEFAULT_CREDIT_THRESHOLD, this.now());
         const kept = g.state === 'unknown' ? 'not held back' : `going by the reading of ${minutes(this.now() - e.at)} ago (${describeReading(e.reading)}${g.state === 'held back' ? ', held back' : ''}) until one succeeds`;
         this.log(`kiro credit guard: reading the plan of ${e.adapters.join(', ') || adapter.id} (kiro-cli ${kiroUsageArgs(adapter).join(' ')}) failed: ${e.error} — ${kept}; the next reading is in ${Math.round(this.ttlMs / 60_000)} min`);
       } finally {
@@ -452,6 +456,7 @@ export class CreditGuard {
   async check(adapter) {
     const guard = adapter?.creditGuard;
     if (!guard) return { ok: true };
+    const off = guard.off === true || guard.threshold === null;
     const e = this._entry(adapter);
     const pending = this.refresh(adapter);
     if (pending && !e.reading && !e.error) {
@@ -460,7 +465,8 @@ export class CreditGuard {
       clearTimeout(timer);
     }
     const now = this.now();
-    const g = guardState(e, guard.threshold, now);
+    const g = guardState(e, off ? null : guard.threshold, now);
+    if (off) return { ok: true, off: true, ...(e.reading ? { reading: e.reading } : {}), ratio: g.ratio };
     if (g.state === 'unknown') return { ok: true, unknown: true, error: g.why, threshold: guard.threshold };
     const said = e.said[adapter.id] ?? null;
     const blocked = g.state === 'held back';
@@ -614,5 +620,6 @@ function fmtCredits(n) {
 }
 
 export function pct(f) {
+  if (f === null) return 'off';
   return `${(Number(f) * 100).toFixed(1).replace(/\.0$/, '')}%`;
 }

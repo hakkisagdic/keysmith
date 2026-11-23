@@ -4,6 +4,7 @@
 
 ### Added
 
+- Let the Kiro credit guard run past 1.25: `creditGuardThreshold` takes any number above 0 or the string `"off"` (default stays 0.9; `off` still reads the meter and shows `guard off` in status, doctor and `/v1/keysmith/routes` as `threshold: null, off: true`), and a SIGHUP reload now re-reads the threshold of a running kiro adapter.
 - Add a per-key daily token cap (`tokensPerDay` on an `auth.keys` entry, `key add|scope --tokens-per-day N` / `--no-tokens-per-day`): tokens come from each usage row (`usage.input + usage.output`, else `ceil((bytesIn + bytesOut) / 4)` marked estimated; cache hits 0), are rebuilt from `usage.jsonl` at start and reset at local midnight; a key at its cap gets 429 with `retry-after` before any body is read or leg chosen (one `limited` row per day with `limit: "tokens"`). Invalid values and conflicting duplicate entries fail closed. Add `keysmith key usage fp:<8 hex> --json`, one JSON line of the key's day, and `tokens`, `tokensEstimated`, `tokensPerDay` in `/v1/keysmith/usage`. A request already running may overshoot the cap by its own size.
 
 ### Security

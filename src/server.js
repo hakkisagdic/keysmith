@@ -24,6 +24,7 @@ import { failureOf, legMetaOf, scopeError } from './gateway.js';
 import { authEnabled, describeScope, hashKey, isKeyExpired, parseKeys, scopeWarnings, targetDecision } from './keys.js';
 import { DailyQuota, MinuteLimiter, overCapMessage, overMinuteMessage, overTokensMessage, rowTokens } from './quota.js';
 import { requestEffort } from './effort.js';
+import { checkCreditGuard } from './credit-guard.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, RECENT_STATUSES, computeCost, credentialAccount, entryFilter, parseFilterNumber, parseTag, roundUsd } from './usage.js';
 import { cachePlanScope, checkPromptCache } from './prompt-cache.js';
@@ -129,6 +130,28 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     }
   }
 
+  /**
+   * A reload also re-reads `creditGuardThreshold` of the adapters that already carry a credit
+   * guard, and only that field (`adapter.creditGuard`). A value that does not validate keeps the
+   * old guard and logs one line.
+   */
+  function reloadCreditGuards(disk) {
+    const rawAdapters = disk?.adapters && typeof disk.adapters === 'object' && !Array.isArray(disk.adapters) ? disk.adapters : null;
+    if (!rawAdapters || !gateway?.adapters?.entries) return;
+    for (const [id, adapter] of gateway.adapters.entries()) {
+      const raw = Object.hasOwn(rawAdapters, id) ? rawAdapters[id] : null;
+      if (!raw || typeof raw !== 'object' || !adapter?.creditGuard) continue;
+      let next;
+      try { next = checkCreditGuard(id, raw, adapter.bin); } catch (e) {
+        log(`creditGuardThreshold reload refused for "${id}", keeping the previous value: ${e.message}`);
+        continue;
+      }
+      if (!next || JSON.stringify(next) === JSON.stringify(adapter.creditGuard)) continue;
+      adapter.creditGuard = next;
+      log(`creditGuardThreshold reloaded for "${id}": ${next.off ? 'off' : `${next.threshold * 100}%`}`);
+    }
+  }
+
   function reloadStructuredOutput(disk) {
     if (!disk || typeof disk !== 'object' || Array.isArray(disk)) return;
     const next = resolveStructuredConfig(disk.structuredOutput);
@@ -157,6 +180,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
         lastFailedSize = 0;
         lastFailedIno = 0;
         reloadPromptCache(disk);
+        reloadCreditGuards(disk);
         reloadStructuredOutput(disk);
         if (disk && typeof disk === 'object' && !Array.isArray(disk)) {
           const nextAuth = disk.auth && typeof disk.auth === 'object' && !Array.isArray(disk.auth)

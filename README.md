@@ -1402,10 +1402,16 @@ leg spends. Every adapter that runs `kiro-cli` (`kiro`, `kiro-emu`, whatever its
 by the plan's own meter instead: keysmith runs `kiro-cli chat --no-interactive --trust-tools=
 --agent <the adapter's agent> /usage` (no tool trusted, the adapter's tool-less agent), reads
 `Credits (X of Y covered in plan)`, and holds the adapter back while X/Y is at or over its
-`creditGuardThreshold` (a share of the plan, `0.9` by default, above 0 and at most `1.25`;
-`keysmith set kiro creditGuardThreshold 0.95`, `1` to hold it back only once the plan is spent,
-`1.12` to let it run into Kiro's overage up to 112% of the plan; on any other entry the key is a
-load error). Held back, a route passes the leg by (`skippedLegs` in the row: `credit_guard`, the
+`creditGuardThreshold` (a share of the plan, `0.9` by default; any number above 0 with no upper
+bound, or the string `"off"`; `keysmith set kiro creditGuardThreshold 0.95`, `1` to hold it back
+only once the plan is spent, `1.12` to let it run into Kiro's overage up to 112% of the plan,
+`keysmith set kiro creditGuardThreshold 3` to hold it back at 300%, `keysmith set kiro
+creditGuardThreshold off` to never hold it back; on any other entry the key is a
+load error). Overage is credits billed beyond the plan (`Credits (11200 of 10000 covered in
+plan)`), paid by the account's overage setting; keysmith not holding an adapter back does not
+stop Kiro from refusing once its own overage limit is reached. With `"off"` the meter is still
+read, so `keysmith status` and `doctor` show the plan (`kiro (guard off)`), and a running gateway
+picks up a changed threshold on reload (SIGHUP, which `keysmith set` sends). Held back, a route passes the leg by (`skippedLegs` in the row: `credit_guard`, the
 share of the plan and the threshold) and the next leg answers; a request that names it gets a
 `429` `rate_limit_error` that says why and names the plan's reset date, with a `retry-after` of
 the time to that reset but at most 300 s (a reset weeks away would stop a client that honours it

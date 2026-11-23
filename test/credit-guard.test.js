@@ -20,7 +20,6 @@ import {
   CREDIT_GUARD_TTL_MS,
   CreditGuard,
   DEFAULT_CREDIT_THRESHOLD,
-  MAX_CREDIT_THRESHOLD,
   STALL_TIMEOUT_MS,
   checkCreditGuard,
   creditGuardError,
@@ -87,13 +86,15 @@ test('checkCreditGuard: every kiro-cli entry is guarded at 0.9 unless it says ot
   assert.deepEqual(checkCreditGuard('kiro', {}, '/Users/x/.local/bin/kiro-cli'), { kind: 'kiro', threshold: 0.9 });
   assert.deepEqual(checkCreditGuard('kiro-emu', { creditGuardThreshold: 0.75 }, 'kiro-cli'), { kind: 'kiro', threshold: 0.75 });
   assert.deepEqual(checkCreditGuard('k', { creditGuardThreshold: 1 }, 'kiro-cli'), { kind: 'kiro', threshold: 1 });
-  // Into the overage, up to 1.25 of the plan.
-  assert.equal(MAX_CREDIT_THRESHOLD, 1.25);
+  // Into the overage, with no upper bound.
   assert.deepEqual(checkCreditGuard('kiro', { creditGuardThreshold: 1.12 }, 'kiro-cli'), { kind: 'kiro', threshold: 1.12 });
   assert.deepEqual(checkCreditGuard('kiro', { creditGuardThreshold: 1.25 }, 'kiro-cli'), { kind: 'kiro', threshold: 1.25 });
+  assert.deepEqual(checkCreditGuard('kiro', { creditGuardThreshold: 3 }, 'kiro-cli'), { kind: 'kiro', threshold: 3 });
+  assert.deepEqual(checkCreditGuard('kiro', { creditGuardThreshold: 100 }, 'kiro-cli'), { kind: 'kiro', threshold: 100 });
+  assert.deepEqual(checkCreditGuard('kiro', { creditGuardThreshold: 'off' }, 'kiro-cli'), { kind: 'kiro', threshold: null, off: true });
   assert.equal(checkCreditGuard('agy', {}, '/usr/local/bin/agy'), null);
-  for (const bad of [0, -0.1, 1.2501, 1.5, 2, Infinity, '0.9', '1.12', NaN, true]) {
-    assert.throws(() => checkCreditGuard('kiro', { creditGuardThreshold: bad }, 'kiro-cli'), /creditGuardThreshold must be a share of the plan above 0 and at most 1\.25 \(0\.9 holds the adapter back at 90% of its credits, 1\.12 at 112%/, String(bad));
+  for (const bad of [0, -0.1, -1, Infinity, '0.9', '1.12', 'abc', 'OFF ', 'Off', NaN, true, false]) {
+    assert.throws(() => checkCreditGuard('kiro', { creditGuardThreshold: bad }, 'kiro-cli'), /creditGuardThreshold must be a share of the plan above 0 \(0\.9 holds the adapter back at 90% of its credits, 1\.12 at 112%/, String(bad));
   }
   assert.throws(() => checkCreditGuard('agy', { creditGuardThreshold: 0.9 }, 'agy'), /does not run kiro-cli/);
   assert.equal(isKiroBin('C:\\tools\\kiro-cli.exe'), true);
@@ -102,7 +103,7 @@ test('checkCreditGuard: every kiro-cli entry is guarded at 0.9 unless it says ot
   const kiro = new CliAdapter('kiro', { kind: 'cli', bin: '/opt/kiro/bin/kiro-cli', args: ['{prompt}'] });
   const emu = new CliAdapter('kiro-emu', { kind: 'cli', bin: '/opt/kiro/bin/kiro-cli', args: ['{prompt}'], cwd: path.join(os.tmpdir(), 'ks-cg-emu'), toolMode: 'emulate', creditGuardThreshold: 0.8 });
   assert.deepEqual([kiro.creditGuard, emu.creditGuard], [{ kind: 'kiro', threshold: 0.9 }, { kind: 'kiro', threshold: 0.8 }]);
-  assert.throws(() => new CliAdapter('k', { kind: 'cli', bin: 'kiro-cli', creditGuardThreshold: 2 }), /creditGuardThreshold/);
+  assert.throws(() => new CliAdapter('k', { kind: 'cli', bin: 'kiro-cli', creditGuardThreshold: -2 }), /creditGuardThreshold/);
   // An HTTP upstream has no Kiro plan: the key is a load error there too, never a silent no-op.
   assert.throws(() => new HttpAdapter('okhttp', { kind: 'http', baseUrl: 'http://127.0.0.1:9/v1', creditGuardThreshold: 0.5 }), /adapter "okhttp": creditGuardThreshold guards a Kiro plan, read through kiro-cli — an HTTP upstream has none/);
   assert.equal(new HttpAdapter('okhttp', { kind: 'http', baseUrl: 'http://127.0.0.1:9/v1' }).creditGuard, null);

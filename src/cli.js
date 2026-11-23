@@ -1006,7 +1006,7 @@ async function cmdServe(flags) {
   // on each tick: a config reload that adds or drops a kiro entry is followed.
   const guarded = [...gateway.adapters.values()].filter((a) => a.creditGuard && !a.disabled);
   if (guarded.length) {
-    out(`  credits : ${guarded.map((a) => `${a.id} held back at ${Math.round(a.creditGuard.threshold * 1000) / 10}% of its Kiro plan`).join(', ')} (read every 10 min)`);
+    out(`  credits : ${guarded.map((a) => (a.creditGuard.off ? `${a.id} guard off (never held back)` : `${a.id} held back at ${Math.round(a.creditGuard.threshold * 1000) / 10}% of its Kiro plan`)).join(', ')} (read every 10 min)`);
   }
   gateway.creditGuard.keepFresh(() => [...gateway.adapters.values()]);
   if (secured.changed.length) out(`  logs    : tightened ${secured.changed.length} file(s)/dir(s) to 0600/0700`);
