@@ -1369,6 +1369,23 @@ export function entryFilter(spec, viewer = null) {
   return pred;
 }
 
+/** One warning per process when the usage log cannot be appended. */
+let usageLogWriteWarned = false;
+
+/** Let a test expect that one-per-process warning again. */
+export function _resetUsageWarningForTests() {
+  usageLogWriteWarned = false;
+}
+
+function warnUsageLogNotWritten(err) {
+  if (usageLogWriteWarned) return;
+  usageLogWriteWarned = true;
+  const raw = typeof err?.code === 'string' ? err.code : '';
+  // The code only: a message or a path can carry the row or a key.
+  const code = /^[A-Z][A-Z0-9_]{0,31}$/.test(raw) ? raw : 'unknown';
+  console.error(`keysmith: usage log not written (${code}): spend caps count this request in memory only`);
+}
+
 export class UsageLog {
   /** `now`: the clock a row's `ts` is read from (ms or Date), injectable for a test. */
   constructor(file = null, { pricing = null, now = null, log = null } = {}) {
@@ -2239,28 +2256,38 @@ export class UsageLog {
       const clean = redactDeep({ ts, ...withCost });
       const line = redactSecrets(JSON.stringify(clean)) + '\n';
 
-      const curMonth = this._detectFileMonth();
+      // The append can fail after the request has already succeeded. Spend still
+      // moves in memory; file offsets move only when this write produced a stat.
       let targetFile = this.file;
-      if (!curMonth) {
-        this._currentMonth = month;
-        if (!this._spendState) this._spendState = this._emptySpendState(month);
-      } else if (month > curMonth) {
-        this._rollover(curMonth, month);
-      } else if (month < curMonth) {
-        targetFile = this.monthFile(month);
+      let st = null;
+      let writeError = null;
+      try {
+        const curMonth = this._detectFileMonth();
+        if (!curMonth) {
+          this._currentMonth = month;
+          if (!this._spendState) this._spendState = this._emptySpendState(month);
+        } else if (month > curMonth) {
+          this._rollover(curMonth, month);
+        } else if (month < curMonth) {
+          targetFile = this.monthFile(month);
+        }
+
+        const fd = openPrivateLog(targetFile);
+        try {
+          fs.writeSync(fd, line);
+          try { st = fs.fstatSync(fd); } catch {}
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch (err) {
+        writeError = err;
+        st = null;
       }
 
-      const fd = openPrivateLog(targetFile);
-      let st = null;
-      try {
-        fs.writeSync(fd, line);
-        try { st = fs.fstatSync(fd); } catch {}
-      } finally {
-        fs.closeSync(fd);
-      }
+      if (writeError) warnUsageLogNotWritten(writeError);
 
       const rowMs = Date.parse(ts);
-      this._noteFileTimestamp(targetFile, rowMs, st);
+      if (st) this._noteFileTimestamp(targetFile, rowMs, st);
 
       if (this._spendState && this._spendState.month === month && !this._spendState.readError) {
         this._addRowToSpendState(this._spendState, clean);
