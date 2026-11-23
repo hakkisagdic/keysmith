@@ -26,6 +26,7 @@ import { DailyQuota, MinuteLimiter, overCapMessage, overMinuteMessage, overToken
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, RECENT_STATUSES, computeCost, credentialAccount, entryFilter, parseFilterNumber, parseTag, roundUsd } from './usage.js';
+import { formatPrometheus, PROMETHEUS_CONTENT_TYPE } from './metrics.js';
 import { cachePlanScope, checkPromptCache } from './prompt-cache.js';
 import { applySecretGuard, findSecrets, guardConfig } from './secret-guard.js';
 import { applyPiiGuard, hasPii, scanInjection } from './pii-guard.js';
@@ -51,7 +52,8 @@ const UHP_DEFAULT_VERSION = '2026-10-19';
 const UHP_VERSIONS = ['2026-10-19', '2026-09-28', '2026-09-12', '2026-08-11'];
 /**
  * The routes that ask a model something, plus `/v1/keysmith/usage`: a request to one of them is
- * what a key's daily cap counts (quota.js). Listing models or routes, and the status page, are not.
+ * what a key's daily cap counts (quota.js). Listing models or routes, the status page, and
+ * `GET /v1/keysmith/metrics` are not — a scrape must not spend `perDay`.
  */
 const METERED = new Set(['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/embeddings']);
 
@@ -450,6 +452,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       }
       // A request that asks a model (or queries /v1/keysmith/usage) counts against its key's daily
       // cap before anything is read: one per client request, whatever alias, failover or retry happens under it.
+      // GET /v1/keysmith/metrics reads the same window and is intentionally not in this set.
       if ((req.method === 'POST' && METERED.has(route)) || (req.method === 'GET' && route === '/v1/keysmith/usage')) {
         meter(who, route, stamped, req);
         meteredRequest = true;
@@ -576,6 +579,33 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
             ...(recent && Object.hasOwn(recent, 'minCostUsd') ? { entriesUnpriced: entriesFilter.unpriced } : {}),
           } : {}),
         });
+      }
+      // Prometheus text for the same scoped window as /v1/keysmith/usage. Not metered: see METERED.
+      if (route === '/v1/keysmith/metrics' && req.method === 'GET') {
+        let hours = 24;
+        if (url.searchParams.has('hours')) {
+          const raw = url.searchParams.get('hours');
+          const parsed = Number(raw);
+          if (raw === null || String(raw).trim() === '' || !Number.isFinite(parsed) || parsed <= 0) {
+            throw new LlmError('hours must be a positive number', { status: 400, type: 'invalid_request_error' });
+          }
+          hours = parsed;
+        }
+        const filter = usageFilterFor(gateway, who);
+        let report = null;
+        try {
+          report = usage?.query({
+            by: ['model'],
+            hours,
+            filter,
+            now: now(),
+            fromDays: true,
+          });
+        } catch (err) {
+          throw new LlmError(err.message, { status: 400, type: 'invalid_request_error' });
+        }
+        const body = formatPrometheus(report || { groups: [] }, { windowHours: hours });
+        return send(res, 200, { 'content-type': PROMETHEUS_CONTENT_TYPE }, body);
       }
       if (route === '/v1/chat/completions' && req.method === 'POST') return await handleChat(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode, responseCache, semanticCache, structuredOutput: structuredResolved, now });
       if (route === '/v1/messages' && req.method === 'POST') return await handleAnthropic(req, res, gateway, { usage: stamped, log, caller, holdMs, keepaliveMs, scope, holdSpend, guard: secretGuardMode });
