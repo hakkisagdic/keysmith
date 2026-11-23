@@ -2007,16 +2007,16 @@ function keyAdd(cfg, flags) {
   if (parsed.issues.length) fail(`not added: ${parsed.issues[0]}`);
   // The file first: a key that could not be handed over is not added either.
   const outFile = flags.out ? path.resolve(expand(String(flags.out))) : null;
-  if (outFile) writeKeyFile(outFile, key, { force: !!flags.force });
+  // `--force` has already truncated an existing file. Unlink would throw away the key
+  // that still works; restore() writes those bytes back (or removes a file this add created).
+  const restoreOut = outFile ? writeKeyFile(outFile, key, { force: !!flags.force }).restore : null;
   cfg.auth.keys.push(entry);
   registerSecrets([key]);
   try {
     saveConfig(cfg);
   } catch (e) {
-    if (outFile) {
-      try {
-        fs.unlinkSync(outFile);
-      } catch {}
+    if (restoreOut) {
+      try { restoreOut(); } catch { /* report the save error, not a second failure */ }
     }
     throw e;
   }
@@ -2369,10 +2369,44 @@ function checkScopePatterns(cfg, patterns, field, flags) {
   }
 }
 
-/** The key, alone on one line, in a new file only its owner can read. Never over a file that is there, unless --force. */
+/**
+ * The key, alone on one line, in a new file only its owner can read. Never over a file
+ * that is there, unless --force.
+ *
+ * Returns `{ restore }`. `--force` opens with `'w'`, which truncates before the config
+ * is saved, so an existing file's bytes are read first and restore writes them back
+ * (open and fchmod 0600, the same as the new key). No `--force` uses `'wx'` (the file
+ * is new). `--force` when nothing is at the path creates one. In both of those cases
+ * restore removes the file. A failure while the new bytes are being written restores
+ * before the error is reported, so a live key is not left truncated.
+ */
 function writeKeyFile(file, key, { force = false } = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  let fd;
+  // null: nothing to put back (no file, or a file this call is about to create).
+  let prior = null;
+  if (force) {
+    try {
+      prior = fs.readFileSync(file);
+    } catch (e) {
+      if (e.code !== 'ENOENT') fail(`--out ${rel(file)}: ${e.code || 'cannot be written'} — no key was added`);
+    }
+  }
+  const restore = () => {
+    if (prior == null) {
+      try { fs.unlinkSync(file); } catch { /* already gone */ }
+      return;
+    }
+    const rfd = fs.openSync(file, 'w', 0o600);
+    try {
+      // Tighten first, as the new key is written. A chmod failure still writes the
+      // previous bytes back, so the file is not left truncated.
+      try { fs.fchmodSync(rfd, 0o600); } catch { /* the bytes matter more than the mode */ }
+      fs.writeSync(rfd, prior);
+    } finally {
+      fs.closeSync(rfd);
+    }
+  };
+  let fd = null;
   try {
     fd = fs.openSync(file, force ? 'w' : 'wx', 0o600);
   } catch (e) {
@@ -2382,9 +2416,15 @@ function writeKeyFile(file, key, { force = false } = {}) {
   try {
     fs.fchmodSync(fd, 0o600);
     fs.writeSync(fd, `${key}\n`);
+  } catch (e) {
+    try { fs.closeSync(fd); } catch { /* the write error is the one to report */ }
+    fd = null;
+    try { restore(); } catch { /* still report the write error */ }
+    fail(`--out ${rel(file)}: ${e.code || 'cannot be written'} — no key was added`);
   } finally {
-    fs.closeSync(fd);
+    if (fd != null) fs.closeSync(fd);
   }
+  return { restore };
 }
 
 /** The model part of an alias leg or target: everything after the first slash. */
