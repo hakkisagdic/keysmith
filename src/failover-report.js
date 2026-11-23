@@ -83,6 +83,7 @@ export function guardShiftLines(gateway, { aliases = Object.keys(gateway?.cfg?.a
     const paid = chain.slice(i + 1).filter((l) => l.adapter.kind === 'http' && (l.adapter.costBasis || 'metered') === 'metered' && !capped(l.adapter));
     if (!paid.length) continue;
     const g = chain[i];
+    if (g.adapter.creditGuard.off || g.adapter.creditGuard.threshold == null) continue;
     lines.push({
       mark: '!',
       text: `${alias}: ${g.target} is held back at ${pct(g.adapter.creditGuard.threshold)} of its Kiro plan, and from then on its requests go to ${paid.map((l) => l.target).join(', ')} — metered, and no spend cap covers ${paid.length > 1 ? 'them' : 'it'} (limits.spend.${paid[0].adapter.id})`,
@@ -93,9 +94,19 @@ export function guardShiftLines(gateway, { aliases = Object.keys(gateway?.cfg?.a
 
 /** The credit guard per login, with each adapter's threshold and state: `cfg` gives the thresholds of a process that holds no adapters (status). */
 export function creditGuardRows(snapshot, { adapters = null, cfg = null } = {}) {
+  const isOff = (id) => {
+    const a = adapters?.get?.(id);
+    if (a?.creditGuard) return !!a.creditGuard.off;
+    const raw = cfg?.adapters?.[id];
+    try {
+      return raw ? !!checkCreditGuard(id, raw, raw.bin || id)?.off : false;
+    } catch {
+      return false;
+    }
+  };
   const thresholdOf = (id) => {
     const a = adapters?.get?.(id);
-    if (a?.creditGuard) return a.creditGuard.threshold;
+    if (a?.creditGuard) return a.creditGuard.off ? null : a.creditGuard.threshold;
     const raw = cfg?.adapters?.[id];
     try {
       return raw ? checkCreditGuard(id, raw, raw.bin || id)?.threshold ?? null : null;
@@ -107,11 +118,12 @@ export function creditGuardRows(snapshot, { adapters = null, cfg = null } = {}) 
     ...s,
     adapters: s.adapters.map((id) => {
       const threshold = thresholdOf(id);
+      const off = isOff(id);
       // check()'s rule (credit-guard.js guardState): a reading of this period holds an adapter at
       // or over its threshold back however many readings after it failed; none, or one from
       // before the plan reset, is unknown.
       const state = !s.reading || s.currentPeriod === false ? 'unknown' : threshold != null && evaluateCredits(s.reading, threshold).blocked ? 'held back' : 'ok';
-      return { id, threshold, state, ...(s.stale && s.reading ? { stale: true } : {}) };
+      return { id, threshold, ...(off ? { off: true } : {}), state, ...(s.stale && s.reading ? { stale: true } : {}) };
     }),
   }));
 }
@@ -153,7 +165,7 @@ function ago(ms) {
 export function creditGuardLines(rows) {
   const lines = [];
   for (const r of rows) {
-    const who = r.adapters.map((a) => `${a.id}${a.threshold != null ? ` (held back at ${pct(a.threshold)})` : ''}`).join(', ');
+    const who = r.adapters.map((a) => `${a.id}${a.off ? ' (guard off)' : a.threshold != null ? ` (held back at ${pct(a.threshold)})` : ''}`).join(', ');
     if (!r.reading) {
       lines.push({ mark: '!', text: `${who}: no reading of the Kiro plan yet${r.error ? ` — the last one failed: ${r.error}` : ''}; not held back` });
       continue;
