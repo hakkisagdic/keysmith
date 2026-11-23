@@ -70,6 +70,7 @@ that is the interesting part.
 | `GET /v1/models` | the whole catalogue, namespaced; `?refresh` re-queries |
 | `GET /v1/keysmith/routes` | adapters, aliases, limits and any unusable alias leg (`alias_warnings`) as JSON |
 | `GET /v1/keysmith/usage` | whole-log audit statistics (`?by=…&since=…&until=…`), spend caps, `?tail=N` recent entries, and recent-row filters `status`, `tag`, `key`, `model`, `min_cost`, `min_ms` (with `tail` only) |
+| `GET /v1/keysmith/metrics` | Prometheus text (`text/plain; version=0.0.4`) of the rolling usage window by model (`?hours=`, default 24): requests, failures, refused, tokens, cost and p95. A scrape is not counted against a key's `perDay`. |
 | `GET /` | status page in a browser: post the key once through its form, a cookie opens it for an hour |
 | `GET /healthz` | keyless liveness probe for a supervisor |
 
@@ -78,6 +79,14 @@ default; when enabled via `auth.allowQueryApiKey: true`, it is accepted only fro
 clients with no `cf-connecting-ip` or `x-forwarded-for` header). A key can carry a scope — the adapters, models
 and aliases it may reach — and every route above answers it with that share only; see
 [Keys with a scope](#keys-with-a-scope-what-each-key-may-reach).
+
+Prometheus scrapes `GET /v1/keysmith/metrics` with the same gateway key (`bearer_token`):
+
+```yaml
+- job_name: keysmith
+  metrics_path: /v1/keysmith/metrics
+  bearer_token: <gateway key>
+```
 
 
 ## Universal Harness Protocol (UHP) & HarnessRouter Relay
