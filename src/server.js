@@ -22,7 +22,7 @@ import { pickChatRelayFields, upstreamError, upstreamIdFromHeaders } from './htt
 import { toolPath } from './tools/router.js';
 import { failureOf, legMetaOf, scopeError } from './gateway.js';
 import { authEnabled, describeScope, hashKey, isKeyExpired, parseKeys, scopeWarnings, targetDecision } from './keys.js';
-import { DailyQuota, MinuteLimiter, overCapMessage, overMinuteMessage } from './quota.js';
+import { DailyQuota, MinuteLimiter, overCapMessage, overMinuteMessage, overTokensMessage, rowTokens } from './quota.js';
 import { requestEffort } from './effort.js';
 import { creditGuardLines, creditGuardRows, recentSkips, skipLines } from './failover-report.js';
 import { TAIL_RING_MAX, RECENT_STATUSES, computeCost, credentialAccount, entryFilter, parseFilterNumber, parseTag, roundUsd } from './usage.js';
@@ -366,6 +366,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
                 label: viewer.entry.label,
                 scope: describeScope(scope),
                 perDay: viewer.entry.perDay ?? null,
+                tokensPerDay: viewer.entry.tokensPerDay ?? null,
                 perMinute: viewer.entry.perMinute ?? null,
                 expires: viewer.entry.expires ?? null,
                 disabled: Boolean(viewer.entry.disabled),
@@ -379,6 +380,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
                 label: k.label,
                 scope: describeScope(k.scope),
                 perDay: k.perDay ?? null,
+                tokensPerDay: k.tokensPerDay ?? null,
                 perMinute: k.perMinute ?? null,
                 expires: k.expires ?? null,
                 disabled: Boolean(k.disabled),
@@ -413,7 +415,13 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       record: (entry) => {
         try {
           if (usage) {
-            usage.record(stamp({ ts: new Date(now()).toISOString(), ...entry }, { who, req, res, route, gateway, cfg }));
+            const row = stamp({ ts: new Date(now()).toISOString(), ...entry }, { who, req, res, route, gateway, cfg });
+            usage.record(row);
+            // The one funnel every route's usage row goes through: what it spent counts toward its key's token cap.
+            if (who?.fp && row.status !== 'limited') {
+              const r = rowTokens(row);
+              quota.addTokens(who.fp, r.tokens, r.estimated);
+            }
           }
         } finally {
           releaseHeldSpend();
@@ -647,7 +655,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
     return true;
   }
 
-  function recordLimitedRow(stamped, route, req, message, type, status) {
+  function recordLimitedRow(stamped, route, req, message, type, status, limit = null) {
     const errJson = JSON.stringify(errorBody(message, type, status, null, faceFromRoute(route)));
     record(stamped, {
       model: null,
@@ -656,6 +664,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       stream: false,
       via: route,
       error: message,
+      ...(limit ? { limit } : {}),
       client: req?.headers?.['user-agent'],
       bytesOut: Buffer.byteLength(errJson, 'utf8'),
     });
@@ -669,7 +678,7 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
 
   /**
    * Check and count one metered request of the key `who` came with, in strict order:
-   * disabled (403), expired (401), perMinute (429), then perDay (429). A refused request counts
+   * disabled (403), expired (401), perMinute (429), tokensPerDay (429), then perDay (429). A refused request counts
    * toward neither limit. Disabled, expired and perMinute write one `limited` usage row and one
    * log line per key per minute; `perDay` writes one on the day's first refusal.
    */
@@ -700,6 +709,20 @@ export function createServer(gateway, cfg, { usage, log: write = () => {}, now: 
       }
       const e = new LlmError(message, { status: 429, type: 'rate_limit_error' });
       e.retryAfter = m.retryAfter;
+      throw e;
+    }
+    // The token cap: refused once the day's tokens reached it, before any body is read or leg chosen.
+    // A request already in flight may overshoot by its own size (tokens are known after the answer).
+    const tk = quota.admitTokens(who.fp, who.tokensPerDay ?? null);
+    if (!tk.ok) {
+      minute.unadmit(who.fp);
+      const message = overTokensMessage(tk);
+      if (tk.first) {
+        log(`key fp:${who.fp}${who.label ? ` (${who.label})` : ''} reached its daily cap of ${tk.tokensPerDay} tokens: refused until local midnight`);
+        recordLimitedRow(stamped, route, req, message, 'rate_limit_error', 429, 'tokens');
+      }
+      const e = new LlmError(message, { status: 429, type: 'rate_limit_error' });
+      e.retryAfter = tk.retryAfter;
       throw e;
     }
     const d = quota.admit(who.fp, who.perDay ?? null);
@@ -2878,7 +2901,7 @@ function isDirectLoopback(req) {
  * `perDay` its daily cap (null: none).
  */
 function identify(req, entries, url, authOn, cfg = null) {
-  if (!authOn) return { caller: '', fp: null, label: null, scope: null, perDay: null, perMinute: null, expires: null, disabled: false };
+  if (!authOn) return { caller: '', fp: null, label: null, scope: null, perDay: null, tokensPerDay: null, perMinute: null, expires: null, disabled: false };
   let entry = headerEntry(req, entries);
   if (!entry && req.headers.authorization === undefined && req.headers['x-api-key'] === undefined) {
     const queryAllowed = cfg?.auth?.allowQueryApiKey === true || cfg?.auth?.queryKey === true;
@@ -2897,6 +2920,7 @@ function identify(req, entries, url, authOn, cfg = null) {
     label: entry.label,
     scope: entry.scope,
     perDay: entry.perDay ?? null,
+    tokensPerDay: entry.tokensPerDay ?? null,
     perMinute: entry.perMinute ?? null,
     expires: entry.expires ?? null,
     disabled: Boolean(entry.disabled),

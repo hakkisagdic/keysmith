@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add a per-key daily token cap (`tokensPerDay` on an `auth.keys` entry, `key add|scope --tokens-per-day N` / `--no-tokens-per-day`): tokens come from each usage row (`usage.input + usage.output`, else `ceil((bytesIn + bytesOut) / 4)` marked estimated; cache hits 0), are rebuilt from `usage.jsonl` at start and reset at local midnight; a key at its cap gets 429 with `retry-after` before any body is read or leg chosen (one `limited` row per day with `limit: "tokens"`). Invalid values and conflicting duplicate entries fail closed. Add `keysmith key usage fp:<8 hex> --json`, one JSON line of the key's day, and `tokens`, `tokensEstimated`, `tokensPerDay` in `/v1/keysmith/usage`. A request already running may overshoot the cap by its own size.
+
 ### Security
 
 - Strip `ANTHROPIC_*` (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, …), `CLAUDE_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, and `CLAUDE_CODE_USE_BEDROCK|VERTEX|FOUNDRY|MANTLE` from the child environment of Claude Code adapters (`parser: "claude-stream-json"` with `bin` basename `claude`, or `bridge.driver: "claude"`) across text, vision, EMULATE, `modelsFrom`, and MCP bridge runs after merging the adapter's `env`, via `claudeSubscriptionEnv` / `isClaudeSubscriptionAdapter` in `src/util.js`, `src/cli-adapter.js`, and `src/bridge/clis.js` — keeping `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `CLAUDE_CONFIG_DIR`, and non-`claude` `claude-stream-json` adapters such as `qodercli` intact so inherited or configured API credentials cannot silently bill the API.

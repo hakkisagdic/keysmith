@@ -6,7 +6,7 @@ import { dataDir } from './config.js';
 import { CLAUDE_PRICING, PRICE_SOURCE } from './prices.js';
 import { FILE_MODE, ensurePrivateDir, openPrivateLog } from './logfiles.js';
 import { fingerprint, redactSecrets } from './redact.js';
-import { dayOf, nextMidnight, startOfDay } from './quota.js';
+import { dayOf, nextMidnight, rowTokens, startOfDay } from './quota.js';
 
 /**
  * Append-only JSONL usage & audit log.
@@ -2048,6 +2048,8 @@ export class UsageLog {
         refused: new Map(),
         rowCounts: new Map(),
         rowRefused: new Map(),
+        tokens: new Map(),
+        tokensEstimated: new Set(),
         extraRefusedByFp: new Map(),
         unloggedFailures: new Map(),
         labels: new Map(),
@@ -2107,6 +2109,9 @@ export class UsageLog {
       if (!state.fromQuota) state.refused.set(fp, (state.refused.get(fp) || 0) + 1);
     } else {
       state.rowCounts.set(fp, (state.rowCounts.get(fp) || 0) + 1);
+      const r = rowTokens(row);
+      state.tokens.set(fp, (state.tokens.get(fp) || 0) + r.tokens);
+      if (r.estimated) state.tokensEstimated.add(fp);
       if (!state.fromQuota) state.counts.set(fp, (state.counts.get(fp) || 0) + 1);
     }
   }
@@ -2763,10 +2768,11 @@ export class UsageLog {
       if (item.scope?.invalid) continue;
       const hasPerDay = Number.isSafeInteger(item.perDay) && item.perDay >= 0;
       const hasPerMinute = Number.isSafeInteger(item.perMinute) && item.perMinute >= 0;
+      const hasTokens = Number.isSafeInteger(item.tokensPerDay) && item.tokensPerDay >= 0;
       const expMs = typeof item.expires === 'string' && item.expires ? Date.parse(item.expires) : NaN;
       const hasExpires = Number.isFinite(expMs);
       const hasDisabled = item.disabled === true;
-      if (!hasPerDay && !hasPerMinute && !hasExpires && !hasDisabled) continue;
+      if (!hasPerDay && !hasTokens && !hasPerMinute && !hasExpires && !hasDisabled) continue;
       const fp = typeof item.fp === 'string' && item.fp ? item.fp : typeof item.key === 'string' && item.key ? fingerprint(item.key) : null;
       if (!fp) continue;
       if (who?.scope && who.fp && fp !== who.fp) continue;
@@ -2774,6 +2780,7 @@ export class UsageLog {
         fp,
         label: typeof item.label === 'string' && item.label ? item.label : null,
         perDay: hasPerDay ? item.perDay : null,
+        tokensPerDay: hasTokens ? item.tokensPerDay : null,
         perMinute: hasPerMinute ? item.perMinute : null,
         expires: hasExpires ? item.expires : null,
         expired: hasExpires && nowMs >= expMs,
@@ -2788,6 +2795,7 @@ export class UsageLog {
 
     return listed.map((c) => {
       const qToday = quota ? quota.today(c.fp) : null;
+      const qTokens = quota?.tokensToday ? quota.tokensToday(c.fp) : null;
       const requests = Math.max(state.counts.get(c.fp) || 0, qToday?.requests || 0);
       const refused = Math.max(state.refused.get(c.fp) || 0, qToday?.refused || 0);
       const hasCap = c.perDay != null;
@@ -2801,6 +2809,13 @@ export class UsageLog {
         remaining: hasCap ? Math.max(0, c.perDay - requests) : null,
         refused,
         exceeded: hasCap ? requests >= c.perDay : false,
+        ...(c.tokensPerDay != null
+          ? {
+              tokens: Math.max(state.tokens.get(c.fp) || 0, qTokens?.tokens || 0),
+              tokensEstimated: state.tokensEstimated.has(c.fp) || Boolean(qTokens?.tokensEstimated),
+              tokensPerDay: c.tokensPerDay,
+            }
+          : {}),
         ...(c.perMinute != null ? { perMinute: c.perMinute } : {}),
         ...(c.expires ? { expires: c.expires, expired: c.expired } : {}),
         ...(c.disabled ? { disabled: true } : {}),

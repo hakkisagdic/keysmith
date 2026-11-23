@@ -1046,6 +1046,33 @@ keysmith key list                              # … deny: claude-api · 300 req
   otherwise an uncapped copy above a capped entry would quietly lift the cap. `perDay: 0` refuses
   every request. Like every key change, a cap takes effect when the gateway restarts.
 
+#### Token cap
+
+`perDay` counts requests; `tokensPerDay` caps their size. One long prompt can cost more than a
+hundred short ones, and a CLI leg reports no token counts at all.
+
+```bash
+keysmith key scope fp:3f9a0c12 --tokens-per-day 200000   # cap it; --no-tokens-per-day lifts it
+keysmith key usage fp:3f9a0c12 --json                    # one line: how much of its day it used
+```
+
+- A key's tokens today are the sum over its usage rows: `usage.input + usage.output` when the row
+  reports both, otherwise an estimate of one token per 4 bytes (`bytesIn + bytesOut`, at least 1),
+  marked `tokensEstimated`. Cache hits cost 0. Refusals count nothing.
+- Once the day's tokens reach the cap, the next request is refused with **429** and a
+  `retry-after` up to local midnight, before its body is read and before any leg is chosen; the
+  first refusal of the day writes one usage row (`"status": "limited"`, `"limit": "tokens"`).
+  Tokens are known only after the answer, so a request that is already running may overshoot the
+  cap by its own size, and requests running at the same time all pass. The estimate over-counts
+  tool-heavy JSON, which is the safe direction.
+- The count is rebuilt from `usage.jsonl` at start, and starts again at 0 at local midnight. Like
+  `perDay` it fails closed (`"1000"`, `-1`, `1.5`, or two entries with different caps leave the key
+  reaching nothing) and a change takes effect when the gateway restarts.
+- `keysmith key usage fp:<8 hex> --json` reads `usage.jsonl` itself (the gateway need not run) and
+  prints one line: `{"fp","label","requests","perDay","tokens","tokensEstimated","tokensPerDay","refused","resets_at"}`.
+  An unknown fingerprint exits 2. `/v1/keysmith/usage` lists `tokens`, `tokensEstimated` and
+  `tokensPerDay` per key.
+
 ### Per-minute limit, expiry and disable switch
 
 Alongside `perDay`, an `auth.keys` entry can carry a rolling 60-second request limit (`perMinute`),

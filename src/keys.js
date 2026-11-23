@@ -37,7 +37,7 @@ import { fingerprint } from './redact.js';
  * fingerprint.
  */
 
-const ENTRY_FIELDS = new Set(['key', 'keyHash', 'label', 'allow', 'deny', 'perDay', 'perMinute', 'expires', 'disabled']);
+const ENTRY_FIELDS = new Set(['key', 'keyHash', 'label', 'allow', 'deny', 'perDay', 'tokensPerDay', 'perMinute', 'expires', 'disabled']);
 
 /** A key string out of an `auth.keys` entry, or null. */
 export function keyOf(entry) {
@@ -141,10 +141,11 @@ function patternList(value, field) {
 export function compileScope(entry) {
   if (typeof entry === 'string') return null;
   for (const field of Object.keys(entry)) {
-    if (!ENTRY_FIELDS.has(field)) throw new Error(`unknown field "${field}" (a key entry has key, keyHash, label, allow, deny, perDay, perMinute, expires, disabled)`);
+    if (!ENTRY_FIELDS.has(field)) throw new Error(`unknown field "${field}" (a key entry has key, keyHash, label, allow, deny, perDay, tokensPerDay, perMinute, expires, disabled)`);
   }
   if (entry.label != null && typeof entry.label !== 'string') throw new Error('"label" must be a string');
   perDayOf(entry);
+  tokensPerDayOf(entry);
   perMinuteOf(entry);
   expiresOf(entry);
   disabledOf(entry);
@@ -171,6 +172,22 @@ export function perDayOf(entry) {
 /** One line for a cap: `300 requests/day`, or '' for none. */
 export function describePerDay(perDay) {
   return perDay == null ? '' : `${perDay} request${perDay === 1 ? '' : 's'}/day`;
+}
+
+/**
+ * The daily token cap an `auth.keys` entry carries: a whole number of tokens (0 refuses every
+ * request), or null for none. Throws on anything else so parseKeys fails closed.
+ */
+export function tokensPerDayOf(entry) {
+  if (!entry || typeof entry !== 'object' || entry.tokensPerDay === undefined) return null;
+  const n = entry.tokensPerDay;
+  if (!Number.isSafeInteger(n) || n < 0) throw new Error(`"tokensPerDay" must be a whole number of tokens, e.g. 200000 (got ${JSON.stringify(n)})`);
+  return n;
+}
+
+/** One line for a token cap: `200000 tokens/day`, or '' for none. */
+export function describeTokensPerDay(tokensPerDay) {
+  return tokensPerDay == null ? '' : `${tokensPerDay} token${tokensPerDay === 1 ? '' : 's'}/day`;
 }
 
 /**
@@ -247,7 +264,7 @@ export function disabledOf(entry) {
 
 /**
  * `auth.keys` as the gateway uses it:
- * `{ entries: [{ key, keyHash, hashed, label, fp, scope, perDay, perMinute, expires, disabled }], issues }`.
+ * `{ entries: [{ key, keyHash, hashed, label, fp, scope, perDay, tokensPerDay, perMinute, expires, disabled }], issues }`.
  * An entry with no usable key is left out (and named in `issues`); one whose scope or limits cannot
  * be read stays in — it authenticates, so its client hears a 403 that says why, not a 401 — with
  * a scope that reaches nothing.
@@ -271,6 +288,7 @@ export function parseKeys(list) {
     const label = item && typeof item === 'object' && typeof item.label === 'string' ? item.label : null;
     let scope;
     let perDay = null;
+    let tokensPerDay = null;
     let perMinute = null;
     let expires = null;
     let disabled = false;
@@ -281,6 +299,7 @@ export function parseKeys(list) {
       }
       scope = compileScope(item);
       perDay = perDayOf(item);
+      tokensPerDay = tokensPerDayOf(item);
       perMinute = perMinuteOf(item);
       expires = expiresOf(item);
       disabled = disabledOf(item);
@@ -291,7 +310,7 @@ export function parseKeys(list) {
     if (scope && typeof scope === 'object') {
       Object.defineProperty(scope, '_fp', { value: fp, enumerable: false, configurable: true });
     }
-    entries.push({ key: key || null, keyHash: keyHash || null, hashed, label, fp, scope, perDay, perMinute, expires, disabled });
+    entries.push({ key: key || null, keyHash: keyHash || null, hashed, label, fp, scope, perDay, tokensPerDay, perMinute, expires, disabled });
   }
   // The same key twice: the gateway would match the first entry, and a hand edit that adds an
   // unscoped (or uncapped) copy above a scoped (or capped) one would quietly widen it. Two
@@ -305,20 +324,23 @@ export function parseKeys(list) {
     if (same.length < 2) continue;
     const scopes = new Set(same.map((e) => JSON.stringify(scopeText(e.scope))));
     const caps = new Set(same.map((e) => e.perDay));
+    const tcaps = new Set(same.map((e) => e.tokensPerDay));
     const rpms = new Set(same.map((e) => e.perMinute));
     const expiries = new Set(same.map((e) => e.expires));
     const disableds = new Set(same.map((e) => e.disabled));
-    if (scopes.size < 2 && caps.size < 2 && rpms.size < 2 && expiries.size < 2 && disableds.size < 2) continue;
+    if (scopes.size < 2 && caps.size < 2 && tcaps.size < 2 && rpms.size < 2 && expiries.size < 2 && disableds.size < 2) continue;
     const what =
       scopes.size > 1
         ? 'different scopes'
         : caps.size > 1
           ? 'different daily caps'
-          : rpms.size > 1
-            ? 'different per-minute limits'
-            : expiries.size > 1
-              ? 'different expiry dates'
-              : 'different disabled states';
+          : tcaps.size > 1
+            ? 'different token caps'
+            : rpms.size > 1
+              ? 'different per-minute limits'
+              : expiries.size > 1
+                ? 'different expiry dates'
+                : 'different disabled states';
     for (const e of same) {
       e.scope = NOTHING(`listed ${same.length} times with ${what}`);
       e.disabled = false;
