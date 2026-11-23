@@ -1873,7 +1873,9 @@ async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSp
   }
   const adapter = gateway.adapters.get(adapterId);
   if (!adapter || adapter.kind !== 'http') throw new LlmError('embeddings need an HTTP adapter', { status: 400 });
-  adapter.assertModelAllowed(upstreamModel, adapter.upstreamModel(upstreamModel));
+  // One modelMap rewrite. Scope, spend and the usage row keep the name the client sent.
+  const sent = adapter.upstreamModel(upstreamModel);
+  adapter.assertModelAllowed(upstreamModel, sent);
   const tokens = typeof gateway.estimateTokens === 'function'
     ? gateway.estimateTokens(adapter, upstreamModel, { input: body.input, maxTokens: 0 })
     : { inputTokens: 16, outputTokens: 0 };
@@ -1885,7 +1887,7 @@ async function handleEmbeddings(req, res, gateway, { usage, scope = null, holdSp
     r = await fetch(`${adapter.baseUrl}/embeddings`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...adapter.authHeaders(), ...adapter.headers },
-      body: JSON.stringify({ ...body, model: upstreamModel }),
+      body: JSON.stringify({ ...body, model: sent }),
       signal: AbortSignal.timeout(adapter.timeoutMs),
     });
     text = await r.text();

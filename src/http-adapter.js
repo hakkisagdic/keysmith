@@ -610,6 +610,8 @@ export class HttpAdapter {
           toolChoice,
           harnessId: isTraycer ? null : harnessId,
           rawModel: isTraycer,
+          // effectiveModel is already modelMap's output (or the Traycer id). Do not map it again.
+          mapped: true,
         }),
       );
     } else if (isAnthropic) {
@@ -738,8 +740,10 @@ export function inferTraycerRoute(model) {
 /**
  * Build a UHP `POST /v1/responses` request body from Keysmith's canonical turn inputs.
  */
-function buildUhpPayload(adapter, baseParams, { model, messages, session, maxTokens, effort, rendered, tools, toolChoice, harnessId, rawModel = false }) {
-  const upstream = rawModel ? model : adapter.upstreamModel(model);
+function buildUhpPayload(adapter, baseParams, { model, messages, session, maxTokens, effort, rendered, tools, toolChoice, harnessId, rawModel = false, mapped = false }) {
+  // `mapped` skips a second modelMap lookup only. parseUhpTarget still runs.
+  // `rawModel` stays the Traycer meaning: the id is used whole and is not parsed as a UHP target.
+  const upstream = rawModel || mapped ? model : adapter.upstreamModel(model);
   const target = rawModel ? { model: upstream } : adapter.parseUhpTarget(upstream);
   const out = { stream: true };
   if (target.model) out.model = target.model;
