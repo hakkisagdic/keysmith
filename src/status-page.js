@@ -60,7 +60,7 @@ ${logErrors.length ? `<p class="bad">${logErrors.map((e) => `usage log unreadabl
 </div>
 <h2>Adapters</h2>
 ${adapters.length ? `<div class="grid">${adapters
-    .map(([id, a]) => `<div class="card"><b>${esc(id)}</b><small>${a.kind === 'cli' ? `cli · ${esc(a.bin || id)} · ${esc(a.parser || 'raw')}` : `http · ${esc(a.wire || 'openai')}`}<br><span class="pill">${a.disabled ? 'disabled' : a.priority ?? 100}</span>${a.toolMode && a.toolMode !== 'off' ? ` <span class="pill">tools: ${esc(a.toolMode)}</span>` : ''}${Object.hasOwn(loadErrors, id) ? ' <span class="bad">did not load</span>' : ''}</small></div>`)
+    .map(([id, a]) => `<div class="card"><b>${esc(id)}</b><small>${a.kind === 'cli' ? `cli · ${esc(a.bin || id)} · ${esc(a.parser || 'raw')}` : `http · ${esc(a.wire || 'openai')}`}<br><span class="pill">${a.disabled ? 'disabled' : Number(a.priority ?? 100)}</span>${a.toolMode && a.toolMode !== 'off' ? ` <span class="pill">tools: ${esc(a.toolMode)}</span>` : ''}${Object.hasOwn(loadErrors, id) ? ' <span class="bad">did not load</span>' : ''}</small></div>`)
     .join('')}</div>` : '<div class="muted">none configured — run <code>keysmith add &lt;profile&gt;</code></div>'}
 ${failed.length ? `<h2>Configured but did not load</h2><table><thead><tr><th>adapter</th><th>why</th></tr></thead><tbody>${failed
     .map(([id, msg]) => `<tr><td class="bad">${esc(id)}</td><td>${esc(msg)}</td></tr>`)
@@ -70,7 +70,7 @@ ${aliasList.length ? `<h2>Alias legs that can never work</h2><table><thead><tr><
     .join('')}</tbody></table><p class="muted">Failover hides these at request time — a dead first leg just looks like a slow provider, so this page is where the typo becomes visible.</p>` : ''}
 <h2>Models</h2>
 <table><thead><tr><th>id</th><th>adapter</th><th>upstream</th><th>context</th></tr></thead><tbody>
-${models.map((m) => `<tr><td${m.keysmith?.kind === 'alias' && aliasIssues[m.id] ? ' class="bad"' : ''}>${esc(m.id)}</td><td class="muted">${esc(m.keysmith?.adapter || '')}</td><td class="muted">${esc(m.keysmith?.upstream || '')}</td><td class="n">${m.keysmith?.contextWindow || ''}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">no models listed — check <code>keysmith doctor</code></td></tr>'}
+${models.map((m) => `<tr><td${m.keysmith?.kind === 'alias' && aliasIssues[m.id] ? ' class="bad"' : ''}>${esc(m.id)}</td><td class="muted">${esc(m.keysmith?.adapter || '')}</td><td class="muted">${esc(m.keysmith?.upstream || '')}</td><td class="n">${contextText(m.keysmith?.contextWindow)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">no models listed — check <code>keysmith doctor</code></td></tr>'}
 </tbody></table>
 ${keys ? `<h2>Keys</h2><table><thead><tr><th>key</th><th>label</th><th>scope</th><th class="n">today / cap</th><th class="n">req 24h (UTC hour)</th><th class="n">denied</th></tr></thead><tbody>${keyRows}</tbody></table>${keyIssues.length ? `<p class="bad">${keyIssues.map(esc).join('<br>')}</p>` : ''}<p class="muted">A key is named by its fingerprint. <code>keysmith key scope fp:&lt;hex&gt; --deny &lt;adapter&gt;</code> narrows one, <code>--per-day N</code> caps its requests per local day; <code>keysmith key who-can &lt;adapter&gt;</code> lists the keys that reach an adapter.</p>` : ''}
 ${failover ? failoverSection(failover) : ''}
@@ -142,12 +142,12 @@ function viewerLine(viewer) {
   if (!viewer) return '';
   const isExpired = viewer.expired ?? isKeyExpired(viewer.expires);
   const extra = [
-    viewer.perMinute != null ? `${viewer.perMinute} request${viewer.perMinute === 1 ? '' : 's'}/minute` : '',
+    viewer.perMinute != null ? `${Number(viewer.perMinute)} request${viewer.perMinute === 1 ? '' : 's'}/minute` : '',
     viewer.expires ? (isExpired ? `<span class="bad">expired (${esc(viewer.expires)})</span>` : `expires ${esc(viewer.expires)}`) : '',
     viewer.disabled ? '<span class="bad">disabled</span>' : '',
   ].filter(Boolean).join(' · ');
   if (viewer.perDay != null) {
-    return `<div class="sub">this key today: <b class="${(viewer.today?.requests || 0) >= viewer.perDay ? 'bad' : 'ok'}">${viewer.today?.requests || 0} of ${viewer.perDay}</b> requests${viewer.today?.refused ? `, ${viewer.today.refused} refused over the cap` : ''} — the count starts again at local midnight.${extra ? ` · ${extra}` : ''}</div>`;
+    return `<div class="sub">this key today: <b class="${(viewer.today?.requests || 0) >= viewer.perDay ? 'bad' : 'ok'}">${viewer.today?.requests || 0} of ${Number(viewer.perDay)}</b> requests${viewer.today?.refused ? `, ${viewer.today.refused} refused over the cap` : ''} — the count starts again at local midnight.${extra ? ` · ${extra}` : ''}</div>`;
   }
   return extra ? `<div class="sub">this key: ${extra}</div>` : '';
 }
@@ -161,13 +161,24 @@ function todayCell(k) {
     parts.push(String(n));
   } else {
     const over = n >= k.perDay;
-    parts.push(`<span class="${over ? 'bad' : ''}">${n} / ${k.perDay}</span>`);
+    parts.push(`<span class="${over ? 'bad' : ''}">${n} / ${Number(k.perDay)}</span>`);
     if (k.today?.refused) parts.push(`<span class="bad">${k.today.refused} refused</span>`);
   }
-  if (k.perMinute != null) parts.push(`<span class="muted">${k.perMinute}/min</span>`);
+  if (k.perMinute != null) parts.push(`<span class="muted">${Number(k.perMinute)}/min</span>`);
   if (k.expires && !isExpired) parts.push(`<span class="muted">expires ${esc(k.expires)}</span>`);
   if (k.expires && isExpired) parts.push(`<span class="bad">expired ${esc(k.expires)}</span>`);
   return parts.join('<br>');
+}
+
+/**
+ * Context length for the models table. A finite positive number is its integer form.
+ * Null and undefined are blank. Anything else is escaped and cut to 24 characters,
+ * so an upstream `/models` value cannot write markup into this page.
+ */
+function contextText(value) {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return String(Math.trunc(value));
+  if (value == null) return '';
+  return esc(String(value)).slice(0, 24);
 }
 
 function esc(s) {
