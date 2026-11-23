@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-23
+
+### Added
+
+- Add `GET /v1/keysmith/metrics`: the usage window as Prometheus text (gauges per model for requests, failures, refused, tokens in/out, metered and list cost, p95 latency, plus `keysmith_window_hours`), behind the same gateway-key auth and scoping as `/v1/keysmith/usage`, `?hours=` validated like usage, and not counted against a key's `perDay`. See the README for a scrape example.
+
+### Fixed
+
+- Apply `modelMap` exactly once: `/v1/embeddings` sends the mapped id upstream, and the UHP wire no longer maps twice.
+- `key add --force` keeps the old key file when saving the new one fails.
+- Escape dynamic values on the status page.
+- `parseTunnelId` returns the tunnel UUID (not the name inside quotes); `writeTunnelConfig` fails clearly when the id or its credentials file is missing.
+- Count a request in the in-memory spend window when the usage log write fails (one warning per process, error code only).
+
 ## [0.1.1] - 2026-11-23
 
 ### Added
