@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-23
+
 ### Added
 
 - Let the Kiro credit guard run past 1.25: `creditGuardThreshold` takes any number above 0 or the string `"off"` (default stays 0.9; `off` still reads the meter and shows `guard off` in status, doctor and `/v1/keysmith/routes` as `threshold: null, off: true`), and a SIGHUP reload now re-reads the threshold of a running kiro adapter.
