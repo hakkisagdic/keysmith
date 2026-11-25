@@ -1388,11 +1388,15 @@ test('a change saved while a gateway runs says it needs a restart, and keysmith 
   // This test process stands in for the running gateway: alive, started a minute ago.
   fs.writeFileSync(pid, JSON.stringify({ pid: process.pid, port: 9, at: new Date(Date.now() - 60_000).toISOString() }), { mode: 0o600 });
   const restart = /still serves the config it started with — .* takes effect when it restarts: (?:pid \d+ \(port 9\): keysmith stop && keysmith start|launchd.*kickstart)/;
-  for (const args of [['add', 'agy'], ['alias', 'argon', 'agy/gemini-4-argon-high'], ['set', 'agy', 'disabled', 'true'], ['alias', 'argon', '--delete'], ['key', 'add'], ['remove', 'agy']]) {
+  for (const args of [['add', 'agy'], ['alias', 'argon', 'agy/gemini-4-argon-high'], ['set', 'agy', 'disabled', 'true'], ['alias', 'argon', '--delete'], ['remove', 'agy']]) {
     const r = run(...args);
     assert.equal(r.status, 0, r.all);
     assert.match(r.all, restart, args.join(' '));
   }
+  const keyAdd = run('key', 'add');
+  assert.equal(keyAdd.status, 0, keyAdd.all);
+  assert.match(keyAdd.all, /picks up the new key automatically on the next request \(no restart needed/);
+  assert.doesNotMatch(keyAdd.all, /takes effect when it restarts/);
   const st = run('status');
   assert.match(st.all, /changes : .*config\.json changed .*after this gateway started.*still serves the old config/);
   fs.rmSync(pid);

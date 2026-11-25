@@ -169,12 +169,18 @@ use each profile's cheap `GET` health path — such as Cloudflare's `/client/v4/
 with `healthPath` overriding the profile and `/models` as fallback — under a 15 s timeout,
 never reading response bodies or issuing paid chat calls.
 
-The gateway reads its config once, when it starts. `add`, `remove`, `set`, `alias` and
-`key add|scope|revoke` change the file, not the running gateway: while one runs they say so, with
-the restart command (`launchctl kickstart -k gui/$UID/dev.keysmith.gateway` under launchd,
-`keysmith stop && keysmith start` otherwise), and `keysmith status` says when the config is
-newer than the gateway. Until then a new alias is a 404, a disabled adapter keeps answering,
-a revoked key keeps working and a key keeps the scope it had.
+A running gateway checks `config.json` on every request (`mtime`, `size`, `inode`) and picks up
+changes to `auth.keys` (added keys, revocations, scopes, `perDay`/`tokensPerDay`/`perMinute` caps,
+`expires`, and `disabled`), `promptCache` on running HTTP adapters, `creditGuardThreshold` on
+running Kiro adapters, and `structuredOutput` automatically on the next request (`SIGHUP` forces
+a reload immediately, and `key add|scope|revoke` also send `SIGHUP`). No restart is needed for
+those. Everything else — adding or removing adapters, other adapter fields, `aliases`, `pricing`,
+other top-level settings, and code updates — is read when the gateway starts: `add`, `remove`,
+`set` (other fields), `alias`, `price set` and `config set` (other keys) print the restart command
+(`launchctl kickstart -k gui/$UID/dev.keysmith.gateway` under launchd, `keysmith stop && keysmith
+start` otherwise) while a gateway runs, and `keysmith status` notes when the config or code is
+newer than the gateway. Until that restart, a new alias is a 404 and a disabled adapter keeps
+answering.
 
 Which is also why a typo in a chain is invisible at request time: a leg naming an adapter
 you do not have gets skipped, and a leg naming a model the adapter never heard of gets
@@ -853,8 +859,10 @@ keysmith scrub-logs path/to/file…   # and any other file the key reached: anot
 A scrub rewrites what it can reach. A key that was in a log may also be in copies it
 cannot — backups, rotated archives, an agent's transcript — so when `scrub-logs` finds a
 configured key it says to rotate it: `keysmith key add --reveal` in a terminal, move the
-clients over, `keysmith key revoke fp:<old>`, restart the gateway. `keysmith status` says
-when the running gateway is older than the code or the config on disk and needs that restart.
+clients over, and `keysmith key revoke fp:<old>` — no restart is needed, because the running
+gateway picks up key additions and revocations automatically on the next request (and via
+`SIGHUP`). `keysmith status` still flags when code or non-reloaded config on disk is newer than
+the running gateway.
 
 ### Outbound secret guard (`guard.secrets`)
 
@@ -1053,7 +1061,8 @@ keysmith key list                              # … deny: claude-api · 300 req
 - It fails closed like a scope: a `perDay` that is not a whole number (`"300"`, `-1`) leaves the
   key reaching nothing, and one key listed twice with two different caps reaches nothing —
   otherwise an uncapped copy above a capped entry would quietly lift the cap. `perDay: 0` refuses
-  every request. Like every key change, a cap takes effect when the gateway restarts.
+  every request. Like every `auth.keys` change, a cap is picked up automatically by the running
+  gateway on the next request (and via `SIGHUP`), with no restart.
 
 #### Token cap
 
@@ -1076,7 +1085,8 @@ keysmith key usage fp:3f9a0c12 --json                    # one line: how much of
   tool-heavy JSON, which is the safe direction.
 - The count is rebuilt from `usage.jsonl` at start, and starts again at 0 at local midnight. Like
   `perDay` it fails closed (`"1000"`, `-1`, `1.5`, or two entries with different caps leave the key
-  reaching nothing) and a change takes effect when the gateway restarts.
+  reaching nothing) and a change is picked up automatically by the running gateway on the next
+  request (and via `SIGHUP`), with no restart.
 - `keysmith key usage fp:<8 hex> --json` reads `usage.jsonl` itself (the gateway need not run) and
   prints one line: `{"fp","label","requests","perDay","tokens","tokensEstimated","tokensPerDay","refused","resets_at"}`.
   An unknown fingerprint exits 2. `/v1/keysmith/usage` lists `tokens`, `tokensEstimated` and
@@ -1134,8 +1144,10 @@ Run the agent as another OS user, in a sandbox, or in CI given its own key and n
 ```bash
 keysmith key add ada --deny claude-api --out ~/.config/ada/keysmith.key
 keysmith key who-can claude-api                          # ada's fingerprint is under "not reachable by"
-launchctl kickstart -k gui/$UID/dev.keysmith.gateway     # or: keysmith stop && keysmith start
 ```
+
+No restart is needed: the running gateway picks up the new key and its scope automatically on the
+next request (and via `SIGHUP`).
 
 The agent reads its key from that file. Asked for `claude-api/…` it gets a 403 that names
 `claude-api`; asked for an alias whose first leg is `claude-api`, it is answered by the next leg,
@@ -1227,7 +1239,7 @@ Off by default (`"structuredOutput": { "mode": "off" }`). When enabled (`"mode":
 - **Healing & validation:** strips surrounding markdown code fences and prose, removes trailing commas, closes open brackets/braces only when truncated after a complete value (never after a half-written number, literal, or key), and validates `json_object` or `json_schema` (without running `pattern` regexes). Inputs over 4 MB are refused without scanning.
 - **Failover & circuit breaker:** a healing or schema failure becomes an HTTP `502` with `error.type: "invalid_output"` before any byte goes to the client, so failover tries the next leg in the route (recording the failed leg and its tokens in `failedLegs`). Because invalid JSON is the model's reply rather than an upstream outage, it does not trip the per-adapter circuit breaker.
 - **Usage & cache:** non-streaming rows record `structuredOutput: "valid"` or `"healed"` (with `healed: true`). Failed `502` responses are never written to the exact response cache; healed responses are cached as canonical JSON. Streaming requests with a spec pass through unchanged and record `structuredOutput: "unchecked"`. Requests carrying `tools`, tool history, `response_format: { "type": "text" }`, `/v1/messages`, and `/v1/embeddings` are untouched.
-- **Config & doctor:** `keysmith config set structuredOutput.mode heal|off` updates it (and `SIGHUP` reloads it live); an invalid value logs an error, fails `keysmith doctor`, and leaves healing off.
+- **Config & doctor:** `keysmith config set structuredOutput.mode heal|off` updates it (picked up automatically on the next request, or immediately on `SIGHUP`); an invalid value logs an error, fails `keysmith doctor`, and leaves healing off.
 
 ## Usage audit, pricing and spend caps
 
@@ -1420,7 +1432,7 @@ load error). Overage is credits billed beyond the plan (`Credits (11200 of 10000
 plan)`), paid by the account's overage setting; keysmith not holding an adapter back does not
 stop Kiro from refusing once its own overage limit is reached. With `"off"` the meter is still
 read, so `keysmith status` and `doctor` show the plan (`kiro (guard off)`), and a running gateway
-picks up a changed threshold on reload (SIGHUP, which `keysmith set` sends). Held back, a route passes the leg by (`skippedLegs` in the row: `credit_guard`, the
+picks up a changed threshold automatically on the next request (or immediately on `SIGHUP`, which `keysmith set` sends), without a restart. Held back, a route passes the leg by (`skippedLegs` in the row: `credit_guard`, the
 share of the plan and the threshold) and the next leg answers; a request that names it gets a
 `429` `rate_limit_error` that says why and names the plan's reset date, with a `retry-after` of
 the time to that reset but at most 300 s (a reset weeks away would stop a client that honours it
@@ -1562,7 +1574,9 @@ change it without opening the file that holds the gateway key:
 
 Each goes through `set`'s checks: a value the gateway would not load is refused before it
 replaces a working entry, and an `unsafeTools` adapter is served, or changed in what it runs,
-only with `--allow-unsafe-tools`. A running gateway picks a change up when it restarts.
+only with `--allow-unsafe-tools`. A running gateway picks up changes to `promptCache` (HTTP
+adapters) and `creditGuardThreshold` (Kiro adapters) automatically on the next request (or on
+`SIGHUP`); all other adapter changes take effect when it restarts.
 
 Fields people set often:
 

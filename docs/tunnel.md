@@ -97,7 +97,7 @@ The logs are safe to tail and paste: the key appears in them only as `ks_Q…35 
 older keysmith may still hold it — `keysmith scrub-logs` rewrites them and their rotated
 copies in place, and any other file you name. Behind a tunnel that key is the whole gate,
 so if it ever did leak: `keysmith key add --reveal` in a terminal, move the clients over,
-`keysmith key revoke fp:<old>`, and restart the gateway (it reads its keys at start).
+`keysmith key revoke fp:<old>` — no restart needed; the running gateway picks up `auth.keys` changes automatically on the next request (and `key add` / `key revoke` also send `SIGHUP`).
 
 `--tunnel` on `serve`/`start` inherits the named tunnel from config. If the tunnel dies
 (a laptop sleeping through a Cloudflare reconnect is the common case), `cloudflared`

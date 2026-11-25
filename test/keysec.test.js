@@ -713,13 +713,14 @@ describe('Security fixes M1-M6 and L1-L6', () => {
     await new Promise((r) => setTimeout(r, 60));
 
     try {
-      // 1. Legacy PID file without `config` field must NOT be signalled, and restart hint MUST be printed
+      // 1. Legacy PID file without `config` field must NOT be signalled, and live-reload fallback hint MUST be printed
       fs.writeFileSync(pidFile, JSON.stringify({ pid: serveChild.pid, port: 9, at: new Date().toISOString() }));
       const scLegacy = runCli(['key', 'scope', `fp:${fp1}`, '--allow', 'stub/m1'], { KEYSMITH_DIR: dir, KEYSMITH_CONFIG: cfgPath });
       assert.equal(scLegacy.code, 0, scLegacy.stderr);
       await new Promise((r) => setTimeout(r, 30));
       assert.equal(goodHups, 0, 'legacy pidfile without config path must not be signalled');
-      assert.match(scLegacy.stdout, /takes effect when it restarts/, 'restart hint must be printed when no signal was delivered');
+      assert.match(scLegacy.stdout, /picks up .* automatically on the next request \(no restart needed/, 'live-reload fallback hint must be printed when no signal was delivered');
+      assert.doesNotMatch(scLegacy.stdout, /works until|takes effect when it restarts/);
 
       // 2. PID file with matching `config`, but non-keysmith command line (stale/reused PID), must NOT be signalled
       fs.writeFileSync(pidFile, JSON.stringify({ pid: nonKeysmithChild.pid, port: 9, config: cfgPath, at: new Date().toISOString() }));
@@ -727,15 +728,16 @@ describe('Security fixes M1-M6 and L1-L6', () => {
       assert.equal(scReused.code, 0, scReused.stderr);
       await new Promise((r) => setTimeout(r, 30));
       assert.equal(badHups, 0, 'non-keysmith process must not receive SIGHUP');
-      assert.match(scReused.stdout, /takes effect when it restarts/, 'restart hint must be printed when pid is not keysmith serve');
+      assert.match(scReused.stdout, /picks up .* automatically on the next request \(no restart needed/, 'live-reload fallback hint must be printed when pid is not keysmith serve');
+      assert.doesNotMatch(scReused.stdout, /works until|takes effect when it restarts/);
 
-      // 3. PID file with matching `config` AND `keysmith serve` command line IS signalled, and "works until" / "takes effect when it restarts" is NOT printed
+      // 3. PID file with matching `config` AND `keysmith serve` command line IS signalled, and fallback/restart hint is NOT printed
       fs.writeFileSync(pidFile, JSON.stringify({ pid: serveChild.pid, port: 9, config: cfgPath, at: new Date().toISOString() }));
       const rvGood = runCli(['key', 'revoke', `fp:${fp2}`], { KEYSMITH_DIR: dir, KEYSMITH_CONFIG: cfgPath });
       assert.equal(rvGood.code, 0, rvGood.stderr);
       await new Promise((r) => setTimeout(r, 30));
       assert.equal(goodHups, 1, 'keysmith serve process with matching config must receive SIGHUP');
-      assert.doesNotMatch(rvGood.stdout, /works until|takes effect when it restarts/, 'restart hint must be suppressed when SIGHUP was delivered');
+      assert.doesNotMatch(rvGood.stdout, /works until|takes effect when it restarts|picks up .* automatically on the next request/, 'fallback hint must be suppressed when SIGHUP was delivered');
     } finally {
       nonKeysmithChild.kill('SIGTERM');
       serveChild.kill('SIGTERM');

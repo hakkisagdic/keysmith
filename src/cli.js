@@ -98,6 +98,8 @@ const HELP = `keysmith ${PKG.version} — forge an API key out of any coding CLI
                                      its daily and per-minute caps, its ISO expiry, and whether it is disabled
   keysmith key who-can <adapter>     the keys, by fingerprint, that can reach an adapter (or adapter/model, alias:<name>)
   keysmith key revoke fp:<8 hex>     revoke by the fingerprint list/logs print (never the key itself: argv is public)
+                                     auth.keys changes (add, scope, caps, revoke) reload automatically on the next request
+                                     (and send SIGHUP); no gateway restart is needed
   keysmith scrub-logs [file…]        redact keys left in the logs, their rotated copies and any file named; counts only
   keysmith mcp [--register]          stdio MCP server; --register adds keysmith to installed MCP clients
 
@@ -485,7 +487,11 @@ function cmdSet(flags) {
   if (imageOff) out(`  and image out of ${id}.media → ${JSON.stringify(next.media)}`);
   if (engineOff) out(`  and ${id}.toolMode ${engineOff} → off: a CLI marked unsafeTools takes no tool request (after unsafeTools false: keysmith set ${id} toolMode ${engineOff})`);
   if (unsafe) out(`! "${id}": ${unsafe}, with --allow-unsafe-tools. It can run commands and edit files on this machine${next.disabled ? ' once it is enabled' : ''}; it is still never an alias leg.`);
-  noteRestart(`${id}.${field}`);
+  if (field === 'promptCache' || field === 'creditGuardThreshold') {
+    if (!signalRunningGateway()) noteLiveReload(`${id}.${field}`);
+  } else {
+    noteRestart(`${id}.${field}`);
+  }
 }
 
 /**
@@ -1323,8 +1329,10 @@ function staleCode(rec) {
 }
 
 /**
- * The same for the config: the gateway reads it once, at start. An alias set since then is a
- * 404, an adapter disabled since then still answers, a key revoked since then still works.
+ * The gateway reads adapters, aliases, prices and most top-level settings once, at start.
+ * An alias set since then is a 404, and an adapter disabled since then still answers.
+ * (`auth.keys`, `promptCache`, `creditGuardThreshold` and `structuredOutput` reload automatically
+ * on the next request.)
  */
 function staleConfig(rec) {
   const started = Date.parse(rec?.at || '');
@@ -1336,7 +1344,7 @@ function staleConfig(rec) {
     return null;
   }
   if (changed <= started) return null;
-  return `${rel(configPath())} changed ${new Date(changed).toISOString()}, after this gateway started (${rec.at}): it still serves the old config — restart it (${restartCommand(rec)})`;
+  return `${rel(configPath())} changed ${new Date(changed).toISOString()}, after this gateway started (${rec.at}): it still serves the old config for adapters, aliases, prices and other settings (auth.keys, promptCache, creditGuardThreshold and structuredOutput reload automatically on the next request) — restart it if you changed anything else (${restartCommand(rec)})`;
 }
 
 function restartCommand(rec = readPid()) {
@@ -1354,14 +1362,26 @@ function restartCommand(rec = readPid()) {
 }
 
 /**
- * Said after `add`, `remove`, `set`, `alias` and `key` save the config while a gateway runs:
- * what they changed is not what it serves until it restarts — in the safe direction too
- * (`set warp disabled true`, `key revoke`).
+ * Said after `add`, `remove`, `set` (fields other than `promptCache` and `creditGuardThreshold`),
+ * `alias`, `price set` and `config set` (keys other than `structuredOutput.mode`) save the config
+ * while a gateway runs: what they changed is not what it serves until it restarts — in the safe
+ * direction too (`set warp disabled true`).
  */
 function noteRestart(what) {
   const rec = readPid();
   if (!rec || !alive(rec.pid)) return;
   out(`! the running gateway (pid ${rec.pid}) still serves the config it started with — ${what} takes effect when it restarts: ${restartCommand(rec)}`);
+}
+
+/**
+ * Said after a live-reloaded config change (`auth.keys`, `promptCache`, `creditGuardThreshold`,
+ * `structuredOutput`) when a gateway pidfile exists but SIGHUP was not delivered: the gateway
+ * still reloads the file automatically on the next request without a restart.
+ */
+function noteLiveReload(what) {
+  const rec = readPid();
+  if (!rec || !alive(rec.pid)) return;
+  out(`  the running gateway (pid ${rec.pid}) picks up ${what} automatically on the next request (no restart needed; SIGHUP forces it immediately)`);
 }
 
 async function cmdRoute(flags) {
@@ -1663,7 +1683,11 @@ function cmdConfig(flags) {
   if (flags.dryRun && op !== 'get') out('(dry run: nothing written)');
   if (res.changed) {
     out(`backup ${rel(res.backup)}`);
-    noteRestart(key);
+    if (key === 'structuredOutput.mode') {
+      if (!signalRunningGateway()) noteLiveReload(key);
+    } else {
+      noteRestart(key);
+    }
   }
 }
 
@@ -1933,7 +1957,7 @@ function cmdKey(flags) {
     const signalled = signalRunningGateway();
     const dispRevoked = (x) => (keyOf(x) ? redactKey(keyOf(x)) : `fp:${entryFp(x)} [hashed]`);
     out(`revoked ${before - cfg.auth.keys.length} key(s): ${revoked.map((x) => `${dispRevoked(x)}${x?.label ? ` (${x.label})` : ''}`).join(', ')}; ${cfg.auth.keys.length} left`);
-    if (!signalled) return noteRestart('the revocation (the revoked key works until then)');
+    if (!signalled) return noteLiveReload('the revocation');
     return;
   }
   fail(KEY_USAGE);
@@ -2034,7 +2058,7 @@ function keyAdd(cfg, flags) {
   if (disabled) out('! --disable: every request of this key is refused (403) until --enable is run');
   // The key and its scope are saved, and apply once auth is on; until then they keep nobody out.
   if (!authEnabled(cfg)) warn(AUTH_OFF);
-  if (!signalled) return noteRestart('the new key');
+  if (!signalled) return noteLiveReload('the new key');
 }
 
 /**
@@ -2133,7 +2157,7 @@ function keyScope(cfg, flags) {
     out("  auth.keys[0] is an object now: a script that reads the key with jq takes .auth.keys[0] | .key? // .");
   }
   if (!authEnabled(cfg)) warn(AUTH_OFF);
-  if (!signalled) return noteRestart(`the scope of fp:${fp}`);
+  if (!signalled) return noteLiveReload(`the scope of fp:${fp}`);
 }
 
 /** `--per-day N` as a whole number of requests; undefined when the flag is absent. */
@@ -2287,7 +2311,7 @@ function keyWhoCan(cfg, flags) {
   }
   for (const n of notes) warn(n);
   for (const issue of issues) warn(`! ${issue}`);
-  // The running gateway goes by the config it started with: say so when this file is newer.
+  // auth.keys reloads automatically on the next request; adapters and aliases still need a restart when this file is newer.
   const rec = readPid();
   const changed = rec && alive(rec.pid) ? staleConfig(rec) : null;
   if (changed) warn(`! ${changed}`);
@@ -2477,7 +2501,7 @@ function cmdScrubLogs(flags) {
         '(Time Machine, transcripts, rotated archives, logs under another KEYSMITH_DATA). Rotate it:',
         '  keysmith key add --reveal     # in a terminal; move every client to the new key',
         '  keysmith key revoke fp:<old>  # the fingerprint `keysmith key list` shows',
-        '  then restart the gateway, which reads its keys at start',
+        '  no restart needed — the running gateway picks up key changes automatically on the next request (SIGHUP forces it)',
       ].join('\n'),
     );
   }
