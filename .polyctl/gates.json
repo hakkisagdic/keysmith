@@ -1,0 +1,28 @@
+{
+  "gates": {
+    "test": {
+      "run": "npm run test",
+      "expect": "exit_zero",
+      "timeout": 2400,
+      "serialise": true,
+      "inputs": [
+        "**"
+      ]
+    },
+    "diff-check": {
+      "run": "git diff --check",
+      "expect": "exit_zero",
+      "timeout": 60
+    }
+  },
+  "profiles": {
+    "quick": [
+      "diff-check"
+    ],
+    "full": [
+      "test",
+      "diff-check"
+    ]
+  },
+  "default_profile": "quick"
+}
