@@ -15,6 +15,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { joinArgs } from '../src/util.js';
 import { cmdNdjson, kiroStreamJson, opencodeNdjson, toLines, warpNdjson } from '../src/parsers.js';
@@ -27,6 +28,12 @@ import { UsageLog } from '../src/usage.js';
 
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const KEY = 'ks_agents_00000000000000000000000';
+
+const _require = createRequire(import.meta.url);
+let hasNodeSqlite = false;
+try {
+  hasNodeSqlite = typeof _require('node:sqlite')?.DatabaseSync === 'function';
+} catch {}
 
 const cleanups = [];
 after(() => {
@@ -1593,7 +1600,10 @@ test('opencode preflight: refuses inherited pattern-map allow and managed-config
   assert.equal(getOpencodePreflightStats().runs, 5, 'changing relevant env invalidated the cache and re-ran preflight');
 });
 
-test('opencode preflight org-config (opencode.db): passes with no db or clean 1.19.3 db without hashing session writes, and refuses active org allowing read, unreadable, locked, or unknown-schema db', async () => {
+test(
+  'opencode preflight org-config (opencode.db): passes with no db or clean 1.19.3 db without hashing session writes, and refuses active org allowing read, unreadable, locked, or unknown-schema db',
+  { skip: !hasNodeSqlite && 'node:sqlite needs node >= 22.5' },
+  async () => {
   const { clearOpencodePreflightCache, getOpencodePreflightStats } = await import('../src/cli-adapter.js');
   const http = await import('node:http');
   const { createRequire } = await import('node:module');
@@ -2279,7 +2289,10 @@ line({ type: 'step_finish', sessionID: 'ses_v', part: { type: 'step-finish', rea
   assert.equal(fs.existsSync(stub1194.recordFile), true, 'opencode 1.19.4 ran when allowUnverifiedVersion: true was set');
 });
 
-test("opencode preflight async org-config fetch: slow /api/config fetch does not block another adapter's request, caches briefly by (account, org, tokenExpiry), and fails closed on timeout or error", async () => {
+test(
+  "opencode preflight async org-config fetch: slow /api/config fetch does not block another adapter's request, caches briefly by (account, org, tokenExpiry), and fails closed on timeout or error",
+  { skip: !hasNodeSqlite && 'node:sqlite needs node >= 22.5' },
+  async () => {
   const {
     clearOpencodePreflightCache,
     getOpencodeOrgConfigStats,
