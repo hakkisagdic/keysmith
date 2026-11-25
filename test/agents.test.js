@@ -15,9 +15,10 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { joinArgs } from '../src/util.js';
-import { cmdNdjson, kiroStreamJson, opencodeNdjson, warpNdjson } from '../src/parsers.js';
+import { cmdNdjson, kiroStreamJson, opencodeNdjson, toLines, warpNdjson } from '../src/parsers.js';
 import { CliAdapter } from '../src/cli-adapter.js';
 import { HttpAdapter } from '../src/http-adapter.js';
 import { CLI_PROFILES } from '../src/profiles.js';
@@ -27,6 +28,12 @@ import { UsageLog } from '../src/usage.js';
 
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const KEY = 'ks_agents_00000000000000000000000';
+
+const _require = createRequire(import.meta.url);
+let hasNodeSqlite = false;
+try {
+  hasNodeSqlite = typeof _require('node:sqlite')?.DatabaseSync === 'function';
+} catch {}
 
 const cleanups = [];
 after(() => {
@@ -486,6 +493,7 @@ fs.writeFileSync(${JSON.stringify(record)}, JSON.stringify({
 }));
 const prompt = argv[argv.length - 1] || '';
 const line = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+const lines = (...os) => process.stdout.write(os.map((o) => JSON.stringify(o)).join('\\n') + '\\n');
 if (prompt.includes('stderr-refusal')) {
   process.stderr.write("Error: OpenCode's free tier can only be used from within OpenCode.\\n");
   setTimeout(() => {}, 20000);
@@ -523,10 +531,13 @@ if (prompt.includes('read-first')) {
     hasReadDeny && hasExtDeny && !prompt.includes('read-rejected')
       ? 'The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules [{"permission":"*","pattern":"*","action":"deny"},{"permission":"external_directory","pattern":"*","action":"deny"},{"permission":"external_directory","pattern":"~/.local/share/opencode/tool-output/*","action":"deny"},{"permission":"read","pattern":"*","action":"deny"},{"permission":"read","pattern":"","action":"deny"}]'
       : 'The user rejected permission to use this specific tool call.';
-  line({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_r1', state: { status: 'error', input: { filePath: '/private/tmp/secret.txt' }, error: errText } } });
+  const evts = [
+    { type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_r1', state: { status: 'error', input: { filePath: '/private/tmp/secret.txt' }, error: errText } } },
+  ];
   if (prompt.includes('then-executed')) {
-    line({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_r2', state: { status: 'completed', input: { filePath: '/etc/hosts' }, output: '127.0.0.1 localhost' } } });
+    evts.push({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_r2', state: { status: 'completed', input: { filePath: '/etc/hosts' }, output: '127.0.0.1 localhost' } } });
   }
+  lines(...evts);
   setTimeout(() => line({ type: 'text', sessionID: 'ses_1', part: { type: 'text', text: 'after read' } }), 4000);
   return;
 }
@@ -540,8 +551,10 @@ if (prompt.includes('hold-cwd')) {
 }
 line({ type: 'text', sessionID: 'ses_1', part: { type: 'text', text: 'OK' } });
 if (prompt.includes('tool-denied-then-executed-after')) {
-  line({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_d1', state: { status: 'error', input: { filePath: '/private/tmp/secret.txt' }, error: 'The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules [{"permission":"*","pattern":"*","action":"deny"}]' } } });
-  line({ type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_e2', state: { status: 'completed', input: { filePath: '/etc/hosts' }, output: '127.0.0.1 localhost' } } });
+  lines(
+    { type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_d1', state: { status: 'error', input: { filePath: '/private/tmp/secret.txt' }, error: 'The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules [{"permission":"*","pattern":"*","action":"deny"}]' } } },
+    { type: 'tool_use', sessionID: 'ses_1', part: { type: 'tool', tool: 'read', callID: 'call_e2', state: { status: 'completed', input: { filePath: '/etc/hosts' }, output: '127.0.0.1 localhost' } } },
+  );
   setTimeout(() => line({ type: 'text', sessionID: 'ses_1', part: { type: 'text', text: 'OK and again' } }), 4000);
   return;
 }
@@ -889,6 +902,33 @@ test('opencode-ndjson: each tool call is reported once, however many lines it ta
   );
   assert.deepEqual(evts.filter((e) => e.type === 'tool').map((e) => e.name), ['bash', 'read']);
   assert.equal(textOf(evts), 'fine');
+});
+
+test('opencode-ndjson: two tool_use lines in one chunk are both parsed (DeniedError then executed)', async () => {
+  const chunk = [
+    JSON.stringify({
+      type: 'tool_use',
+      part: {
+        type: 'tool',
+        tool: 'read',
+        callID: 'c1',
+        state: {
+          status: 'error',
+          error: 'The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules []',
+        },
+      },
+    }),
+    JSON.stringify({
+      type: 'tool_use',
+      part: { type: 'tool', tool: 'read', callID: 'c2', state: { status: 'completed', output: 'leaked' } },
+    }),
+  ].join('\n') + '\n';
+  const evts = await events(opencodeNdjson(toLines((async function* () { yield chunk; })())));
+  const tools = evts.filter((e) => e.type === 'tool');
+  assert.deepEqual(tools.map((e) => [e.name, e.errorType]), [
+    ['read', 'DeniedError'],
+    ['read', 'executed'],
+  ]);
 });
 
 test('cmd: a tool call is reported at tool_queued, before its permission check, and the cmd profile stops the run there', async () => {
@@ -1560,7 +1600,10 @@ test('opencode preflight: refuses inherited pattern-map allow and managed-config
   assert.equal(getOpencodePreflightStats().runs, 5, 'changing relevant env invalidated the cache and re-ran preflight');
 });
 
-test('opencode preflight org-config (opencode.db): passes with no db or clean 1.19.3 db without hashing session writes, and refuses active org allowing read, unreadable, locked, or unknown-schema db', async () => {
+test(
+  'opencode preflight org-config (opencode.db): passes with no db or clean 1.19.3 db without hashing session writes, and refuses active org allowing read, unreadable, locked, or unknown-schema db',
+  { skip: !hasNodeSqlite && 'node:sqlite needs node >= 22.5' },
+  async () => {
   const { clearOpencodePreflightCache, getOpencodePreflightStats } = await import('../src/cli-adapter.js');
   const http = await import('node:http');
   const { createRequire } = await import('node:module');
@@ -2246,7 +2289,10 @@ line({ type: 'step_finish', sessionID: 'ses_v', part: { type: 'step-finish', rea
   assert.equal(fs.existsSync(stub1194.recordFile), true, 'opencode 1.19.4 ran when allowUnverifiedVersion: true was set');
 });
 
-test("opencode preflight async org-config fetch: slow /api/config fetch does not block another adapter's request, caches briefly by (account, org, tokenExpiry), and fails closed on timeout or error", async () => {
+test(
+  "opencode preflight async org-config fetch: slow /api/config fetch does not block another adapter's request, caches briefly by (account, org, tokenExpiry), and fails closed on timeout or error",
+  { skip: !hasNodeSqlite && 'node:sqlite needs node >= 22.5' },
+  async () => {
   const {
     clearOpencodePreflightCache,
     getOpencodeOrgConfigStats,
